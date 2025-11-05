@@ -6,6 +6,7 @@ metrics_port: 9000
 
 # Emir boyutu sınırı (notional = price * qty); hem spot hem futures için uygulanır.
 max_usd_per_order: 100.0
+min_usd_per_order: 10.0
 
 # Kaldıraç (sadece futures)
 leverage: 5
@@ -40,3 +41,10 @@ strategy:
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
   venue: "binance"     # sabit
+  cancel_replace_interval_ms: 1000
+  max_order_age_ms: 10000
+
+websocket:
+  enabled: true
+  reconnect_delay_ms: 5000
+  ping_interval_ms: 30000

@@ -12,3 +12,5 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
+bot_core = { path = "../bot_core" }
+rust_decimal = { workspace = true }

@@ -53,6 +53,7 @@ dependencies = [
  "anyhow",
  "bot_core",
  "config",
+ "data",
  "exec",
  "monitor",
  "reqwest",
@@ -437,8 +438,10 @@ name = "data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bot_core",
  "futures-util",
  "reqwest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tokio",
