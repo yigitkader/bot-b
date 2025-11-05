@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+config = { workspace = true }
+bot_core = { path = "../bot_core" }
+exec = { path = "../exec" }
+monitor = { path = "../monitor" }
+risk = { path = "../risk" }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+strategy = { path = "../strategy" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

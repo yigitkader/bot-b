@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "crates/bot_core",
+    "crates/strategy",
+    "crates/risk",
+    "crates/exec",
+    "crates/data",
+    "crates/monitor",
+    "crates/backtest",
+    "crates/app",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+authors = ["you <you@example.com>"]
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+config = "0.14"
+dashmap = "5"
+futures-util = "0.3"
+flume = "0.11"
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# BINANCE signing
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+urlencoding = "2.1"

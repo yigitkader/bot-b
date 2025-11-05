@@ -1,0 +1,40 @@
+symbol: "BTCUSDT"     # Binance sembol formatı (SPOT/Futures için büyük harf)
+mode: "futures"       # "spot" | "futures"
+metrics_port: 9000
+
+# Emir boyutu sınırı (notional = price * qty); hem spot hem futures için uygulanır.
+max_usd_per_order: 100.0
+
+# Kaldıraç (sadece futures)
+leverage: 5
+
+# Fiyat/lot adımı (quantize için). İstersen exchangeInfo'dan otomatik de çekebiliriz,
+# ama basit ve deterministik olsun diye konfigde tutuyoruz.
+price_tick: 0.10
+qty_step: 0.001
+
+# Binance API
+binance:
+  # SPOT
+  spot_base: "https://api.binance.com"
+  # USDT-M Futures
+  futures_base: "https://fapi.binance.com"
+  api_key: "YOUR_API_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+  recv_window_ms: 5000
+
+risk:
+  inv_cap: "0.50"
+  min_liq_gap_bps: 300
+  dd_limit_bps: 2000
+  max_leverage: 10
+
+strategy:
+  type: "dyn_mm"
+  a: 120.0
+  b: 40.0
+  base_size: "0.005"  # stratejinin önerdiği baz qty; son durumda max_usd_per_order ile kısılır
+
+exec:
+  tif: "post_only"     # "gtc" | "ioc" | "post_only"
+  venue: "binance"     # sabit

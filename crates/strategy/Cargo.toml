@@ -1,0 +1,10 @@
+[package]
+name = "strategy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+bot_core = { path = "../bot_core" }
