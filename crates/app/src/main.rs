@@ -61,8 +61,16 @@ fn tif_from_cfg(s: &str) -> Tif {
 
 fn clamp_qty_by_usd(qty: Qty, px: Px, max_usd: f64, qty_step: f64) -> Qty {
     let p = px.0.to_f64().unwrap_or(0.0);
-    if p <= 0.0 || max_usd <= 0.0 { return qty; }
+    if p <= 0.0 || max_usd <= 0.0 { return Qty(Decimal::ZERO); }
     let max_qty = (max_usd / p).floor_div_step(qty_step);
+    let wanted = qty.0.to_f64().unwrap_or(0.0);
+    let q = wanted.min(max_qty);
+    Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
+}
+
+fn clamp_qty_by_base(qty: Qty, max_base: f64, qty_step: f64) -> Qty {
+    if max_base <= 0.0 { return Qty(Decimal::ZERO); }
+    let max_qty = max_base.floor_div_step(qty_step);
     let wanted = qty.0.to_f64().unwrap_or(0.0);
     let q = wanted.min(max_qty);
     Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
@@ -121,7 +129,13 @@ async fn main() -> Result<()> {
         })
     };
 
-    let mut inv = Qty(Decimal::ZERO);
+    let (base_asset, quote_asset) = match &venue {
+        V::Spot(v) => v.symbol_assets(&cfg.symbol).await?,
+        V::Fut(v) => v.symbol_assets(&cfg.symbol).await?,
+    };
+    info!(symbol = %cfg.symbol, base_asset = %base_asset, quote_asset = %quote_asset, mode = %cfg.mode, "bot initialized assets");
+
+    let inv = Qty(Decimal::ZERO);
     let symbol = cfg.symbol.clone();
     info!(%symbol, mode = %cfg.mode, "bot started with real Binance venue");
 
@@ -142,13 +156,28 @@ async fn main() -> Result<()> {
         let ctx = Context { ob, sigma: 0.5, inv, liq_gap_bps: 800.0 };
         let mut quotes = strat.on_tick(&ctx);
 
-        // max_usd_per_order kuralı: qty clamp
+        // max_usd_per_order kuralı + hesap bakiyesi
+        struct Caps { buy_notional: f64, sell_notional: f64, sell_base: Option<f64> }
+        let caps = match &venue {
+            V::Spot(v) => {
+                let quote_free = v.asset_free(&quote_asset).await?.to_f64().unwrap_or(0.0);
+                let base_free = v.asset_free(&base_asset).await?.to_f64().unwrap_or(0.0);
+                Caps { buy_notional: cfg.max_usd_per_order.min(quote_free), sell_notional: cfg.max_usd_per_order, sell_base: Some(base_free) }
+            }
+            V::Fut(v) => {
+                let avail = v.available_balance(&quote_asset).await?.to_f64().unwrap_or(0.0);
+                let cap = cfg.max_usd_per_order.min(avail);
+                Caps { buy_notional: cap, sell_notional: cap, sell_base: None }
+            }
+        };
+
         if let Some((px, q)) = quotes.bid {
-            let nq = clamp_qty_by_usd(q, px, cfg.max_usd_per_order, cfg.qty_step);
+            let nq = clamp_qty_by_usd(q, px, caps.buy_notional, cfg.qty_step);
             quotes.bid = Some((px, nq));
         }
         if let Some((px, q)) = quotes.ask {
-            let nq = clamp_qty_by_usd(q, px, cfg.max_usd_per_order, cfg.qty_step);
+            let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, cfg.qty_step);
+            if let Some(max_base) = caps.sell_base { nq = clamp_qty_by_base(nq, max_base, cfg.qty_step); }
             quotes.ask = Some((px, nq));
         }
 
