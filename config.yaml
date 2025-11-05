@@ -1,5 +1,6 @@
 symbols: []            # Manuel semboller; boş bırakırsan auto discovery devrede
-auto_discover_usdt: true
+auto_discover_quote: true
+quote_asset: "USDC"
 mode: "futures"       # "spot" | "futures"
 metrics_port: 9000
 
@@ -18,7 +19,7 @@ qty_step: 0.001
 binance:
   # SPOT
   spot_base: "https://api.binance.com"
-  # USDT-M Futures
+  # USDⓈ-M Futures (USDC teminat)
   futures_base: "https://fapi.binance.com"
   api_key: "YOUR_API_KEY"
   secret_key: "YOUR_SECRET_KEY"
