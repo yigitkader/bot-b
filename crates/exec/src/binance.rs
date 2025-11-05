@@ -235,7 +235,7 @@ impl Venue for BinanceFutures {
     async fn place_limit(&self, sym: &str, side: Side, px: Px, qty: Qty, tif: Tif) -> Result<String> {
         let s_side = match side { Side::Buy => "BUY", Side::Sell => "SELL" };
         let tif_str = match tif {
-            Tif::PostOnly => "GTX",   // Post-only Futures
+            Tif::PostOnly => "GTX",
             Tif::Gtc      => "GTC",
             Tif::Ioc      => "IOC",
         };

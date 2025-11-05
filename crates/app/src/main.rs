@@ -28,11 +28,11 @@ struct BinanceCfg {
 
 #[derive(Debug, Deserialize)]
 struct AppCfg {
-    symbol: String,          // e.g. "BTCUSDT"
-    mode: String,            // "spot" | "futures"
+    symbol: String,
+    mode: String,
     metrics_port: Option<u16>,
     max_usd_per_order: f64,
-    leverage: Option<u32>,   // only futures (not set here programmatically)
+    leverage: Option<u32>,
     price_tick: f64,
     qty_step: f64,
     binance: BinanceCfg,
