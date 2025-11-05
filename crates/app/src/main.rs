@@ -391,20 +391,63 @@ async fn main() -> Result<()> {
                 "calculated order caps"
             );
 
+            let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
+
             if let Some((px, q)) = quotes.bid {
-                let nq = clamp_qty_by_usd(q, px, caps.buy_notional, cfg.qty_step);
-                quotes.bid = Some((px, nq));
-                info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared bid quote");
+                if px.0 <= Decimal::ZERO {
+                    warn!(%symbol, ?px, "dropping bid quote with non-positive price");
+                    quotes.bid = None;
+                } else {
+                    let nq = clamp_qty_by_usd(q, px, caps.buy_notional, cfg.qty_step);
+                    let quantized_to_zero = qty_step_dec > Decimal::ZERO
+                        && nq.0 < qty_step_dec
+                        && nq.0 != Decimal::ZERO;
+                    if nq.0 == Decimal::ZERO || quantized_to_zero {
+                        warn!(
+                            %symbol,
+                            ?px,
+                            original_qty = ?q,
+                            qty_step = cfg.qty_step,
+                            quantized_to_zero,
+                            "dropping bid quote after clamps produced zero quantity"
+                        );
+                        quotes.bid = None;
+                    } else {
+                        quotes.bid = Some((px, nq));
+                        info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared bid quote");
+                    }
+                }
             } else {
                 info!(%symbol, "no bid quote generated for this tick");
             }
             if let Some((px, q)) = quotes.ask {
-                let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, cfg.qty_step);
-                if let Some(max_base) = caps.sell_base {
-                    nq = clamp_qty_by_base(nq, max_base, cfg.qty_step);
+                if px.0 <= Decimal::ZERO {
+                    warn!(%symbol, ?px, "dropping ask quote with non-positive price");
+                    quotes.ask = None;
+                } else {
+                    let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, cfg.qty_step);
+                    if let Some(max_base) = caps.sell_base {
+                        nq = clamp_qty_by_base(nq, max_base, cfg.qty_step);
+                    }
+                    let quantized_to_zero = qty_step_dec > Decimal::ZERO
+                        && nq.0 < qty_step_dec
+                        && nq.0 != Decimal::ZERO;
+                    if nq.0 == Decimal::ZERO || quantized_to_zero {
+                        warn!(
+                            %symbol,
+                            ?px,
+                            original_qty = ?q,
+                            sell_base = ?caps.sell_base,
+                            qty_step = cfg.qty_step,
+                            quantized_to_zero,
+                            "dropping ask quote after clamps produced zero quantity"
+                        );
+                        quotes.ask = None;
+                    } else {
+                        quotes.ask = Some((px, nq));
+                        info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared ask quote");
+                    }
                 }
-                quotes.ask = Some((px, nq));
-                info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared ask quote");
             } else {
                 info!(%symbol, "no ask quote generated for this tick");
             }
