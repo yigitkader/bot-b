@@ -1,4 +1,5 @@
-symbol: "BTCUSDT"     # Binance sembol formatı (SPOT/Futures için büyük harf)
+symbols: []            # Manuel semboller; boş bırakırsan auto discovery devrede
+auto_discover_usdt: true
 mode: "futures"       # "spot" | "futures"
 metrics_port: 9000
 
