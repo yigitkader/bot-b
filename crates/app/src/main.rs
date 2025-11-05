@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
             V::Spot(v) => v.best_prices(&symbol).await?,
             V::Fut(v) => v.best_prices(&symbol).await?,
         };
+        info!(%symbol, ?bid, ?ask, "fetched best prices");
         let ob = OrderBook {
             best_bid: Some(BookLevel {
                 px: bid,
@@ -224,6 +225,7 @@ async fn main() -> Result<()> {
             liq_gap_bps: cfg.risk.min_liq_gap_bps.max(0.0),
         };
         let mut quotes = strat.on_tick(&ctx);
+        info!(%symbol, ?quotes, "strategy produced raw quotes");
 
         // max_usd_per_order kuralı + hesap bakiyesi
         struct Caps {
@@ -258,10 +260,19 @@ async fn main() -> Result<()> {
                 }
             }
         };
+        info!(
+            buy_notional = caps.buy_notional,
+            sell_notional = caps.sell_notional,
+            sell_base = ?caps.sell_base,
+            "calculated order caps"
+        );
 
         if let Some((px, q)) = quotes.bid {
             let nq = clamp_qty_by_usd(q, px, caps.buy_notional, cfg.qty_step);
             quotes.bid = Some((px, nq));
+            info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared bid quote");
+        } else {
+            info!(%symbol, "no bid quote generated for this tick");
         }
         if let Some((px, q)) = quotes.ask {
             let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, cfg.qty_step);
@@ -269,24 +280,39 @@ async fn main() -> Result<()> {
                 nq = clamp_qty_by_base(nq, max_base, cfg.qty_step);
             }
             quotes.ask = Some((px, nq));
+            info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared ask quote");
+        } else {
+            info!(%symbol, "no ask quote generated for this tick");
         }
 
         // emirleri gönder
         match &venue {
             V::Spot(v) => {
                 if let Some((px, qty)) = quotes.bid {
-                    let _ = v.place_limit(&symbol, Side::Buy, px, qty, tif).await;
+                    info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot bid order");
+                    if let Err(err) = v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
+                        warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot bid order");
+                    }
                 }
                 if let Some((px, qty)) = quotes.ask {
-                    let _ = v.place_limit(&symbol, Side::Sell, px, qty, tif).await;
+                    info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot ask order");
+                    if let Err(err) = v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
+                        warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot ask order");
+                    }
                 }
             }
             V::Fut(v) => {
                 if let Some((px, qty)) = quotes.bid {
-                    let _ = v.place_limit(&symbol, Side::Buy, px, qty, tif).await;
+                    info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
+                    if let Err(err) = v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
+                        warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures bid order");
+                    }
                 }
                 if let Some((px, qty)) = quotes.ask {
-                    let _ = v.place_limit(&symbol, Side::Sell, px, qty, tif).await;
+                    info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
+                    if let Err(err) = v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
+                        warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures ask order");
+                    }
                 }
             }
         }
