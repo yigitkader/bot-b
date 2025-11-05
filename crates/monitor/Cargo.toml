@@ -1,3 +1,4 @@
+#location: /crates/monitor/Cargo.toml
 [package]
 name = "monitor"
 version = "0.1.0"

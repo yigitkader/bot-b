@@ -1,3 +1,4 @@
+#location: /crates/bot_core/Cargo.toml
 [package]
 name = "bot_core"
 version = "0.1.0"

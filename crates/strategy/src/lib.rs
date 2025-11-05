@@ -1,3 +1,4 @@
+//location: /crates/strategy/src/lib.rs
 use bot_core::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;

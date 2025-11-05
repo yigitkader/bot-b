@@ -1,3 +1,4 @@
+//location: /crates/bot_core/src/lib.rs
 pub mod types {
     use rust_decimal::Decimal;
     use serde::{Deserialize, Serialize};

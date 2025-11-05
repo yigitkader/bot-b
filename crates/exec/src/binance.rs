@@ -1,3 +1,4 @@
+//location: /crates/exec/src/binance.rs
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bot_core::types::*;

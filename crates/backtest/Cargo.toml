@@ -1,3 +1,4 @@
+#location: /crates/backtest/Cargo.toml
 [package]
 name = "backtest"
 version = "0.1.0"

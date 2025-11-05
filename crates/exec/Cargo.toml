@@ -1,3 +1,4 @@
+#location: /crates/exec/Cargo.toml
 [package]
 name = "exec"
 version = "0.1.0"

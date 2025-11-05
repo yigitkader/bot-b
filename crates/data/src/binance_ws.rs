@@ -1,3 +1,4 @@
+//location: /crates/data/src/binance_ws.rs
 use anyhow::{anyhow, Result};
 use bot_core::types::{Px, Qty, Side};
 use futures_util::{SinkExt, StreamExt};

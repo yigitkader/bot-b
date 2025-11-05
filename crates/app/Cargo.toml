@@ -1,3 +1,4 @@
+#location: /crates/app/Cargo.toml
 [package]
 name = "app"
 version = "0.1.0"

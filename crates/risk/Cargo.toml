@@ -1,3 +1,4 @@
+#location: /crates/risk/Cargo.toml
 [package]
 name = "risk"
 version = "0.1.0"

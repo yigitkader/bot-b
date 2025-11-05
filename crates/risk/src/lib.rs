@@ -1,3 +1,4 @@
+//location: /crates/risk/src/lib.rs
 use bot_core::types::*;
 
 pub struct RiskLimits {

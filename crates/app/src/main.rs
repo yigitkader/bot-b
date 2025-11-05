@@ -1,3 +1,5 @@
+//location: /crates/app/src/main.rs
+
 use anyhow::{anyhow, Result};
 use bot_core::types::*;
 use data::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
