@@ -12,7 +12,7 @@ use tracing::{info, warn};
 struct RiskCfg { inv_cap: String, min_liq_gap_bps: f64, dd_limit_bps: i64, max_leverage: u32 }
 
 #[derive(Debug, Deserialize)]
-struct StratCfg { r#type: String, a: f64, b: f64, base_size: String, inv_cap: String }
+struct StratCfg { r#type: String, a: f64, b: f64, base_size: String, #[serde(default)] inv_cap: Option<String> }
 
 #[derive(Debug, Deserialize)]
 struct ExecCfg { tif: String, venue: String }
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         a: cfg.strategy.a,
         b: cfg.strategy.b,
         base_size: Decimal::from_str_radix(&cfg.strategy.base_size, 10).unwrap(),
-        inv_cap: Decimal::from_str_radix(&cfg.strategy.inv_cap, 10).unwrap()
+        inv_cap: Decimal::from_str_radix(cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap), 10).unwrap()
     };
     let mut strat: Box<dyn Strategy> = match cfg.strategy.r#type.as_str() {
         "dyn_mm" => Box::new(DynMm::from(dyn_cfg)),
