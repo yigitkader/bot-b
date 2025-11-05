@@ -1,17 +1,55 @@
 use anyhow::{anyhow, Result};
 use bot_core::types::*;
+use data::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
 use exec::binance::{BinanceCommon, BinanceFutures, BinanceSpot, SymbolMeta};
 use exec::Venue;
+use risk::{RiskAction, RiskLimits};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use strategy::{Context, DynMm, DynMmCfg, Strategy};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+use std::cmp::max;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 struct SymbolState {
     meta: SymbolMeta,
     inv: Qty,
     strategy: Box<dyn Strategy>,
+    active_orders: HashMap<String, OrderInfo>,
+    pnl_history: Vec<Decimal>,
+}
+
+#[derive(Clone, Debug)]
+struct OrderInfo {
+    order_id: String,
+    side: Side,
+    price: Px,
+    qty: Qty,
+    created_at: Instant,
+}
+
+fn compute_drawdown_bps(history: &[Decimal]) -> i64 {
+    if history.is_empty() {
+        return 0;
+    }
+    let mut peak = history[0];
+    let mut max_drawdown = Decimal::ZERO;
+    for value in history {
+        if *value > peak {
+            peak = *value;
+        }
+        if peak > Decimal::ZERO {
+            let drawdown = ((*value - peak) / peak) * Decimal::from(10_000i32);
+            if drawdown < max_drawdown {
+                max_drawdown = drawdown;
+            }
+        }
+    }
+    max_drawdown.to_i64().unwrap_or(0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +74,36 @@ struct StratCfg {
 struct ExecCfg {
     tif: String,
     venue: String,
+    #[serde(default = "default_cancel_interval")]
+    cancel_replace_interval_ms: u64,
+    #[serde(default = "default_max_order_age")]
+    max_order_age_ms: u64,
+}
+
+fn default_cancel_interval() -> u64 {
+    1_000
+}
+
+fn default_max_order_age() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WebsocketCfg {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_ws_reconnect_delay")]
+    reconnect_delay_ms: u64,
+    #[serde(default = "default_ws_ping_interval")]
+    ping_interval_ms: u64,
+}
+
+fn default_ws_reconnect_delay() -> u64 {
+    5_000
+}
+
+fn default_ws_ping_interval() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +132,8 @@ struct AppCfg {
     mode: String,
     metrics_port: Option<u16>,
     max_usd_per_order: f64,
+    #[serde(default)]
+    min_usd_per_order: Option<f64>,
     leverage: Option<u32>,
     price_tick: f64,
     qty_step: f64,
@@ -71,6 +141,8 @@ struct AppCfg {
     risk: RiskCfg,
     strategy: StratCfg,
     exec: ExecCfg,
+    #[serde(default)]
+    websocket: WebsocketCfg,
 }
 
 fn load_cfg() -> Result<AppCfg> {
@@ -296,6 +368,7 @@ async fn main() -> Result<()> {
     }
 
     let mut states: Vec<SymbolState> = Vec::new();
+    let mut symbol_index: HashMap<String, usize> = HashMap::new();
     for meta in selected {
         info!(
             symbol = %meta.symbol,
@@ -305,15 +378,69 @@ async fn main() -> Result<()> {
             "bot initialized assets"
         );
         let strategy = build_strategy(&meta.symbol);
+        let idx = states.len();
+        symbol_index.insert(meta.symbol.clone(), idx);
         states.push(SymbolState {
             meta,
             inv: Qty(Decimal::ZERO),
             strategy,
+            active_orders: HashMap::new(),
+            pnl_history: Vec::new(),
         });
     }
 
     let symbol_list: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
     info!(symbols = ?symbol_list, mode = %cfg.mode, "bot started with real Binance venue");
+
+    let risk_limits = RiskLimits {
+        inv_cap: Qty(Decimal::from_str_radix(&cfg.risk.inv_cap, 10)?),
+        min_liq_gap_bps: cfg.risk.min_liq_gap_bps,
+        dd_limit_bps: cfg.risk.dd_limit_bps,
+        max_leverage: cfg.risk.max_leverage,
+    };
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    if cfg.websocket.enabled {
+        let client = common.client.clone();
+        let api_key = cfg.binance.api_key.clone();
+        let spot_base = cfg.binance.spot_base.clone();
+        let futures_base = cfg.binance.futures_base.clone();
+        let reconnect_delay = Duration::from_millis(cfg.websocket.reconnect_delay_ms);
+        let tx = event_tx.clone();
+        let kind = match &venue {
+            V::Spot(_) => UserStreamKind::Spot,
+            V::Fut(_) => UserStreamKind::Futures,
+        };
+        info!(
+            reconnect_delay_ms = cfg.websocket.reconnect_delay_ms,
+            ping_interval_ms = cfg.websocket.ping_interval_ms,
+            ?kind,
+            "launching user data stream task"
+        );
+        tokio::spawn(async move {
+            let base = match kind {
+                UserStreamKind::Spot => spot_base,
+                UserStreamKind::Futures => futures_base,
+            };
+            loop {
+                match UserDataStream::connect(client.clone(), &base, &api_key, kind).await {
+                    Ok(mut stream) => {
+                        info!(?kind, "connected to Binance user data stream");
+                        while let Ok(event) = stream.next_event().await {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        warn!("user data stream reader exited, retrying");
+                    }
+                    Err(err) => {
+                        warn!(?err, "failed to connect user data stream");
+                    }
+                }
+                tokio::time::sleep(reconnect_delay).await;
+            }
+        });
+    }
 
     struct Caps {
         buy_notional: f64,
@@ -321,14 +448,91 @@ async fn main() -> Result<()> {
         sell_base: Option<f64>,
     }
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(1200));
+    let tick_ms = max(100, cfg.exec.cancel_replace_interval_ms);
+    let min_usd_per_order = cfg.min_usd_per_order.unwrap_or(0.0);
+    let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
     loop {
         interval.tick().await;
+
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                UserEvent::OrderFill {
+                    symbol,
+                    order_id,
+                    side,
+                    qty,
+                    ..
+                } => {
+                    if let Some(idx) = symbol_index.get(&symbol) {
+                        let state = &mut states[*idx];
+                        let mut inv = state.inv.0;
+                        if side == Side::Buy {
+                            inv += qty.0;
+                        } else {
+                            inv -= qty.0;
+                        }
+                        state.inv = Qty(inv);
+                        state.active_orders.remove(&order_id);
+                    }
+                }
+                UserEvent::OrderCanceled { symbol, order_id } => {
+                    if let Some(idx) = symbol_index.get(&symbol) {
+                        let state = &mut states[*idx];
+                        state.active_orders.remove(&order_id);
+                    }
+                }
+                _ => {}
+            }
+        }
 
         for state in states.iter_mut() {
             let symbol = state.meta.symbol.clone();
             let base_asset = state.meta.base_asset.clone();
             let quote_asset = state.meta.quote_asset.clone();
+
+            if !state.active_orders.is_empty() {
+                let existing_orders: Vec<OrderInfo> =
+                    state.active_orders.values().cloned().collect();
+                state.active_orders.clear();
+                for order in existing_orders {
+                    let age_ms = order.created_at.elapsed().as_millis() as u64;
+                    let stale = age_ms > cfg.exec.max_order_age_ms;
+                    if stale {
+                        warn!(
+                            %symbol,
+                            order_id = %order.order_id,
+                            side = ?order.side,
+                            price = ?order.price,
+                            qty = ?order.qty,
+                            age_ms,
+                            max_age = cfg.exec.max_order_age_ms,
+                            "canceling stale order"
+                        );
+                    } else {
+                        info!(
+                            %symbol,
+                            order_id = %order.order_id,
+                            side = ?order.side,
+                            price = ?order.price,
+                            qty = ?order.qty,
+                            age_ms,
+                            "canceling active order before refresh"
+                        );
+                    }
+                    match &venue {
+                        V::Spot(v) => {
+                            if let Err(err) = v.cancel(&order.order_id, &symbol).await {
+                                warn!(%symbol, order_id = %order.order_id, ?err, "failed to cancel existing spot order");
+                            }
+                        }
+                        V::Fut(v) => {
+                            if let Err(err) = v.cancel(&order.order_id, &symbol).await {
+                                warn!(%symbol, order_id = %order.order_id, ?err, "failed to cancel existing futures order");
+                            }
+                        }
+                    }
+                }
+            }
 
             let (bid, ask) = match &venue {
                 V::Spot(v) => v.best_prices(&symbol).await?,
@@ -346,14 +550,91 @@ async fn main() -> Result<()> {
                 }),
             };
 
+            let pos = match &venue {
+                V::Spot(v) => v.get_position(&symbol).await?,
+                V::Fut(v) => v.get_position(&symbol).await?,
+            };
+            state.inv = pos.qty;
+
+            let mark_px = match &venue {
+                V::Spot(v) => v.mark_price(&symbol).await?,
+                V::Fut(v) => v.mark_price(&symbol).await?,
+            };
+
+            let liq_gap_bps = if let Some(liq_px) = pos.liq_px {
+                let mark = mark_px.0.to_f64().unwrap_or(0.0);
+                let liq = liq_px.0.to_f64().unwrap_or(0.0);
+                if mark > 0.0 {
+                    ((mark - liq).abs() / mark) * 10_000.0
+                } else {
+                    9_999.0
+                }
+            } else {
+                9_999.0
+            };
+
+            let dd_bps = compute_drawdown_bps(&state.pnl_history);
+            let risk_action = risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, &risk_limits);
+
+            if matches!(risk_action, RiskAction::Halt) {
+                warn!(%symbol, "risk halt triggered, cancelling and flattening");
+                match &venue {
+                    V::Spot(v) => {
+                        v.cancel_all(&symbol).await?;
+                        v.close_position(&symbol).await?;
+                    }
+                    V::Fut(v) => {
+                        v.cancel_all(&symbol).await?;
+                        v.close_position(&symbol).await?;
+                    }
+                }
+                continue;
+            }
+
             let ctx = Context {
                 ob,
                 sigma: 0.5,
                 inv: state.inv,
-                liq_gap_bps: cfg.risk.min_liq_gap_bps.max(0.0),
+                liq_gap_bps,
+                funding_rate: None,
+                next_funding_time: None,
             };
             let mut quotes = state.strategy.on_tick(&ctx);
-            info!(%symbol, ?quotes, "strategy produced raw quotes");
+            info!(%symbol, ?quotes, ?risk_action, "strategy produced raw quotes");
+
+            match risk_action {
+                RiskAction::Reduce => {
+                    quotes.bid = quotes.bid.map(|(px, qty)| {
+                        let reduced = qty.0 / Decimal::from(2u32);
+                        let reduced = if reduced > Decimal::ZERO {
+                            reduced
+                        } else {
+                            Decimal::ZERO
+                        };
+                        (px, Qty(reduced))
+                    });
+                    quotes.ask = quotes.ask.map(|(px, qty)| {
+                        let reduced = qty.0 / Decimal::from(2u32);
+                        let reduced = if reduced > Decimal::ZERO {
+                            reduced
+                        } else {
+                            Decimal::ZERO
+                        };
+                        (px, Qty(reduced))
+                    });
+                }
+                RiskAction::Widen => {
+                    let widen = Decimal::from_f64_retain(0.001).unwrap_or(Decimal::ZERO);
+                    quotes.bid = quotes
+                        .bid
+                        .map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
+                    quotes.ask = quotes
+                        .ask
+                        .map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
+                }
+                RiskAction::Ok => {}
+                RiskAction::Halt => {}
+            }
 
             let caps = match &venue {
                 V::Spot(v) => {
@@ -402,13 +683,19 @@ async fn main() -> Result<()> {
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
                         && nq.0 != Decimal::ZERO;
-                    if nq.0 == Decimal::ZERO || quantized_to_zero {
+                    let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
+                    if nq.0 == Decimal::ZERO
+                        || quantized_to_zero
+                        || (min_usd_per_order > 0.0 && notional < min_usd_per_order)
+                    {
                         warn!(
                             %symbol,
                             ?px,
                             original_qty = ?q,
                             qty_step = cfg.qty_step,
                             quantized_to_zero,
+                            notional,
+                            min_usd_per_order,
                             "dropping bid quote after clamps produced zero quantity"
                         );
                         quotes.bid = None;
@@ -432,7 +719,11 @@ async fn main() -> Result<()> {
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
                         && nq.0 != Decimal::ZERO;
-                    if nq.0 == Decimal::ZERO || quantized_to_zero {
+                    let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
+                    if nq.0 == Decimal::ZERO
+                        || quantized_to_zero
+                        || (min_usd_per_order > 0.0 && notional < min_usd_per_order)
+                    {
                         warn!(
                             %symbol,
                             ?px,
@@ -440,6 +731,8 @@ async fn main() -> Result<()> {
                             sell_base = ?caps.sell_base,
                             qty_step = cfg.qty_step,
                             quantized_to_zero,
+                            notional,
+                            min_usd_per_order,
                             "dropping ask quote after clamps produced zero quantity"
                         );
                         quotes.ask = None;
@@ -456,28 +749,76 @@ async fn main() -> Result<()> {
                 V::Spot(v) => {
                     if let Some((px, qty)) = quotes.bid {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot bid order");
-                        if let Err(err) = v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
-                            warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot bid order");
+                        match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
+                            Ok(order_id) => {
+                                let info = OrderInfo {
+                                    order_id: order_id.clone(),
+                                    side: Side::Buy,
+                                    price: px,
+                                    qty,
+                                    created_at: Instant::now(),
+                                };
+                                state.active_orders.insert(order_id, info);
+                            }
+                            Err(err) => {
+                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot bid order");
+                            }
                         }
                     }
                     if let Some((px, qty)) = quotes.ask {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot ask order");
-                        if let Err(err) = v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
-                            warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot ask order");
+                        match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
+                            Ok(order_id) => {
+                                let info = OrderInfo {
+                                    order_id: order_id.clone(),
+                                    side: Side::Sell,
+                                    price: px,
+                                    qty,
+                                    created_at: Instant::now(),
+                                };
+                                state.active_orders.insert(order_id, info);
+                            }
+                            Err(err) => {
+                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot ask order");
+                            }
                         }
                     }
                 }
                 V::Fut(v) => {
                     if let Some((px, qty)) = quotes.bid {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
-                        if let Err(err) = v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
-                            warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures bid order");
+                        match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
+                            Ok(order_id) => {
+                                let info = OrderInfo {
+                                    order_id: order_id.clone(),
+                                    side: Side::Buy,
+                                    price: px,
+                                    qty,
+                                    created_at: Instant::now(),
+                                };
+                                state.active_orders.insert(order_id, info);
+                            }
+                            Err(err) => {
+                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures bid order");
+                            }
                         }
                     }
                     if let Some((px, qty)) = quotes.ask {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
-                        if let Err(err) = v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
-                            warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures ask order");
+                        match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
+                            Ok(order_id) => {
+                                let info = OrderInfo {
+                                    order_id: order_id.clone(),
+                                    side: Side::Sell,
+                                    price: px,
+                                    qty,
+                                    created_at: Instant::now(),
+                                };
+                                state.active_orders.insert(order_id, info);
+                            }
+                            Err(err) => {
+                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures ask order");
+                            }
                         }
                     }
                 }

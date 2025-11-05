@@ -8,10 +8,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 use urlencoding::encode;
 
-use super::Venue;
+use super::{Venue, VenueOrder};
 
 // ---- Ortak ----
 
@@ -77,6 +77,38 @@ struct SpotExchangeSymbol {
     #[serde(rename = "quoteAsset")]
     quote_asset: String,
     status: String,
+}
+
+#[derive(Deserialize)]
+struct SpotPlacedOrder {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+}
+
+#[derive(Deserialize)]
+struct SpotOpenOrder {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    #[serde(rename = "price")]
+    price: String,
+    #[serde(rename = "origQty")]
+    orig_qty: String,
+    #[serde(rename = "side")]
+    side: String,
+}
+
+#[derive(Deserialize)]
+struct SpotTrade {
+    #[serde(rename = "id")]
+    id: i64,
+    #[serde(rename = "qty")]
+    qty: String,
+    #[serde(rename = "price")]
+    price: String,
+    #[serde(rename = "isBuyer")]
+    is_buyer: bool,
+    #[serde(rename = "time")]
+    time: u64,
 }
 
 impl BinanceSpot {
@@ -159,6 +191,144 @@ impl BinanceSpot {
         };
         Ok(amt)
     }
+
+    pub async fn fetch_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
+        let qs = format!(
+            "symbol={}&timestamp={}&recvWindow={}",
+            sym,
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/api/v3/openOrders?{}&signature={}", self.base, qs, sig);
+        let orders: Vec<SpotOpenOrder> = self
+            .common
+            .client
+            .get(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let mut res = Vec::new();
+        for o in orders {
+            let price = Decimal::from_str_radix(&o.price, 10)?;
+            let qty = Decimal::from_str_radix(&o.orig_qty, 10)?;
+            let side = if o.side.eq_ignore_ascii_case("buy") {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            res.push(VenueOrder {
+                order_id: o.order_id.to_string(),
+                side,
+                price: Px(price),
+                qty: Qty(qty),
+            });
+        }
+        Ok(res)
+    }
+
+    pub async fn get_fills_since(&self, symbol: &str, from_id: Option<i64>) -> Result<Vec<Fill>> {
+        let mut params = vec![
+            format!("symbol={}", symbol),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        if let Some(id) = from_id {
+            params.push(format!("fromId={}", id));
+        }
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/api/v3/myTrades?{}&signature={}", self.base, qs, sig);
+        let trades: Vec<SpotTrade> = self
+            .common
+            .client
+            .get(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let mut fills = Vec::new();
+        for t in trades {
+            let qty = Decimal::from_str_radix(&t.qty, 10)?;
+            let price = Decimal::from_str_radix(&t.price, 10)?;
+            let side = if t.is_buyer { Side::Buy } else { Side::Sell };
+            fills.push(Fill {
+                id: t.id,
+                symbol: symbol.to_string(),
+                side,
+                qty: Qty(qty),
+                price: Px(price),
+                timestamp: t.time,
+            });
+        }
+        Ok(fills)
+    }
+
+    pub async fn fetch_position(&self, symbol: &str) -> Result<Position> {
+        let (base, _) = self.symbol_assets(symbol).await?;
+        let qty = self.asset_free(&base).await?;
+        Ok(Position {
+            symbol: symbol.to_string(),
+            qty: Qty(qty),
+            entry: Px(Decimal::ZERO),
+            leverage: 1,
+            liq_px: None,
+        })
+    }
+
+    pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
+        let (bid, ask) = self.best_prices(sym).await?;
+        let mid = (bid.0 + ask.0) / Decimal::from(2);
+        Ok(Px(mid))
+    }
+
+    pub async fn flatten_position(&self, symbol: &str) -> Result<()> {
+        let pos = self.fetch_position(symbol).await?;
+        let qty_f = pos.qty.0.to_f64().unwrap_or(0.0);
+        if qty_f.abs() < f64::EPSILON {
+            return Ok(());
+        }
+        let side = if qty_f > 0.0 { Side::Sell } else { Side::Buy };
+        let qty = quantize(qty_f.abs(), self.qty_step);
+        if qty <= 0.0 {
+            warn!(%symbol, original_qty = qty_f, "quantized position size is zero, skipping close");
+            return Ok(());
+        }
+
+        let params = vec![
+            format!("symbol={}", symbol),
+            format!(
+                "side={}",
+                if matches!(side, Side::Buy) {
+                    "BUY"
+                } else {
+                    "SELL"
+                }
+            ),
+            "type=MARKET".to_string(),
+            format!("quantity={}", qty),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
+        self.common
+            .client
+            .post(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -202,7 +372,7 @@ impl Venue for BinanceSpot {
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
 
-        let res = self
+        let order: SpotPlacedOrder = self
             .common
             .client
             .post(url)
@@ -210,12 +380,11 @@ impl Venue for BinanceSpot {
             .send()
             .await?
             .error_for_status()?
-            .text()
+            .json()
             .await?;
 
-        info!(%sym, ?side, %price, %qty, tif = ?tif, "spot place_limit ok");
-        // Dönen JSON içinde orderId var; burada pars etmeyip raw dönebiliriz
-        Ok(res)
+        info!(%sym, ?side, %price, %qty, tif = ?tif, order_id = order.order_id, "spot place_limit ok");
+        Ok(order.order_id.to_string())
     }
 
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()> {
@@ -260,6 +429,22 @@ impl Venue for BinanceSpot {
         let ask = Px(Decimal::from_str_radix(&t.ask_price, 10)?);
         Ok((bid, ask))
     }
+
+    async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
+        self.fetch_open_orders(sym).await
+    }
+
+    async fn get_position(&self, sym: &str) -> Result<Position> {
+        self.fetch_position(sym).await
+    }
+
+    async fn mark_price(&self, sym: &str) -> Result<Px> {
+        self.fetch_mark_price(sym).await
+    }
+
+    async fn close_position(&self, sym: &str) -> Result<()> {
+        self.flatten_position(sym).await
+    }
 }
 
 // ---- USDT-M Futures ----
@@ -293,6 +478,44 @@ struct FutExchangeSymbol {
     #[serde(rename = "contractType")]
     contract_type: String,
     status: String,
+}
+
+#[derive(Deserialize)]
+struct FutPlacedOrder {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+}
+
+#[derive(Deserialize)]
+struct FutOpenOrder {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    #[serde(rename = "price")]
+    price: String,
+    #[serde(rename = "origQty")]
+    orig_qty: String,
+    #[serde(rename = "side")]
+    side: String,
+}
+
+#[derive(Deserialize)]
+struct FutPosition {
+    #[serde(rename = "symbol")]
+    symbol: String,
+    #[serde(rename = "positionAmt")]
+    position_amt: String,
+    #[serde(rename = "entryPrice")]
+    entry_price: String,
+    #[serde(rename = "leverage")]
+    leverage: String,
+    #[serde(rename = "liquidationPrice")]
+    liquidation_price: String,
+}
+
+#[derive(Deserialize)]
+struct PremiumIndex {
+    #[serde(rename = "markPrice")]
+    mark_price: String,
 }
 
 impl BinanceFutures {
@@ -372,6 +595,144 @@ impl BinanceFutures {
         };
         Ok(amt)
     }
+
+    pub async fn fetch_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
+        let qs = format!(
+            "symbol={}&timestamp={}&recvWindow={}",
+            sym,
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/openOrders?{}&signature={}", self.base, qs, sig);
+        let orders: Vec<FutOpenOrder> = self
+            .common
+            .client
+            .get(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut res = Vec::new();
+        for o in orders {
+            let price = Decimal::from_str_radix(&o.price, 10)?;
+            let qty = Decimal::from_str_radix(&o.orig_qty, 10)?;
+            let side = if o.side.eq_ignore_ascii_case("buy") {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            res.push(VenueOrder {
+                order_id: o.order_id.to_string(),
+                side,
+                price: Px(price),
+                qty: Qty(qty),
+            });
+        }
+        Ok(res)
+    }
+
+    pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
+        let qs = format!(
+            "symbol={}&timestamp={}&recvWindow={}",
+            sym,
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!(
+            "{}/fapi/v2/positionRisk?{}&signature={}",
+            self.base, qs, sig
+        );
+        let mut positions: Vec<FutPosition> = self
+            .common
+            .client
+            .get(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let pos = positions
+            .drain(..)
+            .find(|p| p.symbol.eq_ignore_ascii_case(sym))
+            .ok_or_else(|| anyhow!("position not found for symbol"))?;
+        let qty = Decimal::from_str_radix(&pos.position_amt, 10)?;
+        let entry = Decimal::from_str_radix(&pos.entry_price, 10)?;
+        let leverage = pos.leverage.parse::<u32>().unwrap_or(1);
+        let liq = Decimal::from_str_radix(&pos.liquidation_price, 10).unwrap_or(Decimal::ZERO);
+        let liq_px = if liq > Decimal::ZERO {
+            Some(Px(liq))
+        } else {
+            None
+        };
+        Ok(Position {
+            symbol: sym.to_string(),
+            qty: Qty(qty),
+            entry: Px(entry),
+            leverage,
+            liq_px,
+        })
+    }
+
+    pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
+        let url = format!("{}/fapi/v1/premiumIndex?symbol={}", self.base, sym);
+        let premium: PremiumIndex = self
+            .common
+            .client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mark = Decimal::from_str_radix(&premium.mark_price, 10)?;
+        Ok(Px(mark))
+    }
+
+    pub async fn flatten_position(&self, sym: &str) -> Result<()> {
+        let pos = self.fetch_position(sym).await?;
+        let qty_f = pos.qty.0.to_f64().unwrap_or(0.0);
+        if qty_f.abs() < f64::EPSILON {
+            return Ok(());
+        }
+        let side = if qty_f > 0.0 { Side::Sell } else { Side::Buy };
+        let qty = quantize(qty_f.abs(), self.qty_step);
+        if qty <= 0.0 {
+            warn!(symbol = %sym, original_qty = qty_f, "quantized position size is zero, skipping close");
+            return Ok(());
+        }
+        let params = vec![
+            format!("symbol={}", sym),
+            format!(
+                "side={}",
+                if matches!(side, Side::Buy) {
+                    "BUY"
+                } else {
+                    "SELL"
+                }
+            ),
+            "type=MARKET".to_string(),
+            format!("quantity={}", qty),
+            "reduceOnly=true".to_string(),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
+        self.common
+            .client
+            .post(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -412,7 +773,7 @@ impl Venue for BinanceFutures {
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
 
-        let res = self
+        let order: FutPlacedOrder = self
             .common
             .client
             .post(url)
@@ -420,11 +781,11 @@ impl Venue for BinanceFutures {
             .send()
             .await?
             .error_for_status()?
-            .text()
+            .json()
             .await?;
 
-        info!(%sym, ?side, %price, %qty, tif = ?tif, "futures place_limit ok");
-        Ok(res)
+        info!(%sym, ?side, %price, %qty, tif = ?tif, order_id = order.order_id, "futures place_limit ok");
+        Ok(order.order_id.to_string())
     }
 
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()> {
@@ -467,6 +828,22 @@ impl Venue for BinanceFutures {
             Px(Decimal::from_str_radix(&best_ask, 10)?),
         ))
     }
+
+    async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
+        self.fetch_open_orders(sym).await
+    }
+
+    async fn get_position(&self, sym: &str) -> Result<Position> {
+        self.fetch_position(sym).await
+    }
+
+    async fn mark_price(&self, sym: &str) -> Result<Px> {
+        self.fetch_mark_price(sym).await
+    }
+
+    async fn close_position(&self, sym: &str) -> Result<()> {
+        self.flatten_position(sym).await
+    }
 }
 
 // ---- helpers ----
@@ -475,5 +852,9 @@ fn quantize(x: f64, step: f64) -> f64 {
     if step <= 0.0 {
         return x;
     }
-    (x / step).floor() * step
+    let rounded = (x / step).floor() * step;
+    if rounded > 0.0 && rounded < step {
+        return 0.0;
+    }
+    rounded
 }
