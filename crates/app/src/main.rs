@@ -47,14 +47,20 @@ struct BinanceCfg {
     recv_window_ms: u64,
 }
 
+fn default_quote_asset() -> String {
+    "USDC".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct AppCfg {
     #[serde(default)]
     symbol: Option<String>,
     #[serde(default)]
     symbols: Vec<String>,
-    #[serde(default)]
-    auto_discover_usdt: bool,
+    #[serde(default, alias = "auto_discover_usdt")]
+    auto_discover_quote: bool,
+    #[serde(default = "default_quote_asset")]
+    quote_asset: String,
     mode: String,
     metrics_port: Option<u16>,
     max_usd_per_order: f64,
@@ -140,6 +146,7 @@ async fn main() -> Result<()> {
         min_liq_gap_bps = cfg.risk.min_liq_gap_bps,
         dd_limit_bps = cfg.risk.dd_limit_bps,
         max_leverage = cfg.risk.max_leverage,
+        quote_asset = %cfg.quote_asset,
         tif = %cfg.exec.tif,
         venue = %cfg.exec.venue,
         leverage = ?cfg.leverage,
@@ -226,8 +233,13 @@ async fn main() -> Result<()> {
     let mut selected: Vec<SymbolMeta> = Vec::new();
     for sym in &normalized {
         if let Some(meta) = metadata.iter().find(|m| &m.symbol == sym) {
-            if !meta.quote_asset.eq_ignore_ascii_case("USDT") {
-                warn!(symbol = %sym, quote_asset = %meta.quote_asset, "skipping configured symbol that is not quoted in USDT");
+            if !meta.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset) {
+                warn!(
+                    symbol = %sym,
+                    quote_asset = %meta.quote_asset,
+                    required_quote = %cfg.quote_asset,
+                    "skipping configured symbol that is not quoted in required asset"
+                );
                 continue;
             }
             if let Some(status) = meta.status.as_deref() {
@@ -255,11 +267,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    if selected.is_empty() && cfg.auto_discover_usdt {
+    if selected.is_empty() && cfg.auto_discover_quote {
         selected = metadata
             .iter()
             .filter(|m| {
-                m.quote_asset.eq_ignore_ascii_case("USDT")
+                m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                     && (mode_lower != "futures"
                         || m.contract_type
@@ -270,12 +282,16 @@ async fn main() -> Result<()> {
             .cloned()
             .collect();
         selected.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-        info!(count = selected.len(), "auto-discovered USDT symbols");
+        info!(
+            count = selected.len(),
+            quote_asset = %cfg.quote_asset,
+            "auto-discovered symbols for quote asset"
+        );
     }
 
     if selected.is_empty() {
         return Err(anyhow!(
-            "no eligible USDT symbols resolved from configuration"
+            "no eligible symbols resolved for required quote asset"
         ));
     }
 
