@@ -8,6 +8,7 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 use urlencoding::encode;
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 
@@ -45,7 +46,59 @@ pub struct BinanceSpot {
 }
 
 #[derive(Deserialize)]
-struct BookTickerSpot { bidPrice: String, askPrice: String }
+struct BookTickerSpot {
+    #[serde(rename = "bidPrice")]
+    bid_price: String,
+    #[serde(rename = "askPrice")]
+    ask_price: String,
+}
+
+impl BinanceSpot {
+    pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
+        #[derive(Deserialize)]
+        struct SpotSymbolInfo {
+            #[serde(rename = "baseAsset")]
+            base_asset: String,
+            #[serde(rename = "quoteAsset")]
+            quote_asset: String,
+        }
+        #[derive(Deserialize)]
+        struct SpotExchangeInfo { symbols: Vec<SpotSymbolInfo> }
+
+        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
+        let info: SpotExchangeInfo = self.common.client.get(url).send().await?.error_for_status()?.json().await?;
+        let sym = info.symbols.into_iter().next().ok_or_else(|| anyhow!("symbol info missing"))?;
+        Ok((sym.base_asset, sym.quote_asset))
+    }
+
+    pub async fn asset_free(&self, asset: &str) -> Result<Decimal> {
+        #[derive(Deserialize)]
+        struct SpotBalance { asset: String, free: String }
+        #[derive(Deserialize)]
+        struct SpotAccountInfo { balances: Vec<SpotBalance> }
+
+        let qs = format!(
+            "timestamp={}&recvWindow={}",
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/api/v3/account?{}&signature={}", self.base, qs, sig);
+        let info: SpotAccountInfo = self.common.client
+            .get(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+
+        let bal = info.balances.into_iter().find(|b| b.asset == asset);
+        let amt = match bal {
+            Some(b) => Decimal::from_str_radix(&b.free, 10)?,
+            None => Decimal::ZERO,
+        };
+        Ok(amt)
+    }
+}
 
 #[async_trait]
 impl Venue for BinanceSpot {
@@ -109,8 +162,8 @@ impl Venue for BinanceSpot {
         let url = format!("{}/api/v3/ticker/bookTicker?symbol={}", self.base, encode(sym));
         let t: BookTickerSpot = self.common.client.get(url).send().await?.error_for_status()?.json().await?;
         use rust_decimal::Decimal;
-        let bid = Px(Decimal::from_str_radix(&t.bidPrice, 10)?);
-        let ask = Px(Decimal::from_str_radix(&t.askPrice, 10)?);
+        let bid = Px(Decimal::from_str_radix(&t.bid_price, 10)?);
+        let ask = Px(Decimal::from_str_radix(&t.ask_price, 10)?);
         Ok((bid, ask))
     }
 }
@@ -127,6 +180,55 @@ pub struct BinanceFutures {
 
 #[derive(Deserialize)]
 struct OrderBookTop { bids: Vec<(String,String)>, asks: Vec<(String,String)> }
+
+impl BinanceFutures {
+    pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
+        #[derive(Deserialize)]
+        struct FutSymbolInfo {
+            #[serde(rename = "baseAsset")]
+            base_asset: String,
+            #[serde(rename = "quoteAsset")]
+            quote_asset: String,
+        }
+        #[derive(Deserialize)]
+        struct FutExchangeInfo { symbols: Vec<FutSymbolInfo> }
+
+        let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
+        let info: FutExchangeInfo = self.common.client.get(url).send().await?.error_for_status()?.json().await?;
+        let sym = info.symbols.into_iter().next().ok_or_else(|| anyhow!("symbol info missing"))?;
+        Ok((sym.base_asset, sym.quote_asset))
+    }
+
+    pub async fn available_balance(&self, asset: &str) -> Result<Decimal> {
+        #[derive(Deserialize)]
+        struct FutBalance {
+            asset: String,
+            #[serde(rename = "availableBalance")]
+            available_balance: String,
+        }
+
+        let qs = format!(
+            "timestamp={}&recvWindow={}",
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v2/balance?{}&signature={}", self.base, qs, sig);
+        let balances: Vec<FutBalance> = self.common.client
+            .get(url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+
+        let bal = balances.into_iter().find(|b| b.asset == asset);
+        let amt = match bal {
+            Some(b) => Decimal::from_str_radix(&b.available_balance, 10)?,
+            None => Decimal::ZERO,
+        };
+        Ok(amt)
+    }
+}
 
 #[async_trait]
 impl Venue for BinanceFutures {
