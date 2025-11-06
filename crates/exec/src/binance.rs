@@ -2,17 +2,181 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bot_core::types::*;
+use dashmap::DashMap;
 use hmac::{Hmac, Mac};
+use once_cell::sync::Lazy;
 use reqwest::{Client, RequestBuilder, Response};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::Sha256;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use urlencoding::encode;
 
 use super::{Venue, VenueOrder};
+
+#[derive(Clone, Debug)]
+struct SymbolRules {
+    tick_size: Decimal,
+    step_size: Decimal,
+    price_precision: usize,
+    qty_precision: usize,
+    min_notional: Decimal,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "filterType")]
+enum FutFilter {
+    PRICE_FILTER {
+        tickSize: String,
+    },
+    LOT_SIZE {
+        stepSize: String,
+    },
+    MIN_NOTIONAL {
+        notional: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct FutExchangeInfo {
+    symbols: Vec<FutExchangeSymbol>,
+}
+
+#[derive(Deserialize)]
+struct FutExchangeSymbol {
+    symbol: String,
+    #[serde(rename = "baseAsset")]
+    base_asset: String,
+    #[serde(rename = "quoteAsset")]
+    quote_asset: String,
+    #[serde(rename = "contractType")]
+    contract_type: String,
+    status: String,
+    #[serde(default)]
+    filters: Vec<FutFilter>,
+    #[serde(rename = "pricePrecision", default)]
+    price_precision: Option<usize>,
+    #[serde(rename = "quantityPrecision", default)]
+    qty_precision: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SpotExchangeInfo {
+    symbols: Vec<SpotExchangeSymbol>,
+}
+
+#[derive(Deserialize)]
+struct SpotExchangeSymbol {
+    symbol: String,
+    #[serde(rename = "baseAsset")]
+    base_asset: String,
+    #[serde(rename = "quoteAsset")]
+    quote_asset: String,
+    status: String,
+    #[serde(default)]
+    filters: Vec<serde_json::Value>,
+    #[serde(rename = "pricePrecision", default)]
+    price_precision: Option<usize>,
+    #[serde(rename = "quantityPrecision", default)]
+    qty_precision: Option<usize>,
+}
+
+static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
+static SPOT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
+
+fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
+    Decimal::from_str_radix(s.as_ref(), 10).unwrap_or(Decimal::ZERO)
+}
+
+fn scale_from_step(step: Decimal) -> usize {
+    step.scale() as usize
+}
+
+fn rules_from_spot_symbol(sym: SpotExchangeSymbol) -> SymbolRules {
+    let mut tick = Decimal::ZERO;
+    let mut step = Decimal::ZERO;
+    let mut min_notional = Decimal::ZERO;
+
+    for f in sym.filters {
+        if let Some(ft) = f.get("filterType").and_then(|v| v.as_str()) {
+            match ft {
+                "PRICE_FILTER" => {
+                    tick = str_dec(f.get("tickSize").and_then(|v| v.as_str()).unwrap_or("0"));
+                }
+                "LOT_SIZE" => {
+                    step = str_dec(f.get("stepSize").and_then(|v| v.as_str()).unwrap_or("0"));
+                }
+                "MIN_NOTIONAL" | "NOTIONAL" => {
+                    min_notional = str_dec(
+                        f.get("minNotional")
+                            .or_else(|| f.get("notional"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0"),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let p_prec = sym.price_precision.unwrap_or_else(|| scale_from_step(tick));
+    let q_prec = sym.qty_precision.unwrap_or_else(|| scale_from_step(step));
+
+    SymbolRules {
+        tick_size: if tick.is_zero() {
+            Decimal::new(1, 2)
+        } else {
+            tick
+        },
+        step_size: if step.is_zero() {
+            Decimal::new(1, 3)
+        } else {
+            step
+        },
+        price_precision: p_prec,
+        qty_precision: q_prec,
+        min_notional,
+    }
+}
+
+fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
+    let mut tick = Decimal::ZERO;
+    let mut step = Decimal::ZERO;
+    let mut min_notional = Decimal::ZERO;
+
+    for f in sym.filters {
+        match f {
+            FutFilter::PRICE_FILTER { tickSize } => tick = str_dec(tickSize),
+            FutFilter::LOT_SIZE { stepSize } => step = str_dec(stepSize),
+            FutFilter::MIN_NOTIONAL { notional } => min_notional = str_dec(notional),
+            FutFilter::Other => {}
+        }
+    }
+
+    let p_prec = sym.price_precision.unwrap_or_else(|| scale_from_step(tick));
+    let q_prec = sym.qty_precision.unwrap_or_else(|| scale_from_step(step));
+
+    SymbolRules {
+        tick_size: if tick.is_zero() {
+            Decimal::new(1, 2)
+        } else {
+            tick
+        },
+        step_size: if step.is_zero() {
+            Decimal::new(1, 3)
+        } else {
+            step
+        },
+        price_precision: p_prec,
+        qty_precision: q_prec,
+        min_notional,
+    }
+}
 
 // ---- Ortak ----
 
@@ -68,21 +232,6 @@ struct BookTickerSpot {
 }
 
 #[derive(Deserialize)]
-struct SpotExchangeInfo {
-    symbols: Vec<SpotExchangeSymbol>,
-}
-
-#[derive(Deserialize)]
-struct SpotExchangeSymbol {
-    symbol: String,
-    #[serde(rename = "baseAsset")]
-    base_asset: String,
-    #[serde(rename = "quoteAsset")]
-    quote_asset: String,
-    status: String,
-}
-
-#[derive(Deserialize)]
 struct SpotPlacedOrder {
     #[serde(rename = "orderId")]
     order_id: u64,
@@ -115,6 +264,36 @@ struct SpotTrade {
 }
 
 impl BinanceSpot {
+    async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
+        if let Some(r) = SPOT_RULES.get(sym) {
+            return Ok(r.clone());
+        }
+
+        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
+        match send_json(self.common.client.get(url)).await {
+            Ok(info) => {
+                let sym_rec = info
+                    .symbols
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("symbol info missing"))?;
+                let rules = Arc::new(rules_from_spot_symbol(sym_rec));
+                SPOT_RULES.insert(sym.to_string(), rules.clone());
+                Ok(rules)
+            }
+            Err(err) => {
+                warn!(error = ?err, %sym, "failed to fetch spot symbol rules, using fallbacks");
+                Ok(Arc::new(SymbolRules {
+                    tick_size: self.price_tick,
+                    step_size: self.qty_step,
+                    price_precision: self.price_precision,
+                    qty_precision: self.qty_precision,
+                    min_notional: Decimal::ZERO,
+                }))
+            }
+        }
+    }
+
     pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
         let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
         let info: SpotExchangeInfo = send_json(self.common.client.get(url)).await?;
@@ -278,7 +457,8 @@ impl BinanceSpot {
         } else {
             Side::Buy
         };
-        let qty = quantize_decimal(qty_dec.abs(), self.qty_step);
+        let rules = self.rules_for(symbol).await?;
+        let qty = quantize_decimal(qty_dec.abs(), rules.step_size);
         if qty <= Decimal::ZERO {
             warn!(
                 %symbol,
@@ -287,7 +467,7 @@ impl BinanceSpot {
             );
             return Ok(());
         }
-        let qty_str = format_decimal_fixed(qty, self.qty_precision);
+        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
 
         let params = vec![
             format!("symbol={}", symbol),
@@ -338,10 +518,19 @@ impl Venue for BinanceSpot {
             Tif::Ioc => ("LIMIT", Some("IOC")),
         };
 
-        let price = quantize_decimal(px.0, self.price_tick);
-        let qty = quantize_decimal(qty.0.abs(), self.qty_step);
-        let price_str = format_decimal_fixed(price, self.price_precision);
-        let qty_str = format_decimal_fixed(qty, self.qty_precision);
+        let rules = self.rules_for(sym).await?;
+        let price = quantize_decimal(px.0, rules.tick_size);
+        let qty = quantize_decimal(qty.0.abs(), rules.step_size);
+        let notional = price * qty;
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            return Err(anyhow!(
+                "below min notional after clamps ({} < {})",
+                notional,
+                rules.min_notional
+            ));
+        }
+        let price_str = format_decimal_fixed(price, rules.price_precision);
+        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
 
         let mut params = vec![
             format!("symbol={}", sym),
@@ -452,23 +641,6 @@ struct OrderBookTop {
 }
 
 #[derive(Deserialize)]
-struct FutExchangeInfo {
-    symbols: Vec<FutExchangeSymbol>,
-}
-
-#[derive(Deserialize)]
-struct FutExchangeSymbol {
-    symbol: String,
-    #[serde(rename = "baseAsset")]
-    base_asset: String,
-    #[serde(rename = "quoteAsset")]
-    quote_asset: String,
-    #[serde(rename = "contractType")]
-    contract_type: String,
-    status: String,
-}
-
-#[derive(Deserialize)]
 struct FutPlacedOrder {
     #[serde(rename = "orderId")]
     order_id: u64,
@@ -513,6 +685,36 @@ struct PremiumIndex {
 }
 
 impl BinanceFutures {
+    async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
+        if let Some(r) = FUT_RULES.get(sym) {
+            return Ok(r.clone());
+        }
+
+        let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
+        match send_json(self.common.client.get(url)).await {
+            Ok(info) => {
+                let sym_rec = info
+                    .symbols
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("symbol info missing"))?;
+                let rules = Arc::new(rules_from_fut_symbol(sym_rec));
+                FUT_RULES.insert(sym.to_string(), rules.clone());
+                Ok(rules)
+            }
+            Err(err) => {
+                warn!(error = ?err, %sym, "failed to fetch futures symbol rules, using fallbacks");
+                Ok(Arc::new(SymbolRules {
+                    tick_size: self.price_tick,
+                    step_size: self.qty_step,
+                    price_precision: self.price_precision,
+                    qty_precision: self.qty_precision,
+                    min_notional: Decimal::ZERO,
+                }))
+            }
+        }
+    }
+
     pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
         let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
         let info: FutExchangeInfo = send_json(self.common.client.get(url)).await?;
@@ -675,7 +877,8 @@ impl BinanceFutures {
         } else {
             Side::Buy
         };
-        let qty = quantize_decimal(qty_dec.abs(), self.qty_step);
+        let rules = self.rules_for(sym).await?;
+        let qty = quantize_decimal(qty_dec.abs(), rules.step_size);
         if qty <= Decimal::ZERO {
             warn!(
                 symbol = %sym,
@@ -684,7 +887,7 @@ impl BinanceFutures {
             );
             return Ok(());
         }
-        let qty_str = format_decimal_fixed(qty, self.qty_precision);
+        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
         let params = vec![
             format!("symbol={}", sym),
             format!(
@@ -735,10 +938,19 @@ impl Venue for BinanceFutures {
             Tif::Ioc => "IOC",
         };
 
-        let price = quantize_decimal(px.0, self.price_tick);
-        let qty = quantize_decimal(qty.0.abs(), self.qty_step);
-        let price_str = format_decimal_fixed(price, self.price_precision);
-        let qty_str = format_decimal_fixed(qty, self.qty_precision);
+        let rules = self.rules_for(sym).await?;
+        let price = quantize_decimal(px.0, rules.tick_size);
+        let qty = quantize_decimal(qty.0.abs(), rules.step_size);
+        let notional = price * qty;
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            return Err(anyhow!(
+                "below min notional after clamps ({} < {})",
+                notional,
+                rules.min_notional
+            ));
+        }
+        let price_str = format_decimal_fixed(price, rules.price_precision);
+        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
 
         let params = vec![
             format!("symbol={}", sym),
