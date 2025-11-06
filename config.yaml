@@ -24,8 +24,8 @@ binance:
   spot_base: "https://api.binance.com"
   # USDⓈ-M Futures (USDC teminat)
   futures_base: "https://fapi.binance.com"
-  api_key: "6WkI51B0dbz9gbtRm5PphsWYFmr3oaoagJECl0UiGX13ySnLxXlhuEoR5brk74ZU"
-  secret_key: "8N3PxGEp1CTrirTbmkM42mHaNTo5jbyamUFgatfeueHHkH5RBsDgGLCh3b6Ki3nw"
+  api_key: ""
+  secret_key: ""
   recv_window_ms: 5000
 
 risk:
@@ -38,7 +38,7 @@ strategy:
   type: "dyn_mm"
   a: 120.0
   b: 40.0
-  base_size: "25.0"  # stratejinin hedeflediği USD tutarı; son durumda max_usd_per_order ile kısılır
+  base_size: "20.0"  # stratejinin hedeflediği USD tutarı; son durumda max_usd_per_order ile kısılır
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
