@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
             cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap),
             10,
         )
-        .unwrap(),
+            .unwrap(),
     };
     let mode_lower = cfg.mode.to_lowercase();
     let strategy_name = cfg.strategy.r#type.clone();
@@ -348,10 +348,10 @@ async fn main() -> Result<()> {
                 m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                     && (mode_lower != "futures"
-                        || m.contract_type
-                            .as_deref()
-                            .map(|ct| ct == "PERPETUAL")
-                            .unwrap_or(false))
+                    || m.contract_type
+                    .as_deref()
+                    .map(|ct| ct == "PERPETUAL")
+                    .unwrap_or(false))
             })
             .cloned()
             .collect();
