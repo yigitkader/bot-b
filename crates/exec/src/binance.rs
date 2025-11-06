@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bot_core::types::*;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sha2::Sha256;
@@ -54,6 +55,8 @@ pub struct BinanceSpot {
     pub common: BinanceCommon,
     pub price_tick: Decimal,
     pub qty_step: Decimal,
+    pub price_precision: usize,
+    pub qty_precision: usize,
 }
 
 #[derive(Deserialize)]
@@ -309,7 +312,11 @@ impl BinanceSpot {
             );
             return Ok(());
         }
-        let qty_str = qty.normalize().to_string();
+        let qty_str = format!(
+            "{:.prec$}",
+            qty.to_f64().unwrap_or(0.0),
+            prec = self.qty_precision
+        );
 
         let params = vec![
             format!("symbol={}", symbol),
@@ -362,8 +369,16 @@ impl Venue for BinanceSpot {
 
         let price = quantize_decimal(px.0, self.price_tick);
         let qty = quantize_decimal(qty.0.abs(), self.qty_step);
-        let price_str = price.normalize().to_string();
-        let qty_str = qty.normalize().to_string();
+        let price_str = format!(
+            "{:.prec$}",
+            price.to_f64().unwrap_or(0.0),
+            prec = self.price_precision
+        );
+        let qty_str = format!(
+            "{:.prec$}",
+            qty.to_f64().unwrap_or(0.0),
+            prec = self.qty_precision
+        );
 
         let mut params = vec![
             format!("symbol={}", sym),
@@ -474,6 +489,8 @@ pub struct BinanceFutures {
     pub common: BinanceCommon,
     pub price_tick: Decimal,
     pub qty_step: Decimal,
+    pub price_precision: usize,
+    pub qty_precision: usize,
 }
 
 #[derive(Deserialize)]
@@ -748,7 +765,11 @@ impl BinanceFutures {
             );
             return Ok(());
         }
-        let qty_str = qty.normalize().to_string();
+        let qty_str = format!(
+            "{:.prec$}",
+            qty.to_f64().unwrap_or(0.0),
+            prec = self.qty_precision
+        );
         let params = vec![
             format!("symbol={}", sym),
             format!(
@@ -801,8 +822,16 @@ impl Venue for BinanceFutures {
 
         let price = quantize_decimal(px.0, self.price_tick);
         let qty = quantize_decimal(qty.0.abs(), self.qty_step);
-        let price_str = price.normalize().to_string();
-        let qty_str = qty.normalize().to_string();
+        let price_str = format!(
+            "{:.prec$}",
+            price.to_f64().unwrap_or(0.0),
+            prec = self.price_precision
+        );
+        let qty_str = format!(
+            "{:.prec$}",
+            qty.to_f64().unwrap_or(0.0),
+            prec = self.qty_precision
+        );
 
         let params = vec![
             format!("symbol={}", sym),

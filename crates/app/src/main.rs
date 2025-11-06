@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use bot_core::types::*;
 use data::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
 use exec::binance::{BinanceCommon, BinanceFutures, BinanceSpot, SymbolMeta};
-use exec::Venue;
+use exec::{decimal_places, Venue};
 use risk::{RiskAction, RiskLimits};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -227,6 +227,15 @@ impl FloorStep for f64 {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cfg = load_cfg()?;
+    if cfg.price_tick <= 0.0 {
+        return Err(anyhow!("price_tick must be positive"));
+    }
+    if cfg.qty_step <= 0.0 {
+        return Err(anyhow!("qty_step must be positive"));
+    }
+    if cfg.max_usd_per_order <= 0.0 {
+        return Err(anyhow!("max_usd_per_order must be positive"));
+    }
     if let Some(port) = cfg.metrics_port {
         monitor::init_prom(port);
     }
@@ -286,18 +295,24 @@ async fn main() -> Result<()> {
     }
     let price_tick_dec = Decimal::from_f64_retain(cfg.price_tick).unwrap_or(Decimal::ZERO);
     let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
+    let price_precision = decimal_places(price_tick_dec);
+    let qty_precision = decimal_places(qty_step_dec);
     let venue = match cfg.mode.to_lowercase().as_str() {
         "spot" => V::Spot(BinanceSpot {
             base: cfg.binance.spot_base.clone(),
             common: common.clone(),
             price_tick: price_tick_dec,
             qty_step: qty_step_dec,
+            price_precision,
+            qty_precision,
         }),
         _ => V::Fut(BinanceFutures {
             base: cfg.binance.futures_base.clone(),
             common: common.clone(),
             price_tick: price_tick_dec,
             qty_step: qty_step_dec,
+            price_precision,
+            qty_precision,
         }),
     };
 
@@ -714,7 +729,7 @@ async fn main() -> Result<()> {
                         || quantized_to_zero
                         || (min_usd_per_order > 0.0 && notional < min_usd_per_order)
                     {
-                        warn!(
+                        info!(
                             %symbol,
                             ?px,
                             original_qty = ?q,
@@ -722,7 +737,7 @@ async fn main() -> Result<()> {
                             quantized_to_zero,
                             notional,
                             min_usd_per_order,
-                            "dropping bid quote after clamps produced zero quantity"
+                            "skipping quote: qty too small after caps/quantization"
                         );
                         quotes.bid = None;
                     } else {
@@ -750,7 +765,7 @@ async fn main() -> Result<()> {
                         || quantized_to_zero
                         || (min_usd_per_order > 0.0 && notional < min_usd_per_order)
                     {
-                        warn!(
+                        info!(
                             %symbol,
                             ?px,
                             original_qty = ?q,
@@ -759,7 +774,7 @@ async fn main() -> Result<()> {
                             quantized_to_zero,
                             notional,
                             min_usd_per_order,
-                            "dropping ask quote after clamps produced zero quantity"
+                            "skipping quote: qty too small after caps/quantization"
                         );
                         quotes.ask = None;
                     } else {
