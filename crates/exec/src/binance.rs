@@ -517,6 +517,12 @@ struct FutPosition {
 struct PremiumIndex {
     #[serde(rename = "markPrice")]
     mark_price: String,
+    #[serde(rename = "lastFundingRate")]
+    #[serde(default)]
+    last_funding_rate: Option<String>,
+    #[serde(rename = "nextFundingTime")]
+    #[serde(default)]
+    next_funding_time: Option<u64>,
 }
 
 impl BinanceFutures {
@@ -679,7 +685,7 @@ impl BinanceFutures {
         })
     }
 
-    pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
+    pub async fn fetch_premium_index(&self, sym: &str) -> Result<(Px, Option<f64>, Option<u64>)> {
         let url = format!("{}/fapi/v1/premiumIndex?symbol={}", self.base, sym);
         let premium: PremiumIndex = self
             .common
@@ -691,7 +697,17 @@ impl BinanceFutures {
             .json()
             .await?;
         let mark = Decimal::from_str_radix(&premium.mark_price, 10)?;
-        Ok(Px(mark))
+        let funding_rate = premium
+            .last_funding_rate
+            .as_deref()
+            .and_then(|rate| rate.parse::<f64>().ok());
+        let next_time = premium.next_funding_time.filter(|ts| *ts > 0);
+        Ok((Px(mark), funding_rate, next_time))
+    }
+
+    pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
+        let (mark, _, _) = self.fetch_premium_index(sym).await?;
+        Ok(mark)
     }
 
     pub async fn flatten_position(&self, sym: &str) -> Result<()> {
