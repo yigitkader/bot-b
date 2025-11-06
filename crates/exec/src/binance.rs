@@ -29,15 +29,12 @@ struct SymbolRules {
 #[derive(Deserialize)]
 #[serde(tag = "filterType")]
 enum FutFilter {
-    PRICE_FILTER {
-        tickSize: String,
-    },
-    LOT_SIZE {
-        stepSize: String,
-    },
-    MIN_NOTIONAL {
-        notional: String,
-    },
+    #[serde(rename = "PRICE_FILTER")]
+    PriceFilter { tickSize: String },
+    #[serde(rename = "LOT_SIZE")]
+    LotSize { stepSize: String },
+    #[serde(rename = "MIN_NOTIONAL")]
+    MinNotional { notional: String },
     #[serde(other)]
     Other,
 }
@@ -151,9 +148,9 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
 
     for f in sym.filters {
         match f {
-            FutFilter::PRICE_FILTER { tickSize } => tick = str_dec(tickSize),
-            FutFilter::LOT_SIZE { stepSize } => step = str_dec(stepSize),
-            FutFilter::MIN_NOTIONAL { notional } => min_notional = str_dec(notional),
+            FutFilter::PriceFilter { tickSize } => tick = str_dec(tickSize),
+            FutFilter::LotSize { stepSize } => step = str_dec(stepSize),
+            FutFilter::MinNotional { notional } => min_notional = str_dec(notional),
             FutFilter::Other => {}
         }
     }
@@ -270,7 +267,7 @@ impl BinanceSpot {
         }
 
         let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
-        match send_json(self.common.client.get(url)).await {
+        match send_json::<SpotExchangeInfo>(self.common.client.get(url)).await {
             Ok(info) => {
                 let sym_rec = info
                     .symbols
@@ -691,7 +688,7 @@ impl BinanceFutures {
         }
 
         let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
-        match send_json(self.common.client.get(url)).await {
+        match send_json::<FutExchangeInfo>(self.common.client.get(url)).await {
             Ok(info) => {
                 let sym_rec = info
                     .symbols

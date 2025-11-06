@@ -15,6 +15,12 @@ use tokio_tungstenite::tungstenite::Error as WsError;
 
 pub type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+#[derive(Deserialize)]
+struct ListenKeyResp {
+    #[serde(rename = "listenKey")]
+    listen_key: String,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum UserStreamKind {
     Spot,
@@ -35,12 +41,6 @@ pub enum UserEvent {
         order_id: String,
     },
     Heartbeat,
-}
-
-#[derive(Deserialize)]
-struct ListenKeyResp {
-    #[serde(rename = "listenKey")]
-    listen_key: String,
 }
 
 pub struct UserDataStream {
@@ -93,11 +93,6 @@ impl UserDataStream {
             return Err(anyhow!("listenKey create failed: {} {}", status, body));
         }
 
-        #[derive(Deserialize)]
-        struct ListenKeyResp {
-            #[serde(rename = "listenKey")]
-            listen_key: String,
-        }
         let lk: ListenKeyResp = resp.json().await?;
         info!(listen_key=%lk.listen_key, "listenKey created");
         Ok(lk.listen_key)
