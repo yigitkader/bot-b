@@ -639,24 +639,13 @@ async fn main() -> Result<()> {
 
             match risk_action {
                 RiskAction::Reduce => {
-                    quotes.bid = quotes.bid.map(|(px, qty)| {
-                        let reduced = qty.0 / Decimal::from(2u32);
-                        let reduced = if reduced > Decimal::ZERO {
-                            reduced
-                        } else {
-                            Decimal::ZERO
-                        };
-                        (px, Qty(reduced))
-                    });
-                    quotes.ask = quotes.ask.map(|(px, qty)| {
-                        let reduced = qty.0 / Decimal::from(2u32);
-                        let reduced = if reduced > Decimal::ZERO {
-                            reduced
-                        } else {
-                            Decimal::ZERO
-                        };
-                        (px, Qty(reduced))
-                    });
+                    let widen = Decimal::from_f64_retain(0.005).unwrap_or(Decimal::ZERO);
+                    quotes.bid = quotes
+                        .bid
+                        .map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
+                    quotes.ask = quotes
+                        .ask
+                        .map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
                 }
                 RiskAction::Widen => {
                     let widen = Decimal::from_f64_retain(0.001).unwrap_or(Decimal::ZERO);

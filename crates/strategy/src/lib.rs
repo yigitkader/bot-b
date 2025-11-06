@@ -28,7 +28,7 @@ pub struct DynMmCfg {
 pub struct DynMm {
     pub a: f64,
     pub b: f64,
-    pub base_size: Qty,
+    pub base_notional: Decimal,
     pub inv_cap: Qty,
 }
 
@@ -37,7 +37,7 @@ impl From<DynMmCfg> for DynMm {
         Self {
             a: c.a,
             b: c.b,
-            base_size: Qty(c.base_size),
+            base_notional: c.base_size,
             inv_cap: Qty(c.inv_cap),
         }
     }
@@ -50,6 +50,10 @@ impl Strategy for DynMm {
             _ => return Quotes::default(),
         };
         let mid = (bid + ask) / Decimal::from(2u32);
+        let mid_f = mid.to_f64().unwrap_or(0.0);
+        if mid_f <= 0.0 {
+            return Quotes::default();
+        }
         let inv_bias = if self.inv_cap.0.is_zero() {
             0.0
         } else {
@@ -64,9 +68,16 @@ impl Strategy for DynMm {
         let skew = Decimal::try_from(funding_skew / 1e4).unwrap_or(Decimal::ZERO);
         let bid_px = Px(mid * (Decimal::ONE - half - skew));
         let ask_px = Px(mid * (Decimal::ONE + half + skew));
+        let usd_size = self.base_notional.to_f64().unwrap_or(0.0);
+        let qty = if usd_size > 0.0 {
+            usd_size / mid_f
+        } else {
+            0.0
+        };
+        let qty = Qty(Decimal::from_f64_retain(qty).unwrap_or(Decimal::ZERO));
         Quotes {
-            bid: Some((bid_px, self.base_size)),
-            ask: Some((ask_px, self.base_size)),
+            bid: Some((bid_px, qty)),
+            ask: Some((ask_px, qty)),
         }
     }
 }

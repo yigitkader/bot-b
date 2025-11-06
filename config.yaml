@@ -38,7 +38,7 @@ strategy:
   type: "dyn_mm"
   a: 120.0
   b: 40.0
-  base_size: "0.005"  # stratejinin önerdiği baz qty; son durumda max_usd_per_order ile kısılır
+  base_size: "25.0"  # stratejinin hedeflediği USD tutarı; son durumda max_usd_per_order ile kısılır
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
