@@ -7,9 +7,9 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 use std::str::FromStr;
-use tokio::time::{Duration, Instant};
+use tokio::time::{timeout, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 use tokio_tungstenite::tungstenite::Error as WsError;
 
@@ -80,7 +80,11 @@ impl UserDataStream {
             UserStreamKind::Futures => format!("{}/fapi/v1/listenKey", base),
         };
 
-        let resp = client.post(&endpoint).header("X-MBX-APIKEY", api_key).send().await?;
+        let resp = client
+            .post(&endpoint)
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             // resp.text() self'i tükettiği için status’u ÖNCE aldık
@@ -90,7 +94,10 @@ impl UserDataStream {
         }
 
         #[derive(Deserialize)]
-        struct ListenKeyResp { #[serde(rename = "listenKey")] listen_key: String }
+        struct ListenKeyResp {
+            #[serde(rename = "listenKey")]
+            listen_key: String,
+        }
         let lk: ListenKeyResp = resp.json().await?;
         info!(listen_key=%lk.listen_key, "listenKey created");
         Ok(lk.listen_key)
@@ -99,11 +106,16 @@ impl UserDataStream {
     async fn keepalive_listen_key(&self, listen_key: &str) -> Result<()> {
         let base = self.base.trim_end_matches('/');
         let endpoint = match self.kind {
-            UserStreamKind::Spot => format!("{}/api/v3/userDataStream?listenKey={}", base, listen_key),
-            UserStreamKind::Futures => format!("{}/fapi/v1/listenKey?listenKey={}", base, listen_key),
+            UserStreamKind::Spot => {
+                format!("{}/api/v3/userDataStream?listenKey={}", base, listen_key)
+            }
+            UserStreamKind::Futures => {
+                format!("{}/fapi/v1/listenKey?listenKey={}", base, listen_key)
+            }
         };
 
-        let resp = self.client
+        let resp = self
+            .client
             .put(&endpoint)
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
@@ -120,7 +132,6 @@ impl UserDataStream {
         Ok(())
     }
 
-
     /// WS'yi yeni listenKey ile tekrar bağlar (var olan ws kapatılır)
     async fn reconnect_ws(&mut self) -> Result<()> {
         let url = Self::ws_url_for(self.kind, &self.listen_key);
@@ -131,7 +142,12 @@ impl UserDataStream {
         Ok(())
     }
 
-    pub async fn connect(client: Client, base: &str, api_key: &str, kind: UserStreamKind) -> Result<Self> {
+    pub async fn connect(
+        client: Client,
+        base: &str,
+        api_key: &str,
+        kind: UserStreamKind,
+    ) -> Result<Self> {
         let base = base.trim_end_matches('/').to_string();
 
         // 1) listenKey oluştur
@@ -171,7 +187,8 @@ impl UserDataStream {
         }
 
         // Keepalive başarısız → yeni listenKey oluştur
-        let new_key = Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
+        let new_key =
+            Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
         self.listen_key = new_key;
 
         // WS yeniden bağlan
@@ -196,38 +213,47 @@ impl UserDataStream {
     }
 
     pub async fn next_event(&mut self) -> Result<UserEvent> {
-        // keepalive (gerekliyse) — listenKey süresini uzatır veya yeniden kurar
-        self.keep_alive().await?;
+        loop {
+            self.keep_alive().await?;
 
-        while let Some(msg) = self.ws.next().await {
-            let msg = msg.map_err(|e| match e {
-                WsError::ConnectionClosed | WsError::AlreadyClosed => anyhow!("user stream closed"),
-                other => anyhow!(other),
-            })?;
+            match timeout(Duration::from_secs(70), self.ws.next()).await {
+                Ok(Some(msg)) => {
+                    let msg = msg.map_err(|e| match e {
+                        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+                            anyhow!("user stream closed")
+                        }
+                        other => anyhow!(other),
+                    })?;
 
-            match msg {
-                Message::Ping(payload) => {
-                    self.ws.send(Message::Pong(payload)).await?;
-                    return Ok(UserEvent::Heartbeat);
-                }
-                Message::Pong(_) => return Ok(UserEvent::Heartbeat),
-                Message::Text(txt) => {
-                    if txt.is_empty() {
-                        continue;
+                    match msg {
+                        Message::Ping(payload) => {
+                            self.ws.send(Message::Pong(payload)).await?;
+                            return Ok(UserEvent::Heartbeat);
+                        }
+                        Message::Pong(_) => return Ok(UserEvent::Heartbeat),
+                        Message::Text(txt) => {
+                            if txt.is_empty() {
+                                continue;
+                            }
+                            // Uyarı: USDⓈ-M tarafında auth wrapper'da {"stream": "...", "data": {...}} gelebilir.
+                            let value: Value = serde_json::from_str(&txt)?;
+                            let data = value.get("data").cloned().unwrap_or_else(|| value.clone());
+                            if let Some(event) = Self::map_event(&data)? {
+                                return Ok(event);
+                            }
+                        }
+                        Message::Binary(_) => continue,
+                        Message::Close(_) => return Err(anyhow!("user stream closed")),
+                        Message::Frame(_) => continue,
                     }
-                    // Uyarı: USDⓈ-M tarafında auth wrapper'da {"stream": "...", "data": {...}} gelebilir.
-                    let value: Value = serde_json::from_str(&txt)?;
-                    let data = value.get("data").cloned().unwrap_or_else(|| value.clone());
-                    if let Some(event) = Self::map_event(&data)? {
-                        return Ok(event);
-                    }
                 }
-                Message::Binary(_) => continue,
-                Message::Close(_) => return Err(anyhow!("user stream closed")),
-                Message::Frame(_) => continue,
+                Ok(None) => return Err(anyhow!("user stream terminated")),
+                Err(_) => {
+                    warn!("websocket timeout, reconnecting");
+                    self.reconnect_ws().await?;
+                }
             }
         }
-        Err(anyhow!("user stream terminated"))
     }
 
     fn map_event(value: &Value) -> Result<Option<UserEvent>> {
@@ -235,8 +261,16 @@ impl UserDataStream {
         match event_type {
             // SPOT executionReport
             "executionReport" => {
-                let symbol = value.get("s").and_then(Value::as_str).unwrap_or_default().to_string();
-                let order_id = value.get("i").and_then(Value::as_i64).unwrap_or_default().to_string();
+                let symbol = value
+                    .get("s")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let order_id = value
+                    .get("i")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    .to_string();
                 let status = value.get("X").and_then(Value::as_str).unwrap_or_default();
                 if status == "CANCELED" {
                     return Ok(Some(UserEvent::OrderCanceled { symbol, order_id }));
@@ -247,7 +281,8 @@ impl UserDataStream {
                 }
                 let qty = Self::parse_decimal(value, "l"); // last executed qty
                 let price = Self::parse_decimal(value, "L"); // last executed price
-                let side = Self::parse_side(value.get("S").and_then(Value::as_str).unwrap_or("SELL"));
+                let side =
+                    Self::parse_side(value.get("S").and_then(Value::as_str).unwrap_or("SELL"));
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
@@ -259,9 +294,19 @@ impl UserDataStream {
 
             // FUTURES user data wrapper: ORDER_TRADE_UPDATE
             "ORDER_TRADE_UPDATE" => {
-                let data = value.get("o").ok_or_else(|| anyhow!("missing order payload"))?;
-                let symbol = data.get("s").and_then(Value::as_str).unwrap_or_default().to_string();
-                let order_id = data.get("i").and_then(Value::as_i64).unwrap_or_default().to_string();
+                let data = value
+                    .get("o")
+                    .ok_or_else(|| anyhow!("missing order payload"))?;
+                let symbol = data
+                    .get("s")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let order_id = data
+                    .get("i")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    .to_string();
                 let status = data.get("X").and_then(Value::as_str).unwrap_or_default();
                 if status == "CANCELED" {
                     return Ok(Some(UserEvent::OrderCanceled { symbol, order_id }));
@@ -272,7 +317,8 @@ impl UserDataStream {
                 }
                 let qty = Self::parse_decimal(data, "l"); // last filled
                 let price = Self::parse_decimal(data, "L"); // last price
-                let side = Self::parse_side(data.get("S").and_then(Value::as_str).unwrap_or("SELL"));
+                let side =
+                    Self::parse_side(data.get("S").and_then(Value::as_str).unwrap_or("SELL"));
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,

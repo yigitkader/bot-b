@@ -40,18 +40,22 @@ pub trait Venue: Send + Sync {
 }
 
 // ======================= BEGIN: quant helpers =======================
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 /// step'e göre floor: val -> en yakın aşağı step katı
 pub fn quant_utils_floor_to_step(val: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() { return val; }
+    if step.is_zero() {
+        return val;
+    }
     (val / step).floor() * step
 }
 
 /// step'e göre ceil: val -> en yakın yukarı step katı
 pub fn quant_utils_ceil_to_step(val: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() { return val; }
+    if step.is_zero() {
+        return val;
+    }
     (val / step).ceil() * step
 }
 
@@ -66,14 +70,31 @@ pub fn quant_utils_snap_price(raw: Decimal, tick: Decimal, is_buy: bool) -> Deci
 
 /// quote (USDT/USDC) bütçeden qty hesapla, lot step'e floor et
 pub fn quant_utils_qty_from_quote(quote: Decimal, price: Decimal, lot_step: Decimal) -> Decimal {
-    if price.is_zero() { return Decimal::ZERO; }
+    if price.is_zero() {
+        return Decimal::ZERO;
+    }
     quant_utils_floor_to_step(quote / price, lot_step)
 }
 
 /// bps farkı (|new-old|/old)*1e4
 pub fn quant_utils_bps_diff(old_px: Decimal, new_px: Decimal) -> f64 {
-    if old_px.is_zero() { return f64::INFINITY; }
+    if old_px.is_zero() {
+        return f64::INFINITY;
+    }
     let num = (new_px - old_px).abs();
     (num / old_px).to_f64().unwrap_or(0.0) * 10_000.0
+}
+
+/// Decimal adımından hassasiyet (ondalık hane sayısı) çıkarır
+pub fn decimal_places(step: Decimal) -> usize {
+    if step.is_zero() {
+        return 0;
+    }
+    let s = step.normalize().to_string();
+    if let Some(pos) = s.find('.') {
+        s[pos + 1..].trim_end_matches('0').len()
+    } else {
+        0
+    }
 }
 // ======================== END: quant helpers ========================
