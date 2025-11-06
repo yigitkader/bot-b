@@ -284,18 +284,20 @@ async fn main() -> Result<()> {
         Spot(BinanceSpot),
         Fut(BinanceFutures),
     }
+    let price_tick_dec = Decimal::from_f64_retain(cfg.price_tick).unwrap_or(Decimal::ZERO);
+    let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
     let venue = match cfg.mode.to_lowercase().as_str() {
         "spot" => V::Spot(BinanceSpot {
             base: cfg.binance.spot_base.clone(),
             common: common.clone(),
-            price_tick: cfg.price_tick,
-            qty_step: cfg.qty_step,
+            price_tick: price_tick_dec,
+            qty_step: qty_step_dec,
         }),
         _ => V::Fut(BinanceFutures {
             base: cfg.binance.futures_base.clone(),
             common: common.clone(),
-            price_tick: cfg.price_tick,
-            qty_step: cfg.qty_step,
+            price_tick: price_tick_dec,
+            qty_step: qty_step_dec,
         }),
     };
 

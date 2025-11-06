@@ -15,7 +15,7 @@ leverage: 5
 
 # Fiyat/lot adımı (quantize için). İstersen exchangeInfo'dan otomatik de çekebiliriz,
 # ama basit ve deterministik olsun diye konfigde tutuyoruz.
-price_tick: 0.10
+price_tick: 0.001
 qty_step: 0.001
 
 # Binance API

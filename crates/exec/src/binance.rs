@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use bot_core::types::*;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sha2::Sha256;
@@ -53,8 +52,8 @@ impl BinanceCommon {
 pub struct BinanceSpot {
     pub base: String, // e.g. https://api.binance.com
     pub common: BinanceCommon,
-    pub price_tick: f64,
-    pub qty_step: f64,
+    pub price_tick: Decimal,
+    pub qty_step: Decimal,
 }
 
 #[derive(Deserialize)]
@@ -292,16 +291,25 @@ impl BinanceSpot {
 
     pub async fn flatten_position(&self, symbol: &str) -> Result<()> {
         let pos = self.fetch_position(symbol).await?;
-        let qty_f = pos.qty.0.to_f64().unwrap_or(0.0);
-        if qty_f.abs() < f64::EPSILON {
+        let qty_dec = pos.qty.0;
+        if qty_dec.is_zero() {
             return Ok(());
         }
-        let side = if qty_f > 0.0 { Side::Sell } else { Side::Buy };
-        let qty = quantize(qty_f.abs(), self.qty_step);
-        if qty <= 0.0 {
-            warn!(%symbol, original_qty = qty_f, "quantized position size is zero, skipping close");
+        let side = if qty_dec > Decimal::ZERO {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let qty = quantize_decimal(qty_dec.abs(), self.qty_step);
+        if qty <= Decimal::ZERO {
+            warn!(
+                %symbol,
+                original_qty = %qty_dec,
+                "quantized position size is zero, skipping close"
+            );
             return Ok(());
         }
+        let qty_str = qty.normalize().to_string();
 
         let params = vec![
             format!("symbol={}", symbol),
@@ -314,7 +322,7 @@ impl BinanceSpot {
                 }
             ),
             "type=MARKET".to_string(),
-            format!("quantity={}", qty),
+            format!("quantity={}", qty_str),
             format!("timestamp={}", BinanceCommon::ts()),
             format!("recvWindow={}", self.common.recv_window_ms),
         ];
@@ -352,15 +360,17 @@ impl Venue for BinanceSpot {
             Tif::Ioc => ("LIMIT", Some("IOC")),
         };
 
-        let price = quantize(px.0.to_f64().unwrap_or(0.0), self.price_tick);
-        let qty = quantize(qty.0.to_f64().unwrap_or(0.0), self.qty_step);
+        let price = quantize_decimal(px.0, self.price_tick);
+        let qty = quantize_decimal(qty.0.abs(), self.qty_step);
+        let price_str = price.normalize().to_string();
+        let qty_str = qty.normalize().to_string();
 
         let mut params = vec![
             format!("symbol={}", sym),
             format!("side={}", s_side),
             format!("type={}", order_type),
-            format!("price={}", price),
-            format!("quantity={}", qty),
+            format!("price={}", price_str),
+            format!("quantity={}", qty_str),
             format!("timestamp={}", BinanceCommon::ts()),
             format!("recvWindow={}", self.common.recv_window_ms),
             "newOrderRespType=RESULT".to_string(),
@@ -384,7 +394,15 @@ impl Venue for BinanceSpot {
             .json()
             .await?;
 
-        info!(%sym, ?side, %price, %qty, tif = ?tif, order_id = order.order_id, "spot place_limit ok");
+        info!(
+            %sym,
+            ?side,
+            price = %price,
+            qty = %qty,
+            tif = ?tif,
+            order_id = order.order_id,
+            "spot place_limit ok"
+        );
         Ok(order.order_id.to_string())
     }
 
@@ -454,8 +472,8 @@ impl Venue for BinanceSpot {
 pub struct BinanceFutures {
     pub base: String, // e.g. https://fapi.binance.com
     pub common: BinanceCommon,
-    pub price_tick: f64,
-    pub qty_step: f64,
+    pub price_tick: Decimal,
+    pub qty_step: Decimal,
 }
 
 #[derive(Deserialize)]
@@ -712,16 +730,25 @@ impl BinanceFutures {
 
     pub async fn flatten_position(&self, sym: &str) -> Result<()> {
         let pos = self.fetch_position(sym).await?;
-        let qty_f = pos.qty.0.to_f64().unwrap_or(0.0);
-        if qty_f.abs() < f64::EPSILON {
+        let qty_dec = pos.qty.0;
+        if qty_dec.is_zero() {
             return Ok(());
         }
-        let side = if qty_f > 0.0 { Side::Sell } else { Side::Buy };
-        let qty = quantize(qty_f.abs(), self.qty_step);
-        if qty <= 0.0 {
-            warn!(symbol = %sym, original_qty = qty_f, "quantized position size is zero, skipping close");
+        let side = if qty_dec > Decimal::ZERO {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let qty = quantize_decimal(qty_dec.abs(), self.qty_step);
+        if qty <= Decimal::ZERO {
+            warn!(
+                symbol = %sym,
+                original_qty = %qty_dec,
+                "quantized position size is zero, skipping close"
+            );
             return Ok(());
         }
+        let qty_str = qty.normalize().to_string();
         let params = vec![
             format!("symbol={}", sym),
             format!(
@@ -733,7 +760,7 @@ impl BinanceFutures {
                 }
             ),
             "type=MARKET".to_string(),
-            format!("quantity={}", qty),
+            format!("quantity={}", qty_str),
             "reduceOnly=true".to_string(),
             format!("timestamp={}", BinanceCommon::ts()),
             format!("recvWindow={}", self.common.recv_window_ms),
@@ -772,16 +799,18 @@ impl Venue for BinanceFutures {
             Tif::Ioc => "IOC",
         };
 
-        let price = quantize(px.0.to_f64().unwrap_or(0.0), self.price_tick);
-        let qty = quantize(qty.0.to_f64().unwrap_or(0.0), self.qty_step);
+        let price = quantize_decimal(px.0, self.price_tick);
+        let qty = quantize_decimal(qty.0.abs(), self.qty_step);
+        let price_str = price.normalize().to_string();
+        let qty_str = qty.normalize().to_string();
 
         let params = vec![
             format!("symbol={}", sym),
             format!("side={}", s_side),
             "type=LIMIT".to_string(),
             format!("timeInForce={}", tif_str),
-            format!("price={}", price),
-            format!("quantity={}", qty),
+            format!("price={}", price_str),
+            format!("quantity={}", qty_str),
             format!("timestamp={}", BinanceCommon::ts()),
             format!("recvWindow={}", self.common.recv_window_ms),
             "newOrderRespType=RESULT".to_string(),
@@ -801,7 +830,15 @@ impl Venue for BinanceFutures {
             .json()
             .await?;
 
-        info!(%sym, ?side, %price, %qty, tif = ?tif, order_id = order.order_id, "futures place_limit ok");
+        info!(
+            %sym,
+            ?side,
+            price = %price,
+            qty = %qty,
+            tif = ?tif,
+            order_id = order.order_id,
+            "futures place_limit ok"
+        );
         Ok(order.order_id.to_string())
     }
 
@@ -865,13 +902,50 @@ impl Venue for BinanceFutures {
 
 // ---- helpers ----
 
-fn quantize(x: f64, step: f64) -> f64 {
-    if step <= 0.0 {
+pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() || step.is_sign_negative() {
+        return value;
+    }
+
+    let ratio = value / step;
+    let floored = ratio.floor();
+    floored * step
+}
+
+fn quantize_f64(x: f64, step: f64) -> f64 {
+    if step <= 0.0 || !x.is_finite() || !step.is_finite() {
         return x;
     }
-    let rounded = (x / step).floor() * step;
-    if rounded > 0.0 && rounded < step {
-        return 0.0;
+    (x / step).floor() * step
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_quantize_price() {
+        let price = dec!(0.2593620616072499999728690579);
+        let tick = dec!(0.001);
+        let result = quantize_decimal(price, tick);
+        assert_eq!(result, dec!(0.259));
+
+        let result = quantize_decimal(price, dec!(0.1));
+        assert_eq!(result, dec!(0.2));
     }
-    rounded
+
+    #[test]
+    fn test_quantize_qty() {
+        let qty = dec!(76.4964620386307103672152152);
+        let step = dec!(0.001);
+        let result = quantize_decimal(qty, step);
+        assert_eq!(result, dec!(76.496));
+    }
+
+    #[test]
+    fn test_quantize_f64() {
+        assert_eq!(quantize_f64(0.2593, 0.1), 0.2);
+        assert_eq!(quantize_f64(76.4964, 0.001), 76.496);
+    }
 }
