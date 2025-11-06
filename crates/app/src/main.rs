@@ -54,6 +54,22 @@ fn compute_drawdown_bps(history: &[Decimal]) -> i64 {
     max_drawdown.to_i64().unwrap_or(0)
 }
 
+const PNL_HISTORY_MAX_LEN: usize = 1_024;
+
+fn record_pnl_snapshot(history: &mut Vec<Decimal>, pos: &Position, mark_px: Px) {
+    let pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
+    let mut equity = Decimal::ONE + pnl;
+    if equity <= Decimal::ZERO {
+        // Keep the history strictly positive so drawdown math remains stable.
+        equity = Decimal::new(1, 4);
+    }
+    history.push(equity);
+    if history.len() > PNL_HISTORY_MAX_LEN {
+        let excess = history.len() - PNL_HISTORY_MAX_LEN;
+        history.drain(0..excess);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RiskCfg {
     inv_cap: String,
@@ -240,7 +256,7 @@ async fn main() -> Result<()> {
             cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap),
             10,
         )
-            .unwrap(),
+        .unwrap(),
     };
     let mode_lower = cfg.mode.to_lowercase();
     let strategy_name = cfg.strategy.r#type.clone();
@@ -348,10 +364,10 @@ async fn main() -> Result<()> {
                 m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                     && (mode_lower != "futures"
-                    || m.contract_type
-                    .as_deref()
-                    .map(|ct| ct == "PERPETUAL")
-                    .unwrap_or(false))
+                        || m.contract_type
+                            .as_deref()
+                            .map(|ct| ct == "PERPETUAL")
+                            .unwrap_or(false))
             })
             .cloned()
             .collect();
@@ -556,12 +572,29 @@ async fn main() -> Result<()> {
                 V::Spot(v) => v.get_position(&symbol).await?,
                 V::Fut(v) => v.get_position(&symbol).await?,
             };
-            state.inv = pos.qty;
 
-            let mark_px = match &venue {
-                V::Spot(v) => v.mark_price(&symbol).await?,
-                V::Fut(v) => v.mark_price(&symbol).await?,
+            let inv_diff = (state.inv.0 - pos.qty.0).abs();
+            let reconcile_threshold = Decimal::new(1, 8);
+            if inv_diff > reconcile_threshold {
+                warn!(
+                    %symbol,
+                    ws_inv = %state.inv.0,
+                    api_inv = %pos.qty.0,
+                    diff = %inv_diff,
+                    "inventory mismatch detected, syncing with API position"
+                );
+                state.inv = pos.qty;
+            }
+
+            let (mark_px, funding_rate, next_funding_time) = match &venue {
+                V::Spot(v) => (v.mark_price(&symbol).await?, None, None),
+                V::Fut(v) => {
+                    let (mark, funding, next_time) = v.fetch_premium_index(&symbol).await?;
+                    (mark, funding, next_time)
+                }
             };
+
+            record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px);
 
             let liq_gap_bps = if let Some(liq_px) = pos.liq_px {
                 let mark = mark_px.0.to_f64().unwrap_or(0.0);
@@ -598,8 +631,8 @@ async fn main() -> Result<()> {
                 sigma: 0.5,
                 inv: state.inv,
                 liq_gap_bps,
-                funding_rate: None,
-                next_funding_time: None,
+                funding_rate,
+                next_funding_time,
             };
             let mut quotes = state.strategy.on_tick(&ctx);
             info!(%symbol, ?quotes, ?risk_action, "strategy produced raw quotes");
