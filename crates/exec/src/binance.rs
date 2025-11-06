@@ -3,9 +3,9 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bot_core::types::*;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
+use reqwest::{Client, RequestBuilder, Response};
+use rust_decimal::{Decimal, RoundingStrategy};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -117,15 +117,7 @@ struct SpotTrade {
 impl BinanceSpot {
     pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
         let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
-        let info: SpotExchangeInfo = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let info: SpotExchangeInfo = send_json(self.common.client.get(url)).await?;
         let sym = info
             .symbols
             .into_iter()
@@ -136,15 +128,7 @@ impl BinanceSpot {
 
     pub async fn symbol_metadata(&self) -> Result<Vec<SymbolMeta>> {
         let url = format!("{}/api/v3/exchangeInfo", self.base);
-        let info: SpotExchangeInfo = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let info: SpotExchangeInfo = send_json(self.common.client.get(url)).await?;
         Ok(info
             .symbols
             .into_iter()
@@ -176,16 +160,13 @@ impl BinanceSpot {
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/account?{}&signature={}", self.base, qs, sig);
-        let info: SpotAccountInfo = self
-            .common
-            .client
-            .get(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let info: SpotAccountInfo = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         let bal = info.balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
@@ -204,16 +185,13 @@ impl BinanceSpot {
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/openOrders?{}&signature={}", self.base, qs, sig);
-        let orders: Vec<SpotOpenOrder> = self
-            .common
-            .client
-            .get(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let orders: Vec<SpotOpenOrder> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         let mut res = Vec::new();
         for o in orders {
@@ -246,16 +224,13 @@ impl BinanceSpot {
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/myTrades?{}&signature={}", self.base, qs, sig);
-        let trades: Vec<SpotTrade> = self
-            .common
-            .client
-            .get(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let trades: Vec<SpotTrade> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         let mut fills = Vec::new();
         for t in trades {
@@ -312,11 +287,7 @@ impl BinanceSpot {
             );
             return Ok(());
         }
-        let qty_str = format!(
-            "{:.prec$}",
-            qty.to_f64().unwrap_or(0.0),
-            prec = self.qty_precision
-        );
+        let qty_str = format_decimal_fixed(qty, self.qty_precision);
 
         let params = vec![
             format!("symbol={}", symbol),
@@ -336,13 +307,13 @@ impl BinanceSpot {
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
-        self.common
-            .client
-            .post(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?;
+        send_void(
+            self.common
+                .client
+                .post(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -369,16 +340,8 @@ impl Venue for BinanceSpot {
 
         let price = quantize_decimal(px.0, self.price_tick);
         let qty = quantize_decimal(qty.0.abs(), self.qty_step);
-        let price_str = format!(
-            "{:.prec$}",
-            price.to_f64().unwrap_or(0.0),
-            prec = self.price_precision
-        );
-        let qty_str = format!(
-            "{:.prec$}",
-            qty.to_f64().unwrap_or(0.0),
-            prec = self.qty_precision
-        );
+        let price_str = format_decimal_fixed(price, self.price_precision);
+        let qty_str = format_decimal_fixed(qty, self.qty_precision);
 
         let mut params = vec![
             format!("symbol={}", sym),
@@ -398,16 +361,13 @@ impl Venue for BinanceSpot {
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
 
-        let order: SpotPlacedOrder = self
-            .common
-            .client
-            .post(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let order: SpotPlacedOrder = send_json(
+            self.common
+                .client
+                .post(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         info!(
             %sym,
@@ -432,13 +392,13 @@ impl Venue for BinanceSpot {
         let sig = self.common.sign(&qs);
         let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
 
-        self.common
-            .client
-            .delete(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?;
+        send_void(
+            self.common
+                .client
+                .delete(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         Ok(())
     }
@@ -449,15 +409,7 @@ impl Venue for BinanceSpot {
             self.base,
             encode(sym)
         );
-        let t: BookTickerSpot = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let t: BookTickerSpot = send_json(self.common.client.get(url)).await?;
         use rust_decimal::Decimal;
         let bid = Px(Decimal::from_str_radix(&t.bid_price, 10)?);
         let ask = Px(Decimal::from_str_radix(&t.ask_price, 10)?);
@@ -563,15 +515,7 @@ struct PremiumIndex {
 impl BinanceFutures {
     pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
         let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
-        let info: FutExchangeInfo = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let info: FutExchangeInfo = send_json(self.common.client.get(url)).await?;
         let sym = info
             .symbols
             .into_iter()
@@ -582,15 +526,7 @@ impl BinanceFutures {
 
     pub async fn symbol_metadata(&self) -> Result<Vec<SymbolMeta>> {
         let url = format!("{}/fapi/v1/exchangeInfo", self.base);
-        let info: FutExchangeInfo = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let info: FutExchangeInfo = send_json(self.common.client.get(url)).await?;
         Ok(info
             .symbols
             .into_iter()
@@ -619,16 +555,13 @@ impl BinanceFutures {
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v2/balance?{}&signature={}", self.base, qs, sig);
-        let balances: Vec<FutBalance> = self
-            .common
-            .client
-            .get(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let balances: Vec<FutBalance> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         let bal = balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
@@ -647,16 +580,13 @@ impl BinanceFutures {
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/openOrders?{}&signature={}", self.base, qs, sig);
-        let orders: Vec<FutOpenOrder> = self
-            .common
-            .client
-            .get(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let orders: Vec<FutOpenOrder> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
         let mut res = Vec::new();
         for o in orders {
             let price = Decimal::from_str_radix(&o.price, 10)?;
@@ -688,16 +618,13 @@ impl BinanceFutures {
             "{}/fapi/v2/positionRisk?{}&signature={}",
             self.base, qs, sig
         );
-        let mut positions: Vec<FutPosition> = self
-            .common
-            .client
-            .get(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let mut positions: Vec<FutPosition> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
         let pos = positions
             .drain(..)
             .find(|p| p.symbol.eq_ignore_ascii_case(sym))
@@ -722,15 +649,7 @@ impl BinanceFutures {
 
     pub async fn fetch_premium_index(&self, sym: &str) -> Result<(Px, Option<f64>, Option<u64>)> {
         let url = format!("{}/fapi/v1/premiumIndex?symbol={}", self.base, sym);
-        let premium: PremiumIndex = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let premium: PremiumIndex = send_json(self.common.client.get(url)).await?;
         let mark = Decimal::from_str_radix(&premium.mark_price, 10)?;
         let funding_rate = premium
             .last_funding_rate
@@ -765,11 +684,7 @@ impl BinanceFutures {
             );
             return Ok(());
         }
-        let qty_str = format!(
-            "{:.prec$}",
-            qty.to_f64().unwrap_or(0.0),
-            prec = self.qty_precision
-        );
+        let qty_str = format_decimal_fixed(qty, self.qty_precision);
         let params = vec![
             format!("symbol={}", sym),
             format!(
@@ -789,13 +704,13 @@ impl BinanceFutures {
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-        self.common
-            .client
-            .post(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?;
+        send_void(
+            self.common
+                .client
+                .post(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -822,16 +737,8 @@ impl Venue for BinanceFutures {
 
         let price = quantize_decimal(px.0, self.price_tick);
         let qty = quantize_decimal(qty.0.abs(), self.qty_step);
-        let price_str = format!(
-            "{:.prec$}",
-            price.to_f64().unwrap_or(0.0),
-            prec = self.price_precision
-        );
-        let qty_str = format!(
-            "{:.prec$}",
-            qty.to_f64().unwrap_or(0.0),
-            prec = self.qty_precision
-        );
+        let price_str = format_decimal_fixed(price, self.price_precision);
+        let qty_str = format_decimal_fixed(qty, self.qty_precision);
 
         let params = vec![
             format!("symbol={}", sym),
@@ -848,16 +755,13 @@ impl Venue for BinanceFutures {
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
 
-        let order: FutPlacedOrder = self
-            .common
-            .client
-            .post(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let order: FutPlacedOrder = send_json(
+            self.common
+                .client
+                .post(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
 
         info!(
             %sym,
@@ -882,27 +786,19 @@ impl Venue for BinanceFutures {
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
 
-        self.common
-            .client
-            .delete(url)
-            .header("X-MBX-APIKEY", &self.common.api_key)
-            .send()
-            .await?
-            .error_for_status()?;
+        send_void(
+            self.common
+                .client
+                .delete(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
         Ok(())
     }
 
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)> {
         let url = format!("{}/fapi/v1/depth?symbol={}&limit=5", self.base, encode(sym));
-        let d: OrderBookTop = self
-            .common
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let d: OrderBookTop = send_json(self.common.client.get(url)).await?;
         use rust_decimal::Decimal;
         let best_bid = d.bids.get(0).ok_or_else(|| anyhow!("no bid"))?.0.clone();
         let best_ask = d.asks.get(0).ok_or_else(|| anyhow!("no ask"))?.0.clone();
@@ -941,6 +837,38 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     floored * step
 }
 
+fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
+    let scale = precision as u32;
+    let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
+    truncated.normalize().to_string()
+}
+
+async fn ensure_success(resp: Response) -> Result<Response> {
+    let status = resp.status();
+    if status.is_success() {
+        Ok(resp)
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        tracing::error!(%status, %body, "binance api error");
+        Err(anyhow!("binance api error: {} - {}", status, body))
+    }
+}
+
+async fn send_json<T>(builder: RequestBuilder) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let resp = builder.send().await?;
+    let resp = ensure_success(resp).await?;
+    Ok(resp.json().await?)
+}
+
+async fn send_void(builder: RequestBuilder) -> Result<()> {
+    let resp = builder.send().await?;
+    ensure_success(resp).await?;
+    Ok(())
+}
+
 fn quantize_f64(x: f64, step: f64) -> f64 {
     if step <= 0.0 || !x.is_finite() || !step.is_finite() {
         return x;
@@ -976,5 +904,13 @@ mod tests {
     fn test_quantize_f64() {
         assert_eq!(quantize_f64(0.2593, 0.1), 0.2);
         assert_eq!(quantize_f64(76.4964, 0.001), 76.496);
+    }
+
+    #[test]
+    fn test_format_decimal_fixed() {
+        assert_eq!(format_decimal_fixed(dec!(0.123456), 3), "0.123");
+        assert_eq!(format_decimal_fixed(dec!(5), 0), "5");
+        assert_eq!(format_decimal_fixed(dec!(1.2000), 4), "1.2");
+        assert_eq!(format_decimal_fixed(dec!(0.00000001), 8), "0.00000001");
     }
 }
