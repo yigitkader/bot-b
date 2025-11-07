@@ -30,27 +30,128 @@ Bu proje, Binance borsasında (Spot ve Futures) otomatik market making yapan bir
 
 Her tick'te (her döngüde) şu adımlar gerçekleşir:
 
-1. **Mid Price Hesaplama:**
-   - Best bid ve best ask'ten mid price = (bid + ask) / 2
+#### 2.1. Manipülasyon Fırsat Tespiti (Opportunity Detection)
 
-2. **Spread Hesaplama:**
-   - Formül: `spread_bps = max(a * sigma + b * inv_bias, 0.0001)`
-   - `a`: Volatilite katsayısı (örn: 120.0)
-   - `b`: Envanter bias katsayısı (örn: 40.0)
-   - `sigma`: Volatilite (şu an sabit 0.5)
-   - `inv_bias`: Envanter bias = |inventory / inv_cap|
+Strateji, piyasada manipülasyon fırsatlarını tespit eder ve bunları avantaja çevirir:
+
+1. **Flash Crash/Pump Detection:**
+   - Ani fiyat değişimleri tespit edilir (150+ bps = 1.5%+)
+   - Flash crash (fiyat düşüşü) → LONG fırsatı (dip alım)
+   - Flash pump (fiyat yükselişi) → SHORT fırsatı (tepe satış)
+
+2. **Wide Spread Arbitrage:**
+   - Spread 50-200 bps arası → Market maker fırsatı
+   - Spread > 200 bps → Risk çok yüksek, işlem yapılmaz
+
+3. **Volume Anomaly Trend:**
+   - Volume 3x veya daha fazla arttıysa → Trend takibi fırsatı
+   - Trend yönüne göre LONG veya SHORT pozisyon
+
+4. **Momentum Manipulation Reversal:**
+   - Fake breakout tespiti: Fiyat yükseldi ama volume düştü
+   - Ters yönde pozisyon alınır (fake breakout → reversal)
+
+5. **Spoofing Detection:**
+   - Büyük emir duvarı tespit edilir (2x+ likidite değişimi)
+   - Bid wall varsa → Ask tarafında işlem (duvar kalkınca fiyat düşer)
+   - Ask wall varsa → Bid tarafında işlem (duvar kalkınca fiyat yükselir)
+
+6. **Liquidity Withdrawal:**
+   - Likidite %50+ azaldıysa → Spread arbitrajı fırsatı
+   - Her iki tarafta market maker olarak işlem yapılır
+
+#### 2.2. Mikro-Yapı Sinyalleri (Microstructure Signals)
+
+1. **Microprice Hesaplama:**
+   - Volume-weighted mid price: `mp = (ask * bid_vol + bid * ask_vol) / (bid_vol + ask_vol)`
+   - Mid price yerine microprice kullanılır (daha iyi tahmin)
+
+2. **Order Book Imbalance:**
+   - `imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)`
+   - Pozitif imbalance (bid heavy) → Fiyat yukarı baskı
+   - Negatif imbalance (ask heavy) → Fiyat aşağı baskı
+
+3. **EWMA Volatilite:**
+   - Exponential Weighted Moving Average volatilite
+   - Formül: `σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t`
+   - λ = 0.95 (decay factor)
+   - Adaptif spread hesaplamasında kullanılır
+
+4. **Order Flow Imbalance (OFI):**
+   - Mid price momentum'a göre OFI sinyali
+   - Pozitif OFI → Buy pressure
+   - Negatif OFI → Sell pressure
+   - Adverse selection filtrelemesinde kullanılır
+
+#### 2.3. Hedef Envanter Yönetimi (Target Inventory)
+
+1. **Funding Rate Bias:**
+   - Pozitif funding rate → Long bias (pozitif envanter hedefi)
+   - Negatif funding rate → Short bias (negatif envanter hedefi)
+
+2. **Trend Bias:**
+   - Yukarı trend → Long bias
+   - Aşağı trend → Short bias
+   - Trend'in %50'si kadar etkili
+
+3. **Hedef Envanter Hesaplama:**
+   - `target_ratio = sigmoid(combined_bias)`
+   - `target_inventory = inv_cap * target_ratio`
+
+4. **Envanter Kararı:**
+   - Mevcut envanter < hedef → Sadece bid (al)
+   - Mevcut envanter > hedef → Sadece ask (sat)
+   - Hedefe yakınsa (%10 threshold) → Her iki taraf (market making)
+
+#### 2.4. Adaptif Spread Hesaplama
+
+1. **Base Spread:**
+   - `base_spread_bps = max(a * sigma + b * inv_bias, 0.0001)`
+   - `a`: Volatilite katsayısı (120.0)
+   - `b`: Envanter bias katsayısı (40.0)
+
+2. **Adaptif Spread:**
+   - `adaptive = max(min_spread, c₁·σ + c₂·|OFI|)`
+   - `c₁ = 0.5` (volatilite katsayısı)
+   - `c₂ = 0.5` (OFI katsayısı)
+   - Imbalance'a göre ekstra ayarlama (+max 5 bps)
 
 3. **Risk Düzeltmeleri:**
-   - Likidasyon mesafesi < 300 bps ise spread %50 genişletilir
-   - Funding rate'a göre fiyat skew'i uygulanır (funding pozitifse ask yukarı, bid aşağı)
+   - Likidasyon mesafesi < 300 bps → Spread %50 genişletilir
+   - Spread > max_spread_bps (100 bps) → İşlem yapılmaz
 
-4. **Fiyat Hesaplama:**
-   - `bid_px = mid * (1 - half_spread - funding_skew)`
-   - `ask_px = mid * (1 + half_spread + funding_skew)`
+#### 2.5. Fiyat Hesaplama
 
-5. **Miktar Hesaplama:**
-   - `base_size` (örn: 20 USD) / mid_price
-   - Her iki taraf için aynı miktar
+1. **Fiyatlama Bazı:**
+   - Microprice kullanılır (mid price yerine)
+
+2. **Skew Hesaplama:**
+   - Funding skew: `funding_rate * 100 bps`
+   - Envanter skew: `inv_direction * inv_bias * 20 bps`
+   - Imbalance skew: `imbalance * 10 bps`
+
+3. **Fiyat Formülleri:**
+   - `bid_px = microprice * (1 - half_spread - funding_skew - inv_skew - imb_skew)`
+   - `ask_px = microprice * (1 + half_spread + funding_skew + inv_skew + imb_skew)`
+
+#### 2.6. Adverse Selection Filtreleme
+
+1. **OFI ve Momentum Kontrolü:**
+   - OFI > 0.5 ve momentum yukarı → Ask riskli (ask'i geri çek)
+   - OFI < -0.5 ve momentum aşağı → Bid riskli (bid'i geri çek)
+
+2. **Fırsat Modu:**
+   - Manipülasyon fırsatı varsa → Adverse selection filtresi bypass edilir
+   - Agresif pozisyon alınır (2.5x pozisyon boyutu)
+
+#### 2.7. Miktar Hesaplama
+
+1. **Normal Mod:**
+   - `qty = base_size / mid_price`
+
+2. **Fırsat Modu:**
+   - `qty = base_size * opportunity_multiplier (2.5x) / mid_price`
+   - Manipülasyon fırsatı varsa pozisyon boyutu artırılır
 
 ### 3. Risk Yönetimi (Risk)
 
@@ -103,8 +204,14 @@ Her tick'te (her döngüde) şu adımlar gerçekleşir:
    - Drawdown hesaplama için kullanılır
 
 6. **Strateji Çağrısı:**
-   - Context hazırlanır (orderbook, inventory, risk metrikleri)
-   - Strateji `on_tick()` çağrılır → bid/ask quotes üretilir
+   - Context hazırlanır (orderbook, inventory, risk metrikleri, mark price, funding rate)
+   - Strateji `on_tick()` çağrılır:
+     - Manipülasyon fırsatları tespit edilir
+     - Mikro-yapı sinyalleri hesaplanır (microprice, OFI, volatilite, imbalance)
+     - Hedef envanter belirlenir (funding rate + trend bazlı)
+     - Adaptif spread hesaplanır
+     - Adverse selection filtresi uygulanır
+     - Bid/ask quotes üretilir
 
 7. **Risk Düzeltmeleri:**
    - Risk aksiyonuna göre spread genişletilir
@@ -226,15 +333,35 @@ Her tick'te (her döngüde) şu adımlar gerçekleşir:
 
 3. **Risk-Aware Trading:** Drawdown, envanter, likidasyon mesafesi kontrolü
 
-4. **Adaptive Spread:** Envanter ve volatiliteye göre spread ayarlanır
+4. **Adaptive Spread:** Volatilite, OFI, imbalance ve envanter bias'a göre dinamik spread ayarlanır
 
-5. **Funding Rate Skew:** Futures'ta funding rate'a göre fiyat ayarlanır
+5. **Funding Rate Skew:** Futures'ta funding rate'a göre fiyat ayarlanır ve hedef envanter belirlenir
 
 6. **Min Notional Learning:** Exchange'in min notional gereksinimi öğrenilir ve uyum sağlanır
 
 7. **Balance Optimization:** Kalan bakiye ile ekstra emirler yerleştirilir
 
 8. **WebSocket Real-time Updates:** Emir durumları gerçek zamanlı takip edilir
+
+9. **Manipülasyon Fırsat Tespiti:** 7 farklı manipülasyon tipi tespit edilir ve avantaja çevrilir:
+   - Flash crash/pump detection
+   - Wide spread arbitrage
+   - Volume anomaly trend following
+   - Momentum manipulation reversal
+   - Spoofing detection
+   - Liquidity withdrawal opportunities
+
+10. **Mikro-Yapı Sinyalleri:** Gelişmiş fiyatlama için mikro-yapı sinyalleri kullanılır:
+    - Microprice (volume-weighted mid)
+    - Order book imbalance
+    - EWMA volatilite
+    - Order Flow Imbalance (OFI)
+
+11. **Hedef Envanter Yönetimi:** Funding rate ve trend'e göre dinamik hedef envanter belirlenir
+
+12. **Adverse Selection Filtreleme:** OFI ve momentum'a göre riskli taraflar filtrelenir
+
+13. **Fırsat Modu:** Manipülasyon fırsatı tespit edildiğinde pozisyon boyutu 2.5x artırılır ve adverse selection filtresi bypass edilir
 
 ## Güvenlik ve Hata Yönetimi
 
