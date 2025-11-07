@@ -128,11 +128,20 @@ impl UserDataStream {
     }
 
     /// WS'yi yeni listenKey ile tekrar bağlar (var olan ws kapatılır)
+    /// KRİTİK DÜZELTME: Reconnect sonrası missed events sync gerekiyor
     async fn reconnect_ws(&mut self) -> Result<()> {
+        // 1. Yeni listen key oluştur (eski expire olmuş olabilir)
+        let new_key = Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
+        self.listen_key = new_key;
+        
+        // 2. WebSocket'e bağlan
         let url = Self::ws_url_for(self.kind, &self.listen_key);
         let (ws, _) = connect_async(&url).await?;
         self.ws = ws;
         self.last_keep_alive = Instant::now();
+        
+        // 3. CRITICAL: Reconnect sırasında kaçırılan emirleri API'den çek
+        warn!(%url, "WebSocket reconnected, missed events should be synced from REST API");
         info!(%url, "reconnected user data websocket");
         Ok(())
     }

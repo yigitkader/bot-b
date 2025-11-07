@@ -46,6 +46,7 @@ pub fn check_risk(
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
+    use rust_decimal::prelude::ToPrimitive;
     use rust_decimal_macros::dec;
     use bot_core::types::*;
 

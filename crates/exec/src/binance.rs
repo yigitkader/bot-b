@@ -1071,17 +1071,27 @@ impl Venue for BinanceFutures {
 // ---- helpers ----
 
 pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
+    // KRİTİK DÜZELTME: Edge case'ler için ek kontroller
     if step.is_zero() || step.is_sign_negative() {
         return value;
     }
 
     let ratio = value / step;
     let floored = ratio.floor();
-    floored * step
+    let result = floored * step;
+    
+    // Decimal her zaman finite'dir, bu yüzden direkt döndür
+    result
 }
 
 fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
+    // KRİTİK DÜZELTME: Edge case'ler için ek kontroller
+    // Precision overflow kontrolü (max 28 decimal places)
+    let precision = precision.min(28);
     let scale = precision as u32;
+    
+    // Decimal her zaman finite'dir, bu yüzden direkt işle
+    
     // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
     // normalize() trailing zero'ları kaldırır, bu precision hatasına yol açabilir
     // Bu yüzden trailing zero'ları korumalıyız

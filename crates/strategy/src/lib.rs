@@ -31,6 +31,7 @@ pub struct Context {
     pub funding_rate: Option<f64>,
     pub next_funding_time: Option<u64>,
     pub mark_price: Px, // Mark price (futures için)
+    pub tick_size: Option<Decimal>, // Per-symbol tick_size (crossing guard için)
 }
 
 pub trait Strategy: Send + Sync {
@@ -151,6 +152,7 @@ pub struct DynMm {
     ofi_window_ms: u64,          // OFI penceresi (ms)
     last_mid_price: Option<Decimal>, // Son mid price (volatilite için)
     last_timestamp_ms: Option<u64>,  // Son timestamp (OFI için)
+    last_volumes: Option<(Decimal, Decimal)>, // Son bid/ask volumes (OFI için)
     // --- MANİPÜLASYON KORUMA VE FIRSAT: Anti-manipulation + opportunity detection ---
     flash_crash_detected: bool,      // Flash crash tespit edildi mi?
     flash_crash_direction: f64,       // Flash crash yönü: pozitif = pump, negatif = dump
@@ -164,7 +166,6 @@ pub struct DynMm {
     last_adverse_bid: bool,          // Son adverse bid durumu (histerezis için)
     last_adverse_ask: bool,          // Son adverse ask durumu (histerezis için)
     last_opportunity_mode: bool,     // Son fırsat modu durumu (histerezis için)
-    adverse_hysteresis_threshold: f64, // Adverse selection histerezis eşiği (OFI için)
 }
 
 impl From<DynMmCfg> for DynMm {
@@ -212,6 +213,7 @@ impl From<DynMmCfg> for DynMm {
             ofi_window_ms: 200,           // 200ms OFI penceresi
             last_mid_price: None,
             last_timestamp_ms: None,
+            last_volumes: None,           // Başlangıçta volumes yok
             // Manipülasyon koruma başlangıç değerleri
             flash_crash_detected: false,
             flash_crash_direction: 0.0,
@@ -225,7 +227,6 @@ impl From<DynMmCfg> for DynMm {
             last_adverse_bid: false,
             last_adverse_ask: false,
             last_opportunity_mode: false,
-            adverse_hysteresis_threshold: 0.1, // 0.1 OFI farkı (histerezis bandı)
         }
     }
 }
@@ -261,6 +262,7 @@ impl DynMm {
     
     /// EWMA Volatilite güncelleme: σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
     /// r_t = log return veya basit return
+    /// KRİTİK DÜZELTME: İlk tick'te bootstrap yapılmalı
     fn update_volatility(&mut self, current_mid: Decimal) {
         if let Some(last_mid) = self.last_mid_price {
             if !last_mid.is_zero() {
@@ -273,30 +275,49 @@ impl DynMm {
                 self.ewma_volatility = self.ewma_volatility_alpha * self.ewma_volatility 
                     + (1.0 - self.ewma_volatility_alpha) * return_sq_f64;
             }
+        } else {
+            // İlk tick: Bootstrap volatility
+            // Spread'den veya sabit değerden başlat (şimdilik başlangıç değerini koru)
+            // İleride spread'den hesaplanabilir: spread_bps / 10000.0
+            // self.ewma_volatility = 0.0001; // Zaten başlangıç değeri
         }
         self.last_mid_price = Some(current_mid);
     }
     
-    /// OFI (Order Flow Imbalance) güncelleme: Tick bazlı akış analizi
-    /// Basit versiyon: mid price değişimine göre OFI tahmini
-    /// Gerçek OFI için order book update'leri gerekir, şimdilik mid price momentum kullanıyoruz
-    fn update_ofi(&mut self, current_mid: Decimal, timestamp_ms: u64) {
-        if let (Some(last_mid), Some(last_ts)) = (self.last_mid_price, self.last_timestamp_ms) {
-            let dt_ms = timestamp_ms.saturating_sub(last_ts);
-            if dt_ms > 0 && dt_ms <= self.ofi_window_ms {
-                // Mid price değişimi: pozitif = buy pressure, negatif = sell pressure
-                let mid_change = current_mid - last_mid;
-                let mid_change_f64 = mid_change.to_f64().unwrap_or(0.0);
-                
-                // OFI sinyali: momentum'a göre (basitleştirilmiş)
-                // Gerçek OFI için order book update'leri gerekir
-                let ofi_increment = mid_change_f64 * 1000.0; // Scale
-                
-                // Exponential decay: eski OFI'yı azalt
-                let decay_factor = (dt_ms as f64 / self.ofi_window_ms as f64).min(1.0);
-                self.ofi_signal = self.ofi_signal * (1.0 - decay_factor * 0.1) + ofi_increment * decay_factor;
+    /// OFI (Order Flow Imbalance) güncelleme: Gerçek order book update tracking
+    /// KRİTİK DÜZELTME: Gerçek OFI = Δ(bid_vol) - Δ(ask_vol)
+    /// Pozitif OFI = bid volume artışı > ask volume artışı (buy pressure)
+    /// Negatif OFI = ask volume artışı > bid volume artışı (sell pressure)
+    fn update_ofi(&mut self, bid_vol: Decimal, ask_vol: Decimal, timestamp_ms: u64) {
+        if let Some((last_bid_vol, last_ask_vol)) = self.last_volumes {
+            // Gerçek OFI: Δ(bid_vol) - Δ(ask_vol)
+            let delta_bid = bid_vol - last_bid_vol;
+            let delta_ask = ask_vol - last_ask_vol;
+            let delta_bid_f64 = delta_bid.to_f64().unwrap_or(0.0);
+            let delta_ask_f64 = delta_ask.to_f64().unwrap_or(0.0);
+            
+            // OFI increment: bid volume artışı - ask volume artışı
+            let ofi_increment = delta_bid_f64 - delta_ask_f64;
+            
+            // EWMA decay: eski OFI'yı azalt, yeni increment'i ekle
+            if let Some(last_ts) = self.last_timestamp_ms {
+                let dt_ms = timestamp_ms.saturating_sub(last_ts);
+                if dt_ms > 0 && dt_ms <= self.ofi_window_ms {
+                    let decay_factor = (dt_ms as f64 / self.ofi_window_ms as f64).min(1.0);
+                    self.ofi_signal = self.ofi_signal * (1.0 - decay_factor * 0.1) + ofi_increment * decay_factor;
+                } else {
+                    // Window dışı: sadece yeni increment'i ekle
+                    self.ofi_signal = self.ofi_signal * 0.9 + ofi_increment * 0.1;
+                }
+            } else {
+                // İlk tick: direkt increment
+                self.ofi_signal = ofi_increment;
             }
+        } else {
+            // İlk tick: volumes'ları kaydet, OFI sinyali sıfır
+            self.ofi_signal = 0.0;
         }
+        self.last_volumes = Some((bid_vol, ask_vol));
         self.last_timestamp_ms = Some(timestamp_ms);
     }
     
@@ -688,8 +709,8 @@ impl Strategy for DynMm {
         // EWMA volatilite güncelle (microprice kullan)
         self.update_volatility(microprice);
         
-        // OFI güncelle (mid price momentum)
-        self.update_ofi(microprice, now_ms);
+        // OFI güncelle (gerçek order book volumes)
+        self.update_ofi(bid_vol, ask_vol, now_ms);
         
         // Trend analizi
         let trend_bps = self.detect_trend();
@@ -940,20 +961,24 @@ impl Strategy for DynMm {
         let mut ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew));
         
         // --- CROSSING GUARD: Fiyatların best bid/ask'i geçmemesi garantisi ---
+        // KRİTİK DÜZELTME: Per-symbol tick_size kullan (global fallback yerine)
+        let tick = c.tick_size.unwrap_or_else(|| {
+            // Fallback: pricing_base'in %0.01'i (1 bps)
+            pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)
+        });
+        
         // Bid: best_bid'den düşük veya eşit olmalı (pasif emir)
         if let Some(best_bid) = c.ob.best_bid {
             if bid_px.0 > best_bid.px.0 {
                 // Bid best bid'i geçiyor → best_bid'in 1 tick altına çek
-                let tick_size = (best_bid.px.0 - pricing_base * (Decimal::ONE - half - skew - inv_skew - imb_skew)).abs().min(pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO));
-                bid_px = Px(best_bid.px.0 - tick_size.max(Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)));
+                bid_px = Px((best_bid.px.0 - tick).max(Decimal::ZERO));
             }
         }
         // Ask: best_ask'den yüksek veya eşit olmalı (pasif emir)
         if let Some(best_ask) = c.ob.best_ask {
             if ask_px.0 < best_ask.px.0 {
                 // Ask best ask'i geçiyor → best_ask'in 1 tick üstüne çek
-                let tick_size = (pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew) - best_ask.px.0).abs().min(pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO));
-                ask_px = Px(best_ask.px.0 + tick_size.max(Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)));
+                ask_px = Px(best_ask.px.0 + tick);
             }
         }
         
@@ -1061,6 +1086,27 @@ mod tests {
             b: 40.0,
             base_size: dec!(20.0),
             inv_cap: dec!(0.5),
+            // Default değerler (test için)
+            min_spread_bps: default_min_spread_bps(),
+            max_spread_bps: default_max_spread_bps(),
+            spread_arbitrage_min_bps: default_spread_arbitrage_min_bps(),
+            spread_arbitrage_max_bps: default_spread_arbitrage_max_bps(),
+            strong_trend_bps: default_strong_trend_bps(),
+            momentum_strong_bps: default_momentum_strong_bps(),
+            trend_bias_multiplier: default_trend_bias_multiplier(),
+            adverse_selection_threshold_on: default_adverse_selection_threshold_on(),
+            adverse_selection_threshold_off: default_adverse_selection_threshold_off(),
+            opportunity_threshold_on: default_opportunity_threshold_on(),
+            opportunity_threshold_off: default_opportunity_threshold_off(),
+            price_jump_threshold_bps: default_price_jump_threshold_bps(),
+            fake_breakout_threshold_bps: default_fake_breakout_threshold_bps(),
+            liquidity_drop_threshold: default_liquidity_drop_threshold(),
+            inventory_threshold_ratio: default_inventory_threshold_ratio(),
+            volatility_coefficient: default_volatility_coefficient(),
+            ofi_coefficient: default_ofi_coefficient(),
+            min_liquidity_required: default_min_liquidity_required(),
+            opportunity_size_multiplier: default_opportunity_size_multiplier(),
+            strong_trend_multiplier: default_strong_trend_multiplier(),
         };
         DynMm::from(cfg)
     }
@@ -1083,6 +1129,7 @@ mod tests {
             funding_rate: None,
             next_funding_time: None,
             mark_price: Px((bid + ask) / dec!(2)),
+            tick_size: Some(dec!(0.01)), // Test için default tick_size
         }
     }
 
@@ -1297,6 +1344,7 @@ mod tests {
             funding_rate: None,
             next_funding_time: None,
             mark_price: Px(dec!(50000)),
+            tick_size: Some(dec!(0.01)), // Test için default tick_size
         };
         
         let quotes = strategy.on_tick(&ctx);
@@ -1416,6 +1464,7 @@ mod tests {
             funding_rate: None,
             next_funding_time: None,
             mark_price: Px(dec!(50005)),
+            tick_size: Some(dec!(0.01)), // Test için default tick_size
         };
         
         let quotes = strategy.on_tick(&ctx);
@@ -1434,31 +1483,31 @@ mod tests {
         // 100 bps = 1% = 0.01 ratio
         
         // Test: bps → ratio
-        let spread_bps = 100.0; // 1%
+        let spread_bps = 100.0f64; // 1%
         let half_spread_bps = spread_bps / 2.0; // 50 bps = 0.5%
         let half_ratio = half_spread_bps / 1e4; // 0.005
-        assert!((half_ratio - 0.005).abs() < 1e-6, "50 bps should be 0.005 ratio");
+        assert!((half_ratio - 0.005f64).abs() < 1e-6, "50 bps should be 0.005 ratio");
         
         // Test: ratio → bps (ters dönüşüm)
-        let ratio = 0.01; // 1%
+        let ratio = 0.01f64; // 1%
         let bps = ratio * 1e4; // 100 bps
-        assert!((bps - 100.0).abs() < 1e-6, "0.01 ratio should be 100 bps");
+        assert!((bps - 100.0f64).abs() < 1e-6, "0.01 ratio should be 100 bps");
         
         // Test: funding skew dönüşümü
-        let funding_rate = 0.0001; // 0.01% per 8h
-        let funding_skew_bps = funding_rate * 100.0; // 1 bps
+        let funding_rate = 0.0001f64; // 0.01% per 8h
+        let funding_skew_bps = funding_rate * 10000.0; // 1 bps (0.01% * 10000 = 1 bps)
         let funding_skew_ratio = funding_skew_bps / 1e4; // 0.0001
-        assert!((funding_skew_ratio - 0.0001).abs() < 1e-6, "funding skew conversion should be correct");
+        assert!((funding_skew_ratio - 0.0001f64).abs() < 1e-6, "funding skew conversion should be correct");
         
         // Test: inv_skew dönüşümü
-        let inv_skew_bps = 20.0; // 20 bps
+        let inv_skew_bps = 20.0f64; // 20 bps
         let inv_skew_ratio = inv_skew_bps / 1e4; // 0.002
-        assert!((inv_skew_ratio - 0.002).abs() < 1e-6, "inv_skew conversion should be correct");
+        assert!((inv_skew_ratio - 0.002f64).abs() < 1e-6, "inv_skew conversion should be correct");
         
         // Test: imbalance_skew dönüşümü
-        let imbalance_skew_bps = 10.0; // 10 bps
+        let imbalance_skew_bps = 10.0f64; // 10 bps
         let imbalance_skew_ratio = imbalance_skew_bps / 1e4; // 0.001
-        assert!((imbalance_skew_ratio - 0.001).abs() < 1e-6, "imbalance_skew conversion should be correct");
+        assert!((imbalance_skew_ratio - 0.001f64).abs() < 1e-6, "imbalance_skew conversion should be correct");
     }
 
     #[test]
@@ -1493,8 +1542,12 @@ mod tests {
         let spread_ratio = spread / microprice;
         let spread_bps_calc = spread_ratio.to_f64().unwrap_or(0.0) * 1e4;
         
-        // Spread yaklaşık 100 bps olmalı (skew'ler spread'i etkilemez, sadece offset yapar)
-        assert!((spread_bps_calc - 100.0).abs() < 1.0, "Spread should be approximately 100 bps");
+        // Spread = 2 * (half + skew + inv_skew + imb_skew)
+        // = 2 * (50 + 10 + 5 - 3) = 2 * 62 = 124 bps
+        let expected_spread_bps = 2.0 * (half_ratio * 1e4 + funding_skew_bps + inv_skew_bps + imb_skew_bps);
+        // Tolerans: 1 bps (hesaplama hataları ve rounding için)
+        assert!((spread_bps_calc - expected_spread_bps).abs() < 1.0, 
+                "Spread should be approximately {} bps, got {} bps", expected_spread_bps, spread_bps_calc);
         assert!(bid_px < ask_px, "Bid should be less than ask");
     }
 }

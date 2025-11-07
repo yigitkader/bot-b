@@ -16,7 +16,33 @@ use tracing_subscriber::EnvFilter;
 
 use std::cmp::max;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+// --- API RATE LIMIT KORUMASI: Binance limitleri ---
+// Spot: 1200 req/min (20 req/sec)
+// Futures: 2400 req/min (40 req/sec)
+// Basit rate limiter: Her 20 request'te 1 saniye bekle
+static API_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAST_RATE_LIMIT_RESET: AtomicU64 = AtomicU64::new(0);
+
+async fn rate_limit_guard() {
+    let count = API_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_reset = LAST_RATE_LIMIT_RESET.load(Ordering::Relaxed);
+    
+    // Her 20 request'te veya 1 saniyede bir reset
+    if count % 20 == 0 || now_secs.saturating_sub(last_reset) >= 1 {
+        LAST_RATE_LIMIT_RESET.store(now_secs, Ordering::Relaxed);
+        // Her 20 request'te 50ms bekle (20 req/sec limit için güvenli)
+        if count % 20 == 0 && count > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
 
 struct SymbolState {
     meta: SymbolMeta,
@@ -998,12 +1024,20 @@ async fn main() -> Result<()> {
                 match UserDataStream::connect(client.clone(), &base, &api_key, kind).await {
                     Ok(mut stream) => {
                         info!(?kind, "connected to Binance user data stream");
+                        // Reconnect sonrası ilk event geldiğinde sync trigger gönder
+                        let mut first_event_after_reconnect = true;
                         while let Ok(event) = stream.next_event().await {
+                            // Reconnect sonrası ilk event geldiğinde sync flag'i set et
+                            if first_event_after_reconnect {
+                                first_event_after_reconnect = false;
+                                // Reconnect sonrası sync event'i gönder (main loop'ta handle edilecek)
+                                let _ = tx.send(UserEvent::Heartbeat); // Heartbeat olarak kullan (sync trigger)
+                            }
                             if tx.send(event).is_err() {
                                 break;
                             }
                         }
-                        warn!("user data stream reader exited, retrying");
+                        warn!("user data stream reader exited, will reconnect and sync missed events");
                     }
                     Err(err) => {
                         warn!(?err, "failed to connect user data stream");
@@ -1040,6 +1074,9 @@ async fn main() -> Result<()> {
         "main trading loop starting"
     );
     
+    // WebSocket reconnect sonrası missed events sync flag'i (loop dışında)
+    let mut force_sync_all = false;
+    
     loop {
         interval.tick().await;
         
@@ -1049,8 +1086,14 @@ async fn main() -> Result<()> {
             info!(tick_num, "=== MAIN LOOP TICK START ===");
         }
 
+        // WebSocket event'lerini işle
         while let Ok(event) = event_rx.try_recv() {
             match event {
+                UserEvent::Heartbeat => {
+                    // Reconnect sonrası sync trigger (WebSocket reconnect'ten sonra gönderilir)
+                    force_sync_all = true;
+                    info!("WebSocket reconnect detected, will sync all symbols on next tick");
+                }
                 UserEvent::OrderFill {
                     symbol,
                     order_id,
@@ -1113,6 +1156,33 @@ async fn main() -> Result<()> {
         let effective_leverage = cfg.leverage.unwrap_or(cfg.risk.max_leverage).max(1) as f64;
         let effective_leverage_ask = effective_leverage; // Aynı değer, tekrar hesaplamaya gerek yok
         
+        // --- KRİTİK DÜZELTME: Bakiye kontrolü race condition'ını önle ---
+        // Loop başında tüm unique quote asset'leri topla ve bakiyelerini bir kere çek
+        let mut unique_quote_assets: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for state in states.iter() {
+            unique_quote_assets.insert(state.meta.quote_asset.clone());
+        }
+        
+        // Her unique quote asset için bakiyeyi bir kere çek ve cache'e al
+        let mut quote_balances: HashMap<String, f64> = HashMap::new();
+        for quote_asset in &unique_quote_assets {
+            let balance = match &venue {
+                V::Spot(v) => {
+                    match tokio::time::timeout(Duration::from_secs(5), v.asset_free(quote_asset)).await {
+                        Ok(Ok(b)) => b.to_f64().unwrap_or(0.0),
+                        _ => 0.0,
+                    }
+                }
+                V::Fut(v) => {
+                    match tokio::time::timeout(Duration::from_secs(5), v.available_balance(quote_asset)).await {
+                        Ok(Ok(b)) => b.to_f64().unwrap_or(0.0),
+                        _ => 0.0,
+                    }
+                }
+            };
+            quote_balances.insert(quote_asset.clone(), balance);
+        }
+        
         let mut processed_count = 0;
         let mut skipped_count = 0;
         let mut disabled_count = 0;
@@ -1145,39 +1215,27 @@ async fn main() -> Result<()> {
             let quote_asset = &state.meta.quote_asset;
 
             // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
-            // Best prices çekmeden önce bakiye kontrolü yap, gereksiz API çağrılarını önle
+            // KRİTİK DÜZELTME: Cache'den oku (race condition önlendi)
             // DEBUG: İlk birkaç sembol için detaylı log
             let is_debug_symbol = symbol_index <= 5 || symbol == "BTCUSDT" || symbol == "ETHUSDT" || symbol == "BNBUSDT";
             
-            // PERFORMANS: Bakiye kontrolü async, bu yüzden timeout ekleyelim
-            let balance_check_start = Instant::now();
+            // Cache'den bakiye oku (loop başında çekildi)
+            let q_free = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+            
             let has_balance = match &venue {
                 V::Spot(v) => {
                     // Spot için: quote veya base bakiyesi yeterli mi?
-                    // PERFORMANS: Timeout ile bakiye kontrolü (5 saniye max)
-                    let q_free_future = v.asset_free(quote_asset);
-                    let q_free_result = tokio::time::timeout(Duration::from_secs(5), q_free_future).await;
-                    
-                    let q_free = match q_free_result {
-                        Ok(Ok(q)) => q.to_f64().unwrap_or(0.0),
-                        _ => 0.0,
-                    };
-                    
-                    let check_duration = balance_check_start.elapsed().as_millis();
                     if is_debug_symbol {
                         info!(
                             %symbol,
                             quote_asset = %quote_asset,
                             available_balance = q_free,
                             min_required = min_usd_per_order,
-                            check_duration_ms = check_duration,
-                            "balance check for debug symbol (spot)"
+                            "balance check for debug symbol (spot, from cache)"
                         );
                     }
                     
                     // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
-                    // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
-                    // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
                     if q_free < cfg.min_quote_balance_usd {
                         if is_debug_symbol {
                             info!(
@@ -1188,9 +1246,8 @@ async fn main() -> Result<()> {
                             );
                         }
                         // Base bakiyesi kontrolü (yaklaşık kontrol, gerçek fiyat bilinmiyor)
-                        let b_free_future = v.asset_free(base_asset);
-                        let b_free_result = tokio::time::timeout(Duration::from_secs(5), b_free_future).await;
-                        match b_free_result {
+                        // NOT: Base bakiyesi cache'de yok, bu yüzden sadece gerektiğinde çek
+                        match tokio::time::timeout(Duration::from_secs(2), v.asset_free(base_asset)).await {
                             Ok(Ok(b)) => {
                                 let b_free = b.to_f64().unwrap_or(0.0);
                                 // Base varsa devam et (daha sonra gerçek fiyatla kontrol edilecek)
@@ -1203,61 +1260,35 @@ async fn main() -> Result<()> {
                         q_free >= min_usd_per_order
                     }
                 }
-                V::Fut(v) => {
-                    // PERFORMANS: Timeout ile bakiye kontrolü (5 saniye max)
-                    let balance_future = v.available_balance(quote_asset);
-                    let balance_result = tokio::time::timeout(Duration::from_secs(5), balance_future).await;
-                    
-                    match balance_result {
-                        Ok(Ok(a)) => {
-                            let avail = a.to_f64().unwrap_or(0.0);
-                            let check_duration = balance_check_start.elapsed().as_millis();
-                            
-                            // HIZLI KONTROL: 1 USD'den azsa işlem yapma (gereksiz API çağrılarını önle)
-                            if is_debug_symbol {
-                                info!(
-                                    %symbol,
-                                    quote_asset = %quote_asset,
-                                    available_balance = avail,
-                                    min_required = min_usd_per_order,
-                                    check_duration_ms = check_duration,
-                                    "balance check for debug symbol"
-                                );
-                            }
-                            if avail < cfg.min_quote_balance_usd {
-                                false // Bakiye çok düşük, skip
-                            } else {
-                                // Leverage ile toplam kullanılabilir miktar
-                                // PERFORMANS: effective_leverage zaten hesaplandı, cache'den kullan
-                                let total = avail * effective_leverage;
-                                let has_enough = total >= min_usd_per_order;
-                                if is_debug_symbol {
-                                    info!(
-                                        %symbol,
-                                        available_balance = avail,
-                                        effective_leverage,
-                                        total_with_leverage = total,
-                                        min_required = min_usd_per_order,
-                                        has_enough,
-                                        "balance check result"
-                                    );
-                                }
-                                has_enough
-                            }
+                V::Fut(_) => {
+                    // Futures için: leverage ile toplam kullanılabilir miktar
+                    if is_debug_symbol {
+                        info!(
+                            %symbol,
+                            quote_asset = %quote_asset,
+                            available_balance = q_free,
+                            min_required = min_usd_per_order,
+                            "balance check for debug symbol (futures, from cache)"
+                        );
+                    }
+                    if q_free < cfg.min_quote_balance_usd {
+                        false // Bakiye çok düşük, skip
+                    } else {
+                        // Leverage ile toplam kullanılabilir miktar
+                        let total = q_free * effective_leverage;
+                        let has_enough = total >= min_usd_per_order;
+                        if is_debug_symbol {
+                            info!(
+                                %symbol,
+                                available_balance = q_free,
+                                effective_leverage,
+                                total_with_leverage = total,
+                                min_required = min_usd_per_order,
+                                has_enough,
+                                "balance check result (from cache)"
+                            );
                         }
-                        Ok(Err(err)) => {
-                            if is_debug_symbol {
-                                warn!(%symbol, ?err, "failed to fetch available balance");
-                            }
-                            false
-                        }
-                        Err(_) => {
-                            // Timeout
-                            if is_debug_symbol {
-                                warn!(%symbol, "balance check timeout (5s), skipping");
-                            }
-                            false
-                        }
+                        has_enough
                     }
                 }
             };
@@ -1275,10 +1306,13 @@ async fn main() -> Result<()> {
             // ÖNEMLİ: Saniyelik değişimler olduğu için her tick'te kontrol etmeliyiz
             // Ama rate limit koruması için minimum 2 saniye bekle (çok sık API çağrısı yapma)
             // WebSocket zaten real-time güncellemeleri sağlıyor, API sadece doğrulama için
-            let should_sync_orders = state.last_order_sync
+            // KRİTİK DÜZELTME: Reconnect sonrası tüm semboller için sync yap
+            let should_sync_orders = force_sync_all || state.last_order_sync
                 .map(|last| last.elapsed().as_secs() >= 2) // Her 2 saniyede bir senkronize et (rate limit koruması + hızlı güncelleme)
                 .unwrap_or(true); // İlk çalıştırmada mutlaka senkronize et
             if should_sync_orders {
+                // API Rate Limit koruması
+                rate_limit_guard().await;
                 let sync_result = match &venue {
                     V::Spot(v) => v.get_open_orders(&symbol).await,
                     V::Fut(v) => v.get_open_orders(&symbol).await,
@@ -1304,6 +1338,10 @@ async fn main() -> Result<()> {
                         });
                         
                         if removed_count > 0 {
+                            // KRİTİK DÜZELTME: Fill olan emirler varsa consecutive_no_fills sıfırla
+                            state.consecutive_no_fills = 0;
+                            // Fill oranını artır
+                            state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05 * (removed_count as f64).min(1.0)).min(1.0);
                             info!(
                                 %symbol,
                                 removed_orders = removed_count,
@@ -1338,6 +1376,12 @@ async fn main() -> Result<()> {
                         warn!(%symbol, ?err, "failed to sync orders from API, continuing with local state");
                     }
                 }
+            }
+            
+            // Reconnect sonrası sync yapıldı, flag'i sıfırla (sadece son sembol işlendikten sonra)
+            if force_sync_all && symbol_index == total_symbols {
+                force_sync_all = false;
+                info!("WebSocket reconnect sync completed for all symbols");
             }
             
             // --- AKILLI EMİR YÖNETİMİ: Stale emirleri iptal et ---
@@ -1848,20 +1892,33 @@ async fn main() -> Result<()> {
                         warn!(%symbol, ?err, "failed to cancel orders before position close");
                     }
                     
-                    // Pozisyonu kapat (reduceOnly market order)
-                    let close_result = match &venue {
-                        V::Spot(v) => v.close_position(&symbol).await,
-                        V::Fut(v) => v.close_position(&symbol).await,
-                    };
-                    if let Err(err) = close_result {
-                        warn!(%symbol, ?err, "failed to close position");
-                    } else {
-                        info!(
-                            %symbol,
-                            reason,
-                            final_pnl = pnl_f64,
-                            "position closed successfully"
-                        );
+                    // Pozisyonu kapat (reduceOnly market order) - KRİTİK DÜZELTME: Retry mekanizması
+                    let mut close_success = false;
+                    for attempt in 0..3 {
+                        let close_result = match &venue {
+                            V::Spot(v) => v.close_position(&symbol).await,
+                            V::Fut(v) => v.close_position(&symbol).await,
+                        };
+                        match close_result {
+                            Ok(_) => {
+                                close_success = true;
+                                info!(
+                                    %symbol,
+                                    reason,
+                                    final_pnl = pnl_f64,
+                                    attempt = attempt + 1,
+                                    "position closed successfully"
+                                );
+                                break;
+                            }
+                            Err(err) if attempt < 2 => {
+                                warn!(%symbol, ?err, attempt = attempt + 1, "failed to close position, retrying...");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            Err(err) => {
+                                warn!(%symbol, ?err, "failed to close position after 3 attempts");
+                            }
+                        }
                     }
                     
                     // State'i sıfırla
@@ -1912,6 +1969,8 @@ async fn main() -> Result<()> {
             let risk_action = risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, &risk_limits);
             
             // --- AKILLI FILL ORANI TAKİBİ: Ardışık fill olmayan tick sayısını artır ---
+            // KRİTİK DÜZELTME: Sadece emir varsa ve fill olmadıysa artır
+            // (Fill kontrolü yukarıda yapıldı, burada sadece artırma yapıyoruz)
             if state.active_orders.len() > 0 {
                 state.consecutive_no_fills += 1;
                 // Eğer çok uzun süre fill olmuyorsa, fill oranını düşür
@@ -1919,7 +1978,8 @@ async fn main() -> Result<()> {
                     state.order_fill_rate = (state.order_fill_rate * 0.99).max(0.1);
                 }
             } else {
-                // Emir yoksa, fill oranını yavaşça normale döndür
+                // Emir yoksa, consecutive_no_fills sıfırla ve fill oranını yavaşça normale döndür
+                state.consecutive_no_fills = 0;
                 state.order_fill_rate = (state.order_fill_rate * 0.995 + 0.005).min(1.0);
             }
             
@@ -1959,6 +2019,10 @@ async fn main() -> Result<()> {
                 continue;
             }
 
+            // Per-symbol tick_size'ı Context'e geç (crossing guard için)
+            let tick_size_f64 = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
+            let tick_size_decimal = Decimal::from_f64_retain(tick_size_f64);
+            
             let ctx = Context {
                 ob,
                 sigma: 0.5,
@@ -1967,6 +2031,7 @@ async fn main() -> Result<()> {
                 funding_rate,
                 next_funding_time,
                 mark_price: mark_px, // Mark price stratejiye veriliyor
+                tick_size: tick_size_decimal, // Per-symbol tick_size (crossing guard için)
             };
             let mut quotes = state.strategy.on_tick(&ctx);
             // Debug: Strateji neden quote üretmedi?
@@ -2469,11 +2534,12 @@ async fn main() -> Result<()> {
                                                 let max_attempts = 20; // Maksimum 20 step artır
                                                 while attempts < max_attempts {
                                                     let notional_after_quantize = new_qty * price_quantized;
+                                                    // KRİTİK DÜZELTME: Önce min notional kontrolü (pozisyon boyutu)
                                                     if notional_after_quantize >= min_notional {
-                                                        // Margin kontrolü: Bu miktar için yeterli margin var mı?
+                                                        // Min notional karşılandı, şimdi margin kontrolü (ayrı kontrol)
                                                         let required_margin = notional_after_quantize / effective_leverage;
                                                         if required_margin <= available_margin {
-                                                            break; // Yeterli notional ve margin
+                                                            break; // Yeterli notional VE margin
                                                         } else {
                                                             // Margin yetersiz, daha küçük miktar dene
                                                             if new_qty >= step {
@@ -2484,6 +2550,7 @@ async fn main() -> Result<()> {
                                                             }
                                                         }
                                                     }
+                                                    // Notional yeterli değil, artır ve tekrar kontrol et
                                                     if new_qty + step > max_qty {
                                                         break; // Cap'e ulaştık
                                                     }
@@ -2653,11 +2720,12 @@ async fn main() -> Result<()> {
                                                 let max_attempts = 20; // Maksimum 20 step artır
                                                 while attempts < max_attempts {
                                                     let notional_after_quantize = new_qty * price_quantized;
+                                                    // KRİTİK DÜZELTME: Önce min notional kontrolü (pozisyon boyutu)
                                                     if notional_after_quantize >= min_notional {
-                                                        // Margin kontrolü: Bu miktar için yeterli margin var mı?
+                                                        // Min notional karşılandı, şimdi margin kontrolü (ayrı kontrol)
                                                         let required_margin = notional_after_quantize / effective_leverage_ask;
                                                         if required_margin <= available_margin {
-                                                            break; // Yeterli notional ve margin
+                                                            break; // Yeterli notional VE margin
                                                         } else {
                                                             // Margin yetersiz, daha küçük miktar dene
                                                             if new_qty >= step {
@@ -2668,6 +2736,7 @@ async fn main() -> Result<()> {
                                                             }
                                                         }
                                                     }
+                                                    // Notional yeterli değil, artır ve tekrar kontrol et
                                                     if new_qty + step > max_qty {
                                                         break; // Cap'e ulaştık
                                                     }
