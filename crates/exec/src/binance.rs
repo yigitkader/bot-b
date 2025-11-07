@@ -1157,7 +1157,8 @@ mod tests {
     fn test_format_decimal_fixed() {
         assert_eq!(format_decimal_fixed(dec!(0.123456), 3), "0.123");
         assert_eq!(format_decimal_fixed(dec!(5), 0), "5");
-        assert_eq!(format_decimal_fixed(dec!(1.2000), 4), "1.2");
+        // format_decimal_fixed trailing zero'ları korur (precision kadar)
+        assert_eq!(format_decimal_fixed(dec!(1.2000), 4), "1.2000");
         assert_eq!(format_decimal_fixed(dec!(0.00000001), 8), "0.00000001");
     }
 }

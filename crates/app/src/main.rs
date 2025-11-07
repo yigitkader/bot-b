@@ -157,6 +157,10 @@ fn default_quote_asset() -> String {
     "USDC".to_string()
 }
 
+fn default_min_quote_balance_usd() -> f64 {
+    1.0 // Default: 1 USD minimum quote asset balance
+}
+
 #[derive(Debug, Deserialize)]
 struct AppCfg {
     #[serde(default)]
@@ -172,6 +176,8 @@ struct AppCfg {
     max_usd_per_order: f64,
     #[serde(default)]
     min_usd_per_order: Option<f64>,
+    #[serde(default = "default_min_quote_balance_usd")]
+    min_quote_balance_usd: f64, // Quote asset minimum bakiye eşiği (USD)
     leverage: Option<u32>,
     price_tick: f64,
     qty_step: f64,
@@ -467,19 +473,91 @@ async fn main() -> Result<()> {
             .cloned()
             .collect();
         
-        // AKILLI SEÇİM: Hangi USD-stable asset'te daha fazla para varsa onu önceliklendir
-        if want_group && mode_lower == "futures" {
+        // --- QUOTE ASSET BAKİYE FİLTRESİ: Yetersiz bakiye olan quote asset'li sembolleri filtrele ---
+        // Tüm quote asset'lerin bakiyelerini kontrol et ve yetersiz olanları baştan filtrele
+        // Böylece gereksiz işlem yapılmaz
+        let mut quote_asset_balances: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        
+        if mode_lower == "futures" {
             if let V::Fut(vtmp) = &venue {
-                // USDT ve USDC bakiyelerini kontrol et
-                let usdt_bal = vtmp.available_balance("USDT").await.ok()
-                    .and_then(|b| b.to_f64())
-                    .unwrap_or(0.0);
-                let usdc_bal = vtmp.available_balance("USDC").await.ok()
-                    .and_then(|b| b.to_f64())
-                    .unwrap_or(0.0);
+                // Tüm benzersiz quote asset'leri bul
+                let unique_quotes: std::collections::HashSet<String> = auto.iter()
+                    .map(|m| m.quote_asset.clone())
+                    .collect();
+                
+                // Her quote asset için bakiye kontrolü yap
+                for quote in unique_quotes {
+                    let balance = vtmp.available_balance(&quote).await.ok()
+                        .and_then(|b| b.to_f64())
+                        .unwrap_or(0.0);
+                    quote_asset_balances.insert(quote.clone(), balance);
+                    
+                    if balance < cfg.min_quote_balance_usd {
+                        info!(
+                            quote_asset = %quote,
+                            balance,
+                            min_required = cfg.min_quote_balance_usd,
+                            "FILTERING: quote asset balance insufficient, removing all symbols with this quote asset"
+                        );
+                    }
+                }
+            }
+        } else {
+            if let V::Spot(vtmp) = &venue {
+                // Tüm benzersiz quote asset'leri bul
+                let unique_quotes: std::collections::HashSet<String> = auto.iter()
+                    .map(|m| m.quote_asset.clone())
+                    .collect();
+                
+                // Her quote asset için bakiye kontrolü yap
+                for quote in unique_quotes {
+                    let balance = vtmp.asset_free(&quote).await.ok()
+                        .and_then(|b| b.to_f64())
+                        .unwrap_or(0.0);
+                    quote_asset_balances.insert(quote.clone(), balance);
+                    
+                    if balance < cfg.min_quote_balance_usd {
+                        info!(
+                            quote_asset = %quote,
+                            balance,
+                            min_required = cfg.min_quote_balance_usd,
+                            "FILTERING: quote asset balance insufficient, removing all symbols with this quote asset"
+                        );
+                    }
+                }
+            }
+        }
+        
+        // Yetersiz bakiye olan quote asset'li sembolleri filtrele
+        auto.retain(|m| {
+            if let Some(&balance) = quote_asset_balances.get(&m.quote_asset) {
+                if balance >= cfg.min_quote_balance_usd {
+                    true // Yeterli bakiye var, tut
+                } else {
+                    false // Yetersiz bakiye, filtrele
+                }
+            } else {
+                // Bakiye bilgisi yok, güvenli tarafta kal ve filtrele
+                false
+            }
+        });
+        
+        info!(
+            symbols_after_filtering = auto.len(),
+            "filtered symbols by quote asset balance"
+        );
+        
+        // AKILLI SEÇİM: Hangi USD-stable asset'te daha fazla para varsa onu önceliklendir
+        // Not: Yetersiz bakiye olan quote asset'ler zaten filtrelenmiş durumda
+        if want_group && mode_lower == "futures" {
+            if let V::Fut(_) = &venue {
+                // USDT ve USDC bakiyelerini kontrol et (zaten quote_asset_balances'da var)
+                let usdt_bal = quote_asset_balances.get("USDT").copied().unwrap_or(0.0);
+                let usdc_bal = quote_asset_balances.get("USDC").copied().unwrap_or(0.0);
                 
                 // Hangi asset'te daha fazla para varsa, o asset'in sembollerini önceliklendir
-                if usdt_bal >= 1.0 && usdt_bal > usdc_bal {
+                // (Her iki asset de zaten yeterli bakiyeye sahip, çünkü filtrelenmiş)
+                if usdt_bal >= cfg.min_quote_balance_usd && usdt_bal > usdc_bal {
                     // USDT öncelikli
                     auto.sort_by(|a, b| {
                         let a_usdt = a.quote_asset.eq_ignore_ascii_case("USDT");
@@ -497,7 +575,7 @@ async fn main() -> Result<()> {
                         usdc_balance = usdc_bal,
                         "auto-discovered symbols: USDT prioritized (more balance)"
                     );
-                } else if usdc_bal >= 1.0 && usdc_bal > usdt_bal {
+                } else if usdc_bal >= cfg.min_quote_balance_usd && usdc_bal > usdt_bal {
                     // USDC öncelikli
                     auto.sort_by(|a, b| {
                         let a_usdc = a.quote_asset.eq_ignore_ascii_case("USDC");
@@ -527,13 +605,65 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
-        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-        info!(
-            count = auto.len(),
-            quote_asset = %cfg.quote_asset,
-            grouped = want_group,
-            "auto-discovered symbols for quote asset (group-aware)"
-        );
+                // Spot için de aynı önceliklendirme mantığı
+                if want_group {
+                    // USDT ve USDC bakiyelerini kontrol et (zaten quote_asset_balances'da var)
+                    let usdt_bal = quote_asset_balances.get("USDT").copied().unwrap_or(0.0);
+                    let usdc_bal = quote_asset_balances.get("USDC").copied().unwrap_or(0.0);
+                    
+                    if usdt_bal >= cfg.min_quote_balance_usd && usdt_bal > usdc_bal {
+                        auto.sort_by(|a, b| {
+                            let a_usdt = a.quote_asset.eq_ignore_ascii_case("USDT");
+                            let b_usdt = b.quote_asset.eq_ignore_ascii_case("USDT");
+                            match (a_usdt, b_usdt) {
+                                (true, false) => std::cmp::Ordering::Less,
+                                (false, true) => std::cmp::Ordering::Greater,
+                                _ => a.symbol.cmp(&b.symbol),
+                            }
+                        });
+                        info!(
+                            count = auto.len(),
+                            quote_asset = %cfg.quote_asset,
+                            usdt_balance = usdt_bal,
+                            usdc_balance = usdc_bal,
+                            "auto-discovered symbols (spot): USDT prioritized (more balance)"
+                        );
+                    } else if usdc_bal >= cfg.min_quote_balance_usd && usdc_bal > usdt_bal {
+                        auto.sort_by(|a, b| {
+                            let a_usdc = a.quote_asset.eq_ignore_ascii_case("USDC");
+                            let b_usdc = b.quote_asset.eq_ignore_ascii_case("USDC");
+                            match (a_usdc, b_usdc) {
+                                (true, false) => std::cmp::Ordering::Less,
+                                (false, true) => std::cmp::Ordering::Greater,
+                                _ => a.symbol.cmp(&b.symbol),
+                            }
+                        });
+                        info!(
+                            count = auto.len(),
+                            quote_asset = %cfg.quote_asset,
+                            usdt_balance = usdt_bal,
+                            usdc_balance = usdc_bal,
+                            "auto-discovered symbols (spot): USDC prioritized (more balance)"
+                        );
+                    } else {
+                        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+                        info!(
+                            count = auto.len(),
+                            quote_asset = %cfg.quote_asset,
+                            usdt_balance = usdt_bal,
+                            usdc_balance = usdc_bal,
+                            "auto-discovered symbols (spot): equal balance or insufficient, alphabetical order"
+                        );
+                    }
+                } else {
+                    auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+                    info!(
+                        count = auto.len(),
+                        quote_asset = %cfg.quote_asset,
+                        grouped = want_group,
+                        "auto-discovered symbols for quote asset (group-aware)"
+                    );
+                }
             }
         } else {
             auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
@@ -806,8 +936,18 @@ async fn main() -> Result<()> {
                         );
                     }
                     
-                    // HIZLI KONTROL: 1 USD'den azsa işlem yapma
-                    if q_free < 1.0 {
+                    // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
+                    // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
+                    // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
+                    if q_free < cfg.min_quote_balance_usd {
+                        if is_debug_symbol {
+                            info!(
+                                %symbol,
+                                quote_asset = %quote_asset,
+                                available_balance = q_free,
+                                "SKIPPING: quote asset balance < 1 USD, will try other quote assets if available"
+                            );
+                        }
                         // Base bakiyesi kontrolü (yaklaşık kontrol, gerçek fiyat bilinmiyor)
                         let b_free_future = v.asset_free(base_asset);
                         let b_free_result = tokio::time::timeout(Duration::from_secs(5), b_free_future).await;
@@ -845,7 +985,7 @@ async fn main() -> Result<()> {
                                     "balance check for debug symbol"
                                 );
                             }
-                            if avail < 1.0 {
+                            if avail < cfg.min_quote_balance_usd {
                                 false // Bakiye çok düşük, skip
                             } else {
                                 // Leverage ile toplam kullanılabilir miktar
@@ -1589,7 +1729,24 @@ async fn main() -> Result<()> {
             let caps = match &venue {
                 V::Spot(v) => {
                     let quote_free = match v.asset_free(&quote_asset).await {
-                        Ok(q) => q.to_f64().unwrap_or(0.0),
+                        Ok(q) => {
+                            let q_f64 = q.to_f64().unwrap_or(0.0);
+                            // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
+                            // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
+                            // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
+                            if q_f64 < cfg.min_quote_balance_usd {
+                                info!(
+                                    %symbol,
+                                    quote_asset = %quote_asset,
+                                    available_balance = q_f64,
+                                    min_required = cfg.min_quote_balance_usd,
+                                    "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
+                                );
+                                0.0
+                            } else {
+                                q_f64
+                            }
+                        },
                         Err(err) => {
                             warn!(%symbol, ?err, "failed to fetch quote asset balance, using zero");
                             0.0
@@ -1619,10 +1776,18 @@ async fn main() -> Result<()> {
                     let avail = match v.available_balance(&quote_asset).await {
                         Ok(a) => {
                             let avail_f64 = a.to_f64().unwrap_or(0.0);
-                            // HIZLI KONTROL: 1 USD'den azsa işlem yapma
-                            if avail_f64 < 1.0 {
-                                // Bakiye çok düşük, bu sembolü skip et
-                                0.0
+                            // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
+                            // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
+                            // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
+                            if avail_f64 < cfg.min_quote_balance_usd {
+                                info!(
+                                    %symbol,
+                                    quote_asset = %quote_asset,
+                                    available_balance = avail_f64,
+                                    min_required = cfg.min_quote_balance_usd,
+                                    "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
+                                );
+                                0.0 // Bakiye çok düşük, bu sembolü skip et
                             } else if avail_f64 == 0.0 {
                                 warn!(%symbol, quote_asset = %quote_asset, available_balance = %a, "available balance is zero or failed to convert to f64");
                                 0.0
@@ -1693,6 +1858,21 @@ async fn main() -> Result<()> {
                 sell_total_base = caps.sell_total_base,
                 "calculated order caps"
             );
+
+            // --- QUOTE ASSET BAKİYE KONTROLÜ: Eğer quote asset'te bakiye yoksa skip et ---
+            // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
+            // Eğer o quote asset'te bakiye yoksa (config'deki eşikten az), bu sembolü skip et
+            // Diğer quote asset'li semboller (örn: BTCUSDC) devam edebilir
+            if caps.buy_total < cfg.min_quote_balance_usd {
+                info!(
+                    %symbol,
+                    quote_asset = %quote_asset,
+                    buy_total = caps.buy_total,
+                    min_required = cfg.min_quote_balance_usd,
+                    "SKIPPING SYMBOL: quote asset balance below minimum threshold, will try other quote assets if available"
+                );
+                continue; // Bu sembolü skip et, diğer quote asset'li sembollere devam et
+            }
 
             // --- min notional bilgisi varsa, kapasite bunun altındaysa tick'i atla ---
             if let Some(min_req) = state.min_notional_req {
@@ -1973,8 +2153,15 @@ async fn main() -> Result<()> {
                                                     if required_margin <= available_margin {
                                                         break; // Yeterli notional ve margin
                                                     } else {
-                                                        // Margin yetersiz, daha küçük miktar dene
-                                                        break;
+                                                        // Margin yetersiz, daha küçük miktar dene (quantize kayıpları nedeniyle olabilir)
+                                                        // max_qty_by_margin zaten hesaplandı, ama quantize sonrası küçük fark olabilir
+                                                        // Bu durumda bir step azalt ve tekrar dene
+                                                        if new_qty >= step {
+                                                            new_qty -= step;
+                                                            continue; // Tekrar kontrol et
+                                                        } else {
+                                                            break; // Daha fazla azaltılamaz
+                                                        }
                                                     }
                                                 }
                                                 if new_qty + step > max_qty {
@@ -2131,8 +2318,15 @@ async fn main() -> Result<()> {
                                                     if required_margin <= available_margin {
                                                         break; // Yeterli notional ve margin
                                                     } else {
-                                                        // Margin yetersiz, daha küçük miktar dene
-                                                        break;
+                                                        // Margin yetersiz, daha küçük miktar dene (quantize kayıpları nedeniyle olabilir)
+                                                        // max_qty_by_margin zaten hesaplandı, ama quantize sonrası küçük fark olabilir
+                                                        // Bu durumda bir step azalt ve tekrar dene
+                                                        if new_qty >= step {
+                                                            new_qty -= step;
+                                                            continue; // Tekrar kontrol et
+                                                        } else {
+                                                            break; // Daha fazla azaltılamaz
+                                                        }
                                                     }
                                                 }
                                                 if new_qty + step > max_qty {
@@ -2227,3 +2421,7 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "position_order_tests.rs"]
+mod position_order_tests;

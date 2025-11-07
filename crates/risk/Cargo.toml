@@ -6,3 +6,7 @@ edition = "2021"
 
 [dependencies]
 bot_core = { path = "../bot_core" }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1"

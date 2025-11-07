@@ -10,3 +10,7 @@ name = "bot_core"
 [dependencies]
 rust_decimal = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+serde_json = { workspace = true }

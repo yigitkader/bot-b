@@ -10,3 +10,6 @@ rust_decimal = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 bot_core = { path = "../bot_core" }
+
+[dev-dependencies]
+rust_decimal_macros = "1"
