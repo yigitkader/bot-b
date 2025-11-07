@@ -1700,6 +1700,17 @@ async fn main() -> Result<()> {
                 mark_price: mark_px, // Mark price stratejiye veriliyor
             };
             let mut quotes = state.strategy.on_tick(&ctx);
+            // Debug: Strateji neden quote üretmedi?
+            if quotes.bid.is_none() && quotes.ask.is_none() {
+                use tracing::debug;
+                debug!(
+                    %symbol,
+                    ?risk_action,
+                    inventory = %state.inv.0,
+                    liq_gap_bps,
+                    "strategy produced no quotes - investigating reason"
+                );
+            }
             info!(%symbol, ?quotes, ?risk_action, "strategy produced raw quotes");
 
             match risk_action {

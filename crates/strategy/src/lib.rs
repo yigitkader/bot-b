@@ -78,10 +78,18 @@ pub struct DynMm {
 
 impl From<DynMmCfg> for DynMm {
     fn from(c: DynMmCfg) -> Self {
+        // Minimum notional kontrolü: base_size en az 100 USD olmalı (Binance minimum notional)
+        // Eğer config'de daha küçük bir değer varsa, 100 USD'ye yükselt
+        let min_base_notional = Decimal::from(100u32);
+        let base_notional = if c.base_size < min_base_notional {
+            min_base_notional
+        } else {
+            c.base_size
+        };
         Self {
             a: c.a,
             b: c.b,
-            base_notional: c.base_size,
+            base_notional,
             inv_cap: Qty(c.inv_cap),
             price_history: Vec::with_capacity(100), // Son 100 fiyat
             target_inventory: Qty(Decimal::ZERO), // Başlangıçta nötr
@@ -183,14 +191,17 @@ impl DynMm {
     /// Adaptif spread: max(min_spread, c₁·σ + c₂·|OFI|)
     fn calculate_adaptive_spread(&self, base_spread_bps: f64, min_spread_bps: f64) -> f64 {
         // Volatilite bileşeni: c₁·σ (σ = sqrt(σ²))
+        // Volatiliteyi bps'e çevir: sqrt(ewma_volatility) * 10000.0
+        // Örnek: ewma_volatility = 0.0001 → sqrt(0.0001) = 0.01 → 0.01 * 10000 = 100 bps
+        // Ama bu çok yüksek, bu yüzden daha küçük bir katsayı kullanıyoruz
         let vol_component = (self.ewma_volatility.sqrt() * 10000.0).max(0.0); // bps'e çevir
-        let c1 = 2.0; // Volatilite katsayısı
+        let c1 = 0.5; // Volatilite katsayısı (daha küçük, çünkü başlangıç volatilitesi yüksek)
         
         // OFI bileşeni: c₂·|OFI|
         let ofi_component = self.ofi_signal.abs() * 100.0; // Scale to bps
         let c2 = 0.5; // OFI katsayısı
         
-        // Adaptif spread
+        // Adaptif spread: base_spread ve adaptive arasından maksimumu al
         let adaptive = (c1 * vol_component + c2 * ofi_component).max(min_spread_bps);
         base_spread_bps.max(adaptive)
     }
@@ -750,16 +761,19 @@ impl Strategy for DynMm {
         let min_spread_bps = 1.0; // Minimum 1 bps spread
         
         // --- ADAPTİF SPREAD: Volatilite ve OFI'ye göre ---
-        let mut spread_bps = self.calculate_adaptive_spread(base_spread_bps, min_spread_bps);
+        let mut adaptive_spread_bps = self.calculate_adaptive_spread(base_spread_bps, min_spread_bps);
         
         // Imbalance'a göre spread ayarla: dengesizlik yüksekse spread'i genişlet
         let imbalance_adj = (imbalance.abs() * 10.0).min(5.0); // Max 5 bps artış
-        spread_bps += imbalance_adj;
+        adaptive_spread_bps += imbalance_adj;
         
         // Likidasyon riski: yakınsa spread'i genişlet
         if c.liq_gap_bps < 300.0 {
-            spread_bps *= 1.5;
+            adaptive_spread_bps *= 1.5;
         }
+        
+        // Order book spread'i kullan (fiyatlama için), adaptive spread'i risk kontrolü için kullan
+        let spread_bps_for_pricing = adaptive_spread_bps;
         
         // Funding rate skew: pozitif funding'de ask'i yukarı çek (long pozisyon için daha iyi)
         let funding_skew = c.funding_rate.unwrap_or(0.0) * 100.0;
@@ -770,7 +784,7 @@ impl Strategy for DynMm {
         // Imbalance skew: pozitif imbalance (bid heavy) → bid'i yukarı, ask'i aşağı
         let imbalance_skew_bps = imbalance * 10.0; // Imbalance'a göre skew
         
-        let half = Decimal::try_from(spread_bps / 2.0 / 1e4).unwrap_or(Decimal::ZERO);
+        let half = Decimal::try_from(spread_bps_for_pricing / 2.0 / 1e4).unwrap_or(Decimal::ZERO);
         let skew = Decimal::try_from(funding_skew / 1e4).unwrap_or(Decimal::ZERO);
         let inv_skew = Decimal::try_from(inv_skew_bps / 1e4).unwrap_or(Decimal::ZERO);
         let imb_skew = Decimal::try_from(imbalance_skew_bps / 1e4).unwrap_or(Decimal::ZERO);
@@ -809,8 +823,9 @@ impl Strategy for DynMm {
         // Adverse selection filtresi: riskli tarafı kaldır
         // MANİPÜLASYON FIRSAT KULLANIMI: Fırsat varsa agresif pozisyon al
         
-        // Sadece çok geniş spread (>200 bps) varsa işlem yapma, diğer durumlarda fırsatları kullan
-        let final_quotes = if spread_bps > self.max_spread_bps {
+        // Sadece çok geniş spread (>100 bps) varsa işlem yapma, diğer durumlarda fırsatları kullan
+        // NOT: Burada adaptive spread'i kullanıyoruz (fiyatlama spread'i değil)
+        let final_quotes = if adaptive_spread_bps > self.max_spread_bps {
             Quotes::default() // Çok geniş spread, risk çok yüksek
         } else {
             // Manipülasyon fırsatı varsa agresif pozisyon, yoksa normal market making
@@ -832,13 +847,18 @@ impl Strategy for DynMm {
         // Debug log: Manipülasyon fırsat durumu
         debug!(
             flash_crash_detected = self.flash_crash_detected,
-            spread_bps,
+            orderbook_spread_bps = self.last_spread_bps,
+            adaptive_spread_bps,
             max_spread_bps = self.max_spread_bps,
             min_liquidity,
             liquidity_ok = min_liquidity >= self.min_liquidity_required,
             opportunity = ?self.manipulation_opportunity,
             should_bid,
             should_ask,
+            adverse_bid,
+            adverse_ask,
+            final_bid = should_bid && !adverse_bid,
+            final_ask = should_ask && !adverse_ask,
             "anti-manipulation checks and opportunity analysis completed"
         );
         
@@ -1132,5 +1152,95 @@ mod tests {
         // Zero funding, downtrend: should target short
         let target = strategy.calculate_target_inventory(None, -100.0);
         assert!(target.0 <= dec!(0));
+    }
+
+    #[test]
+    fn test_strategy_produces_quotes_when_no_position() {
+        // İlk tick: Pozisyon yok, funding rate yok, trend yok
+        let mut strategy = create_test_strategy();
+        
+        // İlk tick için price_history'yi doldur (10 fiyat gerekli trend için)
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        for i in 0..10 {
+            let price = dec!(50000) + Decimal::from(i);
+            strategy.price_history.push((now - (10 - i) * 1000, price));
+        }
+        
+        let ctx = create_test_context(dec!(50000), dec!(50010), dec!(0), 500.0);
+        let quotes = strategy.on_tick(&ctx);
+        
+        // En azından bir taraf quote üretmeli
+        assert!(
+            quotes.bid.is_some() || quotes.ask.is_some(),
+            "Strategy should produce at least one quote when no position and normal market conditions. bid={:?}, ask={:?}",
+            quotes.bid, quotes.ask
+        );
+    }
+
+    #[test]
+    fn test_target_inventory_with_no_funding_no_trend() {
+        let mut strategy = create_test_strategy();
+        
+        // Funding rate yok, trend yok
+        let target = strategy.calculate_target_inventory(None, 0.0);
+        
+        // combined_bias = 0.0
+        // bias_f64 = 0.0 / 100.0 = 0.0
+        // target_ratio = 0.0 / (1.0 + 0.0) = 0.0
+        // target = 0.5 * 0.0 = 0.0
+        assert_eq!(target.0, dec!(0), "Target inventory should be zero when no funding and no trend");
+    }
+
+    #[test]
+    fn test_inventory_decision_when_target_and_current_both_zero() {
+        let strategy = create_test_strategy();
+        
+        // Target = 0, Current = 0
+        let target = Qty(dec!(0));
+        let current = Qty(dec!(0));
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        
+        // diff = |0 - 0| = 0
+        // threshold = 0.5 * 0.1 = 0.05
+        // diff < threshold → (true, true)
+        assert!(should_bid, "Should bid when target and current are both zero (market making)");
+        assert!(should_ask, "Should ask when target and current are both zero (market making)");
+    }
+
+    #[test]
+    fn test_strategy_with_sufficient_liquidity() {
+        let mut strategy = create_test_strategy();
+        
+        // Yeterli likidite: bid_vol * bid = 1.0 * 50000 = 50000 USD (yeterli)
+        let ctx = Context {
+            ob: OrderBook {
+                best_bid: Some(BookLevel {
+                    px: Px(dec!(50000)),
+                    qty: Qty(dec!(1.0)), // Büyük volume
+                }),
+                best_ask: Some(BookLevel {
+                    px: Px(dec!(50010)),
+                    qty: Qty(dec!(1.0)), // Büyük volume
+                }),
+            },
+            sigma: 0.5,
+            inv: Qty(dec!(0)),
+            liq_gap_bps: 500.0,
+            funding_rate: None,
+            next_funding_time: None,
+            mark_price: Px(dec!(50005)),
+        };
+        
+        let quotes = strategy.on_tick(&ctx);
+        
+        // Yeterli likidite var, quote üretmeli
+        assert!(
+            quotes.bid.is_some() || quotes.ask.is_some(),
+            "Strategy should produce quotes when liquidity is sufficient"
+        );
     }
 }

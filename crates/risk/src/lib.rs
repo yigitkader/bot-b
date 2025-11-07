@@ -29,10 +29,14 @@ pub fn check_risk(
     if inv.0.abs() > lim.inv_cap.0 {
         return RiskAction::Reduce;
     }
-    if liq_gap_bps < lim.min_liq_gap_bps {
+    // Pozisyon yoksa liquidation gap kontrolü yapma (liq_px None ise zaten 9999.0 olarak ayarlanmış)
+    // Ama pozisyon varsa kontrol et
+    let has_position = pos.qty.0.abs() > rust_decimal::Decimal::new(1, 8);
+    if has_position && liq_gap_bps < lim.min_liq_gap_bps {
         return RiskAction::Reduce;
     }
-    if pos.leverage > lim.max_leverage {
+    // Pozisyon yoksa leverage kontrolü yapma (pozisyon yokken leverage anlamsız)
+    if has_position && pos.leverage > lim.max_leverage {
         return RiskAction::Reduce;
     }
     RiskAction::Ok
