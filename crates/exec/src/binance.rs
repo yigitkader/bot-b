@@ -1053,8 +1053,40 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
 
 fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     let scale = precision as u32;
+    // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
+    // normalize() trailing zero'ları kaldırır, bu precision hatasına yol açabilir
+    // Bu yüzden trailing zero'ları korumalıyız
     let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
-    truncated.normalize().to_string()
+    // Trailing zero'ları koru: precision kadar decimal place göster
+    if scale == 0 {
+        truncated.to_string()
+    } else {
+        let s = truncated.to_string();
+        if let Some(dot_pos) = s.find('.') {
+            let current_decimals = s.len() - dot_pos - 1;
+            if current_decimals < scale as usize {
+                // Eksik trailing zero'ları ekle
+                format!("{}{}", s, "0".repeat(scale as usize - current_decimals))
+            } else if current_decimals > scale as usize {
+                // Fazla decimal varsa kes (precision hatasını önle)
+                // Önce Decimal'i doğru scale'e set et
+                let mut fixed = truncated;
+                if fixed.set_scale(scale).is_ok() {
+                    // set_scale başarılı, format et
+                    fixed.to_string()
+                } else {
+                    // set_scale başarısız, string'i kes
+                    let truncated_str = &s[..dot_pos + 1 + scale as usize];
+                    truncated_str.to_string()
+                }
+            } else {
+                s
+            }
+        } else {
+            // Nokta yoksa ekle ve trailing zero ekle
+            format!("{}.{}", s, "0".repeat(scale as usize))
+        }
+    }
 }
 
 async fn ensure_success(resp: Response) -> Result<Response> {

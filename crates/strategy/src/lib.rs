@@ -11,6 +11,7 @@ pub struct Context {
     pub liq_gap_bps: f64,
     pub funding_rate: Option<f64>,
     pub next_funding_time: Option<u64>,
+    pub mark_price: Px, // Mark price (futures için)
 }
 
 pub trait Strategy: Send + Sync {
@@ -30,6 +31,9 @@ pub struct DynMm {
     pub b: f64,
     pub base_notional: Decimal,
     pub inv_cap: Qty,
+    // Akıllı karar verme için state
+    price_history: Vec<(u64, Decimal)>, // (timestamp_ms, price)
+    target_inventory: Qty, // Hedef envanter seviyesi
 }
 
 impl From<DynMmCfg> for DynMm {
@@ -39,6 +43,76 @@ impl From<DynMmCfg> for DynMm {
             b: c.b,
             base_notional: c.base_size,
             inv_cap: Qty(c.inv_cap),
+            price_history: Vec::with_capacity(100), // Son 100 fiyat
+            target_inventory: Qty(Decimal::ZERO), // Başlangıçta nötr
+        }
+    }
+}
+
+impl DynMm {
+    // Fiyat trend analizi: son N fiyatın ortalamasına göre trend
+    fn detect_trend(&self) -> f64 {
+        if self.price_history.len() < 10 {
+            return 0.0; // Yeterli veri yok
+        }
+        let recent: Vec<Decimal> = self.price_history
+            .iter()
+            .rev()
+            .take(10)
+            .map(|(_, p)| *p)
+            .collect();
+        let old_avg: Decimal = recent.iter().take(5).sum::<Decimal>() / Decimal::from(5);
+        let new_avg: Decimal = recent.iter().skip(5).sum::<Decimal>() / Decimal::from(5);
+        if old_avg.is_zero() {
+            return 0.0;
+        }
+        ((new_avg - old_avg) / old_avg).to_f64().unwrap_or(0.0) * 10000.0 // bps
+    }
+    
+    // Funding rate analizi: pozitif funding = long bias, negatif = short bias
+    fn funding_bias(&self, funding_rate: Option<f64>) -> f64 {
+        funding_rate.unwrap_or(0.0) * 10000.0 // bps cinsinden
+    }
+    
+    // Hedef envanter hesaplama: funding rate ve trend'e göre
+    fn calculate_target_inventory(&mut self, funding_rate: Option<f64>, trend_bps: f64) -> Qty {
+        // Funding rate pozitifse long (pozitif envanter), negatifse short (negatif envanter)
+        let funding_bias = self.funding_bias(funding_rate);
+        // Trend yukarıysa long, aşağıysa short
+        let trend_bias = trend_bps * 0.5; // Trend'in %50'si kadar etkili
+        
+        // Kombine bias: funding + trend
+        let combined_bias = funding_bias + trend_bias;
+        
+        // Hedef envanter: bias'a göre inv_cap'in bir yüzdesi
+        // Tanh benzeri fonksiyon: -1 ile 1 arası sınırla
+        let bias_f64 = combined_bias / 100.0;
+        let target_ratio = if bias_f64 > 10.0 {
+            1.0
+        } else if bias_f64 < -10.0 {
+            -1.0
+        } else {
+            // Basit sigmoid: x / (1 + |x|)
+            bias_f64 / (1.0 + bias_f64.abs())
+        };
+        let target = self.inv_cap.0 * Decimal::from_f64_retain(target_ratio).unwrap_or(Decimal::ZERO);
+        Qty(target)
+    }
+    
+    // Envanter yönetimi: hedef envantere göre al/sat kararı
+    fn inventory_decision(&self, current_inv: Qty, target_inv: Qty) -> (bool, bool) {
+        let diff = (current_inv.0 - target_inv.0).abs();
+        let threshold = self.inv_cap.0 * Decimal::from_f64_retain(0.1).unwrap_or(Decimal::ZERO); // %10 threshold
+        
+        if diff < threshold {
+            // Hedef envantere yakınsa: market making (her iki taraf)
+            (true, true)
+        } else if current_inv.0 < target_inv.0 {
+            // Mevcut envanter hedeften düşük: sadece al (bid)
+            (true, false)
+        } else {
+            // Mevcut envanter hedeften yüksek: sadece sat (ask)
+            (false, true)
         }
     }
 }
@@ -54,6 +128,38 @@ impl Strategy for DynMm {
         if mid_f <= 0.0 {
             return Quotes::default();
         }
+        
+        // Fiyat geçmişini güncelle (basit timestamp simülasyonu)
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.price_history.push((now_ms, c.mark_price.0));
+        if self.price_history.len() > 100 {
+            self.price_history.remove(0);
+        }
+        
+        // Trend analizi
+        let trend_bps = self.detect_trend();
+        
+        // Hedef envanter hesapla (funding rate ve trend'e göre)
+        self.target_inventory = self.calculate_target_inventory(c.funding_rate, trend_bps);
+        
+        // Envanter kararı: hedef envantere göre al/sat
+        let (should_bid, should_ask) = self.inventory_decision(c.inv, self.target_inventory);
+        
+        // Debug log (tracing kullanarak)
+        use tracing::debug;
+        debug!(
+            current_inv = %c.inv.0,
+            target_inv = %self.target_inventory.0,
+            trend_bps,
+            funding_rate = ?c.funding_rate,
+            should_bid,
+            should_ask,
+            "strategy decision"
+        );
         // Envanter bias: pozitif envanter varsa ask'i yukarı, bid'i aşağı çek (satmaya zorla)
         // Negatif envanter varsa bid'i yukarı, ask'i aşağı çek (almaya zorla)
         let inv_bias = if self.inv_cap.0.is_zero() {
@@ -103,9 +209,11 @@ impl Strategy for DynMm {
             0.0
         };
         let qty = Qty(Decimal::from_f64_retain(qty).unwrap_or(Decimal::ZERO));
+        
+        // Akıllı karar: hedef envantere göre sadece gerekli tarafı koy
         Quotes {
-            bid: Some((bid_px, qty)),
-            ask: Some((ask_px, qty)),
+            bid: if should_bid { Some((bid_px, qty)) } else { None },
+            ask: if should_ask { Some((ask_px, qty)) } else { None },
         }
     }
 }

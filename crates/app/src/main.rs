@@ -228,6 +228,8 @@ impl FloorStep for f64 {
 }
 
 /// USD-family stablecoin kontrolü (quote eşleştirme için)
+/// Bot USDT, USDC, USD ve diğer USD-stablecoin'leri destekler
+/// Her sembol kendi quote asset'ini kullanır (ADAUSDT → USDT, ADAUSDC → USDC)
 fn is_usd_stable(asset: &str) -> bool {
     matches!(
         asset.to_uppercase().as_str(),
@@ -448,13 +450,84 @@ async fn main() -> Result<()> {
             })
             .cloned()
             .collect();
-        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-        info!(
-            count = auto.len(),
-            quote_asset = %cfg.quote_asset,
-            grouped = want_group,
-            "auto-discovered symbols for quote asset (group-aware)"
-        );
+        
+        // AKILLI SEÇİM: Hangi USD-stable asset'te daha fazla para varsa onu önceliklendir
+        if want_group && mode_lower == "futures" {
+            if let V::Fut(vtmp) = &venue {
+                // USDT ve USDC bakiyelerini kontrol et
+                let usdt_bal = vtmp.available_balance("USDT").await.ok()
+                    .and_then(|b| b.to_f64())
+                    .unwrap_or(0.0);
+                let usdc_bal = vtmp.available_balance("USDC").await.ok()
+                    .and_then(|b| b.to_f64())
+                    .unwrap_or(0.0);
+                
+                // Hangi asset'te daha fazla para varsa, o asset'in sembollerini önceliklendir
+                if usdt_bal >= 1.0 && usdt_bal > usdc_bal {
+                    // USDT öncelikli
+                    auto.sort_by(|a, b| {
+                        let a_usdt = a.quote_asset.eq_ignore_ascii_case("USDT");
+                        let b_usdt = b.quote_asset.eq_ignore_ascii_case("USDT");
+                        match (a_usdt, b_usdt) {
+                            (true, false) => std::cmp::Ordering::Less, // USDT önce
+                            (false, true) => std::cmp::Ordering::Greater, // USDT önce
+                            _ => a.symbol.cmp(&b.symbol),
+                        }
+                    });
+                    info!(
+                        count = auto.len(),
+                        quote_asset = %cfg.quote_asset,
+                        usdt_balance = usdt_bal,
+                        usdc_balance = usdc_bal,
+                        "auto-discovered symbols: USDT prioritized (more balance)"
+                    );
+                } else if usdc_bal >= 1.0 && usdc_bal > usdt_bal {
+                    // USDC öncelikli
+                    auto.sort_by(|a, b| {
+                        let a_usdc = a.quote_asset.eq_ignore_ascii_case("USDC");
+                        let b_usdc = b.quote_asset.eq_ignore_ascii_case("USDC");
+                        match (a_usdc, b_usdc) {
+                            (true, false) => std::cmp::Ordering::Less, // USDC önce
+                            (false, true) => std::cmp::Ordering::Greater, // USDC önce
+                            _ => a.symbol.cmp(&b.symbol),
+                        }
+                    });
+                    info!(
+                        count = auto.len(),
+                        quote_asset = %cfg.quote_asset,
+                        usdt_balance = usdt_bal,
+                        usdc_balance = usdc_bal,
+                        "auto-discovered symbols: USDC prioritized (more balance)"
+                    );
+                } else {
+                    // Eşit veya ikisi de yetersiz, alfabetik sırala
+                    auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+                    info!(
+                        count = auto.len(),
+                        quote_asset = %cfg.quote_asset,
+                        usdt_balance = usdt_bal,
+                        usdc_balance = usdc_bal,
+                        "auto-discovered symbols: equal balance or insufficient, alphabetical order"
+                    );
+                }
+            } else {
+                auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+                info!(
+                    count = auto.len(),
+                    quote_asset = %cfg.quote_asset,
+                    grouped = want_group,
+                    "auto-discovered symbols for quote asset (group-aware)"
+                );
+            }
+        } else {
+            auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+            info!(
+                count = auto.len(),
+                quote_asset = %cfg.quote_asset,
+                grouped = want_group,
+                "auto-discovered symbols for quote asset (group-aware)"
+            );
+        }
         selected = auto;
     }
 
@@ -598,6 +671,56 @@ async fn main() -> Result<()> {
             // --- kalıcı devre dışı kontrolü ---
             if state.disabled {
                 info!(%symbol, "skipping symbol permanently (min_notional > max_usd_per_order)");
+                continue;
+            }
+
+            // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
+            // Best prices çekmeden önce bakiye kontrolü yap, gereksiz API çağrılarını önle
+            let has_balance = match &venue {
+                V::Spot(v) => {
+                    // Spot için: quote veya base bakiyesi yeterli mi?
+                    let q_free = match v.asset_free(&quote_asset).await {
+                        Ok(q) => q.to_f64().unwrap_or(0.0),
+                        Err(_) => 0.0,
+                    };
+                    // HIZLI KONTROL: 1 USD'den azsa işlem yapma
+                    if q_free < 1.0 {
+                        // Base bakiyesi kontrolü (yaklaşık kontrol, gerçek fiyat bilinmiyor)
+                        match v.asset_free(&base_asset).await {
+                            Ok(b) => {
+                                let b_free = b.to_f64().unwrap_or(0.0);
+                                // Base varsa devam et (daha sonra gerçek fiyatla kontrol edilecek)
+                                b_free >= cfg.qty_step
+                            }
+                            Err(_) => false,
+                        }
+                    } else {
+                        // Quote bakiyesi yeterliyse devam et
+                        q_free >= min_usd_per_order
+                    }
+                }
+                V::Fut(v) => {
+                    match v.available_balance(&quote_asset).await {
+                        Ok(a) => {
+                            let avail = a.to_f64().unwrap_or(0.0);
+                            // HIZLI KONTROL: 1 USD'den azsa işlem yapma (gereksiz API çağrılarını önle)
+                            if avail < 1.0 {
+                                false // Bakiye çok düşük, skip
+                            } else {
+                                // Leverage ile toplam kullanılabilir miktar
+                                let effective_leverage = cfg.leverage.unwrap_or(cfg.risk.max_leverage).max(1) as f64;
+                                let total = avail * effective_leverage;
+                                total >= min_usd_per_order
+                            }
+                        }
+                        Err(_) => false,
+                    }
+                }
+            };
+            
+            if !has_balance {
+                // Bakiye yok, bu tick'i atla (best_prices, strateji, vs. çalıştırma)
+                // Log sadece ilk birkaç kez veya periyodik olarak (spam önlemek için)
                 continue;
             }
 
@@ -771,6 +894,7 @@ async fn main() -> Result<()> {
                 liq_gap_bps,
                 funding_rate,
                 next_funding_time,
+                mark_price: mark_px, // Mark price stratejiye veriliyor
             };
             let mut quotes = state.strategy.on_tick(&ctx);
             info!(%symbol, ?quotes, ?risk_action, "strategy produced raw quotes");
@@ -815,11 +939,16 @@ async fn main() -> Result<()> {
                             0.0
                         }
                     };
+                    // Spot için: Tüm quote_free kullanılabilir, ama her emir max 100 USD
+                    // Örnek: 20 USD varsa → buy_total=20 (tamamı kullanılır)
+                    // Örnek: 100 USD varsa → buy_total=100 (tamamı kullanılır)
+                    // Örnek: 200 USD varsa → buy_total=200, ama her emir max 100 USD
+                    // Kalan 100 USD başka emirler için kullanılabilir (loop ile)
                     Caps {
-                        buy_notional: cfg.max_usd_per_order.min(quote_free),
-                        sell_notional: cfg.max_usd_per_order,
+                        buy_notional: cfg.max_usd_per_order.min(quote_free), // Her emir max 100 USD (veya mevcut bakiye, hangisi düşükse)
+                        sell_notional: cfg.max_usd_per_order, // Her emir max 100 USD
                         sell_base: Some(base_free),
-                        buy_total: quote_free,
+                        buy_total: quote_free, // Tüm bakiye kullanılabilir (20 varsa 20, 100 varsa 100, 200 varsa 200)
                         sell_total_base: base_free,
                     }
                 }
@@ -827,10 +956,16 @@ async fn main() -> Result<()> {
                     let avail = match v.available_balance(&quote_asset).await {
                         Ok(a) => {
                             let avail_f64 = a.to_f64().unwrap_or(0.0);
-                            if avail_f64 == 0.0 {
+                            // HIZLI KONTROL: 1 USD'den azsa işlem yapma
+                            if avail_f64 < 1.0 {
+                                // Bakiye çok düşük, bu sembolü skip et
+                                0.0
+                            } else if avail_f64 == 0.0 {
                                 warn!(%symbol, quote_asset = %quote_asset, available_balance = %a, "available balance is zero or failed to convert to f64");
+                                0.0
+                            } else {
+                                avail_f64
                             }
-                            avail_f64
                         },
                         Err(err) => {
                             warn!(%symbol, quote_asset = %quote_asset, ?err, "failed to fetch available balance, using zero");
@@ -841,24 +976,43 @@ async fn main() -> Result<()> {
                     let requested_leverage = cfg.leverage.unwrap_or(risk_max_leverage);
                     let effective_leverage =
                         requested_leverage.max(1).min(risk_max_leverage) as f64;
-                    let total = avail * effective_leverage;
-                    // Her taraf bağımsız: bid ve ask her biri max 100 USD kullanabilir
-                    // Toplam varlık paylaşılır (spent tracking ile)
-                    let per_order_cap = cfg.max_usd_per_order;
+                    
+                    // ÖNEMLİ: Hesaptan giden para mantığı:
+                    // - 20 USD varsa → 20 USD kullanılır (tamamı)
+                    // - 100 USD varsa → 100 USD kullanılır (tamamı)
+                    // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
+                    // Leverage sadece pozisyon boyutunu belirler, hesaptan giden parayı etkilemez
+                    // Örnek: 20 USD bakiye, 20x leverage → hesaptan 20 USD gider, pozisyon 400 USD olur
+                    // Örnek: 200 USD bakiye, 20x leverage → hesaptan 100 USD gider (max limit), pozisyon 2000 USD olur
+                    let max_usable_from_account = avail.min(cfg.max_usd_per_order);
+                    
+                    // Leverage ile açılan pozisyon boyutu (sadece bilgi amaçlı)
+                    let position_size_with_leverage = max_usable_from_account * effective_leverage;
+                    
+                    // per_order_cap = margin (hesaptan giden para) = 100 USD
+                    // per_order_notional = pozisyon boyutu = margin * leverage = 100 * 20 = 2000 USD
+                    let per_order_cap_margin = cfg.max_usd_per_order;
+                    let per_order_notional = per_order_cap_margin * effective_leverage;
                     info!(
                         %symbol,
                         quote_asset = %quote_asset,
                         available_balance = avail,
                         effective_leverage,
-                        total_with_leverage = total,
-                        max_per_order = per_order_cap,
-                        "calculated futures caps (each side independent, max 100 USD per order)"
+                        max_usable_from_account,
+                        position_size_with_leverage,
+                        per_order_limit_margin_usd = per_order_cap_margin,
+                        per_order_limit_notional_usd = per_order_notional,
+                        "calculated futures caps: max_usable_from_account is max USD that will leave your account, leverage only affects position size"
                     );
                     Caps {
-                        buy_notional: per_order_cap,  // Her bid emri max 100 USD
-                        sell_notional: per_order_cap, // Her ask emri max 100 USD
+                        buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
+                        sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
                         sell_base: None,
-                        buy_total: total,  // Toplam kullanılabilir varlık (paylaşılır)
+                        // buy_total: Hesaptan giden para (margin)
+                        // - 20 USD varsa → 20 USD kullanılır (tamamı)
+                        // - 100 USD varsa → 100 USD kullanılır (tamamı)
+                        // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
+                        buy_total: max_usable_from_account,
                         sell_total_base: 0.0,
                     }
                 }
@@ -1071,8 +1225,13 @@ async fn main() -> Result<()> {
                 V::Fut(v) => {
                     // ---- FUTURES BID ----
                     // Her bid emri bağımsız, max 100 USD, toplam varlık paylaşılır
-                    // Örnek: 300 USD varsa → bid 100, ask 100, kalan 100 ile ikinci bid
-                    let mut total_spent_on_bids = 0.0f64; // Tüm bid emirleri için toplam spent (ask'ler için kullanılacak)
+                    // ÖNEMLİ: total_spent_on_bids = hesaptan giden para (margin), pozisyon boyutu değil
+                    // Örnek: 100 USD notional pozisyon, 20x leverage → hesaptan giden: 100/20 = 5 USD
+                    // effective_leverage hesaplaması caps hesaplamasıyla aynı olmalı
+                    let risk_max_leverage = cfg.risk.max_leverage.max(1);
+                    let requested_leverage = cfg.leverage.unwrap_or(risk_max_leverage);
+                    let effective_leverage = requested_leverage.max(1).min(risk_max_leverage) as f64;
+                    let mut total_spent_on_bids = 0.0f64; // Hesaptan giden para (margin) toplamı
                     if let Some((px, qty)) = quotes.bid {
                         
                         // İlk bid emri (max 100 USD)
@@ -1081,8 +1240,10 @@ async fn main() -> Result<()> {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id, info);
-                                // Başarılı emir için spent hesapla
-                                total_spent_on_bids = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
+                                // Başarılı emir için spent hesapla (hesaptan giden para = margin)
+                                // Notional (pozisyon boyutu) / leverage = hesaptan giden para
+                                let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
+                                total_spent_on_bids = notional / effective_leverage;
                             }
                             Err(err) => {
                                 let msg = err.to_string();
@@ -1095,29 +1256,68 @@ async fn main() -> Result<()> {
                                     if let Some(min_notional) = required_min {
                                         // --- öğren & gerekirse kalıcı disable ---
                                         state.min_notional_req = Some(min_notional);
-                                        // >= kontrolü: min_notional >= max_usd_per_order ise devre dışı
-                                        if min_notional >= cfg.max_usd_per_order {
+                                        // >= kontrolü: min_notional (pozisyon boyutu) >= max_notional (margin * leverage) ise devre dışı
+                                        let max_notional = cfg.max_usd_per_order * effective_leverage;
+                                        if min_notional >= max_notional {
                                             state.disabled = true;
-                                            warn!(%symbol, min_notional, max_usd_per_order = cfg.max_usd_per_order,
-                                                  "disabling symbol: exchange min_notional >= per-order cap");
+                                            warn!(%symbol, min_notional, max_notional, max_usd_per_order = cfg.max_usd_per_order, effective_leverage,
+                                                  "disabling symbol: exchange min_notional >= max position size (margin * leverage)");
                                             continue;
                                         }
                                         // retry: min_notional'a göre miktarı büyüt (cap'e kadar)
-                                        let price = px.0.to_f64().unwrap_or(0.0);
-                                        let order_cap = caps.buy_notional.min(cfg.max_usd_per_order);
+                                        // order_cap = pozisyon boyutu (notional), margin değil
+                                        // ÖNEMLİ: Fiyat ve miktar quantize edilecek, bu yüzden quantize edilmiş değerleri kullan
+                                        let price_raw = px.0.to_f64().unwrap_or(0.0);
+                                        let price_tick = cfg.price_tick;
                                         let step = cfg.qty_step;
+                                        
+                                        // Fiyatı quantize et (place_limit içinde yapılan işlem)
+                                        let price_quantized = if price_tick > 0.0 {
+                                            (price_raw / price_tick).floor() * price_tick
+                                        } else {
+                                            price_raw
+                                        };
+                                        
+                                        let order_cap = caps.buy_notional; // Zaten notional (pozisyon boyutu)
+                                        // MARGIN KONTROLÜ: Retry'da hesaplanan miktar için yeterli margin var mı?
+                                        let available_margin = caps.buy_total - total_spent_on_bids; // Kalan margin
                                         let mut new_qty = 0.0f64;
-                                        if price > 0.0 && step > 0.0 {
-                                            // Doğru hesaplama: min_notional / price = qty, sonra step'e quantize et
-                                            let raw_qty = min_notional / price;
+                                        if price_quantized > 0.0 && step > 0.0 && available_margin > 0.0 {
+                                            // Güvenli margin: min_notional'ın %10 fazlasını hedefle (quantize kayıpları için)
+                                            let target_notional = min_notional * 1.10;
+                                            let raw_qty = target_notional / price_quantized;
                                             new_qty = (raw_qty / step).floor() * step;
-                                            // Cap kontrolü: max qty by cap
-                                            let max_qty_by_cap = (order_cap / price / step).floor() * step;
-                                            if new_qty > max_qty_by_cap { new_qty = max_qty_by_cap; }
-                                            // Min notional garantisi: eğer quantize sonrası hala yetersizse, bir step artır
-                                            let notional_after_quantize = new_qty * price;
-                                            if notional_after_quantize < min_notional && new_qty + step <= max_qty_by_cap {
+                                            
+                                            // Cap kontrolü: max qty by cap (notional)
+                                            let max_qty_by_cap = (order_cap / price_quantized / step).floor() * step;
+                                            // Margin kontrolü: max qty by available margin
+                                            let max_qty_by_margin = ((available_margin * effective_leverage) / price_quantized / step).floor() * step;
+                                            let max_qty = max_qty_by_cap.min(max_qty_by_margin);
+                                            if new_qty > max_qty { 
+                                                new_qty = max_qty; 
+                                            }
+                                            
+                                            // Min notional garantisi: quantize edilmiş fiyat ve miktarla kontrol et
+                                            // Loop ile min_notional'ı geçene kadar step artır
+                                            let mut attempts = 0;
+                                            let max_attempts = 20; // Maksimum 20 step artır (daha fazla deneme)
+                                            while attempts < max_attempts {
+                                                let notional_after_quantize = new_qty * price_quantized;
+                                                if notional_after_quantize >= min_notional {
+                                                    // Margin kontrolü: Bu miktar için yeterli margin var mı?
+                                                    let required_margin = notional_after_quantize / effective_leverage;
+                                                    if required_margin <= available_margin {
+                                                        break; // Yeterli notional ve margin
+                                                    } else {
+                                                        // Margin yetersiz, daha küçük miktar dene
+                                                        break;
+                                                    }
+                                                }
+                                                if new_qty + step > max_qty {
+                                                    break; // Cap'e ulaştık
+                                                }
                                                 new_qty += step;
+                                                attempts += 1;
                                             }
                                         }
                                         if new_qty > 0.0 {
@@ -1127,8 +1327,9 @@ async fn main() -> Result<()> {
                                                 Ok(order_id) => {
                                                     let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty: retry_qty, created_at: Instant::now() };
                                                     state.active_orders.insert(order_id, info);
-                                                    // Retry başarılı oldu, spent güncelle
-                                                    total_spent_on_asks = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
+                                                    // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
+                                                    let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
+                                                    total_spent_on_bids = notional / effective_leverage;
                                                 }
                                                 Err(err2) => {
                                                     warn!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, ?err2, "retry bid still failed");
@@ -1156,19 +1357,22 @@ async fn main() -> Result<()> {
                                 break; // Yetersiz bakiye veya geçersiz fiyat
                             }
                             
-                            // Her ek emir max 100 USD
-                            let order_size = remaining.min(cfg.max_usd_per_order);
-                            let qty2 = clamp_qty_by_usd(qty, px, order_size, cfg.qty_step);
+                            // Her ek emir max 100 USD (hesaptan giden para = margin)
+                            // order_size = margin, notional = margin * leverage
+                            let order_size_margin = remaining.min(cfg.max_usd_per_order);
+                            let order_size_notional = order_size_margin * effective_leverage; // Pozisyon boyutu
+                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, cfg.qty_step);
                             let qty2_notional = (px.0.to_f64().unwrap_or(0.0)) * (qty2.0.to_f64().unwrap_or(0.0));
                             
                             if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
-                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size, min_notional = min_req_for_second, "placing extra futures bid with leftover notional");
+                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures bid with leftover notional");
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
                                         let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
                                         state.active_orders.insert(order_id2, info2);
-                                        // Spent güncelle, bir sonraki emir için
-                                        total_spent_on_bids += qty2_notional;
+                                        // Spent güncelle (hesaptan giden para = margin)
+                                        // Notional / leverage = hesaptan giden para
+                                        total_spent_on_bids += qty2_notional / effective_leverage;
                                     }
                                     Err(err) => {
                                         warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra futures bid order");
@@ -1183,9 +1387,13 @@ async fn main() -> Result<()> {
 
                     // ---- FUTURES ASK ----
                     // Her ask emri bağımsız, max 100 USD, toplam varlık paylaşılır (bid'lerden sonra kalan)
+                    // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
+                    // effective_leverage hesaplaması caps hesaplamasıyla aynı olmalı
                     if let Some((px, qty)) = quotes.ask {
-                        // Bid'ler için harcanan miktarı hesapla (eğer varsa)
-                        let mut total_spent_on_asks = 0.0f64; // Tüm ask emirleri için toplam spent
+                        let risk_max_leverage_ask = cfg.risk.max_leverage.max(1);
+                        let requested_leverage_ask = cfg.leverage.unwrap_or(risk_max_leverage_ask);
+                        let effective_leverage_ask = requested_leverage_ask.max(1).min(risk_max_leverage_ask) as f64;
+                        let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı
                         
                         // İlk ask emri (max 100 USD)
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
@@ -1193,8 +1401,10 @@ async fn main() -> Result<()> {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id, info);
-                                // Başarılı emir için spent hesapla
-                                total_spent_on_asks = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
+                                // Başarılı emir için spent hesapla (hesaptan giden para = margin)
+                                // Notional (pozisyon boyutu) / leverage = hesaptan giden para
+                                let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
+                                total_spent_on_asks = notional / effective_leverage_ask;
                             }
                             Err(err) => {
                                 let msg = err.to_string();
@@ -1207,28 +1417,67 @@ async fn main() -> Result<()> {
                                     if let Some(min_notional) = required_min {
                                         // --- öğren & gerekirse kalıcı disable ---
                                         state.min_notional_req = Some(min_notional);
-                                        // >= kontrolü: min_notional >= max_usd_per_order ise devre dışı
-                                        if min_notional >= cfg.max_usd_per_order {
+                                        // >= kontrolü: min_notional (pozisyon boyutu) >= max_notional (margin * leverage) ise devre dışı
+                                        let max_notional = cfg.max_usd_per_order * effective_leverage_ask;
+                                        if min_notional >= max_notional {
                                             state.disabled = true;
-                                            warn!(%symbol, min_notional, max_usd_per_order = cfg.max_usd_per_order,
-                                                  "disabling symbol: exchange min_notional >= per-order cap");
+                                            warn!(%symbol, min_notional, max_notional, max_usd_per_order = cfg.max_usd_per_order, effective_leverage = effective_leverage_ask,
+                                                  "disabling symbol: exchange min_notional >= max position size (margin * leverage)");
                                             continue;
                                         }
-                                        let price = px.0.to_f64().unwrap_or(0.0);
-                                        let order_cap = caps.sell_notional.min(cfg.max_usd_per_order);
+                                        // order_cap = pozisyon boyutu (notional), margin değil
+                                        // ÖNEMLİ: Fiyat ve miktar quantize edilecek, bu yüzden quantize edilmiş değerleri kullan
+                                        let price_raw = px.0.to_f64().unwrap_or(0.0);
+                                        let price_tick = cfg.price_tick;
                                         let step = cfg.qty_step;
+                                        
+                                        // Fiyatı quantize et (place_limit içinde yapılan işlem)
+                                        let price_quantized = if price_tick > 0.0 {
+                                            (price_raw / price_tick).floor() * price_tick
+                                        } else {
+                                            price_raw
+                                        };
+                                        
+                                        let order_cap = caps.sell_notional; // Zaten notional (pozisyon boyutu)
+                                        // MARGIN KONTROLÜ: Retry'da hesaplanan miktar için yeterli margin var mı?
+                                        let available_margin = caps.buy_total - total_spent_on_bids - total_spent_on_asks; // Kalan margin
                                         let mut new_qty = 0.0f64;
-                                        if price > 0.0 && step > 0.0 {
-                                            // Doğru hesaplama: min_notional / price = qty, sonra step'e quantize et
-                                            let raw_qty = min_notional / price;
+                                        if price_quantized > 0.0 && step > 0.0 && available_margin > 0.0 {
+                                            // Güvenli margin: min_notional'ın %10 fazlasını hedefle (quantize kayıpları için)
+                                            let target_notional = min_notional * 1.10;
+                                            let raw_qty = target_notional / price_quantized;
                                             new_qty = (raw_qty / step).floor() * step;
-                                            // Cap kontrolü: max qty by cap
-                                            let max_qty_by_cap = (order_cap / price / step).floor() * step;
-                                            if new_qty > max_qty_by_cap { new_qty = max_qty_by_cap; }
-                                            // Min notional garantisi: eğer quantize sonrası hala yetersizse, bir step artır
-                                            let notional_after_quantize = new_qty * price;
-                                            if notional_after_quantize < min_notional && new_qty + step <= max_qty_by_cap {
+                                            
+                                            // Cap kontrolü: max qty by cap (notional)
+                                            let max_qty_by_cap = (order_cap / price_quantized / step).floor() * step;
+                                            // Margin kontrolü: max qty by available margin
+                                            let max_qty_by_margin = ((available_margin * effective_leverage_ask) / price_quantized / step).floor() * step;
+                                            let max_qty = max_qty_by_cap.min(max_qty_by_margin);
+                                            if new_qty > max_qty { 
+                                                new_qty = max_qty; 
+                                            }
+                                            
+                                            // Min notional garantisi: quantize edilmiş fiyat ve miktarla kontrol et
+                                            // Loop ile min_notional'ı geçene kadar step artır
+                                            let mut attempts = 0;
+                                            let max_attempts = 20; // Maksimum 20 step artır (daha fazla deneme)
+                                            while attempts < max_attempts {
+                                                let notional_after_quantize = new_qty * price_quantized;
+                                                if notional_after_quantize >= min_notional {
+                                                    // Margin kontrolü: Bu miktar için yeterli margin var mı?
+                                                    let required_margin = notional_after_quantize / effective_leverage_ask;
+                                                    if required_margin <= available_margin {
+                                                        break; // Yeterli notional ve margin
+                                                    } else {
+                                                        // Margin yetersiz, daha küçük miktar dene
+                                                        break;
+                                                    }
+                                                }
+                                                if new_qty + step > max_qty {
+                                                    break; // Cap'e ulaştık
+                                                }
                                                 new_qty += step;
+                                                attempts += 1;
                                             }
                                         }
                                         if new_qty > 0.0 {
@@ -1238,8 +1487,9 @@ async fn main() -> Result<()> {
                                                 Ok(order_id) => {
                                                     let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty: retry_qty, created_at: Instant::now() };
                                                     state.active_orders.insert(order_id, info);
-                                                    // Retry başarılı oldu, spent güncelle
-                                                    total_spent_on_asks = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
+                                                    // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
+                                                    let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
+                                                    total_spent_on_asks = notional / effective_leverage_ask;
                                                 }
                                                 Err(err2) => {
                                                     warn!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, ?err2, "retry ask still failed");
@@ -1267,19 +1517,22 @@ async fn main() -> Result<()> {
                                 break; // Yetersiz bakiye veya geçersiz fiyat
                             }
                             
-                            // Her ek emir max 100 USD
-                            let order_size = remaining.min(cfg.max_usd_per_order);
-                            let qty2 = clamp_qty_by_usd(qty, px, order_size, cfg.qty_step);
+                            // Her ek emir max 100 USD (hesaptan giden para = margin)
+                            // order_size = margin, notional = margin * leverage
+                            let order_size_margin = remaining.min(cfg.max_usd_per_order);
+                            let order_size_notional = order_size_margin * effective_leverage_ask; // Pozisyon boyutu
+                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, cfg.qty_step);
                             let qty2_notional = (px.0.to_f64().unwrap_or(0.0)) * (qty2.0.to_f64().unwrap_or(0.0));
                             
                             if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
-                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size, min_notional = min_req_for_second, "placing extra futures ask with leftover notional");
+                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures ask with leftover notional");
                                 match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                     Ok(order_id2) => {
                                         let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
                                         state.active_orders.insert(order_id2, info2);
-                                        // Spent güncelle, bir sonraki emir için
-                                        total_spent_on_asks += qty2_notional;
+                                        // Spent güncelle (hesaptan giden para = margin)
+                                        // Notional / leverage = hesaptan giden para
+                                        total_spent_on_asks += qty2_notional / effective_leverage_ask;
                                     }
                                     Err(err) => {
                                         warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra futures ask order");
