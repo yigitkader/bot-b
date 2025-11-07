@@ -739,7 +739,8 @@ async fn main() -> Result<()> {
 
         // Ana trading loop: Her sembol için işlem yap
         // PERFORMANS: 571 sembol sıralı işlenirse çok uzun sürer, bu yüzden progress log ekliyoruz
-        // PERFORMANS: effective_leverage her sembol için aynı, cache'leyelim
+        // NOT: effective_leverage config'den geliyor ve değişmiyor, bu yüzden loop başında hesaplamak mantıklı
+        // Ama pozisyon, fiyat, funding rate gibi saniyelik değişen veriler her tick'te alınıyor (cache yok)
         let effective_leverage = cfg.leverage.unwrap_or(cfg.risk.max_leverage).max(1) as f64;
         let effective_leverage_ask = effective_leverage; // Aynı değer, tekrar hesaplamaya gerek yok
         
@@ -892,10 +893,11 @@ async fn main() -> Result<()> {
             processed_count += 1;
 
             // --- AKILLI EMİR SENKRONİZASYONU: API'den gerçek durumu kontrol et ---
-            // RATE LIMIT OPTİMİZASYONU: Her 10 saniyede bir senkronize et (gereksiz API çağrılarını önle)
+            // ÖNEMLİ: Saniyelik değişimler olduğu için her tick'te kontrol etmeliyiz
+            // Ama rate limit koruması için minimum 2 saniye bekle (çok sık API çağrısı yapma)
             // WebSocket zaten real-time güncellemeleri sağlıyor, API sadece doğrulama için
             let should_sync_orders = state.last_order_sync
-                .map(|last| last.elapsed().as_secs() >= 10) // Her 10 saniyede bir senkronize et (rate limit koruması)
+                .map(|last| last.elapsed().as_secs() >= 2) // Her 2 saniyede bir senkronize et (rate limit koruması + hızlı güncelleme)
                 .unwrap_or(true); // İlk çalıştırmada mutlaka senkronize et
             if should_sync_orders {
                 let sync_result = match &venue {
@@ -1058,7 +1060,7 @@ async fn main() -> Result<()> {
             };
             info!(%symbol, ?bid, ?ask, "fetched best prices");
             
-            // Pozisyon bilgisini önce al (order analizi için gerekli)
+            // Pozisyon bilgisini al (bir kere, tüm analizler için kullanılacak)
             let pos = match &venue {
                 V::Spot(v) => match v.get_position(&symbol).await {
                     Ok(pos) => pos,
@@ -1076,8 +1078,8 @@ async fn main() -> Result<()> {
                 },
             };
             
-            // Pozisyon boyutu hesapla (order analizi için)
-            let (mark_px_temp, _, _) = match &venue {
+            // Mark price ve funding rate'i al (bir kere, tüm analizler için kullanılacak)
+            let (mark_px, funding_rate, next_funding_time) = match &venue {
                 V::Spot(v) => match v.mark_price(&symbol).await {
                     Ok(px) => (px, None, None),
                     Err(_) => {
@@ -1095,7 +1097,9 @@ async fn main() -> Result<()> {
                     }
                 },
             };
-            let position_size_notional = (mark_px_temp.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
+            
+            // Pozisyon boyutu hesapla (order analizi ve pozisyon analizi için kullanılacak)
+            let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
             
             // --- AKILLI EMİR ANALİZİ: Mevcut emirleri zeka ile değerlendir ---
             // 1. Emir fiyatlarını market ile karşılaştır
@@ -1222,23 +1226,8 @@ async fn main() -> Result<()> {
                 }),
             };
 
-            let pos = match &venue {
-                V::Spot(v) => match v.get_position(&symbol).await {
-                    Ok(pos) => pos,
-                    Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch position, skipping tick");
-                        continue;
-                    }
-                },
-                V::Fut(v) => match v.get_position(&symbol).await {
-                    Ok(pos) => pos,
-                    Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch position, skipping tick");
-                        continue;
-                    }
-                },
-            };
-
+            // Pozisyon ve mark price zaten yukarıda alındı, tekrar almayalım
+            // Envanter senkronizasyonu yap
             let inv_diff = (state.inv.0 - pos.qty.0).abs();
             let reconcile_threshold = Decimal::new(1, 8);
             if inv_diff > reconcile_threshold {
@@ -1252,28 +1241,12 @@ async fn main() -> Result<()> {
                 state.inv = pos.qty;
             }
 
-            // Mark price zaten yukarıda alındı (mark_px_temp), şimdi funding rate ile birlikte al
-            let (mark_px, funding_rate, next_funding_time) = match &venue {
-                V::Spot(v) => {
-                    // Spot için mark price zaten alındı
-                    (mark_px_temp, None, None)
-                },
-                V::Fut(v) => match v.fetch_premium_index(&symbol).await {
-                    Ok((mark, funding, next_time)) => (mark, funding, next_time),
-                    Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch premium index, using fallback");
-                        // Fallback: zaten alınan mark price kullan
-                        (mark_px_temp, None, None)
-                    }
-                },
-            };
-
             record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px);
             
             // --- AKILLI POZİSYON ANALİZİ: Durumu detaylı incele ---
             let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
             let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
-            let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
+            // position_size_notional zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
             
             // --- GELİŞMİŞ RİSK VE KAZANÇ TAKİBİ: Detaylı analiz ---
             
@@ -1307,10 +1280,11 @@ async fn main() -> Result<()> {
             }
             
             // 6. Real-time PnL alerts: Kritik seviyelerde uyarı
+            // ÖNEMLİ: PnL her tick'te kontrol ediliyor, sadece alert spam'ini önle
             let pnl_alert_threshold_positive = 0.05; // %5 kar
             let pnl_alert_threshold_negative = -0.03; // %3 zarar
             let should_alert = state.last_pnl_alert
-                .map(|last| last.elapsed().as_secs() >= 60) // Her 60 saniyede bir alert
+                .map(|last| last.elapsed().as_secs() >= 10) // Her 10 saniyede bir alert (spam önleme, ama hızlı tepki)
                 .unwrap_or(true);
             
             if should_alert {
@@ -1490,9 +1464,10 @@ async fn main() -> Result<()> {
             }
             
             // Pozisyon durumu logla (sadece önemli değişikliklerde)
-            // RATE LIMIT: Log sıklığını azalt (API çağrısı değil ama log spam'ini önle)
+            // ÖNEMLİ: Pozisyon analizi her tick'te yapılıyor, sadece log sıklığını azalt
+            // Log spam'ini önlemek için 30 saniyede bir log (ama analiz her tick'te)
             let should_log_position = state.last_position_check
-                .map(|last| last.elapsed().as_secs() >= 60) // Her 60 saniyede bir log (rate limit koruması)
+                .map(|last| last.elapsed().as_secs() >= 30) // Her 30 saniyede bir log (log spam'ini önle)
                 .unwrap_or(true);
             
             if should_log_position {
@@ -1660,10 +1635,8 @@ async fn main() -> Result<()> {
                             0.0
                         }
                     };
-                    let risk_max_leverage = cfg.risk.max_leverage.max(1);
-                    let requested_leverage = cfg.leverage.unwrap_or(risk_max_leverage);
-                    let effective_leverage =
-                        requested_leverage.max(1).min(risk_max_leverage) as f64;
+                    // NOT: effective_leverage config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
+                    // (Futures için leverage sembol bazında değişmez, config'den gelir)
                     
                     // ÖNEMLİ: Hesaptan giden para mantığı:
                     // - 20 USD varsa → 20 USD kullanılır (tamamı)
@@ -1921,10 +1894,7 @@ async fn main() -> Result<()> {
                     // Her bid emri bağımsız, max 100 USD, toplam varlık paylaşılır
                     // ÖNEMLİ: total_spent_on_bids = hesaptan giden para (margin), pozisyon boyutu değil
                     // Örnek: 100 USD notional pozisyon, 20x leverage → hesaptan giden: 100/20 = 5 USD
-                    // effective_leverage hesaplaması caps hesaplamasıyla aynı olmalı
-                    let risk_max_leverage = cfg.risk.max_leverage.max(1);
-                    let requested_leverage = cfg.leverage.unwrap_or(risk_max_leverage);
-                    let effective_leverage = requested_leverage.max(1).min(risk_max_leverage) as f64;
+                    // NOT: effective_leverage config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     let mut total_spent_on_bids = 0.0f64; // Hesaptan giden para (margin) toplamı
                     if let Some((px, qty)) = quotes.bid {
                         
@@ -2083,7 +2053,7 @@ async fn main() -> Result<()> {
                     // ---- FUTURES ASK ----
                     // Her ask emri bağımsız, max 100 USD, toplam varlık paylaşılır (bid'lerden sonra kalan)
                     // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
-                    // PERFORMANS: effective_leverage_ask zaten loop başında hesaplandı, cache'den kullan
+                    // NOT: effective_leverage_ask config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     if let Some((px, qty)) = quotes.ask {
                         let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı
                         
