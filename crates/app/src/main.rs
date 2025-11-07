@@ -27,6 +27,22 @@ struct SymbolState {
     // --- eklendi: min notional öğrenme ve devre dışı bırakma ---
     min_notional_req: Option<f64>, // borsa min notional (quote cinsinden)
     disabled: bool,                // min_notional > max_usd_per_order => kalıcı disable
+    // --- AKILLI TAKİP: Pozisyon ve emir durumu analizi ---
+    last_position_check: Option<Instant>, // Son pozisyon kontrol zamanı
+    last_order_sync: Option<Instant>,     // Son emir senkronizasyon zamanı
+    order_fill_rate: f64,                 // Emir fill oranı (0.0-1.0)
+    consecutive_no_fills: u32,            // Ardışık fill olmayan tick sayısı
+    // --- AKILLI POZİSYON YÖNETİMİ: Zeka bazlı karar verme ---
+    position_entry_time: Option<Instant>,  // Pozisyon açılış zamanı
+    peak_pnl: Decimal,                     // En yüksek PnL (kar al için)
+    position_hold_duration_ms: u64,        // Pozisyon tutma süresi (ms)
+    last_order_price_update: HashMap<String, Px>, // Son emir fiyat güncellemesi (fiyat değişikliği kontrolü için)
+    // --- GELİŞMİŞ RİSK VE KAZANÇ TAKİBİ: Detaylı analiz ---
+    daily_pnl: Decimal,                    // Günlük PnL (reset edilebilir)
+    total_funding_cost: Decimal,           // Toplam funding maliyeti (futures)
+    position_size_notional_history: Vec<f64>, // Pozisyon boyutu geçmişi (risk analizi için)
+    last_pnl_alert: Option<Instant>,       // Son PnL uyarısı zamanı (spam önleme)
+    cumulative_pnl: Decimal,               // Kümülatif PnL (bot başlangıcından beri)
 }
 
 #[derive(Clone, Debug)]
@@ -511,13 +527,13 @@ async fn main() -> Result<()> {
                     );
                 }
             } else {
-                auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-                info!(
-                    count = auto.len(),
-                    quote_asset = %cfg.quote_asset,
-                    grouped = want_group,
-                    "auto-discovered symbols for quote asset (group-aware)"
-                );
+        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        info!(
+            count = auto.len(),
+            quote_asset = %cfg.quote_asset,
+            grouped = want_group,
+            "auto-discovered symbols for quote asset (group-aware)"
+        );
             }
         } else {
             auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
@@ -558,6 +574,20 @@ async fn main() -> Result<()> {
             pnl_history: Vec::new(),
             min_notional_req: None,
             disabled: false,
+            last_position_check: None,
+            last_order_sync: None,
+            order_fill_rate: 0.5, // Başlangıçta %50 varsay
+            consecutive_no_fills: 0,
+            position_entry_time: None,
+            peak_pnl: Decimal::ZERO,
+            position_hold_duration_ms: 0,
+            last_order_price_update: HashMap::new(),
+            // Gelişmiş risk ve kazanç takibi
+            daily_pnl: Decimal::ZERO,
+            total_funding_cost: Decimal::ZERO,
+            position_size_notional_history: Vec::with_capacity(100),
+            last_pnl_alert: None,
+            cumulative_pnl: Decimal::ZERO,
         });
     }
 
@@ -629,8 +659,26 @@ async fn main() -> Result<()> {
         tokio::time::Instant::now(),
         Duration::from_millis(tick_ms),
     );
+    
+    // Tick counter: Loop başında ve sonunda kullanılacak
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
+    
+    info!(
+        symbol_count = states.len(),
+        tick_interval_ms = tick_ms,
+        min_usd_per_order,
+        "main trading loop starting"
+    );
+    
     loop {
         interval.tick().await;
+        
+        // DEBUG: Her tick'te log (ilk birkaç tick için)
+        let tick_num = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        if tick_num <= 5 || tick_num % 10 == 0 {
+            info!(tick_num, "=== MAIN LOOP TICK START ===");
+        }
 
         while let Ok(event) = event_rx.try_recv() {
             match event {
@@ -651,48 +699,124 @@ async fn main() -> Result<()> {
                         }
                         state.inv = Qty(inv);
                         state.active_orders.remove(&order_id);
+                        
+                        // AKILLI TAKİP: Fill oranını güncelle
+                        state.consecutive_no_fills = 0; // Fill oldu, sıfırla
+                        // Fill oranı: Son 20 tick'te fill olan emir sayısı / toplam emir sayısı
+                        // Basit yaklaşım: Her fill'de artır, her tick'te azalt
+                        state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                        
+                        info!(
+                            %symbol,
+                            order_id = %order_id,
+                            side = ?side,
+                            qty = %qty.0,
+                            new_inventory = %state.inv.0,
+                            fill_rate = state.order_fill_rate,
+                            "order filled: updating inventory and fill rate"
+                        );
                     }
                 }
                 UserEvent::OrderCanceled { symbol, order_id } => {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         let state = &mut states[*idx];
                         state.active_orders.remove(&order_id);
+                        
+                        // AKILLI TAKİP: Cancel oldu, fill oranını düşür
+                        state.order_fill_rate = (state.order_fill_rate * 0.98).max(0.0);
+                        
+                        info!(
+                            %symbol,
+                            order_id = %order_id,
+                            fill_rate = state.order_fill_rate,
+                            "order canceled: updating fill rate"
+                        );
                     }
                 }
                 _ => {}
             }
         }
 
+        // Ana trading loop: Her sembol için işlem yap
+        // PERFORMANS: 571 sembol sıralı işlenirse çok uzun sürer, bu yüzden progress log ekliyoruz
+        // PERFORMANS: effective_leverage her sembol için aynı, cache'leyelim
+        let effective_leverage = cfg.leverage.unwrap_or(cfg.risk.max_leverage).max(1) as f64;
+        let effective_leverage_ask = effective_leverage; // Aynı değer, tekrar hesaplamaya gerek yok
+        
+        let mut processed_count = 0;
+        let mut skipped_count = 0;
+        let mut disabled_count = 0;
+        let mut no_balance_count = 0;
+        let total_symbols = states.len();
+        let mut symbol_index = 0;
+        
         for state in states.iter_mut() {
-            let symbol = state.meta.symbol.clone();
-            let base_asset = state.meta.base_asset.clone();
-            let quote_asset = state.meta.quote_asset.clone();
-
-            // --- kalıcı devre dışı kontrolü ---
+            symbol_index += 1;
+            
+            // Progress log: Her 50 sembolde bir veya ilk 10 sembolde
+            if symbol_index <= 10 || symbol_index % 50 == 0 {
+                info!(
+                    progress = format!("{}/{}", symbol_index, total_symbols),
+                    processed_so_far = processed_count,
+                    skipped_so_far = skipped_count,
+                    "processing symbols..."
+                );
+            }
+            // PERFORMANS: Disabled sembolleri en başta filtrele (clone'dan önce)
             if state.disabled {
-                info!(%symbol, "skipping symbol permanently (min_notional > max_usd_per_order)");
+                skipped_count += 1;
+                disabled_count += 1;
                 continue;
             }
+            
+            // PERFORMANS: Clone'ları sadece gerektiğinde yap
+            let symbol = &state.meta.symbol;
+            let base_asset = &state.meta.base_asset;
+            let quote_asset = &state.meta.quote_asset;
 
             // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
             // Best prices çekmeden önce bakiye kontrolü yap, gereksiz API çağrılarını önle
+            // DEBUG: İlk birkaç sembol için detaylı log
+            let is_debug_symbol = symbol_index <= 5 || symbol == "BTCUSDT" || symbol == "ETHUSDT" || symbol == "BNBUSDT";
+            
+            // PERFORMANS: Bakiye kontrolü async, bu yüzden timeout ekleyelim
+            let balance_check_start = Instant::now();
             let has_balance = match &venue {
                 V::Spot(v) => {
                     // Spot için: quote veya base bakiyesi yeterli mi?
-                    let q_free = match v.asset_free(&quote_asset).await {
-                        Ok(q) => q.to_f64().unwrap_or(0.0),
-                        Err(_) => 0.0,
+                    // PERFORMANS: Timeout ile bakiye kontrolü (5 saniye max)
+                    let q_free_future = v.asset_free(quote_asset);
+                    let q_free_result = tokio::time::timeout(Duration::from_secs(5), q_free_future).await;
+                    
+                    let q_free = match q_free_result {
+                        Ok(Ok(q)) => q.to_f64().unwrap_or(0.0),
+                        _ => 0.0,
                     };
+                    
+                    let check_duration = balance_check_start.elapsed().as_millis();
+                    if is_debug_symbol {
+                        info!(
+                            %symbol,
+                            quote_asset = %quote_asset,
+                            available_balance = q_free,
+                            min_required = min_usd_per_order,
+                            check_duration_ms = check_duration,
+                            "balance check for debug symbol (spot)"
+                        );
+                    }
+                    
                     // HIZLI KONTROL: 1 USD'den azsa işlem yapma
                     if q_free < 1.0 {
                         // Base bakiyesi kontrolü (yaklaşık kontrol, gerçek fiyat bilinmiyor)
-                        match v.asset_free(&base_asset).await {
-                            Ok(b) => {
+                        let b_free_future = v.asset_free(base_asset);
+                        let b_free_result = tokio::time::timeout(Duration::from_secs(5), b_free_future).await;
+                        match b_free_result {
+                            Ok(Ok(b)) => {
                                 let b_free = b.to_f64().unwrap_or(0.0);
                                 // Base varsa devam et (daha sonra gerçek fiyatla kontrol edilecek)
                                 b_free >= cfg.qty_step
                             }
-                            Err(_) => false,
+                            _ => false,
                         }
                     } else {
                         // Quote bakiyesi yeterliyse devam et
@@ -700,42 +824,155 @@ async fn main() -> Result<()> {
                     }
                 }
                 V::Fut(v) => {
-                    match v.available_balance(&quote_asset).await {
-                        Ok(a) => {
+                    // PERFORMANS: Timeout ile bakiye kontrolü (5 saniye max)
+                    let balance_future = v.available_balance(quote_asset);
+                    let balance_result = tokio::time::timeout(Duration::from_secs(5), balance_future).await;
+                    
+                    match balance_result {
+                        Ok(Ok(a)) => {
                             let avail = a.to_f64().unwrap_or(0.0);
+                            let check_duration = balance_check_start.elapsed().as_millis();
+                            
                             // HIZLI KONTROL: 1 USD'den azsa işlem yapma (gereksiz API çağrılarını önle)
+                            if is_debug_symbol {
+                                info!(
+                                    %symbol,
+                                    quote_asset = %quote_asset,
+                                    available_balance = avail,
+                                    min_required = min_usd_per_order,
+                                    check_duration_ms = check_duration,
+                                    "balance check for debug symbol"
+                                );
+                            }
                             if avail < 1.0 {
                                 false // Bakiye çok düşük, skip
                             } else {
                                 // Leverage ile toplam kullanılabilir miktar
-                                let effective_leverage = cfg.leverage.unwrap_or(cfg.risk.max_leverage).max(1) as f64;
+                                // PERFORMANS: effective_leverage zaten hesaplandı, cache'den kullan
                                 let total = avail * effective_leverage;
-                                total >= min_usd_per_order
+                                let has_enough = total >= min_usd_per_order;
+                                if is_debug_symbol {
+                                    info!(
+                                        %symbol,
+                                        available_balance = avail,
+                                        effective_leverage,
+                                        total_with_leverage = total,
+                                        min_required = min_usd_per_order,
+                                        has_enough,
+                                        "balance check result"
+                                    );
+                                }
+                                has_enough
                             }
                         }
-                        Err(_) => false,
+                        Ok(Err(err)) => {
+                            if is_debug_symbol {
+                                warn!(%symbol, ?err, "failed to fetch available balance");
+                            }
+                            false
+                        }
+                        Err(_) => {
+                            // Timeout
+                            if is_debug_symbol {
+                                warn!(%symbol, "balance check timeout (5s), skipping");
+                            }
+                            false
+                        }
                     }
                 }
             };
             
             if !has_balance {
                 // Bakiye yok, bu tick'i atla (best_prices, strateji, vs. çalıştırma)
-                // Log sadece ilk birkaç kez veya periyodik olarak (spam önlemek için)
+                skipped_count += 1;
+                no_balance_count += 1;
                 continue;
             }
+            
+            processed_count += 1;
 
-            // aktif emirleri iptal/temizle
+            // --- AKILLI EMİR SENKRONİZASYONU: API'den gerçek durumu kontrol et ---
+            // RATE LIMIT OPTİMİZASYONU: Her 10 saniyede bir senkronize et (gereksiz API çağrılarını önle)
+            // WebSocket zaten real-time güncellemeleri sağlıyor, API sadece doğrulama için
+            let should_sync_orders = state.last_order_sync
+                .map(|last| last.elapsed().as_secs() >= 10) // Her 10 saniyede bir senkronize et (rate limit koruması)
+                .unwrap_or(true); // İlk çalıştırmada mutlaka senkronize et
+            if should_sync_orders {
+                let sync_result = match &venue {
+                    V::Spot(v) => v.get_open_orders(&symbol).await,
+                    V::Fut(v) => v.get_open_orders(&symbol).await,
+                };
+                
+                match sync_result {
+                    Ok(api_orders) => {
+                        // API'den gelen emirlerle local state'i senkronize et
+                        let api_order_ids: std::collections::HashSet<String> = api_orders
+                            .iter()
+                            .map(|o| o.order_id.clone())
+                            .collect();
+                        
+                        // Local'de olup API'de olmayan emirleri temizle (muhtemelen fill oldu)
+                        let mut removed_count = 0;
+                        state.active_orders.retain(|order_id, _| {
+                            if !api_order_ids.contains(order_id) {
+                                removed_count += 1;
+                                false // Remove
+                            } else {
+                                true // Keep
+                            }
+                        });
+                        
+                        if removed_count > 0 {
+                            info!(
+                                %symbol,
+                                removed_orders = removed_count,
+                                remaining_orders = state.active_orders.len(),
+                                "synced orders: removed filled/canceled orders from local state"
+                            );
+                        }
+                        
+                        // API'de olup local'de olmayan emirleri ekle (başka yerden açılmış olabilir)
+                        for api_order in &api_orders {
+                            if !state.active_orders.contains_key(&api_order.order_id) {
+                                let info = OrderInfo {
+                                    order_id: api_order.order_id.clone(),
+                                    side: api_order.side,
+                                    price: api_order.price,
+                                    qty: api_order.qty,
+                                    created_at: Instant::now(), // Tahmini zaman
+                                };
+                                state.active_orders.insert(api_order.order_id.clone(), info);
+                                info!(
+                                    %symbol,
+                                    order_id = %api_order.order_id,
+                                    side = ?api_order.side,
+                                    "found new order from API (not in local state)"
+                                );
+                            }
+                        }
+                        
+                        state.last_order_sync = Some(Instant::now());
+                    }
+                    Err(err) => {
+                        warn!(%symbol, ?err, "failed to sync orders from API, continuing with local state");
+                    }
+                }
+            }
+            
+            // --- AKILLI EMİR YÖNETİMİ: Stale emirleri iptal et ---
             // Not: WebSocket event'leri bu noktada hala gelebilir, bu normaldir
-            // çünkü event'ler clear() öncesi emirler için olabilir
             if !state.active_orders.is_empty() {
                 let existing_orders: Vec<OrderInfo> =
                     state.active_orders.values().cloned().collect();
-                // Clear'i iptal işlemlerinden önce yapıyoruz ki yeni emirler hemen eklenebilsin
-                state.active_orders.clear();
-                for order in existing_orders {
+                let mut stale_count = 0;
+                let mut canceled_count = 0;
+                
+                for order in &existing_orders {
                     let age_ms = order.created_at.elapsed().as_millis() as u64;
                     let stale = age_ms > cfg.exec.max_order_age_ms;
+                    
                     if stale {
+                        stale_count += 1;
                         warn!(
                             %symbol,
                             order_id = %order.order_id,
@@ -746,26 +983,57 @@ async fn main() -> Result<()> {
                             max_age = cfg.exec.max_order_age_ms,
                             "canceling stale order"
                         );
-                    } else {
-                        info!(
-                            %symbol,
-                            order_id = %order.order_id,
-                            side = ?order.side,
-                            price = ?order.price,
-                            qty = ?order.qty,
-                            age_ms,
-                            "canceling active order before refresh"
-                        );
+                        match &venue {
+                            V::Spot(v) => {
+                                if v.cancel(&order.order_id, &symbol).await.is_ok() {
+                                    canceled_count += 1;
+                                    state.active_orders.remove(&order.order_id);
+                                } else {
+                                    warn!(%symbol, order_id = %order.order_id, "failed to cancel stale spot order");
+                                }
+                            }
+                            V::Fut(v) => {
+                                if v.cancel(&order.order_id, &symbol).await.is_ok() {
+                                    canceled_count += 1;
+                                    state.active_orders.remove(&order.order_id);
+                                } else {
+                                    warn!(%symbol, order_id = %order.order_id, "failed to cancel stale futures order");
+                                }
+                            }
+                        }
                     }
+                }
+                
+                if stale_count > 0 {
+                    info!(
+                        %symbol,
+                        stale_orders = stale_count,
+                        canceled_orders = canceled_count,
+                        remaining_orders = state.active_orders.len(),
+                        "cleaned up stale orders"
+                    );
+                }
+                
+                // Eğer çok fazla stale emir varsa, hepsini temizle
+                if stale_count > 0 && state.active_orders.len() > 10 {
+                    warn!(
+                        %symbol,
+                        total_orders = state.active_orders.len(),
+                        "too many active orders, canceling all to reset"
+                    );
                     match &venue {
                         V::Spot(v) => {
-                            if let Err(err) = v.cancel(&order.order_id, &symbol).await {
-                                warn!(%symbol, order_id = %order.order_id, ?err, "failed to cancel existing spot order");
+                            if let Err(err) = v.cancel_all(&symbol).await {
+                                warn!(%symbol, ?err, "failed to cancel all orders");
+                            } else {
+                                state.active_orders.clear();
                             }
                         }
                         V::Fut(v) => {
-                            if let Err(err) = v.cancel(&order.order_id, &symbol).await {
-                                warn!(%symbol, order_id = %order.order_id, ?err, "failed to cancel existing futures order");
+                            if let Err(err) = v.cancel_all(&symbol).await {
+                                warn!(%symbol, ?err, "failed to cancel all orders");
+                            } else {
+                                state.active_orders.clear();
                             }
                         }
                     }
@@ -789,6 +1057,160 @@ async fn main() -> Result<()> {
                 },
             };
             info!(%symbol, ?bid, ?ask, "fetched best prices");
+            
+            // Pozisyon bilgisini önce al (order analizi için gerekli)
+            let pos = match &venue {
+                V::Spot(v) => match v.get_position(&symbol).await {
+                    Ok(pos) => pos,
+                    Err(err) => {
+                        warn!(%symbol, ?err, "failed to fetch position, skipping tick");
+                        continue;
+                    }
+                },
+                V::Fut(v) => match v.get_position(&symbol).await {
+                    Ok(pos) => pos,
+                    Err(err) => {
+                        warn!(%symbol, ?err, "failed to fetch position, skipping tick");
+                        continue;
+                    }
+                },
+            };
+            
+            // Pozisyon boyutu hesapla (order analizi için)
+            let (mark_px_temp, _, _) = match &venue {
+                V::Spot(v) => match v.mark_price(&symbol).await {
+                    Ok(px) => (px, None, None),
+                    Err(_) => {
+                        // Fallback: bid/ask mid price
+                        let mid = (bid.0 + ask.0) / Decimal::from(2u32);
+                        (Px(mid), None, None)
+                    }
+                },
+                V::Fut(v) => match v.fetch_premium_index(&symbol).await {
+                    Ok((mark, funding, next_time)) => (mark, funding, next_time),
+                    Err(_) => {
+                        // Fallback: bid/ask mid price
+                        let mid = (bid.0 + ask.0) / Decimal::from(2u32);
+                        (Px(mid), None, None)
+                    }
+                },
+            };
+            let position_size_notional = (mark_px_temp.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
+            
+            // --- AKILLI EMİR ANALİZİ: Mevcut emirleri zeka ile değerlendir ---
+            // 1. Emir fiyatlarını market ile karşılaştır
+            // 2. Çok uzakta olan emirleri iptal et veya güncelle
+            // 3. Stale emirleri temizle
+            if !state.active_orders.is_empty() {
+                let mut orders_to_cancel: Vec<String> = Vec::new();
+                
+                for (order_id, order) in &state.active_orders {
+                    let order_price_f64 = order.price.0.to_f64().unwrap_or(0.0);
+                    let order_age_ms = order.created_at.elapsed().as_millis() as u64;
+                    
+                    // Market fiyatı ile karşılaştır
+                    let market_distance_pct = match order.side {
+                        Side::Buy => {
+                            // Bid emri: ask'ten ne kadar uzakta?
+                            let ask_f64 = ask.0.to_f64().unwrap_or(0.0);
+                            if ask_f64 > 0.0 {
+                                (ask_f64 - order_price_f64) / ask_f64
+                            } else {
+                                0.0
+                            }
+                        }
+                        Side::Sell => {
+                            // Ask emri: bid'den ne kadar uzakta?
+                            let bid_f64 = bid.0.to_f64().unwrap_or(0.0);
+                            if bid_f64 > 0.0 {
+                                (order_price_f64 - bid_f64) / bid_f64
+                            } else {
+                                0.0
+                            }
+                        }
+                    };
+                    
+                    // Akıllı karar: Emir çok uzakta mı?
+                    // Pozisyon varsa daha toleranslı ol (pozisyon kapatmak için emir gerekebilir)
+                    let max_distance_pct = if position_size_notional > 0.0 {
+                        0.01 // %1 (pozisyon varsa daha toleranslı)
+                    } else {
+                        0.005 // %0.5 (pozisyon yoksa daha sıkı)
+                    };
+                    let should_cancel_far = market_distance_pct.abs() > max_distance_pct;
+                    
+                    // Akıllı karar: Emir çok eski mi?
+                    // Pozisyon varsa stale emirleri daha hızlı temizle (pozisyon yönetimi için)
+                    let max_age_for_stale = if position_size_notional > 0.0 {
+                        cfg.exec.max_order_age_ms / 2 // Pozisyon varsa yarı süre
+                    } else {
+                        cfg.exec.max_order_age_ms
+                    };
+                    let should_cancel_stale = order_age_ms > max_age_for_stale;
+                    
+                    // Akıllı karar: Fiyat değişti mi? (son güncellemeden beri)
+                    let price_changed = state.last_order_price_update
+                        .get(order_id)
+                        .map(|last_px| {
+                            let price_diff = (order.price.0 - last_px.0).abs();
+                            let price_diff_pct = if order.price.0 > Decimal::ZERO {
+                                price_diff / order.price.0
+                            } else {
+                                Decimal::ZERO
+                            };
+                            price_diff_pct > Decimal::new(1, 4) // %0.01'den fazla değişmiş
+                        })
+                        .unwrap_or(true); // İlk kez görülüyorsa güncelle
+                    
+                    if should_cancel_far || should_cancel_stale {
+                        orders_to_cancel.push(order_id.clone());
+                        info!(
+                            %symbol,
+                            order_id = %order_id,
+                            side = ?order.side,
+                            order_price = %order.price.0,
+                            market_distance_pct = market_distance_pct * 100.0,
+                            order_age_ms,
+                            reason = if should_cancel_far { "too_far_from_market" } else { "stale" },
+                            "intelligent order analysis: canceling order"
+                        );
+                    } else if price_changed && order_age_ms > 5_000 {
+                        // Fiyat değişti ve emir 5 saniyeden eski, güncelleme öner
+                        // (Strateji yeni fiyat üretecek, bu sadece bilgilendirme)
+                        info!(
+                            %symbol,
+                            order_id = %order_id,
+                            side = ?order.side,
+                            order_price = %order.price.0,
+                            market_distance_pct = market_distance_pct * 100.0,
+                            "intelligent order analysis: order price may need update"
+                        );
+                    }
+                }
+                
+                // İptal edilecek emirleri iptal et
+                for order_id in &orders_to_cancel {
+                    match &venue {
+                        V::Spot(v) => {
+                            if let Err(err) = v.cancel(order_id, &symbol).await {
+                                warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order");
+                            } else {
+                                state.active_orders.remove(order_id);
+                                state.last_order_price_update.remove(order_id);
+                            }
+                        }
+                        V::Fut(v) => {
+                            if let Err(err) = v.cancel(order_id, &symbol).await {
+                                warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order");
+                            } else {
+                                state.active_orders.remove(order_id);
+                                state.last_order_price_update.remove(order_id);
+                            }
+                        }
+                    }
+                }
+            }
+            
             let ob = OrderBook {
                 best_bid: Some(BookLevel {
                     px: bid,
@@ -830,24 +1252,265 @@ async fn main() -> Result<()> {
                 state.inv = pos.qty;
             }
 
+            // Mark price zaten yukarıda alındı (mark_px_temp), şimdi funding rate ile birlikte al
             let (mark_px, funding_rate, next_funding_time) = match &venue {
-                V::Spot(v) => match v.mark_price(&symbol).await {
-                    Ok(px) => (px, None, None),
-                    Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch mark price, skipping tick");
-                        continue;
-                    }
+                V::Spot(v) => {
+                    // Spot için mark price zaten alındı
+                    (mark_px_temp, None, None)
                 },
                 V::Fut(v) => match v.fetch_premium_index(&symbol).await {
                     Ok((mark, funding, next_time)) => (mark, funding, next_time),
                     Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch premium index, skipping tick");
-                        continue;
+                        warn!(%symbol, ?err, "failed to fetch premium index, using fallback");
+                        // Fallback: zaten alınan mark price kullan
+                        (mark_px_temp, None, None)
                     }
                 },
             };
 
             record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px);
+            
+            // --- AKILLI POZİSYON ANALİZİ: Durumu detaylı incele ---
+            let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
+            let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
+            let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
+            
+            // --- GELİŞMİŞ RİSK VE KAZANÇ TAKİBİ: Detaylı analiz ---
+            
+            // 1. Günlük PnL takibi (basit: her tick'te güncelle, reset mekanizması eklenebilir)
+            state.daily_pnl = current_pnl; // Şimdilik current PnL, ileride günlük reset eklenebilir
+            
+            // 2. Funding cost takibi (futures için)
+            if let Some(funding) = funding_rate {
+                let funding_cost = funding * position_size_notional;
+                state.total_funding_cost += Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
+            }
+            
+            // 3. Pozisyon boyutu geçmişi (risk analizi için)
+            state.position_size_notional_history.push(position_size_notional);
+            if state.position_size_notional_history.len() > 100 {
+                state.position_size_notional_history.remove(0);
+            }
+            
+            // 4. Kümülatif PnL takibi
+            state.cumulative_pnl = current_pnl; // Şimdilik current, ileride gerçek kümülatif hesaplanabilir
+            
+            // 5. Pozisyon boyutu risk kontrolü: Çok büyük pozisyonlar riskli
+            let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * 5.0; // 5x buffer
+            if position_size_notional > max_position_size_usd {
+                warn!(
+                    %symbol,
+                    position_size_notional,
+                    max_allowed = max_position_size_usd,
+                    "POSITION SIZE RISK: position too large, consider reducing"
+                );
+            }
+            
+            // 6. Real-time PnL alerts: Kritik seviyelerde uyarı
+            let pnl_alert_threshold_positive = 0.05; // %5 kar
+            let pnl_alert_threshold_negative = -0.03; // %3 zarar
+            let should_alert = state.last_pnl_alert
+                .map(|last| last.elapsed().as_secs() >= 60) // Her 60 saniyede bir alert
+                .unwrap_or(true);
+            
+            if should_alert {
+                if pnl_f64 > 0.0 && position_size_notional > 0.0 {
+                    let pnl_pct = pnl_f64 / position_size_notional;
+                    if pnl_pct >= pnl_alert_threshold_positive {
+                        info!(
+                            %symbol,
+                            pnl = pnl_f64,
+                            pnl_pct = pnl_pct * 100.0,
+                            position_size = position_size_notional,
+                            "PNL ALERT: Significant profit achieved"
+                        );
+                        state.last_pnl_alert = Some(Instant::now());
+                    }
+                }
+                if pnl_f64 < 0.0 && position_size_notional > 0.0 {
+                    let pnl_pct = pnl_f64 / position_size_notional;
+                    if pnl_pct <= pnl_alert_threshold_negative {
+                        warn!(
+                            %symbol,
+                            pnl = pnl_f64,
+                            pnl_pct = pnl_pct * 100.0,
+                            position_size = position_size_notional,
+                            "PNL ALERT: Significant loss detected"
+                        );
+                        state.last_pnl_alert = Some(Instant::now());
+                    }
+                }
+            }
+            
+            // Peak PnL takibi: En yüksek karı kaydet (kar al için)
+            if current_pnl > state.peak_pnl {
+                state.peak_pnl = current_pnl;
+            }
+            
+            // Pozisyon tutma süresi takibi
+            if pos.qty.0.abs() > Decimal::new(1, 8) {
+                // Pozisyon var
+                if state.position_entry_time.is_none() {
+                    state.position_entry_time = Some(Instant::now());
+                }
+                if let Some(entry_time) = state.position_entry_time {
+                    state.position_hold_duration_ms = entry_time.elapsed().as_millis() as u64;
+                }
+            } else {
+                // Pozisyon yok, sıfırla
+                state.position_entry_time = None;
+                state.peak_pnl = Decimal::ZERO;
+                state.position_hold_duration_ms = 0;
+            }
+            
+            // Pozisyon trend analizi: Son 10 snapshot'a bak
+            let pnl_trend = if state.pnl_history.len() >= 10 {
+                let recent = &state.pnl_history[state.pnl_history.len().saturating_sub(10)..];
+                let first = recent[0];
+                let last = recent[recent.len() - 1];
+                if first > Decimal::ZERO {
+                    ((last - first) / first).to_f64().unwrap_or(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            
+            // --- AKILLI POZİSYON YÖNETİMİ: Kar al / Zarar durdur mantığı ---
+            let entry_price_f64 = pos.entry.0.to_f64().unwrap_or(0.0);
+            let mark_price_f64 = mark_px.0.to_f64().unwrap_or(0.0);
+            let position_qty_f64 = pos.qty.0.to_f64().unwrap_or(0.0);
+            
+            // Pozisyon varsa akıllı karar ver
+            if position_qty_f64.abs() > 0.0001 && entry_price_f64 > 0.0 && mark_price_f64 > 0.0 {
+                let price_change_pct = if pos.qty.0.is_sign_positive() {
+                    // Long pozisyon: fiyat artışı = kar
+                    (mark_price_f64 - entry_price_f64) / entry_price_f64
+                } else {
+                    // Short pozisyon: fiyat düşüşü = kar
+                    (entry_price_f64 - mark_price_f64) / entry_price_f64
+                };
+                
+                // Kar al mantığı: %2+ kar varsa ve trend tersine dönüyorsa kapat
+                let take_profit_threshold = 0.02; // %2 kar
+                let trailing_stop_threshold = 0.01; // %1 trailing stop (peak'ten düşerse)
+                
+                let should_take_profit = if price_change_pct >= take_profit_threshold {
+                    // Kar var, trend analizi yap
+                    if pnl_trend < -0.1 {
+                        // Trend tersine dönüyor, kar al
+                        true
+                    } else if state.position_hold_duration_ms > 300_000 {
+                        // 5 dakikadan fazla tutuldu ve kar var, kısmi kar al
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                
+                // Trailing stop: Peak'ten %1 düşerse kapat
+                let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
+                let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
+                let should_trailing_stop = if peak_pnl_f64 > 0.0 && current_pnl_f64 < peak_pnl_f64 {
+                    let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
+                    drawdown_from_peak >= trailing_stop_threshold
+                } else {
+                    false
+                };
+                
+                // Zarar durdur: %1'den fazla zarar varsa ve trend kötüleşiyorsa kapat
+                let stop_loss_threshold = -0.01; // %1 zarar
+                let should_stop_loss = if price_change_pct <= stop_loss_threshold {
+                    // Zarar var, trend analizi yap
+                    if pnl_trend < -0.2 || state.position_hold_duration_ms > 600_000 {
+                        // Trend kötüleşiyor veya 10 dakikadan fazla zararda, kapat
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                
+                // Akıllı karar: Pozisyonu kapat
+                if should_take_profit || should_trailing_stop || should_stop_loss {
+                    let reason = if should_take_profit {
+                        "take_profit"
+                    } else if should_trailing_stop {
+                        "trailing_stop"
+                    } else {
+                        "stop_loss"
+                    };
+                    
+                    warn!(
+                        %symbol,
+                        reason,
+                        current_pnl = pnl_f64,
+                        price_change_pct = price_change_pct * 100.0,
+                        peak_pnl = peak_pnl_f64,
+                        position_hold_duration_ms = state.position_hold_duration_ms,
+                        pnl_trend,
+                        "intelligent position management: closing position"
+                    );
+                    
+                    // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
+                    let cancel_result = match &venue {
+                        V::Spot(v) => v.cancel_all(&symbol).await,
+                        V::Fut(v) => v.cancel_all(&symbol).await,
+                    };
+                    if let Err(err) = cancel_result {
+                        warn!(%symbol, ?err, "failed to cancel orders before position close");
+                    }
+                    
+                    // Pozisyonu kapat (reduceOnly market order)
+                    let close_result = match &venue {
+                        V::Spot(v) => v.close_position(&symbol).await,
+                        V::Fut(v) => v.close_position(&symbol).await,
+                    };
+                    if let Err(err) = close_result {
+                        warn!(%symbol, ?err, "failed to close position");
+                    } else {
+                        info!(
+                            %symbol,
+                            reason,
+                            final_pnl = pnl_f64,
+                            "position closed successfully"
+                        );
+                    }
+                    
+                    // State'i sıfırla
+                    state.position_entry_time = None;
+                    state.peak_pnl = Decimal::ZERO;
+                    state.position_hold_duration_ms = 0;
+                    state.daily_pnl = Decimal::ZERO; // Pozisyon kapandı, günlük PnL sıfırla
+                }
+            }
+            
+            // Pozisyon durumu logla (sadece önemli değişikliklerde)
+            // RATE LIMIT: Log sıklığını azalt (API çağrısı değil ama log spam'ini önle)
+            let should_log_position = state.last_position_check
+                .map(|last| last.elapsed().as_secs() >= 60) // Her 60 saniyede bir log (rate limit koruması)
+                .unwrap_or(true);
+            
+            if should_log_position {
+                info!(
+                    %symbol,
+                    position_qty = %pos.qty.0,
+                    entry_price = %pos.entry.0,
+                    mark_price = %mark_px.0,
+                    current_pnl = pnl_f64,
+                    position_size_notional = position_size_notional,
+                    pnl_trend = pnl_trend,
+                    active_orders = state.active_orders.len(),
+                    order_fill_rate = state.order_fill_rate,
+                    consecutive_no_fills = state.consecutive_no_fills,
+                    "position status: monitoring for intelligent decisions"
+                );
+                state.last_position_check = Some(Instant::now());
+            }
 
             let liq_gap_bps = if let Some(liq_px) = pos.liq_px {
                 let mark = mark_px.0.to_f64().unwrap_or(0.0);
@@ -863,6 +1526,31 @@ async fn main() -> Result<()> {
 
             let dd_bps = compute_drawdown_bps(&state.pnl_history);
             let risk_action = risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, &risk_limits);
+            
+            // --- AKILLI FILL ORANI TAKİBİ: Ardışık fill olmayan tick sayısını artır ---
+            if state.active_orders.len() > 0 {
+                state.consecutive_no_fills += 1;
+                // Eğer çok uzun süre fill olmuyorsa, fill oranını düşür
+                if state.consecutive_no_fills > 10 {
+                    state.order_fill_rate = (state.order_fill_rate * 0.99).max(0.1);
+                }
+            } else {
+                // Emir yoksa, fill oranını yavaşça normale döndür
+                state.order_fill_rate = (state.order_fill_rate * 0.995 + 0.005).min(1.0);
+            }
+            
+            // --- AKILLI POZİSYON YÖNETİMİ: Fill oranına göre strateji ayarla ---
+            // Eğer fill oranı çok düşükse (emirler doldurulmuyor), spread'i genişlet veya fiyatı ayarla
+            let fill_rate_threshold = 0.2; // %20'nin altındaysa sorun var
+            if state.order_fill_rate < fill_rate_threshold && state.active_orders.len() > 0 {
+                warn!(
+                    %symbol,
+                    fill_rate = state.order_fill_rate,
+                    active_orders = state.active_orders.len(),
+                    consecutive_no_fills = state.consecutive_no_fills,
+                    "low fill rate detected: orders may be too far from market"
+                );
+            }
 
             if matches!(risk_action, RiskAction::Halt) {
                 warn!(%symbol, "risk halt triggered, cancelling and flattening");
@@ -1159,7 +1847,9 @@ async fn main() -> Result<()> {
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
-                                state.active_orders.insert(order_id, info);
+                                state.active_orders.insert(order_id.clone(), info);
+                                // Fiyat güncellemesini kaydet (akıllı emir analizi için)
+                                state.last_order_price_update.insert(order_id, px);
                             }
                             Err(err) => {
                                 warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot bid order");
@@ -1176,7 +1866,8 @@ async fn main() -> Result<()> {
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
                                         let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
-                                        state.active_orders.insert(order_id2, info2);
+                                        state.active_orders.insert(order_id2.clone(), info2);
+                                        state.last_order_price_update.insert(order_id2, px);
                                     }
                                     Err(err) => {
                                         warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra spot bid order");
@@ -1192,7 +1883,9 @@ async fn main() -> Result<()> {
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
-                                state.active_orders.insert(order_id, info);
+                                state.active_orders.insert(order_id.clone(), info);
+                                // Fiyat güncellemesini kaydet (akıllı emir analizi için)
+                                state.last_order_price_update.insert(order_id, px);
                             }
                             Err(err) => {
                                 warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot ask order");
@@ -1211,7 +1904,8 @@ async fn main() -> Result<()> {
                                     match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                         Ok(order_id2) => {
                                             let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
-                                            state.active_orders.insert(order_id2, info2);
+                                        state.active_orders.insert(order_id2.clone(), info2);
+                                        state.last_order_price_update.insert(order_id2, px);
                                         }
                                         Err(err) => {
                                             warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra spot ask order");
@@ -1326,7 +2020,8 @@ async fn main() -> Result<()> {
                                             match v.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
                                                     let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty: retry_qty, created_at: Instant::now() };
-                                                    state.active_orders.insert(order_id, info);
+                                                    state.active_orders.insert(order_id.clone(), info);
+                                                    state.last_order_price_update.insert(order_id, px);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
                                                     let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
                                                     total_spent_on_bids = notional / effective_leverage;
@@ -1388,11 +2083,8 @@ async fn main() -> Result<()> {
                     // ---- FUTURES ASK ----
                     // Her ask emri bağımsız, max 100 USD, toplam varlık paylaşılır (bid'lerden sonra kalan)
                     // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
-                    // effective_leverage hesaplaması caps hesaplamasıyla aynı olmalı
+                    // PERFORMANS: effective_leverage_ask zaten loop başında hesaplandı, cache'den kullan
                     if let Some((px, qty)) = quotes.ask {
-                        let risk_max_leverage_ask = cfg.risk.max_leverage.max(1);
-                        let requested_leverage_ask = cfg.leverage.unwrap_or(risk_max_leverage_ask);
-                        let effective_leverage_ask = requested_leverage_ask.max(1).min(risk_max_leverage_ask) as f64;
                         let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı
                         
                         // İlk ask emri (max 100 USD)
@@ -1486,7 +2178,8 @@ async fn main() -> Result<()> {
                                             match v.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
                                                     let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty: retry_qty, created_at: Instant::now() };
-                                                    state.active_orders.insert(order_id, info);
+                                                    state.active_orders.insert(order_id.clone(), info);
+                                                    state.last_order_price_update.insert(order_id, px);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
                                                     let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
                                                     total_spent_on_asks = notional / effective_leverage_ask;
@@ -1546,6 +2239,21 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        
+        // Loop sonu: İstatistikleri logla (her 10 tick'te bir veya ilk 5 tick)
+        // tick_num zaten yukarıda hesaplandı, scope'ta hala erişilebilir
+        let current_tick = TICK_COUNTER.load(Ordering::Relaxed);
+        if current_tick <= 5 || current_tick % 10 == 0 {
+                info!(
+                    tick_count = current_tick,
+                    processed_symbols = processed_count,
+                    skipped_symbols = skipped_count,
+                    disabled_symbols = disabled_count,
+                    no_balance_symbols = no_balance_count,
+                    total_symbols = states.len(),
+                    "main loop tick completed: statistics"
+                );
         }
     }
 }
