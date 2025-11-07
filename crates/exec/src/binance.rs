@@ -28,6 +28,7 @@ struct SymbolRules {
 
 #[derive(Deserialize)]
 #[serde(tag = "filterType")]
+#[allow(non_snake_case)]
 enum FutFilter {
     #[serde(rename = "PRICE_FILTER")]
     PriceFilter { tickSize: String },
@@ -342,7 +343,7 @@ impl BinanceSpot {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         let bal = info.balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
@@ -367,7 +368,7 @@ impl BinanceSpot {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         let mut res = Vec::new();
         for o in orders {
@@ -406,7 +407,7 @@ impl BinanceSpot {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         let mut fills = Vec::new();
         for t in trades {
@@ -490,7 +491,7 @@ impl BinanceSpot {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
         Ok(())
     }
 }
@@ -553,7 +554,7 @@ impl Venue for BinanceSpot {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         info!(
             %sym,
@@ -584,7 +585,7 @@ impl Venue for BinanceSpot {
                 .delete(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         Ok(())
     }
@@ -760,7 +761,7 @@ impl BinanceFutures {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         let bal = balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
@@ -785,7 +786,7 @@ impl BinanceFutures {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
         let mut res = Vec::new();
         for o in orders {
             let price = Decimal::from_str_radix(&o.price, 10)?;
@@ -823,7 +824,7 @@ impl BinanceFutures {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
         let pos = positions
             .drain(..)
             .find(|p| p.symbol.eq_ignore_ascii_case(sym))
@@ -910,7 +911,7 @@ impl BinanceFutures {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
         Ok(())
     }
 }
@@ -970,7 +971,7 @@ impl Venue for BinanceFutures {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
 
         info!(
             %sym,
@@ -1001,7 +1002,7 @@ impl Venue for BinanceFutures {
                 .delete(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-        .await?;
+            .await?;
         Ok(())
     }
 
@@ -1078,6 +1079,7 @@ async fn send_void(builder: RequestBuilder) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn quantize_f64(x: f64, step: f64) -> f64 {
     if step <= 0.0 || !x.is_finite() || !step.is_finite() {
         return x;

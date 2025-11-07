@@ -265,7 +265,7 @@ async fn main() -> Result<()> {
             cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap),
             10,
         )
-        .unwrap(),
+            .unwrap(),
     };
     let mode_lower = cfg.mode.to_lowercase();
     let strategy_name = cfg.strategy.r#type.clone();
@@ -381,10 +381,10 @@ async fn main() -> Result<()> {
                 m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                     && (mode_lower != "futures"
-                        || m.contract_type
-                            .as_deref()
-                            .map(|ct| ct == "PERPETUAL")
-                            .unwrap_or(false))
+                    || m.contract_type
+                    .as_deref()
+                    .map(|ct| ct == "PERPETUAL")
+                    .unwrap_or(false))
             })
             .cloned()
             .collect();
@@ -705,6 +705,18 @@ async fn main() -> Result<()> {
                     }
                 }
             };
+            // if both sides (bid & ask) are present, split caps to avoid over-committing balance
+            let both_sides = quotes.bid.is_some() && quotes.ask.is_some();
+            let caps = if both_sides {
+                Caps {
+                    buy_notional: caps.buy_notional / 2.0,
+                    sell_notional: caps.sell_notional / 2.0,
+                    sell_base: caps.sell_base,
+                }
+            } else {
+                caps
+            };
+
             info!(
                 %symbol,
                 buy_notional = caps.buy_notional,
@@ -840,7 +852,44 @@ async fn main() -> Result<()> {
                                 state.active_orders.insert(order_id, info);
                             }
                             Err(err) => {
-                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures bid order");
+                                let msg = err.to_string();
+                                if msg.contains("below min notional after clamps") {
+                                    let required_min = msg
+                                        .split('<')
+                                        .nth(1)
+                                        .and_then(|s| s.split(')').next())
+                                        .and_then(|s| s.trim().parse::<f64>().ok());
+                                    if let Some(min_notional) = required_min {
+                                        let price = px.0.to_f64().unwrap_or(0.0);
+                                        let order_cap = caps.buy_notional.min(cfg.max_usd_per_order);
+                                        let step = cfg.qty_step;
+                                        let mut new_qty = 0.0f64;
+                                        if price > 0.0 && step > 0.0 {
+                                            new_qty = ((min_notional / price) / step).floor() * step;
+                                            let max_qty_by_cap = ((order_cap / price) / step).floor() * step;
+                                            if new_qty > max_qty_by_cap { new_qty = max_qty_by_cap; }
+                                        }
+                                        if new_qty > 0.0 {
+                                            let retry_qty = Qty(rust_decimal::Decimal::from_f64_retain(new_qty).unwrap_or(rust_decimal::Decimal::ZERO));
+                                            info!(%symbol, ?px, qty=?retry_qty, tif=?tif, min_notional, "retrying futures bid with exchange min notional");
+                                            match v.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
+                                                Ok(order_id) => {
+                                                    let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty: retry_qty, created_at: Instant::now() };
+                                                    state.active_orders.insert(order_id, info);
+                                                }
+                                                Err(err2) => {
+                                                    warn!(%symbol, ?px, qty=?retry_qty, tif=?tif, ?err2, "retry bid still failed");
+                                                }
+                                            }
+                                        } else {
+                                            warn!(%symbol, ?px, required_min=?min_notional, cap=?order_cap, "skip bid: insufficient balance for exchange min notional");
+                                        }
+                                    } else {
+                                        warn!(%symbol, ?px, ?qty, ?err, "failed bid (min notional parse failed)");
+                                    }
+                                } else {
+                                    warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures bid order");
+                                }
                             }
                         }
                     }
@@ -858,7 +907,44 @@ async fn main() -> Result<()> {
                                 state.active_orders.insert(order_id, info);
                             }
                             Err(err) => {
-                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures ask order");
+                                let msg = err.to_string();
+                                if msg.contains("below min notional after clamps") {
+                                    let required_min = msg
+                                        .split('<')
+                                        .nth(1)
+                                        .and_then(|s| s.split(')').next())
+                                        .and_then(|s| s.trim().parse::<f64>().ok());
+                                    if let Some(min_notional) = required_min {
+                                        let price = px.0.to_f64().unwrap_or(0.0);
+                                        let order_cap = caps.sell_notional.min(cfg.max_usd_per_order);
+                                        let step = cfg.qty_step;
+                                        let mut new_qty = 0.0f64;
+                                        if price > 0.0 && step > 0.0 {
+                                            new_qty = ((min_notional / price) / step).floor() * step;
+                                            let max_qty_by_cap = ((order_cap / price) / step).floor() * step;
+                                            if new_qty > max_qty_by_cap { new_qty = max_qty_by_cap; }
+                                        }
+                                        if new_qty > 0.0 {
+                                            let retry_qty = Qty(rust_decimal::Decimal::from_f64_retain(new_qty).unwrap_or(rust_decimal::Decimal::ZERO));
+                                            info!(%symbol, ?px, qty=?retry_qty, tif=?tif, min_notional, "retrying futures ask with exchange min notional");
+                                            match v.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
+                                                Ok(order_id) => {
+                                                    let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty: retry_qty, created_at: Instant::now() };
+                                                    state.active_orders.insert(order_id, info);
+                                                }
+                                                Err(err2) => {
+                                                    warn!(%symbol, ?px, qty=?retry_qty, tif=?tif, ?err2, "retry ask still failed");
+                                                }
+                                            }
+                                        } else {
+                                            warn!(%symbol, ?px, required_min=?min_notional, cap=?order_cap, "skip ask: insufficient balance for exchange min notional");
+                                        }
+                                    } else {
+                                        warn!(%symbol, ?px, ?qty, ?err, "failed ask (min notional parse failed)");
+                                    }
+                                } else {
+                                    warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures ask order");
+                                }
                             }
                         }
                     }
