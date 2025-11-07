@@ -22,26 +22,85 @@ use std::time::{Duration, Instant};
 // --- API RATE LIMIT KORUMASI: Binance limitleri ---
 // Spot: 1200 req/min (20 req/sec)
 // Futures: 2400 req/min (40 req/sec)
-// Basit rate limiter: Her 20 request'te 1 saniye bekle
-static API_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static LAST_RATE_LIMIT_RESET: AtomicU64 = AtomicU64::new(0);
+// KRİTİK: En güvenli limit kullan (Spot: 20 req/sec)
+// Sliding window rate limiter: Son 1 saniyede kaç request yapıldığını takip et
+use std::sync::Mutex;
+use std::collections::VecDeque;
 
-async fn rate_limit_guard() {
-    let count = API_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let last_reset = LAST_RATE_LIMIT_RESET.load(Ordering::Relaxed);
-    
-    // Her 20 request'te veya 1 saniyede bir reset
-    if count % 20 == 0 || now_secs.saturating_sub(last_reset) >= 1 {
-        LAST_RATE_LIMIT_RESET.store(now_secs, Ordering::Relaxed);
-        // Her 20 request'te 50ms bekle (20 req/sec limit için güvenli)
-        if count % 20 == 0 && count > 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+struct RateLimiter {
+    requests: Mutex<VecDeque<Instant>>,
+    max_requests_per_sec: u32,
+    min_interval_ms: u64,
+}
+
+impl RateLimiter {
+    fn new(max_requests_per_sec: u32) -> Self {
+        // Güvenlik için %20 margin ekle (20 req/sec → 16 req/sec kullan)
+        let safe_limit = (max_requests_per_sec as f64 * 0.8) as u32;
+        let min_interval_ms = 1000 / safe_limit as u64;
+        Self {
+            requests: Mutex::new(VecDeque::new()),
+            max_requests_per_sec: safe_limit,
+            min_interval_ms,
         }
     }
+    
+    async fn wait_if_needed(&self) {
+        loop {
+            let now = Instant::now();
+            let mut requests = self.requests.lock().unwrap();
+            
+            // Son 1 saniyede yapılan request'leri temizle
+            let one_sec_ago = now.checked_sub(Duration::from_secs(1)).unwrap_or(Instant::now());
+            while requests.front().map_or(false, |&t| t < one_sec_ago) {
+                requests.pop_front();
+            }
+            
+            // Eğer limit aşıldıysa bekle
+            if requests.len() >= self.max_requests_per_sec as usize {
+                if let Some(oldest) = requests.front().copied() {
+                    let wait_time = oldest + Duration::from_secs(1);
+                    if wait_time > now {
+                        let sleep_duration = wait_time.duration_since(now);
+                        drop(requests); // Lock'u bırak
+                        tokio::time::sleep(sleep_duration).await;
+                        continue; // Tekrar kontrol et
+                    }
+                }
+            }
+            
+            // Minimum interval kontrolü (her request arasında minimum bekleme)
+            if let Some(last) = requests.back() {
+                let elapsed = now.duration_since(*last);
+                if elapsed.as_millis() < self.min_interval_ms as u128 {
+                    let wait = Duration::from_millis(self.min_interval_ms).saturating_sub(elapsed);
+                    if wait.as_millis() > 0 {
+                        drop(requests);
+                        tokio::time::sleep(wait).await;
+                        continue; // Tekrar kontrol et
+                    }
+                }
+            }
+            
+            // Request'i kaydet ve çık
+            requests.push_back(now);
+            break;
+        }
+    }
+}
+
+// Global rate limiter (Spot limit kullan - en güvenli)
+use std::sync::OnceLock;
+static RATE_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
+
+fn get_rate_limiter() -> &'static RateLimiter {
+    RATE_LIMITER.get_or_init(|| {
+        RateLimiter::new(20) // Spot: 20 req/sec, güvenlik için 16 req/sec kullan
+    })
+}
+
+async fn rate_limit_guard() {
+    get_rate_limiter().wait_if_needed().await;
 }
 
 struct SymbolState {
@@ -1422,6 +1481,8 @@ async fn main() -> Result<()> {
                             max_age = cfg.exec.max_order_age_ms,
                             "canceling stale order"
                         );
+                        // API Rate Limit koruması
+                        rate_limit_guard().await;
                         match &venue {
                             V::Spot(v) => {
                                 if v.cancel(&order.order_id, &symbol).await.is_ok() {
@@ -1460,6 +1521,8 @@ async fn main() -> Result<()> {
                         total_orders = state.active_orders.len(),
                         "too many active orders, canceling all to reset"
                     );
+                    // API Rate Limit koruması
+                    rate_limit_guard().await;
                     match &venue {
                         V::Spot(v) => {
                             if let Err(err) = v.cancel_all(&symbol).await {
@@ -1499,6 +1562,8 @@ async fn main() -> Result<()> {
             
             // Pozisyon bilgisini al (bir kere, tüm analizler için kullanılacak)
             // KRİTİK DÜZELTME: Bakiye yoksa bile pozisyon kontrolü yap (açık pozisyon olabilir)
+            // API Rate Limit koruması
+            rate_limit_guard().await;
             let pos = match &venue {
                 V::Spot(v) => match v.get_position(&symbol).await {
                     Ok(pos) => pos,
@@ -1553,6 +1618,8 @@ async fn main() -> Result<()> {
             }
             
             // Mark price ve funding rate'i al (bir kere, tüm analizler için kullanılacak)
+            // API Rate Limit koruması
+            rate_limit_guard().await;
             let (mark_px, funding_rate, next_funding_time) = match &venue {
                 V::Spot(v) => match v.mark_price(&symbol).await {
                     Ok(px) => (px, None, None),
@@ -1673,6 +1740,8 @@ async fn main() -> Result<()> {
                         // İlk iptal hariç, her iptal arasında bekle (stagger)
                         tokio::time::sleep(Duration::from_millis(stagger_delay_ms)).await;
                     }
+                    // API Rate Limit koruması
+                    rate_limit_guard().await;
                     match &venue {
                         V::Spot(v) => {
                             if let Err(err) = v.cancel(order_id, &symbol).await {
@@ -1935,6 +2004,8 @@ async fn main() -> Result<()> {
                     );
                     
                     // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
+                    // API Rate Limit koruması
+                    rate_limit_guard().await;
                     let cancel_result = match &venue {
                         V::Spot(v) => v.cancel_all(&symbol).await,
                         V::Fut(v) => v.cancel_all(&symbol).await,
@@ -1946,6 +2017,8 @@ async fn main() -> Result<()> {
                     // Pozisyonu kapat (reduceOnly market order) - KRİTİK DÜZELTME: Retry mekanizması
                     let mut position_closed = false;
                     for attempt in 0..3 {
+                        // API Rate Limit koruması
+                        rate_limit_guard().await;
                         let close_result = match &venue {
                             V::Spot(v) => v.close_position(&symbol).await,
                             V::Fut(v) => v.close_position(&symbol).await,
@@ -2053,11 +2126,14 @@ async fn main() -> Result<()> {
 
             if matches!(risk_action, RiskAction::Halt) {
                 warn!(%symbol, "risk halt triggered, cancelling and flattening");
+                // API Rate Limit koruması
+                rate_limit_guard().await;
                 match &venue {
                     V::Spot(v) => {
                         if let Err(err) = v.cancel_all(&symbol).await {
                             warn!(%symbol, ?err, "failed to cancel all orders during halt");
                         }
+                        rate_limit_guard().await;
                         if let Err(err) = v.close_position(&symbol).await {
                             warn!(%symbol, ?err, "failed to close position during halt");
                         }
@@ -2066,6 +2142,7 @@ async fn main() -> Result<()> {
                         if let Err(err) = v.cancel_all(&symbol).await {
                             warn!(%symbol, ?err, "failed to cancel all orders during halt");
                         }
+                        rate_limit_guard().await;
                         if let Err(err) = v.close_position(&symbol).await {
                             warn!(%symbol, ?err, "failed to close position during halt");
                         }
@@ -2436,6 +2513,8 @@ async fn main() -> Result<()> {
                     // ---- SPOT BID ----
                     if let Some((px, qty)) = quotes.bid {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot bid order");
+                        // API Rate Limit koruması
+                        rate_limit_guard().await;
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
@@ -2456,6 +2535,8 @@ async fn main() -> Result<()> {
                             let qty2 = clamp_qty_by_usd(qty, px, remaining, qty_step_local);
                             if qty2.0 > Decimal::ZERO {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, "placing extra spot bid with leftover USD");
+                                // API Rate Limit koruması
+                                rate_limit_guard().await;
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
                                         let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
@@ -2473,6 +2554,8 @@ async fn main() -> Result<()> {
                     // ---- SPOT ASK ----
                     if let Some((px, qty)) = quotes.ask {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot ask order");
+                        // API Rate Limit koruması
+                        rate_limit_guard().await;
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
@@ -2495,6 +2578,8 @@ async fn main() -> Result<()> {
                                 let qty2 = clamp_qty_by_base(qty, remaining_base, qty_step_local);
                                 if qty2.0 > Decimal::ZERO {
                                     info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining_base, "placing extra spot ask with leftover base");
+                                    // API Rate Limit koruması
+                                    rate_limit_guard().await;
                                     match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                         Ok(order_id2) => {
                                             let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
@@ -2521,6 +2606,8 @@ async fn main() -> Result<()> {
                         
                         // İlk bid emri (max 100 USD)
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
+                        // API Rate Limit koruması
+                        rate_limit_guard().await;
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
@@ -2634,6 +2721,8 @@ async fn main() -> Result<()> {
                                         if new_qty > 0.0 {
                                             let retry_qty = Qty(rust_decimal::Decimal::from_f64_retain(new_qty).unwrap_or(rust_decimal::Decimal::ZERO));
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures bid with exchange min notional");
+                                            // API Rate Limit koruması
+                                            rate_limit_guard().await;
                                             match v.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
                                                     let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty: retry_qty, created_at: Instant::now() };
@@ -2679,6 +2768,8 @@ async fn main() -> Result<()> {
                             
                             if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures bid with leftover notional");
+                                // API Rate Limit koruması
+                                rate_limit_guard().await;
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
                                         let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
@@ -2707,6 +2798,8 @@ async fn main() -> Result<()> {
                         
                         // İlk ask emri (max 100 USD)
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
+                        // API Rate Limit koruması
+                        rate_limit_guard().await;
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
@@ -2820,6 +2913,8 @@ async fn main() -> Result<()> {
                                         if new_qty > 0.0 {
                                             let retry_qty = Qty(rust_decimal::Decimal::from_f64_retain(new_qty).unwrap_or(rust_decimal::Decimal::ZERO));
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures ask with exchange min notional");
+                                            // API Rate Limit koruması
+                                            rate_limit_guard().await;
                                             match v.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
                                                     let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty: retry_qty, created_at: Instant::now() };
@@ -2865,6 +2960,8 @@ async fn main() -> Result<()> {
                             
                             if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures ask with leftover notional");
+                                // API Rate Limit koruması
+                                rate_limit_guard().await;
                                 match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                     Ok(order_id2) => {
                                         let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
@@ -2907,3 +3004,4 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 #[path = "position_order_tests.rs"]
 mod position_order_tests;
+
