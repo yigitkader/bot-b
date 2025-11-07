@@ -27,6 +27,8 @@ struct SymbolState {
     // --- eklendi: min notional öğrenme ve devre dışı bırakma ---
     min_notional_req: Option<f64>, // borsa min notional (quote cinsinden)
     disabled: bool,                // min_notional > max_usd_per_order => kalıcı disable
+    // --- PER-SYMBOL METADATA: Exchange'den çekilen tick_size ve step_size ---
+    symbol_rules: Option<std::sync::Arc<exec::binance::SymbolRules>>, // Per-symbol metadata (fallback: global cfg)
     // --- AKILLI TAKİP: Pozisyon ve emir durumu analizi ---
     last_position_check: Option<Instant>, // Son pozisyon kontrol zamanı
     last_order_sync: Option<Instant>,     // Son emir senkronizasyon zamanı
@@ -106,6 +108,54 @@ struct StratCfg {
     base_size: String,
     #[serde(default)]
     inv_cap: Option<String>,
+    // --- Spread ve Fiyatlama Eşikleri ---
+    #[serde(default)]
+    min_spread_bps: Option<f64>,
+    #[serde(default)]
+    max_spread_bps: Option<f64>,
+    #[serde(default)]
+    spread_arbitrage_min_bps: Option<f64>,
+    #[serde(default)]
+    spread_arbitrage_max_bps: Option<f64>,
+    // --- Trend Takibi Eşikleri ---
+    #[serde(default)]
+    strong_trend_bps: Option<f64>,
+    #[serde(default)]
+    momentum_strong_bps: Option<f64>,
+    #[serde(default)]
+    trend_bias_multiplier: Option<f64>,
+    // --- Adverse Selection Eşikleri ---
+    #[serde(default)]
+    adverse_selection_threshold_on: Option<f64>,
+    #[serde(default)]
+    adverse_selection_threshold_off: Option<f64>,
+    // --- Fırsat Modu Eşikleri ---
+    #[serde(default)]
+    opportunity_threshold_on: Option<f64>,
+    #[serde(default)]
+    opportunity_threshold_off: Option<f64>,
+    // --- Manipülasyon Tespit Eşikleri ---
+    #[serde(default)]
+    price_jump_threshold_bps: Option<f64>,
+    #[serde(default)]
+    fake_breakout_threshold_bps: Option<f64>,
+    #[serde(default)]
+    liquidity_drop_threshold: Option<f64>,
+    // --- Envanter Yönetimi ---
+    #[serde(default)]
+    inventory_threshold_ratio: Option<f64>,
+    // --- Adaptif Spread Katsayıları ---
+    #[serde(default)]
+    volatility_coefficient: Option<f64>,
+    #[serde(default)]
+    ofi_coefficient: Option<f64>,
+    // --- Diğer ---
+    #[serde(default)]
+    min_liquidity_required: Option<f64>,
+    #[serde(default)]
+    opportunity_size_multiplier: Option<f64>,
+    #[serde(default)]
+    strong_trend_multiplier: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +265,20 @@ fn tif_from_cfg(s: &str) -> Tif {
     }
 }
 
+/// Per-symbol step_size kullanır, yoksa fallback olarak global qty_step kullanır
+fn get_qty_step(symbol_rules: Option<&std::sync::Arc<exec::binance::SymbolRules>>, fallback: f64) -> f64 {
+    symbol_rules
+        .map(|r| r.step_size.to_f64().unwrap_or(fallback))
+        .unwrap_or(fallback)
+}
+
+/// Per-symbol tick_size kullanır, yoksa fallback olarak global price_tick kullanır
+fn get_price_tick(symbol_rules: Option<&std::sync::Arc<exec::binance::SymbolRules>>, fallback: f64) -> f64 {
+    symbol_rules
+        .map(|r| r.tick_size.to_f64().unwrap_or(fallback))
+        .unwrap_or(fallback)
+}
+
 fn clamp_qty_by_usd(qty: Qty, px: Px, max_usd: f64, qty_step: f64) -> Qty {
     let p = px.0.to_f64().unwrap_or(0.0);
     if p <= 0.0 || max_usd <= 0.0 {
@@ -309,6 +373,27 @@ async fn main() -> Result<()> {
             10,
         )
         .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap: {}", e))?,
+        // Config'den gelen değerler (yoksa default kullanılır)
+        min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(3.0),
+        max_spread_bps: cfg.strategy.max_spread_bps.unwrap_or(100.0),
+        spread_arbitrage_min_bps: cfg.strategy.spread_arbitrage_min_bps.unwrap_or(30.0),
+        spread_arbitrage_max_bps: cfg.strategy.spread_arbitrage_max_bps.unwrap_or(200.0),
+        strong_trend_bps: cfg.strategy.strong_trend_bps.unwrap_or(100.0),
+        momentum_strong_bps: cfg.strategy.momentum_strong_bps.unwrap_or(50.0),
+        trend_bias_multiplier: cfg.strategy.trend_bias_multiplier.unwrap_or(1.0),
+        adverse_selection_threshold_on: cfg.strategy.adverse_selection_threshold_on.unwrap_or(0.6),
+        adverse_selection_threshold_off: cfg.strategy.adverse_selection_threshold_off.unwrap_or(0.4),
+        opportunity_threshold_on: cfg.strategy.opportunity_threshold_on.unwrap_or(0.5),
+        opportunity_threshold_off: cfg.strategy.opportunity_threshold_off.unwrap_or(0.2),
+        price_jump_threshold_bps: cfg.strategy.price_jump_threshold_bps.unwrap_or(150.0),
+        fake_breakout_threshold_bps: cfg.strategy.fake_breakout_threshold_bps.unwrap_or(100.0),
+        liquidity_drop_threshold: cfg.strategy.liquidity_drop_threshold.unwrap_or(0.5),
+        inventory_threshold_ratio: cfg.strategy.inventory_threshold_ratio.unwrap_or(0.05),
+        volatility_coefficient: cfg.strategy.volatility_coefficient.unwrap_or(0.5),
+        ofi_coefficient: cfg.strategy.ofi_coefficient.unwrap_or(0.5),
+        min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
+        opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(5.0),
+        strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(3.0),
     };
     let mode_lower = cfg.mode.to_lowercase();
     let strategy_name = cfg.strategy.r#type.clone();
@@ -812,6 +897,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Per-symbol metadata'yı başlangıçta çek (quantize için)
+    info!("fetching per-symbol metadata for quantization...");
     let mut states: Vec<SymbolState> = Vec::new();
     let mut symbol_index: HashMap<String, usize> = HashMap::new();
     for meta in selected {
@@ -822,6 +909,28 @@ async fn main() -> Result<()> {
             mode = %cfg.mode,
             "bot initialized assets"
         );
+        
+        // Per-symbol metadata çek (fallback: global cfg değerleri)
+        let symbol_rules = match &venue {
+            V::Spot(v) => v.rules_for(&meta.symbol).await.ok(),
+            V::Fut(v) => v.rules_for(&meta.symbol).await.ok(),
+        };
+        if let Some(ref rules) = symbol_rules {
+            info!(
+                symbol = %meta.symbol,
+                tick_size = %rules.tick_size,
+                step_size = %rules.step_size,
+                price_precision = rules.price_precision,
+                qty_precision = rules.qty_precision,
+                "fetched per-symbol metadata"
+            );
+        } else {
+            warn!(
+                symbol = %meta.symbol,
+                "failed to fetch per-symbol metadata, will use global fallback"
+            );
+        }
+        
         let strategy = build_strategy(&meta.symbol);
         let idx = states.len();
         symbol_index.insert(meta.symbol.clone(), idx);
@@ -833,6 +942,7 @@ async fn main() -> Result<()> {
             pnl_history: Vec::new(),
             min_notional_req: None,
             disabled: false,
+            symbol_rules, // Per-symbol metadata (fallback: None, global cfg kullanılır)
             last_position_check: None,
             last_order_sync: None,
             order_fill_rate: 0.5, // Başlangıçta %50 varsay
@@ -1461,8 +1571,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 
-                // İptal edilecek emirleri iptal et
-                for order_id in &orders_to_cancel {
+                // İptal edilecek emirleri iptal et (STAGGER: Her iptal arasında kısa gecikme)
+                let stagger_delay_ms = 50; // Her iptal arasında 50ms bekle
+                for (idx, order_id) in orders_to_cancel.iter().enumerate() {
+                    if idx > 0 {
+                        // İlk iptal hariç, her iptal arasında bekle (stagger)
+                        tokio::time::sleep(Duration::from_millis(stagger_delay_ms)).await;
+                    }
                     match &venue {
                         V::Spot(v) => {
                             if let Err(err) = v.cancel(order_id, &symbol).await {
@@ -1635,18 +1750,32 @@ async fn main() -> Result<()> {
                     (entry_price_f64 - mark_price_f64) / entry_price_f64
                 };
                 
-                // Kar al mantığı: %2+ kar varsa ve trend tersine dönüyorsa kapat
-                let take_profit_threshold = 0.02; // %2 kar
-                let trailing_stop_threshold = 0.01; // %1 trailing stop (peak'ten düşerse)
+                // Kar al mantığı: Daha büyük kazançlar için optimize edildi
+                // Küçük kazançlar için erken kar alma, büyük kazançlar için daha uzun tut
+                let take_profit_threshold_small = 0.01; // %1 kar (küçük pozisyonlar için)
+                let take_profit_threshold_large = 0.05; // %5 kar (büyük pozisyonlar/fırsat modu için)
+                let trailing_stop_threshold = 0.02; // %2 trailing stop (peak'ten düşerse, optimize: 0.01 → 0.02)
+                
+                // Pozisyon boyutuna göre eşik seç
+                let is_large_position = position_size_notional > 200.0; // 200 USD'den büyük = büyük pozisyon
+                let take_profit_threshold = if is_large_position {
+                    take_profit_threshold_large // Büyük pozisyonlar için daha yüksek eşik
+                } else {
+                    take_profit_threshold_small // Küçük pozisyonlar için düşük eşik
+                };
                 
                 let should_take_profit = if price_change_pct >= take_profit_threshold {
                     // Kar var, trend analizi yap
-                    if pnl_trend < -0.1 {
-                        // Trend tersine dönüyor, kar al
+                    if pnl_trend < -0.15 {
+                        // Trend tersine dönüyor (%15'ten fazla), kar al
                         true
-                    } else if state.position_hold_duration_ms > 300_000 {
-                        // 5 dakikadan fazla tutuldu ve kar var, kısmi kar al
+                    } else if state.position_hold_duration_ms > 600_000 && price_change_pct < 0.10 {
+                        // 10 dakikadan fazla tutuldu ve %10'dan az kar varsa, kısmi kar al
                         true
+                    } else if price_change_pct >= 0.10 {
+                        // %10+ kar varsa, trend hala iyiyse tut (daha büyük kazançlar için)
+                        // Sadece trend çok kötüyse kar al
+                        pnl_trend < -0.20
                     } else {
                         false
                     }
@@ -1654,15 +1783,26 @@ async fn main() -> Result<()> {
                     false
                 };
                 
-                // Trailing stop: Peak'ten %1 düşerse kapat
+                // Trailing stop: Peak'ten %2 düşerse kapat (optimize: %1 → %2, daha büyük kazançlar için)
                 let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
                 let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
                 let should_trailing_stop = if peak_pnl_f64 > 0.0 && current_pnl_f64 < peak_pnl_f64 {
                     let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
-                    drawdown_from_peak >= trailing_stop_threshold
+                    // Büyük kazançlar için daha geniş trailing stop
+                    let adjusted_threshold = if peak_pnl_f64 > 10.0 {
+                        trailing_stop_threshold * 1.5 // %3 trailing stop (büyük kazançlar için)
+                    } else {
+                        trailing_stop_threshold
+                    };
+                    drawdown_from_peak >= adjusted_threshold
                 } else {
                     false
                 };
+                
+                // Peak PnL güncelle
+                if current_pnl_f64 > peak_pnl_f64 {
+                    state.peak_pnl = current_pnl;
+                }
                 
                 // Zarar durdur: %1'den fazla zarar varsa ve trend kötüleşiyorsa kapat
                 let stop_loss_threshold = -0.01; // %1 zarar
@@ -2071,17 +2211,25 @@ async fn main() -> Result<()> {
                 quotes.ask = None;
             }
 
-            let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
+            // Per-symbol metadata kullan (fallback: global cfg)
+            let qty_step_f64 = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
+            let qty_step_dec = Decimal::from_f64_retain(qty_step_f64).unwrap_or(Decimal::ZERO);
+            
+            // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Base clamp (spot sell), 3) Quantize, 4) Min notional check
+            // min_usd_per_order > 0 doğrulaması zaten yukarıda yapıldı, burada sadece notional kontrolü yapıyoruz
 
             if let Some((px, q)) = quotes.bid {
                 if px.0 <= Decimal::ZERO {
                     warn!(%symbol, ?px, "dropping bid quote with non-positive price");
                     quotes.bid = None;
                 } else {
-                    let nq = clamp_qty_by_usd(q, px, caps.buy_notional, cfg.qty_step);
+                    // 1. USD clamp
+                    let nq = clamp_qty_by_usd(q, px, caps.buy_notional, qty_step_f64);
+                    // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
                         && nq.0 != Decimal::ZERO;
+                    // 3. Min notional kontrolü (min_usd_per_order > 0 garantisi yukarıda)
                     let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
                     if nq.0 == Decimal::ZERO
                         || quantized_to_zero
@@ -2091,7 +2239,7 @@ async fn main() -> Result<()> {
                             %symbol,
                             ?px,
                             original_qty = ?q,
-                            qty_step = cfg.qty_step,
+                            qty_step = qty_step_f64,
                             quantized_to_zero,
                             notional,
                             min_usd_per_order,
@@ -2112,13 +2260,18 @@ async fn main() -> Result<()> {
                     warn!(%symbol, ?px, "dropping ask quote with non-positive price");
                     quotes.ask = None;
                 } else {
-                    let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, cfg.qty_step);
+                    // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Base clamp (spot sell), 3) Quantize, 4) Min notional check
+                    // 1. USD clamp
+                    let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, qty_step_f64);
+                    // 2. Base clamp (spot sell için)
                     if let Some(max_base) = caps.sell_base {
-                        nq = clamp_qty_by_base(nq, max_base, cfg.qty_step);
+                        nq = clamp_qty_by_base(nq, max_base, qty_step_f64);
                     }
+                    // 3. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
                         && nq.0 != Decimal::ZERO;
+                    // 4. Min notional kontrolü (min_usd_per_order > 0 garantisi yukarıda)
                     let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
                     if nq.0 == Decimal::ZERO
                         || quantized_to_zero
@@ -2129,7 +2282,7 @@ async fn main() -> Result<()> {
                             ?px,
                             original_qty = ?q,
                             sell_base = ?caps.sell_base,
-                            qty_step = cfg.qty_step,
+                            qty_step = qty_step_f64,
                             quantized_to_zero,
                             notional,
                             min_usd_per_order,
@@ -2166,7 +2319,8 @@ async fn main() -> Result<()> {
                         let spent = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
                         let remaining = (caps.buy_total - spent).max(0.0);
                         if remaining >= min_usd_per_order && px.0 > Decimal::ZERO {
-                            let qty2 = clamp_qty_by_usd(qty, px, remaining, cfg.qty_step);
+                            let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
+                            let qty2 = clamp_qty_by_usd(qty, px, remaining, qty_step_local);
                             if qty2.0 > Decimal::ZERO {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, "placing extra spot bid with leftover USD");
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
@@ -2204,7 +2358,8 @@ async fn main() -> Result<()> {
                             let remaining_base = (base_total - spent_base).max(0.0);
                             let remaining_notional = remaining_base * px.0.to_f64().unwrap_or(0.0);
                             if remaining_notional >= min_usd_per_order && px.0 > Decimal::ZERO {
-                                let qty2 = clamp_qty_by_base(qty, remaining_base, cfg.qty_step);
+                                let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
+                                let qty2 = clamp_qty_by_base(qty, remaining_base, qty_step_local);
                                 if qty2.0 > Decimal::ZERO {
                                     info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining_base, "placing extra spot ask with leftover base");
                                     match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
@@ -2383,7 +2538,8 @@ async fn main() -> Result<()> {
                             // order_size = margin, notional = margin * leverage
                             let order_size_margin = remaining.min(cfg.max_usd_per_order);
                             let order_size_notional = order_size_margin * effective_leverage; // Pozisyon boyutu
-                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, cfg.qty_step);
+                            let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
+                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, qty_step_local);
                             let qty2_notional = (px.0.to_f64().unwrap_or(0.0)) * (qty2.0.to_f64().unwrap_or(0.0));
                             
                             if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
@@ -2446,9 +2602,10 @@ async fn main() -> Result<()> {
                                         }
                                         // order_cap = pozisyon boyutu (notional), margin değil
                                         // ÖNEMLİ: Fiyat ve miktar quantize edilecek, bu yüzden quantize edilmiş değerleri kullan
+                                        // Per-symbol metadata kullan (fallback: global cfg)
                                         let price_raw = px.0.to_f64().unwrap_or(0.0);
-                                        let price_tick = cfg.price_tick;
-                                        let step = cfg.qty_step;
+                                        let price_tick = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
+                                        let step = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
                                         
                                         // Fiyatı quantize et (place_limit içinde yapılan işlem)
                                         let price_quantized = if price_tick > 0.0 {
@@ -2565,7 +2722,8 @@ async fn main() -> Result<()> {
                             // order_size = margin, notional = margin * leverage
                             let order_size_margin = remaining.min(cfg.max_usd_per_order);
                             let order_size_notional = order_size_margin * effective_leverage_ask; // Pozisyon boyutu
-                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, cfg.qty_step);
+                            let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
+                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, qty_step_local);
                             let qty2_notional = (px.0.to_f64().unwrap_or(0.0)) * (qty2.0.to_f64().unwrap_or(0.0));
                             
                             if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {

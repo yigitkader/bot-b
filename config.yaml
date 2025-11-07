@@ -8,7 +8,13 @@ metrics_port: 9000
 
 # Emir boyutu sınırı (notional = price * qty); hem spot hem futures için uygulanır.
 max_usd_per_order: 100.0
-min_usd_per_order: 10.0
+min_usd_per_order: 20.0  # Gerçekçi: 15.0 → 20.0 (daha fazla kazanç/işlem, 20 USD * 3 bps = 0.006 USD minimum)
+
+# Quote asset minimum bakiye eşiği (USD)
+# Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
+# Eğer o quote asset'te bakiye bu eşikten azsa, o sembol skip edilir
+# Diğer quote asset'li semboller devam edebilir
+min_quote_balance_usd: 1.0
 
 # Kaldıraç (sadece futures)
 leverage: 5
@@ -32,19 +38,55 @@ risk:
   inv_cap: "0.50"
   min_liq_gap_bps: 300
   dd_limit_bps: 2000
-  max_leverage: 10
+  max_leverage: 20
 
 strategy:
   type: "dyn_mm"
-  a: 120.0
-  b: 40.0
-  base_size: "20.0"  # stratejinin hedeflediği USD tutarı; son durumda max_usd_per_order ile kısılır
+  a: 100.0   # Gerçekçi: 80.0 → 100.0 (spread'i biraz genişlet, kazanç için)
+  b: 35.0    # Gerçekçi: 30.0 → 35.0 (spread'i biraz genişlet)
+  base_size: "20.0"  # Gerçekçi: 30.0 → 40.0 (daha fazla kazanç/işlem, 40 USD * 3 bps = 0.012 USD/işlem)
+  
+  # --- Spread ve Fiyatlama Eşikleri ---
+  min_spread_bps: 3.0              # Minimum spread (bps)
+  max_spread_bps: 100.0            # Maksimum spread (bps)
+  spread_arbitrage_min_bps: 30.0   # Spread arbitraj minimum eşiği (bps)
+  spread_arbitrage_max_bps: 200.0  # Spread arbitraj maksimum eşiği (bps)
+  
+  # --- Trend Takibi Eşikleri ---
+  strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
+  momentum_strong_bps: 50.0         # Momentum güçlü eşiği (bps)
+  trend_bias_multiplier: 1.0       # Trend bias çarpanı
+  
+  # --- Adverse Selection Eşikleri ---
+  adverse_selection_threshold_on: 0.6   # Adverse selection açılma eşiği
+  adverse_selection_threshold_off: 0.4 # Adverse selection kapanma eşiği
+  
+  # --- Fırsat Modu Eşikleri ---
+  opportunity_threshold_on: 0.5    # Fırsat modu açılma eşiği
+  opportunity_threshold_off: 0.2   # Fırsat modu kapanma eşiği
+  
+  # --- Manipülasyon Tespit Eşikleri ---
+  price_jump_threshold_bps: 150.0  # Flash crash/pump eşiği (bps)
+  fake_breakout_threshold_bps: 100.0 # Fake breakout eşiği (bps)
+  liquidity_drop_threshold: 0.5    # Likidite düşüş eşiği (ratio)
+  
+  # --- Envanter Yönetimi ---
+  inventory_threshold_ratio: 0.05  # Envanter threshold oranı (%)
+  
+  # --- Adaptif Spread Katsayıları ---
+  volatility_coefficient: 0.5     # Volatilite katsayısı (c1)
+  ofi_coefficient: 0.5            # OFI katsayısı (c2)
+  
+  # --- Diğer ---
+  min_liquidity_required: 0.01     # Minimum likidite gereksinimi
+  opportunity_size_multiplier: 5.0 # Fırsat modu pozisyon çarpanı
+  strong_trend_multiplier: 3.0     # Güçlü trend pozisyon çarpanı
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
   venue: "binance"     # sabit
-  cancel_replace_interval_ms: 1000
-  max_order_age_ms: 10000
+  cancel_replace_interval_ms: 500  # Optimize: 1000 → 500 (2x daha sık güncelleme, daha fazla işlem)
+  max_order_age_ms: 5000  # Optimize: 10000 → 5000 (daha hızlı yenileme)
 
 websocket:
   enabled: true

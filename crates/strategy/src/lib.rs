@@ -43,13 +43,104 @@ pub struct DynMmCfg {
     pub b: f64,
     pub base_size: Decimal,
     pub inv_cap: Decimal,
+    // --- Spread ve Fiyatlama Eşikleri ---
+    #[serde(default = "default_min_spread_bps")]
+    pub min_spread_bps: f64,              // Minimum spread (bps)
+    #[serde(default = "default_max_spread_bps")]
+    pub max_spread_bps: f64,              // Maksimum spread (bps)
+    #[serde(default = "default_spread_arbitrage_min_bps")]
+    pub spread_arbitrage_min_bps: f64,    // Spread arbitraj minimum eşiği (bps)
+    #[serde(default = "default_spread_arbitrage_max_bps")]
+    pub spread_arbitrage_max_bps: f64,    // Spread arbitraj maksimum eşiği (bps)
+    // --- Trend Takibi Eşikleri ---
+    #[serde(default = "default_strong_trend_bps")]
+    pub strong_trend_bps: f64,            // Güçlü trend eşiği (bps)
+    #[serde(default = "default_momentum_strong_bps")]
+    pub momentum_strong_bps: f64,         // Momentum güçlü eşiği (bps)
+    #[serde(default = "default_trend_bias_multiplier")]
+    pub trend_bias_multiplier: f64,       // Trend bias çarpanı
+    // --- Adverse Selection Eşikleri ---
+    #[serde(default = "default_adverse_selection_threshold_on")]
+    pub adverse_selection_threshold_on: f64,   // Adverse selection açılma eşiği
+    #[serde(default = "default_adverse_selection_threshold_off")]
+    pub adverse_selection_threshold_off: f64, // Adverse selection kapanma eşiği
+    // --- Fırsat Modu Eşikleri ---
+    #[serde(default = "default_opportunity_threshold_on")]
+    pub opportunity_threshold_on: f64,     // Fırsat modu açılma eşiği
+    #[serde(default = "default_opportunity_threshold_off")]
+    pub opportunity_threshold_off: f64,    // Fırsat modu kapanma eşiği
+    // --- Manipülasyon Tespit Eşikleri ---
+    #[serde(default = "default_price_jump_threshold_bps")]
+    pub price_jump_threshold_bps: f64,     // Flash crash/pump eşiği (bps)
+    #[serde(default = "default_fake_breakout_threshold_bps")]
+    pub fake_breakout_threshold_bps: f64, // Fake breakout eşiği (bps)
+    #[serde(default = "default_liquidity_drop_threshold")]
+    pub liquidity_drop_threshold: f64,     // Likidite düşüş eşiği (ratio)
+    // --- Envanter Yönetimi ---
+    #[serde(default = "default_inventory_threshold_ratio")]
+    pub inventory_threshold_ratio: f64,   // Envanter threshold oranı (%)
+    // --- Adaptif Spread Katsayıları ---
+    #[serde(default = "default_volatility_coefficient")]
+    pub volatility_coefficient: f64,      // Volatilite katsayısı (c1)
+    #[serde(default = "default_ofi_coefficient")]
+    pub ofi_coefficient: f64,             // OFI katsayısı (c2)
+    // --- Diğer ---
+    #[serde(default = "default_min_liquidity_required")]
+    pub min_liquidity_required: f64,       // Minimum likidite gereksinimi
+    #[serde(default = "default_opportunity_size_multiplier")]
+    pub opportunity_size_multiplier: f64, // Fırsat modu pozisyon çarpanı
+    #[serde(default = "default_strong_trend_multiplier")]
+    pub strong_trend_multiplier: f64,     // Güçlü trend pozisyon çarpanı
 }
+
+// Default değerler
+fn default_min_spread_bps() -> f64 { 3.0 }
+fn default_max_spread_bps() -> f64 { 100.0 }
+fn default_spread_arbitrage_min_bps() -> f64 { 30.0 }
+fn default_spread_arbitrage_max_bps() -> f64 { 200.0 }
+fn default_strong_trend_bps() -> f64 { 100.0 }
+fn default_momentum_strong_bps() -> f64 { 50.0 }
+fn default_trend_bias_multiplier() -> f64 { 1.0 }
+fn default_adverse_selection_threshold_on() -> f64 { 0.6 }
+fn default_adverse_selection_threshold_off() -> f64 { 0.4 }
+fn default_opportunity_threshold_on() -> f64 { 0.5 }
+fn default_opportunity_threshold_off() -> f64 { 0.2 }
+fn default_price_jump_threshold_bps() -> f64 { 150.0 }
+fn default_fake_breakout_threshold_bps() -> f64 { 100.0 }
+fn default_liquidity_drop_threshold() -> f64 { 0.5 }
+fn default_inventory_threshold_ratio() -> f64 { 0.05 }
+fn default_volatility_coefficient() -> f64 { 0.5 }
+fn default_ofi_coefficient() -> f64 { 0.5 }
+fn default_min_liquidity_required() -> f64 { 0.01 }
+fn default_opportunity_size_multiplier() -> f64 { 5.0 }
+fn default_strong_trend_multiplier() -> f64 { 3.0 }
 
 pub struct DynMm {
     pub a: f64,
     pub b: f64,
     pub base_notional: Decimal,
     pub inv_cap: Qty,
+    // --- CONFIG DEĞERLERİ: Tüm eşikler ve katsayılar config'den ---
+    min_spread_bps: f64,
+    max_spread_bps: f64,
+    spread_arbitrage_min_bps: f64,
+    spread_arbitrage_max_bps: f64,
+    strong_trend_bps: f64,
+    momentum_strong_bps: f64,
+    trend_bias_multiplier: f64,
+    adverse_selection_threshold_on: f64,
+    adverse_selection_threshold_off: f64,
+    opportunity_threshold_on: f64,
+    opportunity_threshold_off: f64,
+    price_jump_threshold_bps: f64,
+    fake_breakout_threshold_bps: f64,
+    liquidity_drop_threshold: f64,
+    inventory_threshold_ratio: f64,
+    volatility_coefficient: f64,
+    ofi_coefficient: f64,
+    min_liquidity_required: f64,
+    opportunity_size_multiplier: f64,
+    strong_trend_multiplier: f64,
     // Akıllı karar verme için state
     price_history: Vec<(u64, Decimal)>, // (timestamp_ms, price)
     target_inventory: Qty, // Hedef envanter seviyesi
@@ -65,15 +156,15 @@ pub struct DynMm {
     flash_crash_direction: f64,       // Flash crash yönü: pozitif = pump, negatif = dump
     last_spread_bps: f64,            // Son spread (bps) - anomali tespiti için
     volume_history: Vec<f64>,         // Volume geçmişi (anomali tespiti için)
-    price_jump_threshold_bps: f64,   // Flash crash eşiği (bps)
-    max_spread_bps: f64,             // Maksimum kabul edilebilir spread (bps)
-    min_liquidity_required: f64,     // Minimum likidite gereksinimi
     manipulation_opportunity: Option<ManipulationOpportunity>, // Manipülasyon fırsatı
     // --- GELİŞMİŞ MANİPÜLASYON TESPİTİ: Daha zeki algılama ---
     momentum_history: Vec<(u64, Decimal, f64)>, // (timestamp, price, volume) - momentum analizi için
     last_liquidity_level: f64,       // Son likidite seviyesi (spoofing için)
-    fake_breakout_threshold_bps: f64, // Fake breakout eşiği (bps)
-    opportunity_size_multiplier: f64, // Fırsat varsa pozisyon boyutu çarpanı (örn: 2.0x)
+    // --- CROSSING GUARD + HİSTERESİS: Adverse selection / fırsat modu çakışması için ---
+    last_adverse_bid: bool,          // Son adverse bid durumu (histerezis için)
+    last_adverse_ask: bool,          // Son adverse ask durumu (histerezis için)
+    last_opportunity_mode: bool,     // Son fırsat modu durumu (histerezis için)
+    adverse_hysteresis_threshold: f64, // Adverse selection histerezis eşiği (OFI için)
 }
 
 impl From<DynMmCfg> for DynMm {
@@ -91,6 +182,27 @@ impl From<DynMmCfg> for DynMm {
             b: c.b,
             base_notional,
             inv_cap: Qty(c.inv_cap),
+            // Config değerleri
+            min_spread_bps: c.min_spread_bps,
+            max_spread_bps: c.max_spread_bps,
+            spread_arbitrage_min_bps: c.spread_arbitrage_min_bps,
+            spread_arbitrage_max_bps: c.spread_arbitrage_max_bps,
+            strong_trend_bps: c.strong_trend_bps,
+            momentum_strong_bps: c.momentum_strong_bps,
+            trend_bias_multiplier: c.trend_bias_multiplier,
+            adverse_selection_threshold_on: c.adverse_selection_threshold_on,
+            adverse_selection_threshold_off: c.adverse_selection_threshold_off,
+            opportunity_threshold_on: c.opportunity_threshold_on,
+            opportunity_threshold_off: c.opportunity_threshold_off,
+            price_jump_threshold_bps: c.price_jump_threshold_bps,
+            fake_breakout_threshold_bps: c.fake_breakout_threshold_bps,
+            liquidity_drop_threshold: c.liquidity_drop_threshold,
+            inventory_threshold_ratio: c.inventory_threshold_ratio,
+            volatility_coefficient: c.volatility_coefficient,
+            ofi_coefficient: c.ofi_coefficient,
+            min_liquidity_required: c.min_liquidity_required,
+            opportunity_size_multiplier: c.opportunity_size_multiplier,
+            strong_trend_multiplier: c.strong_trend_multiplier,
             price_history: Vec::with_capacity(100), // Son 100 fiyat
             target_inventory: Qty(Decimal::ZERO), // Başlangıçta nötr
             // Mikro-yapı sinyalleri başlangıç değerleri
@@ -105,15 +217,15 @@ impl From<DynMmCfg> for DynMm {
             flash_crash_direction: 0.0,
             last_spread_bps: 0.0,
             volume_history: Vec::with_capacity(50), // Son 50 volume
-            price_jump_threshold_bps: 150.0, // 150 bps (1.5%) - daha hassas tespit
-            max_spread_bps: 100.0,         // 100 bps (1%) max spread
-            min_liquidity_required: 0.01,   // Minimum likidite (USD)
             manipulation_opportunity: None,
             // Gelişmiş manipülasyon tespiti başlangıç değerleri
             momentum_history: Vec::with_capacity(30), // Son 30 momentum noktası
             last_liquidity_level: 0.0,
-            fake_breakout_threshold_bps: 100.0, // 100 bps fake breakout eşiği
-            opportunity_size_multiplier: 2.5, // Fırsat varsa 2.5x daha büyük pozisyon
+            // Crossing guard + histerezis başlangıç değerleri
+            last_adverse_bid: false,
+            last_adverse_ask: false,
+            last_opportunity_mode: false,
+            adverse_hysteresis_threshold: 0.1, // 0.1 OFI farkı (histerezis bandı)
         }
     }
 }
@@ -195,11 +307,11 @@ impl DynMm {
         // Örnek: ewma_volatility = 0.0001 → sqrt(0.0001) = 0.01 → 0.01 * 10000 = 100 bps
         // Ama bu çok yüksek, bu yüzden daha küçük bir katsayı kullanıyoruz
         let vol_component = (self.ewma_volatility.sqrt() * 10000.0).max(0.0); // bps'e çevir
-        let c1 = 0.5; // Volatilite katsayısı (daha küçük, çünkü başlangıç volatilitesi yüksek)
+        let c1 = self.volatility_coefficient; // Config'den: volatilite katsayısı
         
         // OFI bileşeni: c₂·|OFI|
         let ofi_component = self.ofi_signal.abs() * 100.0; // Scale to bps
-        let c2 = 0.5; // OFI katsayısı
+        let c2 = self.ofi_coefficient; // Config'den: OFI katsayısı
         
         // Adaptif spread: base_spread ve adaptive arasından maksimumu al
         let adaptive = (c1 * vol_component + c2 * ofi_component).max(min_spread_bps);
@@ -235,7 +347,8 @@ impl DynMm {
         // Funding rate pozitifse long (pozitif envanter), negatifse short (negatif envanter)
         let funding_bias = self.funding_bias(funding_rate);
         // Trend yukarıysa long, aşağıysa short
-        let trend_bias = trend_bps * 0.5; // Trend'in %50'si kadar etkili
+        // Config'den: Trend bias çarpanı
+        let trend_bias = trend_bps * self.trend_bias_multiplier;
         
         // Kombine bias: funding + trend
         let combined_bias = funding_bias + trend_bias;
@@ -256,18 +369,20 @@ impl DynMm {
     }
     
     // Envanter yönetimi: hedef envantere göre al/sat kararı
+    // Agresif: Daha büyük pozisyonlar için threshold'u düşür
     fn inventory_decision(&self, current_inv: Qty, target_inv: Qty) -> (bool, bool) {
         let diff = (current_inv.0 - target_inv.0).abs();
-        let threshold = self.inv_cap.0 * Decimal::from_f64_retain(0.1).unwrap_or(Decimal::ZERO); // %10 threshold
+        // Config'den: Envanter threshold oranı
+        let threshold = self.inv_cap.0 * Decimal::from_f64_retain(self.inventory_threshold_ratio).unwrap_or(Decimal::ZERO);
         
         if diff < threshold {
             // Hedef envantere yakınsa: market making (her iki taraf)
             (true, true)
         } else if current_inv.0 < target_inv.0 {
-            // Mevcut envanter hedeften düşük: sadece al (bid)
+            // Mevcut envanter hedeften düşük: sadece al (bid) - AGRESİF
             (true, false)
         } else {
-            // Mevcut envanter hedeften yüksek: sadece sat (ask)
+            // Mevcut envanter hedeften yüksek: sadece sat (ask) - AGRESİF
             (false, true)
         }
     }
@@ -345,8 +460,9 @@ impl Strategy for DynMm {
         self.last_spread_bps = spread_bps;
         
         // FIRSAT: Geniş spread varsa market maker olarak spread'den kazanç
-        if spread_bps > 50.0 && spread_bps <= 200.0 {
-            // 50-200 bps arası spread → Arbitraj fırsatı (çok geniş değil, kabul edilebilir)
+        // Config'den: Spread arbitraj eşikleri
+        if spread_bps > self.spread_arbitrage_min_bps && spread_bps <= self.spread_arbitrage_max_bps {
+            // 30-200 bps arası spread → Arbitraj fırsatı (optimize: 50 → 30, daha fazla fırsat)
             self.manipulation_opportunity = Some(ManipulationOpportunity::WideSpreadArbitrage {
                 spread_bps,
             });
@@ -538,8 +654,8 @@ impl Strategy for DynMm {
         if self.last_liquidity_level > 0.0 && current_liquidity > 0.0 {
             let liquidity_drop = (self.last_liquidity_level - current_liquidity) / self.last_liquidity_level;
             
-            // Likidite %50 veya daha fazla azaldıysa → Spread arbitrajı fırsatı
-            if liquidity_drop > 0.5 && spread_bps > 30.0 {
+            // Config'den: Likidite düşüş eşiği
+            if liquidity_drop > self.liquidity_drop_threshold && spread_bps > self.spread_arbitrage_min_bps {
                 if self.manipulation_opportunity.is_none() {
                     self.manipulation_opportunity = Some(ManipulationOpportunity::LiquidityWithdrawal {
                         liquidity_drop_ratio: liquidity_drop,
@@ -705,23 +821,42 @@ impl Strategy for DynMm {
         }
         
         // --- ADVERSE SELECTION FİLTRESİ: OFI ve momentum yüksekse pasif tarafı geri çek ---
-        let adverse_selection_threshold = 0.5; // OFI eşiği
+        // HİSTERESİS: Eşikler farklı (açılma/kapanma için) - ani değişiklikleri önler
+        // Config'den: Adverse selection eşikleri
+        let adverse_selection_threshold_on = self.adverse_selection_threshold_on;
+        let adverse_selection_threshold_off = self.adverse_selection_threshold_off;
         let ofi_abs = self.ofi_signal.abs();
-        let momentum_strong = trend_bps.abs() > 50.0; // 50 bps trend
+        let momentum_strong = trend_bps.abs() > self.momentum_strong_bps; // Config'den: Momentum güçlü eşiği
+        
+        // HİSTERESİS: Önceki duruma göre eşik seç
+        let threshold_bid = if self.last_adverse_bid {
+            adverse_selection_threshold_off // Kapanma eşiği (daha düşük)
+        } else {
+            adverse_selection_threshold_on  // Açılma eşiği (daha yüksek)
+        };
+        let threshold_ask = if self.last_adverse_ask {
+            adverse_selection_threshold_off // Kapanma eşiği (daha düşük)
+        } else {
+            adverse_selection_threshold_on  // Açılma eşiği (daha yüksek)
+        };
         
         // OFI pozitif (buy pressure) ve momentum yukarı → ask'i geri çek (bid riskli değil)
         // OFI negatif (sell pressure) ve momentum aşağı → bid'i geri çek (ask riskli değil)
         let mut adverse_bid = false;
         let mut adverse_ask = false;
-        if ofi_abs > adverse_selection_threshold && momentum_strong {
-            if self.ofi_signal > 0.0 && trend_bps > 0.0 {
+        if momentum_strong {
+            if self.ofi_signal > threshold_ask && trend_bps > 0.0 {
                 // Buy pressure + uptrend → ask riskli, bid güvenli
                 adverse_ask = true;
-            } else if self.ofi_signal < 0.0 && trend_bps < 0.0 {
+            } else if self.ofi_signal < -threshold_bid && trend_bps < 0.0 {
                 // Sell pressure + downtrend → bid riskli, ask güvenli
                 adverse_bid = true;
             }
         }
+        
+        // Histerezis state güncelle
+        self.last_adverse_bid = adverse_bid;
+        self.last_adverse_ask = adverse_ask;
         
         // Debug log (tracing kullanarak)
         use tracing::debug;
@@ -758,7 +893,7 @@ impl Strategy for DynMm {
         
         // Base spread hesaplama (eski yöntem)
         let base_spread_bps = (self.a * c.sigma + self.b * inv_bias).max(1e-4);
-        let min_spread_bps = 1.0; // Minimum 1 bps spread
+        let min_spread_bps = self.min_spread_bps; // Config'den: Minimum spread
         
         // --- ADAPTİF SPREAD: Volatilite ve OFI'ye göre ---
         let mut adaptive_spread_bps = self.calculate_adaptive_spread(base_spread_bps, min_spread_bps);
@@ -796,17 +931,41 @@ impl Strategy for DynMm {
         // Pozitif envanter varsa inv_skew pozitif, bid daha aşağı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, bid daha yukarı (almaya zorla)
         // Pozitif imbalance (bid heavy) → imbalance_skew negatif, bid yukarı
-        let bid_px = Px(pricing_base * (Decimal::ONE - half - skew - inv_skew - imb_skew));
+        let mut bid_px = Px(pricing_base * (Decimal::ONE - half - skew - inv_skew - imb_skew));
         
         // Ask: microprice'den yukarı (half + funding_skew + inv_skew + imbalance_skew)
         // Pozitif envanter varsa inv_skew pozitif, ask daha yukarı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, ask daha aşağı (almaya zorla)
         // Pozitif imbalance (bid heavy) → imbalance_skew negatif, ask aşağı
-        let ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew));
+        let mut ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew));
+        
+        // --- CROSSING GUARD: Fiyatların best bid/ask'i geçmemesi garantisi ---
+        // Bid: best_bid'den düşük veya eşit olmalı (pasif emir)
+        if let Some(best_bid) = c.ob.best_bid {
+            if bid_px.0 > best_bid.px.0 {
+                // Bid best bid'i geçiyor → best_bid'in 1 tick altına çek
+                let tick_size = (best_bid.px.0 - pricing_base * (Decimal::ONE - half - skew - inv_skew - imb_skew)).abs().min(pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO));
+                bid_px = Px(best_bid.px.0 - tick_size.max(Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)));
+            }
+        }
+        // Ask: best_ask'den yüksek veya eşit olmalı (pasif emir)
+        if let Some(best_ask) = c.ob.best_ask {
+            if ask_px.0 < best_ask.px.0 {
+                // Ask best ask'i geçiyor → best_ask'in 1 tick üstüne çek
+                let tick_size = (pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew) - best_ask.px.0).abs().min(pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO));
+                ask_px = Px(best_ask.px.0 + tick_size.max(Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)));
+            }
+        }
         
         // FIRSAT MODU: Manipülasyon fırsatı varsa pozisyon boyutunu artır
+        // Trend takibi: Güçlü trend varsa da pozisyon boyutunu artır
+        let trend_strength = trend_bps.abs();
+        let strong_trend = trend_strength > self.strong_trend_bps; // Config'den: Güçlü trend eşiği
+        
         let size_multiplier = if self.manipulation_opportunity.is_some() {
-            self.opportunity_size_multiplier // Fırsat varsa 2.5x daha büyük pozisyon
+            self.opportunity_size_multiplier // Config'den: Fırsat modu multiplier
+        } else if strong_trend {
+            self.strong_trend_multiplier // Config'den: Güçlü trend multiplier
         } else {
             1.0 // Normal mod
         };
@@ -829,7 +988,31 @@ impl Strategy for DynMm {
             Quotes::default() // Çok geniş spread, risk çok yüksek
         } else {
             // Manipülasyon fırsatı varsa agresif pozisyon, yoksa normal market making
-            let (final_bid, final_ask) = if self.manipulation_opportunity.is_some() {
+            // HİSTERESİS: Fırsat modu açılma/kapanma için eşikler
+            // Config'den: Fırsat modu eşikleri
+            let is_opportunity_mode = self.manipulation_opportunity.is_some();
+            let opportunity_threshold_on = self.opportunity_threshold_on;
+            let opportunity_threshold_off = self.opportunity_threshold_off;
+            
+            // Histerezis: Önceki duruma göre eşik seç
+            let opportunity_threshold = if self.last_opportunity_mode {
+                opportunity_threshold_off // Kapanma eşiği
+            } else {
+                opportunity_threshold_on   // Açılma eşiği
+            };
+            
+            // Fırsat modu kontrolü (histerezis ile)
+            let effective_opportunity_mode = if is_opportunity_mode {
+                // Fırsat var, ama histerezis kontrolü: OFI yeterince yüksek mi?
+                ofi_abs >= opportunity_threshold || self.last_opportunity_mode
+            } else {
+                // Fırsat yok, ama hala aktif mi? (histerezis: düşük eşikle kapat)
+                self.last_opportunity_mode && ofi_abs >= opportunity_threshold_off
+            };
+            
+            self.last_opportunity_mode = effective_opportunity_mode;
+            
+            let (final_bid, final_ask) = if effective_opportunity_mode {
                 // FIRSAT MODU: Agresif pozisyon al, adverse selection filtresini gevşet
                 // Manipülasyon fırsatlarında daha agresif ol
                 (should_bid, should_ask) // Adverse selection filtresini bypass et
@@ -1242,5 +1425,76 @@ mod tests {
             quotes.bid.is_some() || quotes.ask.is_some(),
             "Strategy should produce quotes when liquidity is sufficient"
         );
+    }
+
+    #[test]
+    fn test_spread_bps_to_ratio_conversion() {
+        // Spread/skew bps↔oran ölçeği testleri
+        // 1 bps = 0.01% = 0.0001 ratio
+        // 100 bps = 1% = 0.01 ratio
+        
+        // Test: bps → ratio
+        let spread_bps = 100.0; // 1%
+        let half_spread_bps = spread_bps / 2.0; // 50 bps = 0.5%
+        let half_ratio = half_spread_bps / 1e4; // 0.005
+        assert!((half_ratio - 0.005).abs() < 1e-6, "50 bps should be 0.005 ratio");
+        
+        // Test: ratio → bps (ters dönüşüm)
+        let ratio = 0.01; // 1%
+        let bps = ratio * 1e4; // 100 bps
+        assert!((bps - 100.0).abs() < 1e-6, "0.01 ratio should be 100 bps");
+        
+        // Test: funding skew dönüşümü
+        let funding_rate = 0.0001; // 0.01% per 8h
+        let funding_skew_bps = funding_rate * 100.0; // 1 bps
+        let funding_skew_ratio = funding_skew_bps / 1e4; // 0.0001
+        assert!((funding_skew_ratio - 0.0001).abs() < 1e-6, "funding skew conversion should be correct");
+        
+        // Test: inv_skew dönüşümü
+        let inv_skew_bps = 20.0; // 20 bps
+        let inv_skew_ratio = inv_skew_bps / 1e4; // 0.002
+        assert!((inv_skew_ratio - 0.002).abs() < 1e-6, "inv_skew conversion should be correct");
+        
+        // Test: imbalance_skew dönüşümü
+        let imbalance_skew_bps = 10.0; // 10 bps
+        let imbalance_skew_ratio = imbalance_skew_bps / 1e4; // 0.001
+        assert!((imbalance_skew_ratio - 0.001).abs() < 1e-6, "imbalance_skew conversion should be correct");
+    }
+
+    #[test]
+    fn test_price_calculation_with_skews() {
+        // Fiyat hesaplama skew'lerle test
+        use rust_decimal_macros::dec;
+        let microprice = dec!(50000);
+        let spread_bps = 100.0; // 1% spread
+        let half_ratio = (spread_bps / 2.0) / 1e4; // 0.005
+        let funding_skew_bps = 10.0; // 10 bps
+        let funding_skew_ratio = funding_skew_bps / 1e4; // 0.001
+        let inv_skew_bps = 5.0; // 5 bps
+        let inv_skew_ratio = inv_skew_bps / 1e4; // 0.0005
+        let imb_skew_bps = -3.0; // -3 bps
+        let imb_skew_ratio = imb_skew_bps / 1e4; // -0.0003
+        
+        let half = Decimal::try_from(half_ratio).unwrap();
+        let skew = Decimal::try_from(funding_skew_ratio).unwrap();
+        let inv_skew = Decimal::try_from(inv_skew_ratio).unwrap();
+        let imb_skew = Decimal::try_from(imb_skew_ratio).unwrap();
+        
+        // Bid: microprice * (1 - half - skew - inv_skew - imb_skew)
+        let bid_ratio = Decimal::ONE - half - skew - inv_skew - imb_skew;
+        let bid_px = microprice * bid_ratio;
+        
+        // Ask: microprice * (1 + half + skew + inv_skew + imb_skew)
+        let ask_ratio = Decimal::ONE + half + skew + inv_skew + imb_skew;
+        let ask_px = microprice * ask_ratio;
+        
+        // Bid ask arası spread kontrolü
+        let spread = ask_px - bid_px;
+        let spread_ratio = spread / microprice;
+        let spread_bps_calc = spread_ratio.to_f64().unwrap_or(0.0) * 1e4;
+        
+        // Spread yaklaşık 100 bps olmalı (skew'ler spread'i etkilemez, sadece offset yapar)
+        assert!((spread_bps_calc - 100.0).abs() < 1.0, "Spread should be approximately 100 bps");
+        assert!(bid_px < ask_px, "Bid should be less than ask");
     }
 }

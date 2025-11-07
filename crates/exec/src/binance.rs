@@ -18,12 +18,12 @@ use urlencoding::encode;
 use super::{Venue, VenueOrder};
 
 #[derive(Clone, Debug)]
-struct SymbolRules {
-    tick_size: Decimal,
-    step_size: Decimal,
-    price_precision: usize,
-    qty_precision: usize,
-    min_notional: Decimal,
+pub struct SymbolRules {
+    pub tick_size: Decimal,
+    pub step_size: Decimal,
+    pub price_precision: usize,
+    pub qty_precision: usize,
+    pub min_notional: Decimal,
 }
 
 #[derive(Deserialize)]
@@ -277,7 +277,8 @@ struct SpotTrade {
 }
 
 impl BinanceSpot {
-    async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
+    /// Per-symbol metadata (tick_size, step_size) alır, fallback olarak global değerleri kullanır
+    pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
         if let Some(r) = SPOT_RULES.get(sym) {
             return Ok(r.clone());
         }
@@ -706,7 +707,8 @@ struct PremiumIndex {
 }
 
 impl BinanceFutures {
-    async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
+    /// Per-symbol metadata (tick_size, step_size) alır, fallback olarak global değerleri kullanır
+    pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }

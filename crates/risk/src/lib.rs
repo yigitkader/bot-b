@@ -172,4 +172,107 @@ mod tests {
         let action = check_risk(&pos_over_leverage, Qty(dec!(0.05)), 500.0, -100, &limits);
         assert_eq!(action, RiskAction::Reduce);
     }
+
+    #[test]
+    fn test_liq_gap_bps_long_position() {
+        // Long pozisyon: liq_px < mark_px
+        // liq_gap_bps = ((mark - liq) / mark) * 10000
+        // Örnek: mark=50000, liq=48500 → gap = (1500/50000)*10000 = 300 bps
+        let pos = Position {
+            symbol: "BTCUSDT".to_string(),
+            qty: Qty(dec!(0.1)), // Long
+            entry: Px(dec!(50000)),
+            leverage: 5,
+            liq_px: Some(Px(dec!(48500))), // Liquidation price
+        };
+        let mark_px = Px(dec!(50000));
+        let liq_gap_bps = if let Some(liq_px) = pos.liq_px {
+            let mark = mark_px.0.to_f64().unwrap_or(0.0);
+            let liq = liq_px.0.to_f64().unwrap_or(0.0);
+            if mark > 0.0 {
+                ((mark - liq).abs() / mark) * 10_000.0
+            } else {
+                9_999.0
+            }
+        } else {
+            9_999.0
+        };
+        // Long: mark=50000, liq=48500 → gap = 300 bps
+        assert!((liq_gap_bps - 300.0).abs() < 1.0, "Long liq gap should be ~300 bps");
+        
+        let limits = create_test_limits(dec!(1.0), 300.0, 2000, 10);
+        let action = check_risk(&pos, Qty(dec!(0.05)), liq_gap_bps, -100, &limits);
+        assert_eq!(action, RiskAction::Ok, "300 bps gap should be OK (>= 300)");
+        
+        // Düşük gap: 200 bps
+        let liq_gap_low = 200.0;
+        let action_low = check_risk(&pos, Qty(dec!(0.05)), liq_gap_low, -100, &limits);
+        assert_eq!(action_low, RiskAction::Reduce, "200 bps gap should trigger Reduce (< 300)");
+    }
+
+    #[test]
+    fn test_liq_gap_bps_short_position() {
+        // Short pozisyon: liq_px > mark_px
+        // liq_gap_bps = ((liq - mark) / mark) * 10000
+        // Örnek: mark=50000, liq=51500 → gap = (1500/50000)*10000 = 300 bps
+        let pos = Position {
+            symbol: "BTCUSDT".to_string(),
+            qty: Qty(dec!(-0.1)), // Short
+            entry: Px(dec!(50000)),
+            leverage: 5,
+            liq_px: Some(Px(dec!(51500))), // Liquidation price (short için yukarıda)
+        };
+        let mark_px = Px(dec!(50000));
+        let liq_gap_bps = if let Some(liq_px) = pos.liq_px {
+            let mark = mark_px.0.to_f64().unwrap_or(0.0);
+            let liq = liq_px.0.to_f64().unwrap_or(0.0);
+            if mark > 0.0 {
+                ((mark - liq).abs() / mark) * 10_000.0
+            } else {
+                9_999.0
+            }
+        } else {
+            9_999.0
+        };
+        // Short: mark=50000, liq=51500 → gap = 300 bps
+        assert!((liq_gap_bps - 300.0).abs() < 1.0, "Short liq gap should be ~300 bps");
+        
+        let limits = create_test_limits(dec!(1.0), 300.0, 2000, 10);
+        let action = check_risk(&pos, Qty(dec!(-0.05)), liq_gap_bps, -100, &limits);
+        assert_eq!(action, RiskAction::Ok, "300 bps gap should be OK (>= 300)");
+    }
+
+    #[test]
+    fn test_risk_action_priority() {
+        // Risk eylem önceliği: HALT > REDUCE > WIDEN > OK
+        // HALT en yüksek öncelik, her zaman önce kontrol edilmeli
+        let pos = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 5);
+        let limits = create_test_limits(dec!(1.0), 300.0, 2000, 10);
+        
+        // HALT: Drawdown çok kötü
+        let action_halt = check_risk(&pos, Qty(dec!(0.05)), 500.0, -2500, &limits);
+        assert_eq!(action_halt, RiskAction::Halt, "HALT should have highest priority");
+        
+        // REDUCE: Inventory exceeded (HALT değil, çünkü drawdown OK)
+        let action_reduce_inv = check_risk(&pos, Qty(dec!(1.5)), 500.0, -100, &limits);
+        assert_eq!(action_reduce_inv, RiskAction::Reduce, "REDUCE on inventory exceeded");
+        
+        // REDUCE: Low liq gap (HALT değil, çünkü drawdown OK)
+        let action_reduce_liq = check_risk(&pos, Qty(dec!(0.05)), 200.0, -100, &limits);
+        assert_eq!(action_reduce_liq, RiskAction::Reduce, "REDUCE on low liq gap");
+        
+        // REDUCE: Leverage exceeded (HALT değil, çünkü drawdown OK)
+        let pos_high_leverage = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 15);
+        let action_reduce_leverage = check_risk(&pos_high_leverage, Qty(dec!(0.05)), 500.0, -100, &limits);
+        assert_eq!(action_reduce_leverage, RiskAction::Reduce, "REDUCE on leverage exceeded");
+        
+        // OK: Her şey normal
+        let action_ok = check_risk(&pos, Qty(dec!(0.05)), 500.0, -100, &limits);
+        assert_eq!(action_ok, RiskAction::Ok, "OK when all checks pass");
+        
+        // Öncelik testi: HALT + REDUCE durumunda HALT kazanmalı
+        // (Drawdown çok kötü + inventory exceeded → HALT)
+        let action_priority = check_risk(&pos, Qty(dec!(1.5)), 500.0, -2500, &limits);
+        assert_eq!(action_priority, RiskAction::Halt, "HALT should override REDUCE");
+    }
 }
