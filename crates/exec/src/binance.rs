@@ -197,13 +197,17 @@ pub struct BinanceCommon {
 
 impl BinanceCommon {
     fn ts() -> u64 {
+        // SystemTime::now() her zaman UNIX_EPOCH'den sonra olduğu için unwrap güvenlidir
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system time is before UNIX epoch")
             .as_millis() as u64
     }
     fn sign(&self, qs: &str) -> String {
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret_key.as_bytes()).unwrap();
+        // secret_key boş olsa bile new_from_slice başarılı olur (boş key ile imza üretir)
+        // Ancak yine de expect ile açık hale getiriyoruz
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret_key.as_bytes())
+            .expect("HMAC key initialization failed");
         mac.update(qs.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
