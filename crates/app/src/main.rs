@@ -24,6 +24,9 @@ struct SymbolState {
     strategy: Box<dyn Strategy>,
     active_orders: HashMap<String, OrderInfo>,
     pnl_history: Vec<Decimal>,
+    // --- eklendi: min notional öğrenme ve devre dışı bırakma ---
+    min_notional_req: Option<f64>, // borsa min notional (quote cinsinden)
+    disabled: bool,                // min_notional > max_usd_per_order => kalıcı disable
 }
 
 #[derive(Clone, Debug)]
@@ -224,9 +227,17 @@ impl FloorStep for f64 {
     }
 }
 
+/// USD-family stablecoin kontrolü (quote eşleştirme için)
+fn is_usd_stable(asset: &str) -> bool {
+    matches!(
+        asset.to_uppercase().as_str(),
+        "USD" | "USDT" | "USDC" | "BUSD" | "TUSD" | "FDUSD" | "USDA"
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ---- LOG INIT (fix) ----
+    // ---- LOG INIT ----
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -347,12 +358,15 @@ async fn main() -> Result<()> {
     let mut selected: Vec<SymbolMeta> = Vec::new();
     for sym in &normalized {
         if let Some(meta) = metadata.iter().find(|m| &m.symbol == sym) {
-            if !meta.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset) {
+            // --- quote eşleşmesi ya birebir ya da USD-stable grubu uyumu ---
+            let exact_quote = meta.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset);
+            let group_quote = is_usd_stable(&cfg.quote_asset) && is_usd_stable(&meta.quote_asset);
+            if !(exact_quote || group_quote) {
                 warn!(
                     symbol = %sym,
                     quote_asset = %meta.quote_asset,
                     required_quote = %cfg.quote_asset,
-                    "skipping configured symbol that is not quoted in required asset"
+                    "skipping configured symbol that is not in required quote group"
                 );
                 continue;
             }
@@ -375,6 +389,40 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+
+            // --- opsiyonel: başlangıçta bakiye tabanlı ön eleme ---
+            let have_min = cfg.min_usd_per_order.unwrap_or(0.0);
+            if mode_lower == "futures" {
+                if let V::Fut(vtmp) = &venue {
+                    let avail = vtmp.available_balance(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
+                    if avail < have_min {
+                        warn!(
+                            symbol = %sym,
+                            quote = %meta.quote_asset,
+                            avail,
+                            min_needed = have_min,
+                            "skipping symbol at discovery: zero/low quote balance for futures wallet"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                if let V::Spot(vtmp) = &venue {
+                    let q_free = vtmp.asset_free(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
+                    let b_free = vtmp.asset_free(&meta.base_asset).await?.to_f64().unwrap_or(0.0);
+                    if q_free < have_min && b_free < cfg.qty_step {
+                        warn!(
+                            symbol = %sym,
+                            quote = %meta.quote_asset,
+                            q_free,
+                            b_free,
+                            "skipping symbol at discovery: no usable balances (spot)"
+                        );
+                        continue;
+                    }
+                }
+            }
+
             selected.push(meta.clone());
         } else {
             warn!(symbol = %sym, "configured symbol not found on venue");
@@ -382,25 +430,31 @@ async fn main() -> Result<()> {
     }
 
     if selected.is_empty() && cfg.auto_discover_quote {
-        selected = metadata
+        // --- auto-discover: USD-stable grup kuralı ---
+        let want_group = is_usd_stable(&cfg.quote_asset);
+        let mut auto: Vec<SymbolMeta> = metadata
             .iter()
             .filter(|m| {
-                m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
+                let match_quote = if want_group {
+                    is_usd_stable(&m.quote_asset)
+                } else {
+                    m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
+                };
+                match_quote
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                     && (mode_lower != "futures"
-                    || m.contract_type
-                    .as_deref()
-                    .map(|ct| ct == "PERPETUAL")
-                    .unwrap_or(false))
+                    || m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false))
             })
             .cloned()
             .collect();
-        selected.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
         info!(
-            count = selected.len(),
+            count = auto.len(),
             quote_asset = %cfg.quote_asset,
-            "auto-discovered symbols for quote asset"
+            grouped = want_group,
+            "auto-discovered symbols for quote asset (group-aware)"
         );
+        selected = auto;
     }
 
     if selected.is_empty() {
@@ -428,6 +482,8 @@ async fn main() -> Result<()> {
             strategy,
             active_orders: HashMap::new(),
             pnl_history: Vec::new(),
+            min_notional_req: None,
+            disabled: false,
         });
     }
 
@@ -534,6 +590,13 @@ async fn main() -> Result<()> {
             let base_asset = state.meta.base_asset.clone();
             let quote_asset = state.meta.quote_asset.clone();
 
+            // --- kalıcı devre dışı kontrolü ---
+            if state.disabled {
+                info!(%symbol, "skipping symbol permanently (min_notional > max_usd_per_order)");
+                continue;
+            }
+
+            // aktif emirleri iptal/temizle
             if !state.active_orders.is_empty() {
                 let existing_orders: Vec<OrderInfo> =
                     state.active_orders.values().cloned().collect();
@@ -686,7 +749,7 @@ async fn main() -> Result<()> {
                 RiskAction::Halt => {}
             }
 
-            // ---- CAP HESABI ----
+            // ---- CAP HESABI (sembolün kendi quote'u ile) ----
             let caps = match &venue {
                 V::Spot(v) => {
                     let quote_free = v.asset_free(&quote_asset).await?.to_f64().unwrap_or(0.0);
@@ -720,7 +783,8 @@ async fn main() -> Result<()> {
                     }
                 }
             };
-            // Her iki taraf da varsa tek-emir limitini böl (toplamı BÖLME!)
+
+            // İki taraf da varsa tek-emir limitini böl (toplamı BÖLME!)
             let both_sides = quotes.bid.is_some() && quotes.ask.is_some();
             let caps = if both_sides {
                 Caps {
@@ -743,6 +807,50 @@ async fn main() -> Result<()> {
                 sell_total_base = caps.sell_total_base,
                 "calculated order caps"
             );
+
+            // --- min notional bilgisi varsa, kapasite bunun altındaysa tick'i atla ---
+            if let Some(min_req) = state.min_notional_req {
+                let buy_ok = caps.buy_notional >= min_req;
+                let sell_ok = caps.sell_notional >= min_req;
+                if !buy_ok && !sell_ok {
+                    info!(
+                        %symbol,
+                        min_notional_req = min_req,
+                        buy_notional = caps.buy_notional,
+                        sell_notional = caps.sell_notional,
+                        "skip tick: notional caps below exchange min_notional"
+                    );
+                    continue;
+                }
+            }
+
+            // --- bakiye/min_emir hızlı kontrolü: gürültüyü kes ---
+            let px_bid_f = bid.0.to_f64().unwrap_or(0.0);
+            let px_ask_f = ask.0.to_f64().unwrap_or(0.0);
+            let buy_cap_ok = caps.buy_notional >= min_usd_per_order;
+            let mut sell_cap_ok = caps.sell_notional >= min_usd_per_order;
+            if let Some(base_free) = caps.sell_base {
+                let ref_px = if px_ask_f > 0.0 { px_ask_f } else { px_bid_f };
+                if ref_px > 0.0 {
+                    sell_cap_ok = sell_cap_ok && (base_free * ref_px >= min_usd_per_order);
+                }
+            }
+            if !buy_cap_ok && !sell_cap_ok {
+                info!(
+                    %symbol,
+                    buy_total = caps.buy_total,
+                    sell_total_base = caps.sell_total_base,
+                    min_usd_per_order,
+                    "skip tick: zero/insufficient balance for this symbol"
+                );
+                continue;
+            }
+            if !buy_cap_ok {
+                quotes.bid = None;
+            }
+            if !sell_cap_ok {
+                quotes.ask = None;
+            }
 
             let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
 
@@ -779,6 +887,7 @@ async fn main() -> Result<()> {
             } else {
                 info!(%symbol, "no bid quote generated for this tick");
             }
+
             if let Some((px, q)) = quotes.ask {
                 if px.0 <= Decimal::ZERO {
                     warn!(%symbol, ?px, "dropping ask quote with non-positive price");
@@ -824,13 +933,7 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot bid order");
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo {
-                                    order_id: order_id.clone(),
-                                    side: Side::Buy,
-                                    price: px,
-                                    qty,
-                                    created_at: Instant::now(),
-                                };
+                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id, info);
                             }
                             Err(err) => {
@@ -838,7 +941,7 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // EK: Kalan USD ile ikinci emir (ör. 140$ => 100$ + 40$)
+                        // Kalan USD ile ikinci emir
                         let spent = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
                         let remaining = (caps.buy_total - spent).max(0.0);
                         if remaining >= min_usd_per_order && px.0 > Decimal::ZERO {
@@ -847,13 +950,7 @@ async fn main() -> Result<()> {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, "placing extra spot bid with leftover USD");
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo {
-                                            order_id: order_id2.clone(),
-                                            side: Side::Buy,
-                                            price: px,
-                                            qty: qty2,
-                                            created_at: Instant::now(),
-                                        };
+                                        let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
                                         state.active_orders.insert(order_id2, info2);
                                     }
                                     Err(err) => {
@@ -869,13 +966,7 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot ask order");
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo {
-                                    order_id: order_id.clone(),
-                                    side: Side::Sell,
-                                    price: px,
-                                    qty,
-                                    created_at: Instant::now(),
-                                };
+                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id, info);
                             }
                             Err(err) => {
@@ -883,7 +974,7 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // (Opsiyonel) Kalan base ile ikinci ask
+                        // Kalan base ile ikinci ask (opsiyonel)
                         if let Some(base_total) = caps.sell_base {
                             let spent_base = qty.0.to_f64().unwrap_or(0.0);
                             let remaining_base = (base_total - spent_base).max(0.0);
@@ -894,13 +985,7 @@ async fn main() -> Result<()> {
                                     info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining_base, "placing extra spot ask with leftover base");
                                     match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                         Ok(order_id2) => {
-                                            let info2 = OrderInfo {
-                                                order_id: order_id2.clone(),
-                                                side: Side::Sell,
-                                                price: px,
-                                                qty: qty2,
-                                                created_at: Instant::now(),
-                                            };
+                                            let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
                                             state.active_orders.insert(order_id2, info2);
                                         }
                                         Err(err) => {
@@ -918,13 +1003,7 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo {
-                                    order_id: order_id.clone(),
-                                    side: Side::Buy,
-                                    price: px,
-                                    qty,
-                                    created_at: Instant::now(),
-                                };
+                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id, info);
                             }
                             Err(err) => {
@@ -936,6 +1015,15 @@ async fn main() -> Result<()> {
                                         .and_then(|s| s.split(')').next())
                                         .and_then(|s| s.trim().parse::<f64>().ok());
                                     if let Some(min_notional) = required_min {
+                                        // --- öğren & gerekirse kalıcı disable ---
+                                        state.min_notional_req = Some(min_notional);
+                                        if min_notional > cfg.max_usd_per_order {
+                                            state.disabled = true;
+                                            warn!(%symbol, min_notional, max_usd_per_order = cfg.max_usd_per_order,
+                                                  "disabling symbol: exchange min_notional exceeds per-order cap");
+                                            continue;
+                                        }
+                                        // retry: min_notional'a göre miktarı büyüt (cap'e kadar)
                                         let price = px.0.to_f64().unwrap_or(0.0);
                                         let order_cap = caps.buy_notional.min(cfg.max_usd_per_order);
                                         let step = cfg.qty_step;
@@ -969,7 +1057,7 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // EK: Futures — kalan notional ile ikinci bid
+                        // Kalan notional ile ikinci bid (min_emir korumalı)
                         let spent = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
                         let remaining = (caps.buy_total - spent).max(0.0);
                         if remaining >= min_usd_per_order && px.0 > Decimal::ZERO {
@@ -978,13 +1066,7 @@ async fn main() -> Result<()> {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, "placing extra futures bid with leftover notional");
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo {
-                                            order_id: order_id2.clone(),
-                                            side: Side::Buy,
-                                            price: px,
-                                            qty: qty2,
-                                            created_at: Instant::now(),
-                                        };
+                                        let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
                                         state.active_orders.insert(order_id2, info2);
                                     }
                                     Err(err) => {
@@ -1000,13 +1082,7 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo {
-                                    order_id: order_id.clone(),
-                                    side: Side::Sell,
-                                    price: px,
-                                    qty,
-                                    created_at: Instant::now(),
-                                };
+                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id, info);
                             }
                             Err(err) => {
@@ -1018,6 +1094,14 @@ async fn main() -> Result<()> {
                                         .and_then(|s| s.split(')').next())
                                         .and_then(|s| s.trim().parse::<f64>().ok());
                                     if let Some(min_notional) = required_min {
+                                        // --- öğren & gerekirse kalıcı disable ---
+                                        state.min_notional_req = Some(min_notional);
+                                        if min_notional > cfg.max_usd_per_order {
+                                            state.disabled = true;
+                                            warn!(%symbol, min_notional, max_usd_per_order = cfg.max_usd_per_order,
+                                                  "disabling symbol: exchange min_notional exceeds per-order cap");
+                                            continue;
+                                        }
                                         let price = px.0.to_f64().unwrap_or(0.0);
                                         let order_cap = caps.sell_notional.min(cfg.max_usd_per_order);
                                         let step = cfg.qty_step;
@@ -1050,8 +1134,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-
-                        // İstersek burada da “kalan” mantığı eklenebilir.
+                        // (gerekirse burada da kalan notional ile ikinci ask yapılabilir)
                     }
                 }
             }
