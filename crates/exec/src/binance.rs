@@ -92,7 +92,18 @@ fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
 }
 
 fn scale_from_step(step: Decimal) -> usize {
-    step.scale() as usize
+    if step.is_zero() {
+        return 8; // Default precision
+    }
+    // Eğer step 1 veya daha büyükse, precision 0 olmalı
+    if step >= Decimal::ONE {
+        return 0;
+    }
+    // tick_size veya step_size'dan precision hesapla
+    // Decimal'in scale() metodu internal scale'i döner (trailing zero'lar dahil)
+    // Bu bizim için doğru precision'ı verir
+    let scale = step.scale() as usize;
+    scale
 }
 
 fn rules_from_spot_symbol(sym: SpotExchangeSymbol) -> SymbolRules {
@@ -531,8 +542,16 @@ impl Venue for BinanceSpot {
                 rules.min_notional
             ));
         }
-        let price_str = format_decimal_fixed(price, rules.price_precision);
-        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
+        // Precision'ı tick_size ve step_size ile uyumlu hale getir
+        // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
+        let price_prec_from_tick = scale_from_step(rules.tick_size);
+        let qty_prec_from_step = scale_from_step(rules.step_size);
+        // tick_size'dan hesaplanan precision'ı kullan (exchange'in verdiği precision yanlış olabilir)
+        // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
+        let price_precision = price_prec_from_tick.min(rules.price_precision);
+        let qty_precision = qty_prec_from_step.min(rules.qty_precision);
+        let price_str = format_decimal_fixed(price, price_precision);
+        let qty_str = format_decimal_fixed(qty, qty_precision);
 
         let mut params = vec![
             format!("symbol={}", sym),
@@ -951,8 +970,16 @@ impl Venue for BinanceFutures {
                 rules.min_notional
             ));
         }
-        let price_str = format_decimal_fixed(price, rules.price_precision);
-        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
+        // Precision'ı tick_size ve step_size ile uyumlu hale getir
+        // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
+        let price_prec_from_tick = scale_from_step(rules.tick_size);
+        let qty_prec_from_step = scale_from_step(rules.step_size);
+        // tick_size'dan hesaplanan precision'ı kullan (exchange'in verdiği precision yanlış olabilir)
+        // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
+        let price_precision = price_prec_from_tick.min(rules.price_precision);
+        let qty_precision = qty_prec_from_step.min(rules.qty_precision);
+        let price_str = format_decimal_fixed(price, price_precision);
+        let qty_str = format_decimal_fixed(qty, qty_precision);
 
         let params = vec![
             format!("symbol={}", sym),
@@ -1056,7 +1083,10 @@ fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
     // normalize() trailing zero'ları kaldırır, bu precision hatasına yol açabilir
     // Bu yüzden trailing zero'ları korumalıyız
+    // ÖNCE: Decimal'i doğru scale'e truncate et (precision hatasını önlemek için)
+    // Her zaman round_dp_with_strategy kullan çünkü set_scale güvenilir değil
     let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
+    
     // Trailing zero'ları koru: precision kadar decimal place göster
     if scale == 0 {
         truncated.to_string()
@@ -1069,16 +1099,11 @@ fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
                 format!("{}{}", s, "0".repeat(scale as usize - current_decimals))
             } else if current_decimals > scale as usize {
                 // Fazla decimal varsa kes (precision hatasını önle)
-                // Önce Decimal'i doğru scale'e set et
-                let mut fixed = truncated;
-                if fixed.set_scale(scale).is_ok() {
-                    // set_scale başarılı, format et
-                    fixed.to_string()
-                } else {
-                    // set_scale başarısız, string'i kes
-                    let truncated_str = &s[..dot_pos + 1 + scale as usize];
-                    truncated_str.to_string()
-                }
+                // String'i kes - kesinlikle precision'dan fazla basamak gösterme
+                let integer_part = &s[..dot_pos];
+                let decimal_part = &s[dot_pos + 1..];
+                let truncated_decimal = &decimal_part[..scale as usize];
+                format!("{}.{}", integer_part, truncated_decimal)
             } else {
                 s
             }
@@ -1160,5 +1185,33 @@ mod tests {
         // format_decimal_fixed trailing zero'ları korur (precision kadar)
         assert_eq!(format_decimal_fixed(dec!(1.2000), 4), "1.2000");
         assert_eq!(format_decimal_fixed(dec!(0.00000001), 8), "0.00000001");
+        
+        // Yüksek fiyatlı semboller için testler (BNBUSDC gibi)
+        assert_eq!(format_decimal_fixed(dec!(950.649470), 2), "950.64");
+        assert_eq!(format_decimal_fixed(dec!(950.649470), 3), "950.649");
+        assert_eq!(format_decimal_fixed(dec!(956.370530), 2), "956.37");
+        assert_eq!(format_decimal_fixed(dec!(956.370530), 3), "956.370");
+        
+        // Fazla precision'ı kesme testi
+        assert_eq!(format_decimal_fixed(dec!(202.129776525), 2), "202.12");
+        assert_eq!(format_decimal_fixed(dec!(202.129776525), 3), "202.129");
+        assert_eq!(format_decimal_fixed(dec!(0.08082180550260300), 4), "0.0808");
+        assert_eq!(format_decimal_fixed(dec!(0.08082180550260300), 5), "0.08082");
+        
+        // Integer precision testi
+        assert_eq!(format_decimal_fixed(dec!(100.5), 0), "100");
+        assert_eq!(format_decimal_fixed(dec!(1000), 0), "1000");
+    }
+    
+    #[test]
+    fn test_scale_from_step() {
+        // tick_size'dan precision hesaplama testleri
+        assert_eq!(scale_from_step(dec!(0.1)), 1);
+        assert_eq!(scale_from_step(dec!(0.01)), 2);
+        assert_eq!(scale_from_step(dec!(0.001)), 3);
+        assert_eq!(scale_from_step(dec!(0.0001)), 4);
+        assert_eq!(scale_from_step(dec!(1)), 0);
+        assert_eq!(scale_from_step(dec!(10)), 0);
+        assert_eq!(scale_from_step(dec!(0.000001)), 6);
     }
 }
