@@ -1293,11 +1293,25 @@ async fn main() -> Result<()> {
                 }
             };
             
-            if !has_balance {
-                // Bakiye yok, bu tick'i atla (best_prices, strateji, vs. çalıştırma)
+            // KRİTİK DÜZELTME: Bakiye yoksa bile açık pozisyon/emir varsa devam et
+            // Önce açık pozisyon/emir kontrolü yap (bakiye kontrolünden önce)
+            let has_open_position_or_orders = !state.active_orders.is_empty();
+            
+            // Eğer bakiye yoksa VE açık pozisyon/emir de yoksa, atla
+            if !has_balance && !has_open_position_or_orders {
+                // Bakiye yok ve açık pozisyon/emir yok, bu tick'i atla
                 skipped_count += 1;
                 no_balance_count += 1;
                 continue;
+            }
+            
+            // Bakiye yoksa ama açık pozisyon/emir varsa devam et (yönetmeye devam)
+            if !has_balance && has_open_position_or_orders {
+                info!(
+                    %symbol,
+                    active_orders = state.active_orders.len(),
+                    "no balance but has open position/orders, continuing to manage them"
+                );
             }
             
             processed_count += 1;
@@ -1484,22 +1498,59 @@ async fn main() -> Result<()> {
             info!(%symbol, ?bid, ?ask, "fetched best prices");
             
             // Pozisyon bilgisini al (bir kere, tüm analizler için kullanılacak)
+            // KRİTİK DÜZELTME: Bakiye yoksa bile pozisyon kontrolü yap (açık pozisyon olabilir)
             let pos = match &venue {
                 V::Spot(v) => match v.get_position(&symbol).await {
                     Ok(pos) => pos,
                     Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch position, skipping tick");
-                        continue;
+                        // Pozisyon fetch hatası: Eğer açık emir varsa devam et, yoksa atla
+                        if state.active_orders.is_empty() && !has_balance {
+                            warn!(%symbol, ?err, "failed to fetch position, no open orders, and no balance, skipping tick");
+                            continue;
+                        } else {
+                            warn!(%symbol, ?err, "failed to fetch position but has open orders/balance, continuing with default position");
+                            // Default pozisyon (qty=0) kullan
+                            Position {
+                                symbol: symbol.clone(),
+                                qty: Qty(Decimal::ZERO),
+                                entry: Px(Decimal::ZERO),
+                                leverage: 1,
+                                liq_px: None,
+                            }
+                        }
                     }
                 },
                 V::Fut(v) => match v.get_position(&symbol).await {
                     Ok(pos) => pos,
                     Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch position, skipping tick");
-                        continue;
+                        // Pozisyon fetch hatası: Eğer açık emir varsa devam et, yoksa atla
+                        if state.active_orders.is_empty() && !has_balance {
+                            warn!(%symbol, ?err, "failed to fetch position, no open orders, and no balance, skipping tick");
+                            continue;
+                        } else {
+                            warn!(%symbol, ?err, "failed to fetch position but has open orders/balance, continuing with default position");
+                            // Default pozisyon (qty=0) kullan
+                            Position {
+                                symbol: symbol.clone(),
+                                qty: Qty(Decimal::ZERO),
+                                entry: Px(Decimal::ZERO),
+                                leverage: 1,
+                                liq_px: None,
+                            }
+                        }
                     }
                 },
             };
+            
+            // KRİTİK DÜZELTME: Pozisyon varsa (qty != 0) veya açık emir varsa, bakiye kontrolünü atla
+            let has_position = !pos.qty.0.is_zero();
+            if has_position && !has_balance {
+                info!(
+                    %symbol,
+                    position_qty = %pos.qty.0,
+                    "has open position but no balance, continuing to manage position"
+                );
+            }
             
             // Mark price ve funding rate'i al (bir kere, tüm analizler için kullanılacak)
             let (mark_px, funding_rate, next_funding_time) = match &venue {
@@ -1893,7 +1944,7 @@ async fn main() -> Result<()> {
                     }
                     
                     // Pozisyonu kapat (reduceOnly market order) - KRİTİK DÜZELTME: Retry mekanizması
-                    let mut close_success = false;
+                    let mut position_closed = false;
                     for attempt in 0..3 {
                         let close_result = match &venue {
                             V::Spot(v) => v.close_position(&symbol).await,
@@ -1901,7 +1952,7 @@ async fn main() -> Result<()> {
                         };
                         match close_result {
                             Ok(_) => {
-                                close_success = true;
+                                position_closed = true;
                                 info!(
                                     %symbol,
                                     reason,
@@ -1919,6 +1970,10 @@ async fn main() -> Result<()> {
                                 warn!(%symbol, ?err, "failed to close position after 3 attempts");
                             }
                         }
+                    }
+                    
+                    if !position_closed {
+                        warn!(%symbol, reason, "position close failed after retries, state will be reset anyway");
                     }
                     
                     // State'i sıfırla
@@ -2282,6 +2337,19 @@ async fn main() -> Result<()> {
             
             // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Base clamp (spot sell), 3) Quantize, 4) Min notional check
             // min_usd_per_order > 0 doğrulaması zaten yukarıda yapıldı, burada sadece notional kontrolü yapıyoruz
+            
+            // KRİTİK DÜZELTME: Bakiye yoksa ama pozisyon/emir varsa, yeni emir verme (sadece mevcut pozisyon/emirleri yönet)
+            // Pozisyon/emir yönetimi yukarıda yapıldı, burada sadece yeni emir verme kontrolü
+            let should_place_new_orders = has_balance || has_position || has_open_position_or_orders;
+            if !should_place_new_orders {
+                info!(
+                    %symbol,
+                    "no balance, no position, no open orders - skipping new order placement"
+                );
+                // Yeni emir verme, ama mevcut pozisyon/emir yönetimi yukarıda yapıldı
+                quotes.bid = None;
+                quotes.ask = None;
+            }
 
             if let Some((px, q)) = quotes.bid {
                 if px.0 <= Decimal::ZERO {
