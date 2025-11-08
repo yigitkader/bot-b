@@ -32,14 +32,18 @@ pub enum UserEvent {
     OrderFill {
         symbol: String,
         order_id: String,
+        client_order_id: Option<String>, // Idempotency için
         side: Side,
-        qty: Qty,
+        qty: Qty, // Last executed qty (incremental)
+        cumulative_filled_qty: Qty, // Cumulative filled qty (total filled so far)
         price: Px,
         is_maker: bool, // true = maker, false = taker
+        order_status: String, // Order status: NEW, PARTIALLY_FILLED, FILLED, CANCELED, etc.
     },
     OrderCanceled {
         symbol: String,
         order_id: String,
+        client_order_id: Option<String>, // Idempotency için
     },
     Heartbeat,
 }
@@ -276,15 +280,24 @@ impl UserDataStream {
                     .and_then(Value::as_i64)
                     .unwrap_or_default()
                     .to_string();
+                let client_order_id = value
+                    .get("c")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
                 let status = value.get("X").and_then(Value::as_str).unwrap_or_default();
                 if status == "CANCELED" {
-                    return Ok(Some(UserEvent::OrderCanceled { symbol, order_id }));
+                    return Ok(Some(UserEvent::OrderCanceled { 
+                        symbol, 
+                        order_id,
+                        client_order_id,
+                    }));
                 }
                 let exec_type = value.get("x").and_then(Value::as_str).unwrap_or_default();
                 if exec_type != "TRADE" {
                     return Ok(Some(UserEvent::Heartbeat));
                 }
-                let qty = Self::parse_decimal(value, "l"); // last executed qty
+                let qty = Self::parse_decimal(value, "l"); // last executed qty (incremental)
+                let cumulative_filled_qty = Self::parse_decimal(value, "z"); // cumulative filled qty (total)
                 let price = Self::parse_decimal(value, "L"); // last executed price
                 let side =
                     Self::parse_side(value.get("S").and_then(Value::as_str).unwrap_or("SELL"));
@@ -293,10 +306,13 @@ impl UserDataStream {
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
+                    client_order_id,
                     side,
                     qty: Qty(qty),
+                    cumulative_filled_qty: Qty(cumulative_filled_qty),
                     price: Px(price),
                     is_maker,
+                    order_status: status.to_string(),
                 }));
             }
 
@@ -315,15 +331,24 @@ impl UserDataStream {
                     .and_then(Value::as_i64)
                     .unwrap_or_default()
                     .to_string();
+                let client_order_id = data
+                    .get("c")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
                 let status = data.get("X").and_then(Value::as_str).unwrap_or_default();
                 if status == "CANCELED" {
-                    return Ok(Some(UserEvent::OrderCanceled { symbol, order_id }));
+                    return Ok(Some(UserEvent::OrderCanceled { 
+                        symbol, 
+                        order_id,
+                        client_order_id,
+                    }));
                 }
                 let exec_type = data.get("x").and_then(Value::as_str).unwrap_or_default();
                 if exec_type != "TRADE" {
                     return Ok(Some(UserEvent::Heartbeat));
                 }
-                let qty = Self::parse_decimal(data, "l"); // last filled
+                let qty = Self::parse_decimal(data, "l"); // last filled (incremental)
+                let cumulative_filled_qty = Self::parse_decimal(data, "z"); // cumulative filled qty (total)
                 let price = Self::parse_decimal(data, "L"); // last price
                 let side =
                     Self::parse_side(data.get("S").and_then(Value::as_str).unwrap_or("SELL"));
@@ -332,10 +357,13 @@ impl UserDataStream {
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
+                    client_order_id,
                     side,
                     qty: Qty(qty),
+                    cumulative_filled_qty: Qty(cumulative_filled_qty),
                     price: Px(price),
                     is_maker,
+                    order_status: status.to_string(),
                 }));
             }
 

@@ -150,15 +150,18 @@ use std::time::{Duration, Instant};
 /// - POST /fapi/v1/order: Weight 1
 /// - DELETE /fapi/v1/order: Weight 1
 /// - GET /fapi/v2/positionRisk: Weight 5
+#[cfg_attr(test, derive(Debug))]
 pub struct RateLimiter {
     /// Per-second request timestamps (for burst protection)
     requests: Mutex<VecDeque<Instant>>,
     /// Per-minute weight tracking (for weight-based limits)
     weights: Mutex<VecDeque<(Instant, u32)>>,
     /// Maximum requests per second (with safety margin)
-    max_requests_per_sec: u32,
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) max_requests_per_sec: u32,
     /// Maximum weight per minute (with safety margin)
-    max_weight_per_minute: u32,
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) max_weight_per_minute: u32,
     /// Minimum interval between requests (ms)
     min_interval_ms: u64,
     /// Safety factor (0.0-1.0) - how much of the limit to use
@@ -672,4 +675,8 @@ pub fn should_place_trade(
     
     (true, "ok")
 }
+
+#[cfg(test)]
+#[path = "rate_limiter_tests.rs"]
+mod rate_limiter_tests;
 

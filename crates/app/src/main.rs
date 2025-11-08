@@ -860,13 +860,36 @@ async fn main() -> Result<()> {
                 UserEvent::OrderFill {
                     symbol,
                     order_id,
+                    client_order_id,
                     side,
                     qty,
+                    cumulative_filled_qty,
                     price,
                     is_maker,
+                    order_status,
                 } => {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         let state = &mut states[*idx];
+                        
+                        // KRİTİK: Event-based state management - sadece event'lerle state güncelle
+                        // Duplicate event handling: Aynı order_id için aynı cumulative_filled_qty'yi ignore et
+                        let is_duplicate = if let Some(existing_order) = state.active_orders.get(&order_id) {
+                            // Eğer cumulative filled qty aynıysa, bu duplicate event
+                            existing_order.filled_qty.0 >= cumulative_filled_qty.0
+                        } else {
+                            // Order yoksa, bu yeni bir fill (reconnect sonrası olabilir)
+                            false
+                        };
+                        
+                        if is_duplicate {
+                            warn!(
+                                %symbol,
+                                order_id = %order_id,
+                                cumulative_filled_qty = %cumulative_filled_qty.0,
+                                "duplicate fill event ignored"
+                            );
+                            continue; // Duplicate event'i ignore et
+                        }
                         
                         // Post-Only doğrulaması: Post-only emirler maker olarak fill olmalı
                         let is_post_only = cfg.exec.tif.to_lowercase() == "post_only";
@@ -877,24 +900,84 @@ async fn main() -> Result<()> {
                                 side = ?side,
                                 "POST-ONLY VIOLATION: order filled as taker (should be maker), this should not happen with post-only orders"
                             );
-                            // Post-only emir taker olarak fill olduysa, bu bir sorun
-                            // Ancak fill zaten oldu, sadece uyarı veriyoruz
                         }
                         
+                        // KRİTİK: Partial fill handling
+                        // Event'ten gelen qty = last executed qty (incremental)
+                        // cumulative_filled_qty = total filled so far
+                        let fill_increment = qty.0; // Bu fill'de ne kadar fill oldu
+                        
+                        // Inventory güncelle (sadece incremental fill miktarı)
                         let mut inv = state.inv.0;
                         if side == Side::Buy {
-                            inv += qty.0;
+                            inv += fill_increment;
                         } else {
-                            inv -= qty.0;
+                            inv -= fill_increment;
                         }
                         state.inv = Qty(inv);
-                        state.last_inventory_update = Some(std::time::Instant::now()); // Race condition önleme
-                        state.active_orders.remove(&order_id);
-                        update_fill_rate_on_fill(
-                            state,
-                            cfg.internal.fill_rate_increase_factor,
-                            cfg.internal.fill_rate_increase_bonus,
-                        );
+                        state.last_inventory_update = Some(std::time::Instant::now());
+                        
+                        // Order state güncelle
+                        let should_remove = if let Some(order_info) = state.active_orders.get_mut(&order_id) {
+                            // Order var, güncelle
+                            order_info.filled_qty = cumulative_filled_qty;
+                            order_info.remaining_qty = Qty(order_info.qty.0 - cumulative_filled_qty.0);
+                            order_info.last_fill_time = Some(std::time::Instant::now());
+                            
+                            let remaining_qty = order_info.remaining_qty.0;
+                            
+                            // KRİTİK: Partial fill sonrası risk limit kontrolü
+                            // Pozisyon boyutu değişti, risk limitleri tekrar kontrol et
+                            // Bu kontrol main loop'ta yapılıyor, burada sadece log
+                            info!(
+                                %symbol,
+                                order_id = %order_id,
+                                side = ?side,
+                                fill_increment = %fill_increment,
+                                cumulative_filled_qty = %cumulative_filled_qty.0,
+                                remaining_qty = %remaining_qty,
+                                order_status = %order_status,
+                                is_maker,
+                                new_inventory = %state.inv.0,
+                                "order fill event: {}",
+                                if order_status == "FILLED" { "fully filled" } else { "partial fill" }
+                            );
+                            
+                            // Eğer order tamamen fill olduysa (FILLED status), active_orders'dan kaldır
+                            if order_status == "FILLED" || remaining_qty.is_zero() {
+                                update_fill_rate_on_fill(
+                                    state,
+                                    cfg.internal.fill_rate_increase_factor,
+                                    cfg.internal.fill_rate_increase_bonus,
+                                );
+                                true // Remove order
+                            } else {
+                                // Partial fill - sadece fill rate'i hafifçe artır
+                                state.order_fill_rate = (state.order_fill_rate * 0.98 + 0.02).min(1.0);
+                                false // Keep order
+                            }
+                        } else {
+                            // Order local state'de yok (reconnect sonrası olabilir)
+                            // API'den order bilgisini al ve state'e ekle
+                            warn!(
+                                %symbol,
+                                order_id = %order_id,
+                                "fill event for unknown order (reconnect?), will sync from API"
+                            );
+                            // Reconnect sonrası sync yapılacak, burada sadece inventory güncelle
+                            update_fill_rate_on_fill(
+                                state,
+                                cfg.internal.fill_rate_increase_factor,
+                                cfg.internal.fill_rate_increase_bonus,
+                            );
+                            false // Don't remove (order not in state)
+                        };
+                        
+                        // Order'ı kaldır (eğer tamamen fill olduysa)
+                        if should_remove {
+                            state.active_orders.remove(&order_id);
+                            state.last_order_price_update.remove(&order_id);
+                        }
                         
                         // JSON log: Order filled
                         if let Ok(logger) = json_logger.lock() {
@@ -909,24 +992,44 @@ async fn main() -> Result<()> {
                                 state.order_fill_rate,
                             );
                         }
-                        
-                        info!(
-                            %symbol,
-                            order_id = %order_id,
-                            side = ?side,
-                            qty = %qty.0,
-                            is_maker,
-                            new_inventory = %state.inv.0,
-                            fill_rate = state.order_fill_rate,
-                            "order filled: updating inventory and fill rate"
-                        );
                     }
                 }
-                UserEvent::OrderCanceled { symbol, order_id } => {
+                UserEvent::OrderCanceled { symbol, order_id, client_order_id } => {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         let state = &mut states[*idx];
-                        state.active_orders.remove(&order_id);
-                        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                        
+                        // KRİTİK: Event-based state management - sadece event'lerle state güncelle
+                        // client_order_id ile idempotency kontrolü
+                        let was_removed = if let Some(order_info) = state.active_orders.get(&order_id) {
+                            // client_order_id eşleşiyorsa veya yoksa, order'ı kaldır
+                            if let (Some(client_id), Some(order_client_id)) = (&client_order_id, &order_info.client_order_id) {
+                                client_id == order_client_id
+                            } else {
+                                true // client_order_id yoksa, order_id ile eşleştir
+                            }
+                        } else {
+                            false // Order zaten yok
+                        };
+                        
+                        if was_removed {
+                            state.active_orders.remove(&order_id);
+                            state.last_order_price_update.remove(&order_id);
+                            update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                            
+                            info!(
+                                %symbol,
+                                order_id = %order_id,
+                                client_order_id = ?client_order_id,
+                                "order canceled via event"
+                            );
+                        } else {
+                            warn!(
+                                %symbol,
+                                order_id = %order_id,
+                                client_order_id = ?client_order_id,
+                                "cancel event for unknown order or client_order_id mismatch"
+                            );
+                        }
                         
                         // JSON log: Order canceled
                         if let Ok(logger) = json_logger.lock() {
@@ -1196,10 +1299,14 @@ async fn main() -> Result<()> {
                             if !state.active_orders.contains_key(&api_order.order_id) {
                                 let info = OrderInfo {
                                     order_id: api_order.order_id.clone(),
+                                    client_order_id: None, // API'den gelmiyor, sync sonrası event'lerle güncellenecek
                                     side: api_order.side,
                                     price: api_order.price,
                                     qty: api_order.qty,
+                                    filled_qty: Qty(Decimal::ZERO), // API sync'te bilinmiyor, event'lerle güncellenecek
+                                    remaining_qty: api_order.qty, // Başlangıçta qty = remaining
                                     created_at: Instant::now(), // Tahmini zaman
+                                    last_fill_time: None,
                                 };
                                 state.active_orders.insert(api_order.order_id.clone(), info);
                                 info!(
@@ -1628,7 +1735,7 @@ async fn main() -> Result<()> {
             state.cumulative_pnl = current_pnl; // Şimdilik current, ileride gerçek kümülatif hesaplanabilir
             
             // 5. Pozisyon boyutu risk kontrolü: Çok büyük pozisyonlar riskli
-            // PATCH: Fırsat modunda bile max position size sınırı
+            // KRİTİK: Opportunity mode için soft-limit mekanizması
             let is_opportunity_mode = state.strategy.is_opportunity_mode();
             let max_position_multiplier = if is_opportunity_mode {
                 cfg.internal.opportunity_mode_position_multiplier
@@ -1636,35 +1743,192 @@ async fn main() -> Result<()> {
                 1.0
             };
             
+            // KRİTİK: max_position_size_usd hesabını exchange pozisyon riskine göre hesapla
+            // Mark-price vs entry-price: Exchange risk hesaplaması için mark-price kullanılmalı
+            // Ancak entry-price ile karşılaştırma yaparak risk değerlendirmesi yapılabilir
+            let position_size_notional_mark = position_size_notional; // Mark-price ile (mevcut)
+            let position_size_notional_entry = (pos.entry.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0); // Entry-price ile
+            
+            // Exchange risk hesaplaması: Mark-price bazlı (exchange'in gördüğü risk)
+            // Ancak entry-price ile karşılaştırma yaparak gerçek risk değerlendirmesi
             let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer * max_position_multiplier;
-            if position_size_notional > max_position_size_usd {
-                warn!(
-                    %symbol,
-                    position_size_notional,
-                    max_allowed = max_position_size_usd,
-                    is_opportunity_mode,
-                    "POSITION SIZE RISK: position too large, force closing (even in opportunity mode)"
-                );
-                // KRİTİK DÜZELTME: Risk limiti aşılınca pozisyonu kapat
-                // close_position uses place_limit internally: Weight 1
-                rate_limit_guard(1).await;
-                match &venue {
-                    V::Spot(v) => {
-                        if let Err(err) = v.close_position(&symbol).await {
-                            error!(%symbol, ?err, "failed to close position due to size risk");
-                        } else {
-                            info!(%symbol, "closed position due to size risk");
+            
+            // KRİTİK: Multiple open orders ve toplam notional birikimi reconcile et
+            // Active orders'ın toplam notional'ını hesapla
+            let total_active_orders_notional: f64 = state.active_orders.values()
+                .map(|order| {
+                    let order_notional = (order.price.0 * order.remaining_qty.0).to_f64().unwrap_or(0.0);
+                    order_notional
+                })
+                .sum();
+            
+            // Toplam risk: Mevcut pozisyon + açık emirler
+            let total_exposure_notional = position_size_notional_mark + total_active_orders_notional;
+            
+            // Opportunity mode için soft-limit mekanizması
+            let soft_limit = max_position_size_usd * cfg.internal.opportunity_mode_soft_limit_ratio;
+            let medium_limit = max_position_size_usd * cfg.internal.opportunity_mode_medium_limit_ratio;
+            let hard_limit = max_position_size_usd * cfg.internal.opportunity_mode_hard_limit_ratio;
+            
+            // Risk seviyesi belirleme
+            let position_size_risk_level = if total_exposure_notional >= hard_limit {
+                "hard" // Force-close
+            } else if total_exposure_notional >= medium_limit {
+                "medium" // Mevcut emirleri azalt
+            } else if total_exposure_notional >= soft_limit {
+                "soft" // Yeni emirleri durdur
+            } else {
+                "ok" // Normal
+            };
+            
+            // KRİTİK: Opportunity mode için soft-limit flag'i
+            // quotes henüz tanımlanmadı, bu yüzden flag kullanıyoruz
+            let mut should_block_new_orders = false;
+            
+            // Opportunity mode'da soft-limit uygula
+            if is_opportunity_mode {
+                match position_size_risk_level {
+                    "hard" => {
+                        // KRİTİK: Hard limit - Force-close
+                        warn!(
+                            %symbol,
+                            position_size_notional = position_size_notional_mark,
+                            total_exposure_notional,
+                            max_allowed = max_position_size_usd,
+                            hard_limit,
+                            active_orders_count = state.active_orders.len(),
+                            active_orders_notional = total_active_orders_notional,
+                            "OPPORTUNITY MODE HARD LIMIT: position + orders exceed hard limit, force closing"
+                        );
+                        // Önce tüm emirleri iptal et
+                        rate_limit_guard(1).await;
+                        match &venue {
+                            V::Spot(v) => {
+                                if let Err(err) = v.cancel_all(&symbol).await {
+                                    warn!(%symbol, ?err, "failed to cancel all orders before force-close");
+                                }
+                            }
+                            V::Fut(v) => {
+                                if let Err(err) = v.cancel_all(&symbol).await {
+                                    warn!(%symbol, ?err, "failed to cancel all orders before force-close");
+                                }
+                            }
                         }
+                        // Sonra pozisyonu kapat
+                        rate_limit_guard(1).await;
+                        match &venue {
+                            V::Spot(v) => {
+                                if let Err(err) = v.close_position(&symbol).await {
+                                    error!(%symbol, ?err, "failed to close position due to hard limit");
+                                } else {
+                                    info!(%symbol, "closed position due to hard limit");
+                                }
+                            }
+                            V::Fut(v) => {
+                                if let Err(err) = v.close_position(&symbol).await {
+                                    error!(%symbol, ?err, "failed to close position due to hard limit");
+                                } else {
+                                    info!(%symbol, "closed position due to hard limit");
+                                }
+                            }
+                        }
+                        continue; // Bu tick'i atla
                     }
-                    V::Fut(v) => {
-                        if let Err(err) = v.close_position(&symbol).await {
-                            error!(%symbol, ?err, "failed to close position due to size risk");
-                        } else {
-                            info!(%symbol, "closed position due to size risk");
+                    "medium" => {
+                        // Medium limit - Mevcut emirleri kademeli azalt
+                        warn!(
+                            %symbol,
+                            position_size_notional = position_size_notional_mark,
+                            total_exposure_notional,
+                            max_allowed = max_position_size_usd,
+                            medium_limit,
+                            active_orders_count = state.active_orders.len(),
+                            active_orders_notional = total_active_orders_notional,
+                            "OPPORTUNITY MODE MEDIUM LIMIT: reducing active orders gradually"
+                        );
+                        // En eski emirlerin %50'sini iptal et (kademeli azaltma)
+                        let mut orders_with_times: Vec<(String, Instant)> = state.active_orders.iter()
+                            .map(|(order_id, order)| (order_id.clone(), order.created_at))
+                            .collect();
+                        // En eski önce sırala
+                        orders_with_times.sort_by(|a, b| a.1.cmp(&b.1));
+                        let orders_to_cancel: Vec<String> = orders_with_times
+                            .into_iter()
+                            .take((state.active_orders.len() / 2).max(1)) // En az 1 emir iptal et
+                            .map(|(order_id, _)| order_id)
+                            .collect();
+                        
+                        for order_id in &orders_to_cancel {
+                            rate_limit_guard(1).await;
+                            match &venue {
+                                V::Spot(v) => {
+                                    if let Err(err) = v.cancel(order_id, &symbol).await {
+                                        warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order in medium limit");
+                                    } else {
+                                        state.active_orders.remove(order_id);
+                                        state.last_order_price_update.remove(order_id);
+                                    }
+                                }
+                                V::Fut(v) => {
+                                    if let Err(err) = v.cancel(order_id, &symbol).await {
+                                        warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order in medium limit");
+                                    } else {
+                                        state.active_orders.remove(order_id);
+                                        state.last_order_price_update.remove(order_id);
+                                    }
+                                }
+                            }
                         }
+                        // Yeni emirleri de durdur (soft limit davranışı)
+                        should_block_new_orders = true;
+                    }
+                    "soft" => {
+                        // Soft limit - Yeni emirleri durdur
+                        info!(
+                            %symbol,
+                            position_size_notional = position_size_notional_mark,
+                            total_exposure_notional,
+                            max_allowed = max_position_size_usd,
+                            soft_limit,
+                            active_orders_count = state.active_orders.len(),
+                            active_orders_notional = total_active_orders_notional,
+                            "OPPORTUNITY MODE SOFT LIMIT: stopping new orders, keeping existing orders"
+                        );
+                        // Yeni emirleri durdur
+                        should_block_new_orders = true;
+                    }
+                    _ => {
+                        // Normal - Yeni emirler verilebilir
                     }
                 }
-                continue; // Bu tick'i atla
+            } else {
+                // Normal mode: Eski davranış (anında force-close)
+                if position_size_notional_mark > max_position_size_usd {
+                    warn!(
+                        %symbol,
+                        position_size_notional = position_size_notional_mark,
+                        max_allowed = max_position_size_usd,
+                        "POSITION SIZE RISK: position too large, force closing (normal mode)"
+                    );
+                    rate_limit_guard(1).await;
+                    match &venue {
+                        V::Spot(v) => {
+                            if let Err(err) = v.close_position(&symbol).await {
+                                error!(%symbol, ?err, "failed to close position due to size risk");
+                            } else {
+                                info!(%symbol, "closed position due to size risk");
+                            }
+                        }
+                        V::Fut(v) => {
+                            if let Err(err) = v.close_position(&symbol).await {
+                                error!(%symbol, ?err, "failed to close position due to size risk");
+                            } else {
+                                info!(%symbol, "closed position due to size risk");
+                            }
+                        }
+                    }
+                    continue; // Bu tick'i atla
+                }
             }
             
             // 6. Real-time PnL alerts: Kritik seviyelerde uyarı
@@ -2062,6 +2326,16 @@ async fn main() -> Result<()> {
                 tick_size: tick_size_decimal, // Per-symbol tick_size (crossing guard için)
             };
             let mut quotes = state.strategy.on_tick(&ctx);
+            
+            // KRİTİK: Opportunity mode soft-limit kontrolü - yeni emirleri durdur
+            if should_block_new_orders {
+                quotes.bid = None;
+                quotes.ask = None;
+                info!(
+                    %symbol,
+                    "OPPORTUNITY MODE: blocking new orders due to position size limits"
+                );
+            }
             
             // Debug: Strateji neden quote üretmedi?
             if quotes.bid.is_none() && quotes.ask.is_none() {
@@ -2475,7 +2749,17 @@ async fn main() -> Result<()> {
                         rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
+                                let info = OrderInfo { 
+                                    order_id: order_id.clone(), 
+                                    client_order_id: None, // TODO: clientOrderId ekle
+                                    side: Side::Buy, 
+                                    price: px, 
+                                    qty, 
+                                    filled_qty: Qty(Decimal::ZERO),
+                                    remaining_qty: qty,
+                                    created_at: Instant::now(),
+                                    last_fill_time: None,
+                                };
                                 state.active_orders.insert(order_id.clone(), info);
                                 // Fiyat güncellemesini kaydet (akıllı emir analizi için)
                                 state.last_order_price_update.insert(order_id, px);
@@ -2497,7 +2781,17 @@ async fn main() -> Result<()> {
                                 rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
+                                        let info2 = OrderInfo { 
+                                            order_id: order_id2.clone(), 
+                                            client_order_id: None,
+                                            side: Side::Buy, 
+                                            price: px, 
+                                            qty: qty2, 
+                                            filled_qty: Qty(Decimal::ZERO),
+                                            remaining_qty: qty2,
+                                            created_at: Instant::now(),
+                                            last_fill_time: None,
+                                        };
                                         state.active_orders.insert(order_id2.clone(), info2);
                                         state.last_order_price_update.insert(order_id2, px);
                                     }
@@ -2516,7 +2810,17 @@ async fn main() -> Result<()> {
                         rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
+                                let info = OrderInfo { 
+                                    order_id: order_id.clone(), 
+                                    client_order_id: None, // TODO: clientOrderId ekle
+                                    side: Side::Sell, 
+                                    price: px, 
+                                    qty, 
+                                    filled_qty: Qty(Decimal::ZERO),
+                                    remaining_qty: qty,
+                                    created_at: Instant::now(),
+                                    last_fill_time: None,
+                                };
                                 state.active_orders.insert(order_id.clone(), info);
                                 // Fiyat güncellemesini kaydet (akıllı emir analizi için)
                                 state.last_order_price_update.insert(order_id.clone(), px);
@@ -2553,7 +2857,17 @@ async fn main() -> Result<()> {
                                     rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
                                     match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                         Ok(order_id2) => {
-                                            let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
+                                            let info2 = OrderInfo { 
+                                            order_id: order_id2.clone(), 
+                                            client_order_id: None,
+                                            side: Side::Sell, 
+                                            price: px, 
+                                            qty: qty2, 
+                                            filled_qty: Qty(Decimal::ZERO),
+                                            remaining_qty: qty2,
+                                            created_at: Instant::now(),
+                                            last_fill_time: None,
+                                        };
                                         state.active_orders.insert(order_id2.clone(), info2);
                                         state.last_order_price_update.insert(order_id2, px);
                                         }
@@ -2581,7 +2895,17 @@ async fn main() -> Result<()> {
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
+                                let info = OrderInfo { 
+                                    order_id: order_id.clone(), 
+                                    client_order_id: None, // TODO: clientOrderId ekle
+                                    side: Side::Buy, 
+                                    price: px, 
+                                    qty, 
+                                    filled_qty: Qty(Decimal::ZERO),
+                                    remaining_qty: qty,
+                                    created_at: Instant::now(),
+                                    last_fill_time: None,
+                                };
                                 state.active_orders.insert(order_id.clone(), info);
                                 // Başarılı emir için spent hesapla (hesaptan giden para = margin)
                                 // Notional (pozisyon boyutu) / leverage = hesaptan giden para
@@ -2688,7 +3012,17 @@ async fn main() -> Result<()> {
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                                             match v.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
-                                                    let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty: retry_qty, created_at: Instant::now() };
+                                                    let info = OrderInfo { 
+                                                        order_id: order_id.clone(), 
+                                                        client_order_id: None,
+                                                        side: Side::Buy, 
+                                                        price: px, 
+                                                        qty: retry_qty, 
+                                                        filled_qty: Qty(Decimal::ZERO),
+                                                        remaining_qty: retry_qty,
+                                                        created_at: Instant::now(),
+                                                        last_fill_time: None,
+                                                    };
                                                     state.active_orders.insert(order_id.clone(), info);
                                                     state.last_order_price_update.insert(order_id, px);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
@@ -2735,7 +3069,17 @@ async fn main() -> Result<()> {
                                 rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                                 match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Buy, price: px, qty: qty2, created_at: Instant::now() };
+                                        let info2 = OrderInfo { 
+                                            order_id: order_id2.clone(), 
+                                            client_order_id: None,
+                                            side: Side::Buy, 
+                                            price: px, 
+                                            qty: qty2, 
+                                            filled_qty: Qty(Decimal::ZERO),
+                                            remaining_qty: qty2,
+                                            created_at: Instant::now(),
+                                            last_fill_time: None,
+                                        };
                                         state.active_orders.insert(order_id2, info2);
                                         // Spent güncelle (hesaptan giden para = margin)
                                         // Notional / leverage = hesaptan giden para
@@ -2765,7 +3109,17 @@ async fn main() -> Result<()> {
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
+                                let info = OrderInfo { 
+                                    order_id: order_id.clone(), 
+                                    client_order_id: None, // TODO: clientOrderId ekle
+                                    side: Side::Sell, 
+                                    price: px, 
+                                    qty, 
+                                    filled_qty: Qty(Decimal::ZERO),
+                                    remaining_qty: qty,
+                                    created_at: Instant::now(),
+                                    last_fill_time: None,
+                                };
                                 state.active_orders.insert(order_id.clone(), info);
                                 
                                 // JSON log: Order created
@@ -2872,7 +3226,17 @@ async fn main() -> Result<()> {
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                                             match v.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
-                                                    let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty: retry_qty, created_at: Instant::now() };
+                                                    let info = OrderInfo { 
+                                                        order_id: order_id.clone(), 
+                                                        client_order_id: None,
+                                                        side: Side::Sell, 
+                                                        price: px, 
+                                                        qty: retry_qty, 
+                                                        filled_qty: Qty(Decimal::ZERO),
+                                                        remaining_qty: retry_qty,
+                                                        created_at: Instant::now(),
+                                                        last_fill_time: None,
+                                                    };
                                                     state.active_orders.insert(order_id.clone(), info);
                                                     state.last_order_price_update.insert(order_id, px);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
@@ -2919,7 +3283,17 @@ async fn main() -> Result<()> {
                                 rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                                 match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo { order_id: order_id2.clone(), side: Side::Sell, price: px, qty: qty2, created_at: Instant::now() };
+                                        let info2 = OrderInfo { 
+                                            order_id: order_id2.clone(), 
+                                            client_order_id: None,
+                                            side: Side::Sell, 
+                                            price: px, 
+                                            qty: qty2, 
+                                            filled_qty: Qty(Decimal::ZERO),
+                                            remaining_qty: qty2,
+                                            created_at: Instant::now(),
+                                            last_fill_time: None,
+                                        };
                                         state.active_orders.insert(order_id2, info2);
                                         // Spent güncelle (hesaptan giden para = margin)
                                         // Notional / leverage = hesaptan giden para

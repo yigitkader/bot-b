@@ -155,6 +155,9 @@ internal:
   max_position_size_buffer: 5.0  # 5x buffer
   opportunity_mode_position_multiplier: 2.0  # Fırsat modunda pozisyon çarpanı (normal 1x)
   opportunity_mode_leverage_reduction: 0.5  # Fırsat modunda leverage azaltma faktörü (0.5 = yarıya düşür)
+  opportunity_mode_soft_limit_ratio: 0.8  # Soft limit: Yeni emirleri durdur (%80)
+  opportunity_mode_medium_limit_ratio: 0.9  # Medium limit: Mevcut emirleri azalt (%90)
+  opportunity_mode_hard_limit_ratio: 1.0  # Hard limit: Force-close (%100)
   
   # Risk/Reward ve Profit Guarantee
   # Market making için: 1.0-1.5 yeterli (spread'den kazanç garantili)

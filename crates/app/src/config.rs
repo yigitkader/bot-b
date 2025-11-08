@@ -177,6 +177,12 @@ pub struct InternalCfg {
     pub opportunity_mode_position_multiplier: f64,
     #[serde(default = "default_opportunity_mode_leverage_reduction")]
     pub opportunity_mode_leverage_reduction: f64,
+    #[serde(default = "default_opportunity_mode_soft_limit_ratio")]
+    pub opportunity_mode_soft_limit_ratio: f64, // Soft limit: Yeni emirleri durdur (örn: 0.8 = %80)
+    #[serde(default = "default_opportunity_mode_medium_limit_ratio")]
+    pub opportunity_mode_medium_limit_ratio: f64, // Medium limit: Mevcut emirleri azalt (örn: 0.9 = %90)
+    #[serde(default = "default_opportunity_mode_hard_limit_ratio")]
+    pub opportunity_mode_hard_limit_ratio: f64, // Hard limit: Force-close (örn: 1.0 = %100)
     #[serde(default = "default_min_risk_reward_ratio")]
     pub min_risk_reward_ratio: f64,
     #[serde(default = "default_take_profit_position_size_threshold")]
@@ -321,6 +327,9 @@ fn default_stop_loss_trend_threshold() -> f64 { -0.2 }
 fn default_max_position_size_buffer() -> f64 { 5.0 }
 fn default_opportunity_mode_position_multiplier() -> f64 { 2.0 }
 fn default_opportunity_mode_leverage_reduction() -> f64 { 0.5 }
+fn default_opportunity_mode_soft_limit_ratio() -> f64 { 0.8 } // %80'de yeni emirleri durdur
+fn default_opportunity_mode_medium_limit_ratio() -> f64 { 0.9 } // %90'da mevcut emirleri azalt
+fn default_opportunity_mode_hard_limit_ratio() -> f64 { 1.0 } // %100'de force-close
 fn default_min_risk_reward_ratio() -> f64 { 2.0 }
 fn default_take_profit_position_size_threshold() -> f64 { 100.0 }
 fn default_initial_fill_rate() -> f64 { 0.5 }

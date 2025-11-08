@@ -54,12 +54,17 @@ pub struct SymbolState {
 // ============================================================================
 
 /// Order information for tracking
+/// KRİTİK: Partial fill ve idempotency desteği
 #[derive(Clone, Debug)]
 pub struct OrderInfo {
     pub order_id: String,
+    pub client_order_id: Option<String>, // Idempotency için client order ID
     pub side: Side,
     pub price: Px,
-    pub qty: Qty,
+    pub qty: Qty, // Original order quantity
+    pub filled_qty: Qty, // Cumulative filled quantity
+    pub remaining_qty: Qty, // Remaining quantity (qty - filled_qty)
     pub created_at: Instant,
+    pub last_fill_time: Option<Instant>, // Son fill zamanı
 }
 
