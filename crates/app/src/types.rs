@@ -49,6 +49,14 @@ pub struct SymbolState {
     pub position_size_notional_history: Vec<f64>,
     pub last_pnl_alert: Option<Instant>,
     pub cumulative_pnl: Decimal,
+    
+    // Funding cost tracking (futures)
+    // KRİTİK: Son uygulanan funding time'ı takip et (8 saatte bir tek seferde uygula)
+    pub last_applied_funding_time: Option<u64>, // Unix timestamp (ms) - son uygulanan funding time
+    
+    // PnL tracking
+    pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı
+    pub avg_entry_price: Option<Decimal>, // Ortalama entry price (pozisyon açılırken güncellenir)
 }
 
 // ============================================================================

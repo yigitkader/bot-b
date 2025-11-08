@@ -166,6 +166,7 @@ pub struct BinanceFutures {
     pub qty_step: Decimal,
     pub price_precision: usize,
     pub qty_precision: usize,
+    pub hedge_mode: bool, // Hedge mode (dual-side position) açık mı?
 }
 
 #[derive(Deserialize)]
@@ -206,6 +207,8 @@ struct FutPosition {
     leverage: String,
     #[serde(rename = "liquidationPrice")]
     liquidation_price: String,
+    #[serde(rename = "positionSide", default)]
+    position_side: Option<String>, // "LONG" | "SHORT" | "BOTH" (hedge mode) veya None (one-way mode)
 }
 
 #[derive(Deserialize)]
@@ -221,6 +224,71 @@ struct PremiumIndex {
 }
 
 impl BinanceFutures {
+    /// Leverage ayarla (sembol bazlı)
+    /// KRİTİK: Başlangıçta her sembol için leverage'i açıkça ayarla
+    /// /fapi/v1/leverage endpoint'i ile sembol bazlı leverage set edilir
+    pub async fn set_leverage(&self, sym: &str, leverage: u32) -> Result<()> {
+        let params = vec![
+            format!("symbol={}", sym),
+            format!("leverage={}", leverage),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/leverage?{}&signature={}", self.base, qs, sig);
+        
+        match send_void(
+            self.common
+                .client
+                .post(&url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(%sym, leverage, "leverage set successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(%sym, leverage, error = %e, "failed to set leverage");
+                Err(e)
+            }
+        }
+    }
+    
+    /// Position side mode ayarla (hedge mode aç/kapa)
+    /// KRİTİK: Başlangıçta hesap modunu açıkça ayarla
+    /// /fapi/v1/positionSide/dual endpoint'i ile hedge mode açılır/kapanır
+    pub async fn set_position_side_dual(&self, dual: bool) -> Result<()> {
+        let params = vec![
+            format!("dualSidePosition={}", if dual { "true" } else { "false" }),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/positionSide/dual?{}&signature={}", self.base, qs, sig);
+        
+        match send_void(
+            self.common
+                .client
+                .post(&url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(dual_side = dual, "position side mode set successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(dual_side = dual, error = %e, "failed to set position side mode");
+                Err(e)
+            }
+        }
+    }
+    
     /// Per-symbol metadata (tick_size, step_size) alır, fallback olarak global değerleri kullanır
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
         if let Some(r) = FUT_RULES.get(sym) {
@@ -410,7 +478,8 @@ impl BinanceFutures {
     /// 2. Pozisyon tam olarak kapatıldığını doğrula
     /// 3. Kısmi kapatma durumunda retry yap
     /// 4. Leverage ile uyumlu olduğundan emin ol
-    pub async fn flatten_position(&self, sym: &str) -> Result<()> {
+    /// 5. Hedge mode açıksa positionSide parametresi ekle
+    pub async fn flatten_position(&self, sym: &str, hedge_mode: bool) -> Result<()> {
         // İlk pozisyon kontrolü
         let initial_pos = self.fetch_position(sym).await?;
         let initial_qty = initial_pos.qty.0;
@@ -419,12 +488,6 @@ impl BinanceFutures {
             // Pozisyon zaten kapalı
             return Ok(());
         }
-
-        let initial_side = if initial_qty.is_sign_positive() {
-            Side::Sell // Long pozisyon → Sell ile kapat
-        } else {
-            Side::Buy // Short pozisyon → Buy ile kapat
-        };
 
         let rules = self.rules_for(sym).await?;
         let initial_qty_abs = quantize_decimal(initial_qty.abs(), rules.step_size);
@@ -477,8 +540,20 @@ impl BinanceFutures {
 
             let qty_str = format_decimal_fixed(remaining_qty, rules.qty_precision);
 
+            // KRİTİK: Hedge mode açıksa positionSide parametresi ekle
+            // positionSide: "LONG" (pozitif qty) veya "SHORT" (negatif qty)
+            let position_side = if hedge_mode {
+                if current_qty.is_sign_positive() {
+                    Some("LONG")
+                } else {
+                    Some("SHORT")
+                }
+            } else {
+                None
+            };
+
             // KRİTİK: reduceOnly=true ve type=MARKET garantisi
-            let params = vec![
+            let mut params = vec![
                 format!("symbol={}", sym),
                 format!(
                     "side={}",
@@ -494,6 +569,11 @@ impl BinanceFutures {
                 format!("timestamp={}", BinanceCommon::ts()),
                 format!("recvWindow={}", self.common.recv_window_ms),
             ];
+            
+            // Hedge mode açıksa positionSide ekle
+            if let Some(pos_side) = position_side {
+                params.push(format!("positionSide={}", pos_side));
+            }
 
             let qs = params.join("&");
             let sig = self.common.sign(&qs);
@@ -608,8 +688,32 @@ impl Venue for BinanceFutures {
         qty: Qty,
         tif: Tif,
     ) -> Result<String> {
-        // Futures için clientOrderId olmadan eski davranış
-        self.place_limit_with_client_id(sym, side, px, qty, tif, "").await.map(|(order_id, _)| order_id)
+        // KRİTİK DÜZELTME: Idempotency için deterministik client_order_id üret
+        // Format: {symbol}_{side}_{price_hash}_{qty_hash}_{timestamp}
+        // Hash kullanarak price ve qty'yi kısalt (deterministic)
+        let price_str = format!("{:.8}", px.0.to_f64().unwrap_or(0.0));
+        let qty_str = format!("{:.8}", qty.0.to_f64().unwrap_or(0.0));
+        // Basit hash: price ve qty'nin son 6 karakterini al
+        let price_hash = price_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
+        let qty_hash = qty_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
+        let timestamp_ms = BinanceCommon::ts();
+        let side_str = match side {
+            Side::Buy => "B",
+            Side::Sell => "S",
+        };
+        let symbol_clean = sym.replace("-", "_").replace("/", "_");
+        let client_order_id = format!("{}_{}_{}_{}_{}", symbol_clean, side_str, price_hash, qty_hash, timestamp_ms);
+        // 36 karakter limit kontrolü
+        let client_order_id = if client_order_id.len() > 36 {
+            // Kısalt: symbol'ü kısalt
+            let symbol_short = symbol_clean.chars().take(8).collect::<String>();
+            format!("{}_{}_{}_{}_{}", symbol_short, side_str, price_hash, qty_hash, timestamp_ms)
+                .chars().take(36).collect::<String>()
+        } else {
+            client_order_id
+        };
+        
+        self.place_limit_with_client_id(sym, side, px, qty, tif, &client_order_id).await.map(|(order_id, _)| order_id)
     }
     
     async fn place_limit_with_client_id(
@@ -694,17 +798,91 @@ impl Venue for BinanceFutures {
                 );
             }
         }
-        let qs = params.join("&");
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-
-        let order: FutPlacedOrder = send_json(
-            self.common
+        // KRİTİK DÜZELTME: Retry/backoff mekanizması
+        // Transient hatalar için exponential backoff ile retry (aynı clientOrderId ile)
+        const MAX_RETRIES: u32 = 3;
+        const INITIAL_BACKOFF_MS: u64 = 100;
+        
+        let mut last_error = None;
+        let mut order_result: Option<FutPlacedOrder> = None;
+        
+        for attempt in 0..=MAX_RETRIES {
+            // Her retry'de yeni request oluştur (aynı parametrelerle, aynı clientOrderId ile)
+            let retry_qs = params.join("&");
+            let retry_sig = self.common.sign(&retry_qs);
+            let retry_url = format!("{}/fapi/v1/order?{}&signature={}", self.base, retry_qs, retry_sig);
+            
+            match self.common
                 .client
-                .post(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
+                .post(&retry_url)
+                .header("X-MBX-APIKEY", &self.common.api_key)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        match resp.json::<FutPlacedOrder>().await {
+                            Ok(order) => {
+                                order_result = Some(order);
+                                break; // Başarılı, döngüden çık
+                            }
+                            Err(e) => {
+                                if attempt < MAX_RETRIES {
+                                    let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                                    tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms, "json parse error, retrying");
+                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                    last_error = Some(anyhow!("json parse error: {}", e));
+                                    continue;
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    } else {
+                        // Status code hata
+                        let body = resp.text().await.unwrap_or_default();
+                        
+                        // Kalıcı hata kontrolü
+                        if is_permanent_error(status.as_u16(), &body) {
+                            tracing::error!(%status, %body, attempt, "permanent error, no retry");
+                            return Err(anyhow!("binance api error: {} - {} (permanent)", status, body));
+                        }
+                        
+                        // Transient hata kontrolü
+                        if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
+                            let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                            tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms, "transient error, retrying with exponential backoff (same clientOrderId)");
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            last_error = Some(anyhow!("binance api error: {} - {}", status, body));
+                            continue;
+                        } else {
+                            // Transient değil veya max retry'ye ulaşıldı
+                            tracing::error!(%status, %body, attempt, "error after retries");
+                            return Err(anyhow!("binance api error: {} - {}", status, body));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Network hatası
+                    if attempt < MAX_RETRIES {
+                        let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                        tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms, "network error, retrying with exponential backoff (same clientOrderId)");
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        last_error = Some(e.into());
+                        continue;
+                    } else {
+                        tracing::error!(error = %e, attempt, "network error after retries");
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        
+        // Başarılı sonuç döndür
+        let order = order_result.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("unknown error after retries"))
+        })?;
 
         info!(
             %sym,
@@ -765,7 +943,7 @@ impl Venue for BinanceFutures {
     }
 
     async fn close_position(&self, sym: &str) -> Result<()> {
-        self.flatten_position(sym).await
+        self.flatten_position(sym, self.hedge_mode).await
     }
 }
 
@@ -846,16 +1024,61 @@ async fn ensure_success(resp: Response) -> Result<Response> {
     }
 }
 
+/// Transient hata mı kontrol et (retry yapılabilir mi?)
+/// 408 (Request Timeout), 429 (Too Many Requests), 5xx (Server Errors) → transient
+/// 400 (Bad Request) → body'ye göre karar ver (bazıları transient olabilir)
+fn is_transient_error(status: u16, _body: &str) -> bool {
+    match status {
+        408 => true,  // Request Timeout
+        429 => true,  // Too Many Requests
+        500..=599 => true,  // Server Errors
+        400 => {
+            // 400 için body'ye bak - bazı hatalar transient olabilir
+            // "Invalid symbol" gibi kalıcı hatalar retry edilmemeli
+            // "Precision is over" gibi hatalar kalıcı
+            // "Insufficient margin" gibi hatalar kalıcı
+            // Ama network timeout gibi durumlar transient olabilir
+            // Şimdilik 400'leri kalıcı sayalım (daha güvenli)
+            false
+        }
+        _ => false,  // Diğer hatalar kalıcı
+    }
+}
+
+/// Kalıcı hata mı kontrol et (sembol disable edilmeli mi?)
+/// "invalid", "margin", "precision" gibi hatalar kalıcıdır
+fn is_permanent_error(status: u16, body: &str) -> bool {
+    if status == 400 {
+        let body_lower = body.to_lowercase();
+        body_lower.contains("invalid") ||
+        body_lower.contains("margin") ||
+        body_lower.contains("precision") ||
+        body_lower.contains("insufficient balance") ||
+        body_lower.contains("min notional") ||
+        body_lower.contains("below min notional")
+    } else {
+        false
+    }
+}
+
 async fn send_json<T>(builder: RequestBuilder) -> Result<T>
 where
     T: DeserializeOwned,
 {
+    // KRİTİK DÜZELTME: Retry/backoff mekanizması
+    // RequestBuilder clone edilemediği için, request'i baştan oluşturmalıyız
+    // Ama builder'ı closure'a wrap edemeyiz çünkü builder consume ediliyor
+    // Bu yüzden şimdilik sadece ilk denemeyi yapıyoruz, retry mekanizması üst seviyede implement edilebilir
     let resp = builder.send().await?;
     let resp = ensure_success(resp).await?;
     Ok(resp.json().await?)
 }
 
 async fn send_void(builder: RequestBuilder) -> Result<()> {
+    // KRİTİK DÜZELTME: Retry/backoff mekanizması
+    // RequestBuilder clone edilemediği için, request'i baştan oluşturmalıyız
+    // Ama builder'ı closure'a wrap edemeyiz çünkü builder consume ediliyor
+    // Bu yüzden şimdilik sadece ilk denemeyi yapıyoruz, retry mekanizması üst seviyede implement edilebilir
     let resp = builder.send().await?;
     ensure_success(resp).await?;
     Ok(())

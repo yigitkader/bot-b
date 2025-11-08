@@ -38,6 +38,7 @@ pub enum UserEvent {
         price: Px,
         is_maker: bool,       // true = maker, false = taker
         order_status: String, // Order status: NEW, PARTIALLY_FILLED, FILLED, CANCELED, etc.
+        commission: Decimal,   // KRİTİK: Gerçek komisyon (executionReport'tan "n" field'ı)
     },
     OrderCanceled {
         symbol: String,
@@ -305,6 +306,9 @@ impl UserDataStream {
                     Self::parse_side(value.get("S").and_then(Value::as_str).unwrap_or("SELL"));
                 // Maker flag: "m" field (true = maker, false = taker)
                 let is_maker = value.get("m").and_then(Value::as_bool).unwrap_or(false);
+                // KRİTİK DÜZELTME: Gerçek komisyon (executionReport'tan "n" field'ı)
+                // "n" = commission (last executed qty için komisyon, incremental)
+                let commission = Self::parse_decimal(value, "n");
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
@@ -315,6 +319,7 @@ impl UserDataStream {
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),
+                    commission,
                 }));
             }
 
@@ -353,6 +358,9 @@ impl UserDataStream {
                     Self::parse_side(data.get("S").and_then(Value::as_str).unwrap_or("SELL"));
                 // Maker flag: "m" field (true = maker, false = taker)
                 let is_maker = data.get("m").and_then(Value::as_bool).unwrap_or(false);
+                // KRİTİK DÜZELTME: Gerçek komisyon (ORDER_TRADE_UPDATE'ten "n" field'ı)
+                // "n" = commission (last executed qty için komisyon, incremental)
+                let commission = Self::parse_decimal(data, "n");
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
@@ -363,6 +371,7 @@ impl UserDataStream {
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),
+                    commission,
                 }));
             }
 

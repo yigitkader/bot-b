@@ -231,6 +231,7 @@ async fn main() -> Result<()> {
     init_rate_limiter();
     info!("rate limiter initialized for futures");
     
+    let hedge_mode = cfg.binance.hedge_mode;
     let venue = BinanceFutures {
             base: cfg.binance.futures_base.clone(),
             common: common.clone(),
@@ -238,7 +239,17 @@ async fn main() -> Result<()> {
             qty_step: qty_step_dec,
             price_precision,
             qty_precision,
+            hedge_mode,
     };
+    
+    // KRİTİK: Başlangıçta position side mode'u açıkça ayarla
+    // Hedge mode açıksa dual-side, kapalıysa one-way mode
+    if let Err(err) = venue.set_position_side_dual(hedge_mode).await {
+        warn!(hedge_mode, error = %err, "failed to set position side mode, continuing anyway");
+        // Hata olsa bile devam et (hesap zaten doğru modda olabilir)
+    } else {
+        info!(hedge_mode, "position side mode set successfully");
+    }
 
     let metadata = venue.symbol_metadata().await?;
 
@@ -601,7 +612,32 @@ async fn main() -> Result<()> {
             position_size_notional_history: Vec::with_capacity(cfg.internal.position_size_history_max_len),
             last_pnl_alert: None,
             cumulative_pnl: Decimal::ZERO,
+            // Funding cost tracking
+            last_applied_funding_time: None,
+            // PnL tracking
+            last_daily_reset: None,
+            avg_entry_price: None,
         });
+    }
+
+    // KRİTİK: Başlangıçta her sembol için leverage'i açıkça ayarla
+    // Config'den leverage al: exec.default_leverage veya cfg.leverage (fallback)
+    let leverage_to_set = cfg.exec.default_leverage
+        .or(cfg.leverage)
+        .unwrap_or(1); // Default: 1x (en güvenli)
+    
+    if cfg.mode == "futures" {
+        info!(leverage = leverage_to_set, "setting leverage for all symbols");
+        for state in &states {
+            let symbol = &state.meta.symbol;
+            // API Rate Limit koruması
+            rate_limit_guard(1).await; // POST /fapi/v1/leverage: Weight 1
+            if let Err(err) = venue.set_leverage(symbol, leverage_to_set).await {
+                warn!(%symbol, leverage = leverage_to_set, error = %err, "failed to set leverage, continuing anyway");
+                // Hata olsa bile devam et (leverage zaten doğru olabilir)
+            }
+        }
+        info!("leverage set for all symbols");
     }
 
     let symbol_list: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
@@ -831,6 +867,7 @@ async fn main() -> Result<()> {
                     price,
                     is_maker,
                     order_status,
+                    commission,
                 } => {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         let state = &mut states[*idx];
@@ -882,8 +919,8 @@ async fn main() -> Result<()> {
                         // cumulative_filled_qty = total filled so far
                         let fill_increment = qty.0; // Bu fill'de ne kadar fill oldu
                         
-                        // Inventory güncelle (sadece incremental fill miktarı)
-                        // NOT: Order state'de yoksa bile inventory güncelle (reconnect sonrası olabilir)
+                        // KRİTİK DÜZELTME: Fill event'lerinden gerçekleşen PnL hesapla
+                        // Pozisyon kapatıldığında (inv sıfıra düştüğünde veya tersine döndüğünde) PnL hesapla
                         let old_inv = state.inv.0;
                         let mut inv = old_inv;
                         if side == Side::Buy {
@@ -891,8 +928,95 @@ async fn main() -> Result<()> {
                         } else {
                             inv -= fill_increment;
                         }
+                        
+                        // PnL hesaplama: Pozisyon kapatıldığında (long → sell fill veya short → buy fill)
+                        let realized_pnl = if let Some(avg_entry) = state.avg_entry_price {
+                            // Pozisyon var, entry price biliniyor
+                            let closed_qty = if (old_inv.is_sign_positive() && side == Side::Sell) || 
+                                               (old_inv.is_sign_negative() && side == Side::Buy) {
+                                // Pozisyon kapatılıyor
+                                fill_increment.min(old_inv.abs())
+                            } else {
+                                Decimal::ZERO // Pozisyon açılıyor/artıyor, PnL yok
+                            };
+                            
+                            if closed_qty > Decimal::ZERO {
+                                // Gerçekleşen PnL = (fill_price - entry_price) * closed_qty - komisyon
+                                let price_diff = if old_inv.is_sign_positive() {
+                                    // Long pozisyon kapatılıyor (sell fill)
+                                    price.0 - avg_entry
+                                } else {
+                                    // Short pozisyon kapatılıyor (buy fill)
+                                    avg_entry - price.0
+                                };
+                                let gross_pnl = price_diff * closed_qty;
+                                
+                                // KRİTİK DÜZELTME: Gerçek komisyon kullan (executionReport'tan gelen)
+                                // commission zaten UserEvent::OrderFill'den geliyor (executionReport'tan "n" field'ı)
+                                // commission = last executed qty için komisyon (incremental)
+                                // closed_qty ile orantılı olarak hesapla (eğer partial fill ise)
+                                let actual_commission = if fill_increment > Decimal::ZERO {
+                                    // Proportional commission: (commission / fill_increment) * closed_qty
+                                    (commission / fill_increment) * closed_qty
+                                } else {
+                                    commission // Full fill, direkt kullan
+                                };
+                                
+                                let net_pnl = gross_pnl - actual_commission;
+                                
+                                // Daily ve cumulative PnL'e ekle
+                                state.daily_pnl += net_pnl;
+                                state.cumulative_pnl += net_pnl;
+                                
+                                info!(
+                                    %symbol,
+                                    fill_price = %price.0,
+                                    entry_price = %avg_entry,
+                                    closed_qty = %closed_qty,
+                                    gross_pnl = %gross_pnl,
+                                    actual_commission = %actual_commission,
+                                    net_pnl = %net_pnl,
+                                    daily_pnl = %state.daily_pnl,
+                                    cumulative_pnl = %state.cumulative_pnl,
+                                    "realized PnL from fill event (using actual commission from executionReport)"
+                                );
+                                
+                                net_pnl
+                            } else {
+                                Decimal::ZERO
+                            }
+                        } else {
+                            Decimal::ZERO // Entry price bilinmiyor, PnL hesaplanamaz
+                        };
+                        
+                        // Inventory güncelle (sadece incremental fill miktarı)
+                        // NOT: Order state'de yoksa bile inventory güncelle (reconnect sonrası olabilir)
                         state.inv = Qty(inv);
                         state.last_inventory_update = Some(std::time::Instant::now());
+                        
+                        // Avg entry price güncelle (pozisyon açılıyor/artıyor)
+                        if (old_inv.is_zero() && !inv.is_zero()) || 
+                           (old_inv.is_sign_positive() && side == Side::Buy && inv > old_inv) ||
+                           (old_inv.is_sign_negative() && side == Side::Sell && inv < old_inv) {
+                            // Pozisyon açılıyor veya artıyor → avg entry price güncelle
+                            if let Some(ref mut avg_entry) = state.avg_entry_price {
+                                // Weighted average: (old_qty * old_avg + new_qty * new_price) / total_qty
+                                let old_qty = old_inv.abs();
+                                let new_qty = fill_increment;
+                                let total_qty = inv.abs();
+                                if total_qty > Decimal::ZERO {
+                                    *avg_entry = (*avg_entry * old_qty + price.0 * new_qty) / total_qty;
+                                }
+                            } else {
+                                // İlk pozisyon → entry price = fill price
+                                state.avg_entry_price = Some(price.0);
+                            }
+                        }
+                        
+                        // Pozisyon sıfıra düştüyse avg_entry_price'ı sıfırla
+                        if inv.is_zero() && !old_inv.is_zero() {
+                            state.avg_entry_price = None;
+                        }
                         
                         // KRİTİK İYİLEŞTİRME: Order-to-position mapping - pozisyon oluşturan order'ları track et
                         // Buy fill → pozisyon artar → order'ı ekle
@@ -1679,20 +1803,79 @@ async fn main() -> Result<()> {
             let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
             // position_size_notional zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
             
+            // KRİTİK DÜZELTME: Günlük PnL reset mekanizması (gün başında reset)
+            // Her gün başında (00:00 UTC) daily_pnl'i sıfırla
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            
+            let should_reset_daily = if let Some(last_reset) = state.last_daily_reset {
+                // Son reset'ten bu yana 24 saat geçti mi?
+                const DAY_MS: u64 = 24 * 3600 * 1000;
+                now_ms.saturating_sub(last_reset) >= DAY_MS
+            } else {
+                // İlk kez, reset yap
+                true
+            };
+            
+            if should_reset_daily {
+                let old_daily_pnl = state.daily_pnl;
+                state.daily_pnl = Decimal::ZERO;
+                state.last_daily_reset = Some(now_ms);
+                info!(
+                    %symbol,
+                    old_daily_pnl = %old_daily_pnl,
+                    "daily PnL reset (new day started)"
+                );
+            }
+            
+            // KRİTİK DÜZELTME: Avg entry price'ı pozisyon bilgisinden güncelle
+            // Binance'tan gelen pozisyon bilgisinde entry price var, bunu kullan
+            if !pos.qty.0.is_zero() {
+                state.avg_entry_price = Some(pos.entry.0);
+            } else {
+                state.avg_entry_price = None;
+            }
+            
             // --- GELİŞMİŞ RİSK VE KAZANÇ TAKİBİ: Detaylı analiz ---
             
-            // 1. Günlük PnL takibi (basit: her tick'te güncelle, reset mekanizması eklenebilir)
-            state.daily_pnl = current_pnl; // Şimdilik current PnL, ileride günlük reset eklenebilir
+            // NOT: daily_pnl ve cumulative_pnl artık fill event'lerinden akümüle ediliyor
+            // Burada sadece anlık PnL hesaplanıyor (risk analizi için)
             
             // 2. Funding cost takibi (futures için)
-            // KRİTİK DÜZELTME: Funding cost normalizasyonu - her tick için doğru maliyet
-            // Funding rate 8 saatlik (28800 saniye) bir orandır
-            // Tick başına maliyet = funding_rate_8h * (tick_secs / 28800) * position_size_notional
-            if let Some(funding_rate) = funding_rate {
-                let tick_secs = (tick_ms as f64) / 1000.0; // Tick süresi saniye cinsinden
-                const FUNDING_INTERVAL_SEC: f64 = 8.0 * 3600.0; // 8 saat = 28800 saniye
-                let funding_cost_per_tick = funding_rate * (tick_secs / FUNDING_INTERVAL_SEC) * position_size_notional;
-                state.total_funding_cost += Decimal::from_f64_retain(funding_cost_per_tick).unwrap_or(Decimal::ZERO);
+            // KRİTİK DÜZELTME: Funding 8 saatte bir işler; sadece funding anında tek seferde uygula
+            // next_funding_time: Gelecekteki funding time (Unix timestamp ms)
+            // Bu funding time geçmişse, bir önceki funding (next_funding_ts - 8 hours) uygulanmış demektir
+            // Kontrol: Son uygulanan funding time'dan sonra yeni bir funding geldi mi?
+            if let (Some(funding_rate), Some(next_funding_ts)) = (funding_rate, next_funding_time) {
+                const FUNDING_INTERVAL_MS: u64 = 8 * 3600 * 1000; // 8 saat = 28800000 ms
+                let this_funding_ts = next_funding_ts.saturating_sub(FUNDING_INTERVAL_MS); // Bu funding time
+                
+                // Bu funding time daha önce uygulanmamış mı?
+                let should_apply = if let Some(last_applied) = state.last_applied_funding_time {
+                    this_funding_ts > last_applied // Yeni bir funding time
+                } else {
+                    true // İlk kez
+                };
+                
+                if should_apply && position_size_notional > 0.0 {
+                    // Funding cost = funding_rate * position_size_notional (8 saatte bir, tek seferde)
+                    let funding_cost = funding_rate * position_size_notional;
+                    state.total_funding_cost += Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
+                    state.last_applied_funding_time = Some(this_funding_ts);
+                    
+                    info!(
+                        %symbol,
+                        funding_rate,
+                        this_funding_ts,
+                        next_funding_ts,
+                        position_size_notional,
+                        funding_cost,
+                        total_funding_cost = %state.total_funding_cost,
+                        "funding cost applied (8-hour interval, single application)"
+                    );
+                }
             }
             
             // 3. Pozisyon boyutu geçmişi (risk analizi için)
@@ -1701,8 +1884,8 @@ async fn main() -> Result<()> {
                 state.position_size_notional_history.remove(0);
             }
             
-            // 4. Kümülatif PnL takibi
-            state.cumulative_pnl = current_pnl; // Şimdilik current, ileride gerçek kümülatif hesaplanabilir
+            // NOT: cumulative_pnl artık fill event'lerinden akümüle ediliyor
+            // Burada sadece anlık PnL hesaplanıyor (risk analizi için)
             
             // 5. Pozisyon boyutu risk kontrolü: Çok büyük pozisyonlar riskli
             // KRİTİK: Opportunity mode için soft-limit mekanizması
@@ -2103,8 +2286,9 @@ async fn main() -> Result<()> {
                     state.position_entry_time = None;
                     state.peak_pnl = Decimal::ZERO;
                     state.position_hold_duration_ms = 0;
-                    state.daily_pnl = Decimal::ZERO; // Pozisyon kapandı, günlük PnL sıfırla
+                    // NOT: daily_pnl sıfırlanmıyor - fill event'lerinden akümüle ediliyor, gün başında reset ediliyor
                     state.position_orders.clear(); // KRİTİK İYİLEŞTİRME: Pozisyon kapandı, order tracking'i temizle
+                    state.avg_entry_price = None; // Pozisyon kapandı, entry price sıfırla
                 }
             }
             
@@ -2492,10 +2676,11 @@ async fn main() -> Result<()> {
                 
                 // KRİTİK DÜZELTME: Dinamik min_spread_bps hesapla (ProfitGuarantee ile)
                 // Sabit 60 bps yerine, pozisyon boyutuna göre dinamik hesapla
-                let min_spread_bps_dynamic = profit_guarantee.calculate_min_spread_bps(position_size_usd);
-                // Config'deki min_spread_bps minimum eşik olarak kullan (fallback)
+                // Formül: min_spread = calculate_min_spread_bps(position_size_usd) - slippage_reserve
+                let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd) - cfg.risk.slippage_bps_reserve;
+                // Config'deki min_spread_bps minimum eşik olarak kullan (fallback, dinamik'ten küçükse)
                 let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(60.0);
-                let min_spread_bps = min_spread_bps_dynamic.max(min_spread_bps_config);
+                let min_spread_bps = dyn_min_spread_bps.max(min_spread_bps_config);
                 
                 let stop_loss_threshold = cfg.internal.stop_loss_threshold;
                 let min_risk_reward_ratio = cfg.internal.min_risk_reward_ratio;
@@ -2796,16 +2981,32 @@ async fn main() -> Result<()> {
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures bid with exchange min notional");
                                             // API Rate Limit koruması
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                                            // Retry için clientOrderId
+                                            // KRİTİK DÜZELTME: Retry için deterministik clientOrderId (idempotency)
+                                            // Retry'de qty değiştiği için yeni ID oluştur, ama deterministik olmalı
+                                            let retry_price_str = format!("{:.8}", px.0.to_f64().unwrap_or(0.0));
+                                            let retry_qty_str = format!("{:.8}", retry_qty.0.to_f64().unwrap_or(0.0));
+                                            let retry_price_hash = retry_price_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
+                                            let retry_qty_hash = retry_qty_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
                                             let retry_timestamp_ms = SystemTime::now()
                                                 .duration_since(UNIX_EPOCH)
                                                 .unwrap()
                                                 .as_millis();
-                                            let retry_client_order_id = format!("{}_{}_R_{}", 
-                                                symbol.replace("-", "_").replace("/", "_"),
+                                            let symbol_clean = symbol.replace("-", "_").replace("/", "_");
+                                            let retry_client_order_id = format!("{}_{}_{}_{}_{}", 
+                                                symbol_clean,
                                                 "B",
+                                                retry_price_hash,
+                                                retry_qty_hash,
                                                 retry_timestamp_ms
-                                            ).chars().take(36).collect::<String>();
+                                            );
+                                            // 36 karakter limit kontrolü
+                                            let retry_client_order_id = if retry_client_order_id.len() > 36 {
+                                                let symbol_short = symbol_clean.chars().take(8).collect::<String>();
+                                                format!("{}_{}_{}_{}_{}", symbol_short, "B", retry_price_hash, retry_qty_hash, retry_timestamp_ms)
+                                                    .chars().take(36).collect::<String>()
+                                            } else {
+                                                retry_client_order_id
+                                            };
                     match venue.place_limit_with_client_id(&symbol, Side::Buy, px, retry_qty, tif, &retry_client_order_id).await {
                                                 Ok((order_id, returned_client_id)) => {
                             let info = OrderInfo { 
@@ -3059,16 +3260,32 @@ async fn main() -> Result<()> {
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures ask with exchange min notional");
                                             // API Rate Limit koruması
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                            // Retry için clientOrderId
+                            // KRİTİK DÜZELTME: Retry için deterministik clientOrderId (idempotency)
+                            // Retry'de qty değiştiği için yeni ID oluştur, ama deterministik olmalı
+                            let retry_price_str = format!("{:.8}", px.0.to_f64().unwrap_or(0.0));
+                            let retry_qty_str = format!("{:.8}", retry_qty.0.to_f64().unwrap_or(0.0));
+                            let retry_price_hash = retry_price_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
+                            let retry_qty_hash = retry_qty_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
                             let retry_timestamp_ms = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis();
-                            let retry_client_order_id = format!("{}_{}_R_{}", 
-                                symbol.replace("-", "_").replace("/", "_"),
+                            let symbol_clean = symbol.replace("-", "_").replace("/", "_");
+                            let retry_client_order_id = format!("{}_{}_{}_{}_{}", 
+                                symbol_clean,
                                 "S",
+                                retry_price_hash,
+                                retry_qty_hash,
                                 retry_timestamp_ms
-                            ).chars().take(36).collect::<String>();
+                            );
+                            // 36 karakter limit kontrolü
+                            let retry_client_order_id = if retry_client_order_id.len() > 36 {
+                                let symbol_short = symbol_clean.chars().take(8).collect::<String>();
+                                format!("{}_{}_{}_{}_{}", symbol_short, "S", retry_price_hash, retry_qty_hash, retry_timestamp_ms)
+                                    .chars().take(36).collect::<String>()
+                            } else {
+                                retry_client_order_id
+                            };
                             match venue.place_limit_with_client_id(&symbol, Side::Sell, px, retry_qty, tif, &retry_client_order_id).await {
                                                 Ok((order_id, returned_client_id)) => {
                                 let info = OrderInfo { 

@@ -35,12 +35,14 @@ binance:
   api_key: ""
   secret_key: ""
   recv_window_ms: 5000
+  hedge_mode: false  # Hedge mode (dual-side position) açık mı? Default: false (one-way mode)
 
 risk:
   inv_cap: "0.50"
   min_liq_gap_bps: 300
   dd_limit_bps: 2000
   max_leverage: 20
+  slippage_bps_reserve: 2.0  # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
 
 strategy:
   type: "dyn_mm"
@@ -58,7 +60,7 @@ strategy:
   min_profit_usd: 0.50              # Minimum kar hedefi (USD) - default: 0.50 (50 cent)
   maker_fee_rate: 0.0002            # Maker fee oranı (0.0002 = 2 bps = 0.02%) - Binance Futures default
   taker_fee_rate: 0.0004            # Taker fee oranı (0.0004 = 4 bps = 0.04%) - Binance Futures default
-  slippage_bps_reserve: 2.0         # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
+  # Not: slippage_bps_reserve artık risk.slippage_bps_reserve altında
   
   # --- Trend Takibi Eşikleri ---
   strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
@@ -97,6 +99,7 @@ exec:
   venue: "binance"     # sabit
   cancel_replace_interval_ms: 1500  # Rate limit koruması: 500 → 1500 (daha az churn, rate limit riski azalır)
   max_order_age_ms: 10000  # 5000 → 10000 (daha uzun emir ömrü, daha az cancel/replace)
+  default_leverage: 5  # Default leverage (futures için) - her sembol için set edilir (cfg.leverage fallback olarak kullanılır)
 
 websocket:
   enabled: true

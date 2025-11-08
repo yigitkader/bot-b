@@ -15,6 +15,8 @@ pub struct RiskCfg {
     pub min_liq_gap_bps: f64,
     pub dd_limit_bps: i64,
     pub max_leverage: u32,
+    #[serde(default = "default_slippage_bps_reserve")]
+    pub slippage_bps_reserve: f64, // Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,8 +86,7 @@ pub struct StratCfg {
     pub maker_fee_rate: Option<f64>, // Maker fee oranı (default: 0.0002 = 2 bps)
     #[serde(default)]
     pub taker_fee_rate: Option<f64>, // Taker fee oranı (default: 0.0004 = 4 bps)
-    #[serde(default)]
-    pub slippage_bps_reserve: Option<f64>, // Slipaj tamponu (bps) - default: 2.0
+    // Not: slippage_bps_reserve artık RiskCfg altında (risk.slippage_bps_reserve)
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +97,8 @@ pub struct ExecCfg {
     pub cancel_replace_interval_ms: u64,
     #[serde(default = "default_max_order_age")]
     pub max_order_age_ms: u64,
+    #[serde(default)]
+    pub default_leverage: Option<u32>, // Default leverage (futures için) - her sembol için set edilir
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -235,6 +238,8 @@ pub struct BinanceCfg {
     #[serde(default = "default_recv_window")]
     pub recv_window_ms: u64,
     pub futures_base: String,
+    #[serde(default = "default_hedge_mode")]
+    pub hedge_mode: bool, // Hedge mode (dual-side position) açık mı? Default: false (one-way mode)
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +329,7 @@ fn default_cancel_interval() -> u64 { 1_000 }
 fn default_max_order_age() -> u64 { 10_000 }
 fn default_ws_reconnect_delay() -> u64 { 5_000 }
 fn default_ws_ping_interval() -> u64 { 30_000 }
+fn default_slippage_bps_reserve() -> f64 { 2.0 } // Default: 2 bps slippage reserve
 fn default_pnl_history_max_len() -> usize { 1024 }
 fn default_position_size_history_max_len() -> usize { 100 }
 fn default_max_symbols_per_tick() -> usize { 8 }
@@ -372,6 +378,7 @@ fn default_fill_rate_decrease_on_no_fill() -> f64 { 0.90 }
 fn default_min_fill_rate() -> f64 { 0.1 }
 fn default_spread_widen_factor() -> f64 { 0.001 }
 fn default_recv_window() -> u64 { 5_000 }
+fn default_hedge_mode() -> bool { false } // Default: one-way mode (hedge mode kapalı)
 fn default_quote_asset() -> String { "USDC".to_string() }
 fn default_allow_usdt_quote() -> bool { true }
 fn default_min_quote_balance_usd() -> f64 { 1.0 }
@@ -499,6 +506,7 @@ mod tests {
                 min_liq_gap_bps: 300.0,
                 dd_limit_bps: 2000,
                 max_leverage: 20,
+                slippage_bps_reserve: 2.0,
             },
             strategy: StratCfg {
                 r#type: "dyn_mm".to_string(),
