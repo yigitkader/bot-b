@@ -2666,7 +2666,15 @@ async fn main() -> Result<()> {
                     quotes.bid = None;
                 } else {
                     // 1. USD clamp
-                    let nq = clamp_qty_by_usd(q, px, caps.buy_notional, qty_step_f64);
+                    // KRİTİK DÜZELTME: Futures için gerçek kullanılabilir notional (margin * leverage) kullan
+                    // Spot için: caps.buy_notional = caps.buy_total (aynı)
+                    // Futures için: caps.buy_notional = per_order_notional (300), ama gerçek kullanılabilir = buy_total * leverage (26.63 * 3 = 79.89)
+                    let effective_buy_notional = if is_futures {
+                        caps.buy_total * effective_leverage // Gerçek kullanılabilir pozisyon boyutu (margin * leverage)
+                    } else {
+                        caps.buy_notional // Spot için aynı
+                    };
+                    let nq = clamp_qty_by_usd(q, px, effective_buy_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
@@ -2704,7 +2712,15 @@ async fn main() -> Result<()> {
                 } else {
                     // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Base clamp (spot sell), 3) Quantize, 4) Min notional check
                     // 1. USD clamp
-                    let mut nq = clamp_qty_by_usd(q, px, caps.sell_notional, qty_step_f64);
+                    // KRİTİK DÜZELTME: Futures için gerçek kullanılabilir notional (margin * leverage) kullan
+                    // Spot için: caps.sell_notional = caps.sell_total_base * price (aynı mantık)
+                    // Futures için: caps.sell_notional = per_order_notional (300), ama gerçek kullanılabilir = buy_total * leverage (26.63 * 3 = 79.89)
+                    let effective_sell_notional = if is_futures {
+                        caps.buy_total * effective_leverage // Futures için ask de aynı margin'i kullanır
+                    } else {
+                        caps.sell_notional // Spot için aynı
+                    };
+                    let mut nq = clamp_qty_by_usd(q, px, effective_sell_notional, qty_step_f64);
                     // 2. Base clamp (spot sell için)
                     if let Some(max_base) = caps.sell_base {
                         nq = clamp_qty_by_base(nq, max_base, qty_step_f64);
