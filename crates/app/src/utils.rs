@@ -308,8 +308,8 @@ pub fn init_rate_limiter(is_futures: bool) {
         (20, 1200) // Spot: 20 req/sec, 1200 weight/min
     };
     
-    // %60 safety factor - çok güvenli, ban riski minimal
-    let safety_factor = 0.6;
+    // PATCH: Safety factor 0.6 → 0.7 (daha agresif, ban riski hala minimal)
+    let safety_factor = 0.7;
     
     RATE_LIMITER.set(RateLimiter::new(
         max_req_per_sec,

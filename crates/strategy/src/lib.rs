@@ -859,18 +859,63 @@ impl Strategy for DynMm {
         
         // --- MANİPÜLASYON FIRSAT KULLANIMI: Fırsatları avantaja çevir ---
         if let Some(ref opp) = self.manipulation_opportunity {
-            match opp {
+            // PATCH: Confidence threshold ekle - False positive koruması
+            // Güven seviyesi hesapla
+            let confidence = match opp {
                 ManipulationOpportunity::FlashCrashLong { price_drop_bps } => {
-                    // Flash crash → LONG pozisyon (dip alım)
-                    // Agresif bid, ask'i kaldır
-                    should_bid = true;
-                    should_ask = false;
-                    use tracing::info;
-                    info!(
-                        price_drop_bps,
-                        "EXECUTING FLASH CRASH STRATEGY: aggressive LONG (buying the dip)"
-                    );
+                    let price_drop_abs = price_drop_bps.abs();
+                    (price_drop_abs / self.confidence_price_drop_max).min(1.0).max(0.5)
                 }
+                ManipulationOpportunity::FlashPumpShort { price_rise_bps } => {
+                    let price_rise_abs = price_rise_bps.abs();
+                    (price_rise_abs / self.confidence_price_drop_max).min(1.0).max(0.5)
+                }
+                ManipulationOpportunity::VolumeAnomalyTrend { volume_ratio, .. } => {
+                    let ratio_range = self.confidence_volume_ratio_max - self.confidence_volume_ratio_min;
+                    if ratio_range > 0.0 {
+                        ((volume_ratio - self.confidence_volume_ratio_min) / ratio_range).min(1.0).max(0.5)
+                    } else {
+                        0.7
+                    }
+                }
+                ManipulationOpportunity::WideSpreadArbitrage { spread_bps } => {
+                    let spread_range = self.confidence_spread_max - self.confidence_spread_min;
+                    if spread_range > 0.0 {
+                        ((spread_bps - self.confidence_spread_min) / spread_range).min(1.0).max(0.5)
+                    } else {
+                        0.7
+                    }
+                }
+                _ => 0.7,
+            };
+            
+            // PATCH: Sadece yüksek güven varsa işlem yap (%75+ güven gerekli)
+            const MIN_CONFIDENCE_THRESHOLD: f64 = 0.75; // %75+ güven gerekli
+            
+            if confidence < MIN_CONFIDENCE_THRESHOLD {
+                use tracing::warn;
+                warn!(
+                    confidence,
+                    threshold = MIN_CONFIDENCE_THRESHOLD,
+                    "SKIPPING OPPORTUNITY: confidence too low (false positive risk)"
+                );
+                self.manipulation_opportunity = None; // Fırsatı iptal et
+                // should_bid ve should_ask değişmeyecek, normal strateji devam edecek
+            } else {
+                // Güven yeterli, devam et
+                match opp {
+                    ManipulationOpportunity::FlashCrashLong { price_drop_bps } => {
+                        // Flash crash → LONG pozisyon (dip alım)
+                        // Agresif bid, ask'i kaldır
+                        should_bid = true;
+                        should_ask = false;
+                        use tracing::info;
+                        info!(
+                            price_drop_bps,
+                            confidence,
+                            "EXECUTING FLASH CRASH STRATEGY: high confidence, aggressive LONG (buying the dip)"
+                        );
+                    }
                 ManipulationOpportunity::FlashPumpShort { price_rise_bps } => {
                     // Flash pump → SHORT pozisyon (tepe satış)
                     // Agresif ask, bid'i kaldır
@@ -971,8 +1016,10 @@ impl Strategy for DynMm {
                     use tracing::info;
                     info!(
                         liquidity_drop_ratio,
-                        "EXECUTING LIQUIDITY WITHDRAWAL STRATEGY: spread arbitrage opportunity"
+                        confidence,
+                        "EXECUTING LIQUIDITY WITHDRAWAL STRATEGY: high confidence, spread arbitrage opportunity"
                     );
+                }
                 }
             }
         }

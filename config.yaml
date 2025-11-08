@@ -48,10 +48,10 @@ strategy:
   base_size: "20.0"  # Gerçekçi: 30.0 → 40.0 (daha fazla kazanç/işlem, 40 USD * 3 bps = 0.012 USD/işlem)
   
   # --- Spread ve Fiyatlama Eşikleri ---
-  min_spread_bps: 3.0              # Minimum spread (bps)
-  max_spread_bps: 100.0            # Maksimum spread (bps)
-  spread_arbitrage_min_bps: 10.0   # Spread arbitraj minimum eşiği (bps) (50 → 10: gerçekçi Binance spread)
-  spread_arbitrage_max_bps: 30.0   # Spread arbitraj maksimum eşiği (bps) (150 → 30: gerçekçi Binance spread)
+  min_spread_bps: 2.0              # Minimum spread (bps) (3.0 → 2.0: daha fazla işlem)
+  max_spread_bps: 150.0            # Maksimum spread (bps) (100 → 150: daha toleranslı)
+  spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
+  spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)
   
   # --- Trend Takibi Eşikleri ---
   strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
@@ -67,12 +67,12 @@ strategy:
   opportunity_threshold_off: 0.2   # Fırsat modu kapanma eşiği
   
   # --- Manipülasyon Tespit Eşikleri ---
-  price_jump_threshold_bps: 100.0  # Flash crash/pump eşiği (bps) (250 → 100: gerçekçi, daha fazla fırsat)
+  price_jump_threshold_bps: 300.0  # Flash crash/pump eşiği (bps) (100 → 300: false positive azalt)
   fake_breakout_threshold_bps: 100.0 # Fake breakout eşiği (bps)
   liquidity_drop_threshold: 0.5    # Likidite düşüş eşiği (ratio)
   
   # --- Envanter Yönetimi ---
-  inventory_threshold_ratio: 0.15  # Envanter threshold oranı (%) (0.05 → 0.15: daha toleranslı, market making için)
+  inventory_threshold_ratio: 0.10  # Envanter threshold oranı (%) (0.15 → 0.10: daha çevik)
   
   # --- Adaptif Spread Katsayıları ---
   volatility_coefficient: 0.5     # Volatilite katsayısı (c1)
@@ -80,7 +80,7 @@ strategy:
   
   # --- Diğer ---
   min_liquidity_required: 0.01     # Minimum likidite gereksinimi
-  opportunity_size_multiplier: 2.0 # Fırsat modu pozisyon çarpanı (1.2 → 2.0: daha agresif, kazanç için)
+  opportunity_size_multiplier: 1.1 # Fırsat modu pozisyon çarpanı (2.0 → 1.1: daha güvenli)
   strong_trend_multiplier: 1.5     # Güçlü trend pozisyon çarpanı (1.2 → 1.5: daha agresif)
 
 exec:
@@ -110,7 +110,7 @@ internal:
   # Fill rate güncelleme katsayıları
   fill_rate_increase_factor: 0.95
   fill_rate_increase_bonus: 0.05
-  fill_rate_decrease_factor: 0.98
+  fill_rate_decrease_factor: 0.95  # 0.98 → 0.95 (daha agresif düşürme)
   fill_rate_slow_decrease_factor: 0.995
   fill_rate_slow_decrease_bonus: 0.005
   
@@ -143,7 +143,7 @@ internal:
   trailing_stop_min_peak: 0.01           # Minimum peak (USD)
   
   # Stop loss eşikleri
-  stop_loss_threshold: -0.005  # %0.5 zarar
+  stop_loss_threshold: -0.01  # %1 zarar (-0.005 → -0.01: daha erken kes)
   stop_loss_time_threshold_ms: 120000  # 2 dakika
   stop_loss_trend_threshold: -0.2       # %20 trend düşüşü
   

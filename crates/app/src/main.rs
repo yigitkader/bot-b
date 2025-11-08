@@ -746,6 +746,49 @@ async fn main() -> Result<()> {
                 UserEvent::Heartbeat => {
                     force_sync_all = true;
                     info!("websocket reconnect detected, will sync all symbols");
+                    
+                    // PATCH: Reconnect sonrası tüm sembollerin açık emirlerini sync et
+                    // Hayalet emirleri önlemek için full sync yap
+                    for state in &mut states {
+                        rate_limit_guard(3).await; // GET /api/v3/openOrders: Weight 3
+                        let sync_result = match &venue {
+                            V::Spot(v) => v.get_open_orders(&state.meta.symbol).await,
+                            V::Fut(v) => v.get_open_orders(&state.meta.symbol).await,
+                        };
+                        
+                        match sync_result {
+                            Ok(api_orders) => {
+                                let api_order_ids: std::collections::HashSet<String> = api_orders
+                                    .iter()
+                                    .map(|o| o.order_id.clone())
+                                    .collect();
+                                
+                                // Local'de olup API'de olmayan emirleri temizle
+                                let mut removed_count = 0;
+                                state.active_orders.retain(|order_id, _| {
+                                    if !api_order_ids.contains(order_id) {
+                                        removed_count += 1;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                });
+                                
+                                if removed_count > 0 {
+                                    state.consecutive_no_fills = 0;
+                                    state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                                    info!(
+                                        symbol = %state.meta.symbol,
+                                        removed_orders = removed_count,
+                                        "full sync after reconnect: removed filled/canceled orders"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                warn!(symbol = %state.meta.symbol, ?err, "failed to sync orders after reconnect");
+                            }
+                        }
+                    }
                 }
                 UserEvent::OrderFill {
                     symbol,
@@ -1478,13 +1521,22 @@ async fn main() -> Result<()> {
             state.cumulative_pnl = current_pnl; // Şimdilik current, ileride gerçek kümülatif hesaplanabilir
             
             // 5. Pozisyon boyutu risk kontrolü: Çok büyük pozisyonlar riskli
-            let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer; // Config'den: Buffer multiplier
+            // PATCH: Fırsat modunda bile max position size sınırı
+            let is_opportunity_mode = state.strategy.is_opportunity_mode();
+            let max_position_multiplier = if is_opportunity_mode {
+                2.0 // Fırsat modunda 2x (normal 1x)
+            } else {
+                1.0
+            };
+            
+            let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer * max_position_multiplier;
             if position_size_notional > max_position_size_usd {
                 warn!(
                     %symbol,
                     position_size_notional,
                     max_allowed = max_position_size_usd,
-                    "POSITION SIZE RISK: position too large, force closing"
+                    is_opportunity_mode,
+                    "POSITION SIZE RISK: position too large, force closing (even in opportunity mode)"
                 );
                 // KRİTİK DÜZELTME: Risk limiti aşılınca pozisyonu kapat
                 // close_position uses place_limit internally: Weight 1
@@ -1741,8 +1793,16 @@ async fn main() -> Result<()> {
                 // Eğer emirler 5 saniyeden fazla açıksa ve son fill'den 5 saniye geçtiyse, fill rate'i düşür
                 let no_fill_threshold_sec = 5.0; // 5 saniye
                 if oldest_order_age > no_fill_threshold_sec && time_since_last_fill > no_fill_threshold_sec {
-                    state.order_fill_rate = (state.order_fill_rate * 0.99).max(0.1);
+                    // PATCH: Daha agresif düşür (0.99 → 0.90)
+                    state.order_fill_rate = (state.order_fill_rate * 0.90).max(0.1);
                     state.consecutive_no_fills += 1; // Geriye dönük uyumluluk için
+                    
+                    warn!(
+                        symbol = %state.meta.symbol,
+                        fill_rate = state.order_fill_rate,
+                        consecutive_no_fills = state.consecutive_no_fills,
+                        "FILL RATE WARNING: no fills for 5+ seconds, reducing fill rate aggressively"
+                    );
                 }
             } else {
                 // Emir yoksa, consecutive_no_fills sıfırla ve fill oranını yavaşça normale döndür
@@ -2330,7 +2390,8 @@ async fn main() -> Result<()> {
                                             } else {
                                                 // Bakiye yeterli, min notional'a göre qty hesapla
                                                 // Min notional için gerekli qty'yi hesapla (%10 güvenli margin ile)
-                                                let min_qty_for_notional = (min_notional * 1.1 / price_quantized / step).ceil() * step;
+                                                // PATCH: Güvenlik marjını 10% → 5%'e düşür
+                                                let min_qty_for_notional = (min_notional * 1.05 / price_quantized / step).ceil() * step;
                                                 
                                                 // Cap kontrolü: max qty by cap (notional)
                                                 let max_qty_by_cap = (order_cap / price_quantized / step).floor() * step;
@@ -2500,7 +2561,8 @@ async fn main() -> Result<()> {
                                             } else {
                                                 // Bakiye yeterli, min notional'a göre qty hesapla
                                                 // Min notional için gerekli qty'yi hesapla (%10 güvenli margin ile)
-                                                let min_qty_for_notional = (min_notional * 1.1 / price_quantized / step).ceil() * step;
+                                                // PATCH: Güvenlik marjını 10% → 5%'e düşür
+                                                let min_qty_for_notional = (min_notional * 1.05 / price_quantized / step).ceil() * step;
                                                 
                                                 // Cap kontrolü: max qty by cap (notional)
                                                 let max_qty_by_cap = (order_cap / price_quantized / step).floor() * step;
@@ -2784,9 +2846,10 @@ fn should_close_position(
         false
     };
     
+    // PATCH: Stop loss'u daha erken tetikle (zarar varsa trend kontrolü gereksiz)
     let should_stop_loss = if price_change_pct <= cfg.stop_loss_threshold {
-        pnl_trend < cfg.stop_loss_trend_threshold
-            || position_hold_duration_ms > cfg.stop_loss_time_threshold_ms
+        // Sadece stop_loss_threshold yeterli, trend kontrolü gereksiz (daha sıkı)
+        true
     } else {
         false
     };
