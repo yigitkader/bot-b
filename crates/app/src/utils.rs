@@ -613,12 +613,17 @@ pub fn calculate_spread_bps(bid: Decimal, ask: Decimal) -> f64 {
 
 /// Check if a trade should be placed based on profit guarantee and risk/reward
 /// 
+/// Market Making için özel mantık:
+/// - Spread'den kazanç garantili (maker olarak)
+/// - Risk/reward kontrolü daha esnek (market making için 1.0-1.5 yeterli)
+/// - Büyük pozisyonlar için daha sıkı risk/reward kontrolü
+/// 
 /// # Arguments
 /// * `spread_bps` - Current spread in basis points
 /// * `position_size_usd` - Position size in USD
 /// * `min_spread_bps` - Minimum spread threshold from config
 /// * `stop_loss_threshold` - Stop loss threshold (negative, e.g., -0.01 for 1%)
-/// * `min_risk_reward_ratio` - Minimum risk/reward ratio (e.g., 2.0 for 2:1)
+/// * `min_risk_reward_ratio` - Minimum risk/reward ratio (e.g., 1.0 for 1:1, market making için)
 /// 
 /// # Returns
 /// (should_place, reason) - true if trade should be placed, false otherwise with reason
@@ -640,7 +645,8 @@ pub fn should_place_trade(
         return (false, "not_profitable_after_fees");
     }
     
-    // 3. Risk/Reward oranı kontrolü
+    // 3. Risk/Reward oranı kontrolü (Market Making için esnek)
+    // Market making'de spread'den kazanç garantili, bu yüzden risk/reward daha esnek olabilir
     let max_loss_pct = stop_loss_threshold.abs();
     let risk_reward_ratio = profit_guarantee.calculate_risk_reward_ratio(
         spread_bps,
@@ -648,7 +654,19 @@ pub fn should_place_trade(
         max_loss_pct,
     );
     
-    if risk_reward_ratio < min_risk_reward_ratio {
+    // Market making için dinamik risk/reward threshold:
+    // - Küçük pozisyonlar (< 50 USD): Risk/reward kontrolü daha esnek (0.8x threshold)
+    // - Orta pozisyonlar (50-200 USD): Normal threshold
+    // - Büyük pozisyonlar (> 200 USD): Daha sıkı kontrol (1.2x threshold)
+    let adjusted_threshold = if position_size_usd < 50.0 {
+        min_risk_reward_ratio * 0.8  // Küçük pozisyonlar için daha esnek
+    } else if position_size_usd > 200.0 {
+        min_risk_reward_ratio * 1.2  // Büyük pozisyonlar için daha sıkı
+    } else {
+        min_risk_reward_ratio  // Normal
+    };
+    
+    if risk_reward_ratio < adjusted_threshold {
         return (false, "risk_reward_too_low");
     }
     

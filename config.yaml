@@ -157,7 +157,9 @@ internal:
   opportunity_mode_leverage_reduction: 0.5  # Fırsat modunda leverage azaltma faktörü (0.5 = yarıya düşür)
   
   # Risk/Reward ve Profit Guarantee
-  min_risk_reward_ratio: 2.0  # Minimum risk/reward oranı (2:1)
+  # Market making için: 1.0-1.5 yeterli (spread'den kazanç garantili)
+  # Directional trading için: 2.0+ gerekli
+  min_risk_reward_ratio: 1.0  # Minimum risk/reward oranı (1:1, market making için esnek)
   take_profit_position_size_threshold: 100.0  # Take profit için pozisyon boyutu eşiği (USD)
   
   # Fill rate yönetimi
