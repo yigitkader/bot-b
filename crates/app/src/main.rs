@@ -1833,20 +1833,25 @@ async fn main() -> Result<()> {
             // Envanter senkronizasyonu yap
             // KRİTİK DÜZELTME: WebSocket reconnect sonrası pozisyon sync'i
             // Reconnect sonrası sadece emirleri değil, pozisyonları da sync et
+            // force_sync_all true ise TAM sync yap (reconnect sonrası)
             let inv_diff = (state.inv.0 - pos.qty.0).abs();
             let reconcile_threshold = Decimal::new(1, 8);
-            if inv_diff > reconcile_threshold {
-                // Normal durumda veya reconnect sonrası: Envanter uyumsuzluğu var
-                let is_reconnect_sync = force_sync_all;
+            let is_reconnect_sync = force_sync_all;
+            
+            // Reconnect sonrası veya normal durumda uyumsuzluk varsa sync yap
+            if is_reconnect_sync || inv_diff > reconcile_threshold {
                 if is_reconnect_sync {
-                    warn!(
+                    // Reconnect sonrası: Her zaman sync yap (uyumsuzluk olsun ya da olmasın)
+                    info!(
                         %symbol,
                         ws_inv = %state.inv.0,
                         api_inv = %pos.qty.0,
                         diff = %inv_diff,
-                        "force syncing position after reconnect"
+                        "force syncing position after reconnect (full sync)"
                     );
-                } else {
+                    state.inv = pos.qty; // Force sync
+                } else if inv_diff > reconcile_threshold {
+                    // Normal durumda: Sadece uyumsuzluk varsa sync yap
                     warn!(
                         %symbol,
                         ws_inv = %state.inv.0,
@@ -1854,8 +1859,8 @@ async fn main() -> Result<()> {
                         diff = %inv_diff,
                         "inventory mismatch detected, syncing with API position"
                     );
+                    state.inv = pos.qty; // Force sync
                 }
-                state.inv = pos.qty; // Force sync
             }
 
             record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px);
@@ -2392,14 +2397,16 @@ async fn main() -> Result<()> {
                     
                     // MEVCUT POZİSYONLARIN GERÇEK MARGİN'İNİ ÇIKAR: Unrealized PnL hesaba katılmalı
                     // KRİTİK DÜZELTME: Zarar eden pozisyon margin'i tüketir ama kod bunu görmüyordu
-                    // Mevcut pozisyonun margin'i = (pozisyon notional / leverage) - unrealized PnL
+                    // Mevcut pozisyonun GERÇEK margin'i = (pozisyon notional / leverage) - unrealized PnL
                     // position_size_notional ve current_pnl zaten yukarıda hesaplandı
                     let existing_position_margin = if position_size_notional > 0.0 {
+                        // Base margin: Pozisyon açmak için gereken margin
                         let base_margin = position_size_notional / effective_leverage;
                         // Unrealized PnL: Zarar eden pozisyon margin'i tüketir, kar eden pozisyon margin'i serbest bırakır
-                        let unrealized_pnl = current_pnl.to_f64().unwrap_or(0.0);
-                        // Margin kullanımı = base_margin - unrealized_pnl (negatif PnL margin'i tüketir)
-                        (base_margin - unrealized_pnl).max(0.0) // Negatif olamaz
+                        let position_pnl = current_pnl.to_f64().unwrap_or(0.0);
+                        // Gerçek margin kullanımı = base_margin - position_pnl
+                        // Negatif PnL (zarar) margin'i tüketir, pozitif PnL (kar) margin'i serbest bırakır
+                        (base_margin - position_pnl).max(0.0) // Negatif olamaz
                     } else {
                         0.0
                     };

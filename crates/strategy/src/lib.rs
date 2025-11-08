@@ -769,7 +769,8 @@ impl Strategy for DynMm {
         // Fiyat geçmişini güncelle (basit timestamp simülasyonu)
         // now_ms zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
         self.price_history.push((now_ms, c.mark_price.0));
-        if self.price_history.len() > 100 {
+        // KRİTİK DÜZELTME: Fiyat geçmişi limitini artır (100 → 200) - Trend analizi için daha fazla veri
+        if self.price_history.len() > 200 {
             self.price_history.remove(0);
         }
         
@@ -1057,8 +1058,39 @@ impl Strategy for DynMm {
         let trend_strength = trend_bps.abs();
         let strong_trend = trend_strength > self.strong_trend_bps; // Config'den: Güçlü trend eşiği
         
-        let size_multiplier = if self.manipulation_opportunity.is_some() {
-            self.opportunity_size_multiplier // Config'den: Fırsat modu multiplier
+        // KRİTİK DÜZELTME: Güven seviyesine göre dinamik multiplier
+        // Yanlış sinyal + yüksek multiplier = büyük zarar riski
+        // Güven seviyesi 0.0-1.0 arası, multiplier = 1.0 + (0.5 * confidence) → Max 1.5x
+        let size_multiplier = if let Some(ref opp) = self.manipulation_opportunity {
+            // Opportunity türüne göre güven seviyesi hesapla
+            let confidence = match opp {
+                ManipulationOpportunity::FlashCrashLong { price_drop_bps } => {
+                    // Ne kadar büyük düşüş, o kadar güvenilir (250 bps = %2.5 eşik)
+                    // 250-500 bps arası: 0.5-1.0 confidence
+                    (price_drop_bps / 500.0).min(1.0).max(0.5)
+                }
+                ManipulationOpportunity::FlashPumpShort { price_rise_bps } => {
+                    // Ne kadar büyük yükseliş, o kadar güvenilir
+                    (price_rise_bps / 500.0).min(1.0).max(0.5)
+                }
+                ManipulationOpportunity::VolumeAnomalyTrend { volume_ratio, .. } => {
+                    // Volume ratio'ya göre: 5x = 0.5, 10x+ = 1.0
+                    ((volume_ratio - 5.0) / 5.0).min(1.0).max(0.5)
+                }
+                ManipulationOpportunity::WideSpreadArbitrage { spread_bps } => {
+                    // Spread ne kadar geniş, o kadar güvenilir (50-150 bps arası)
+                    ((spread_bps - 50.0) / 100.0).min(1.0).max(0.5)
+                }
+                _ => {
+                    // Diğer opportunity türleri için orta güven
+                    0.7
+                }
+            };
+            // Dinamik multiplier: 1.0 + (0.5 * confidence) → Max 1.5x, Min 1.25x
+            // Base multiplier (1.2) ile confidence'ı birleştir
+            let base_multiplier = self.opportunity_size_multiplier; // Config'den: 1.2
+            let confidence_bonus = 0.3 * confidence; // Max 0.3 bonus
+            (base_multiplier + confidence_bonus).min(1.5) // Max 1.5x
         } else if strong_trend {
             self.strong_trend_multiplier // Config'den: Güçlü trend multiplier
         } else {
