@@ -113,6 +113,12 @@ pub struct DynMmCfg {
     #[serde(default)]
     pub manipulation_price_history_max_len: Option<usize>,
     #[serde(default)]
+    pub flash_crash_recovery_window_ms: Option<u64>,
+    #[serde(default)]
+    pub flash_crash_recovery_min_points: Option<usize>,
+    #[serde(default)]
+    pub flash_crash_recovery_min_ratio: Option<f64>,
+    #[serde(default)]
     pub confidence_price_drop_max: Option<f64>,
     #[serde(default)]
     pub confidence_volume_ratio_min: Option<f64>,
@@ -241,6 +247,9 @@ pub struct DynMm {
     manipulation_time_threshold_ms: u64,
     manipulation_price_history_min_len: usize,
     manipulation_price_history_max_len: usize,
+    flash_crash_recovery_window_ms: u64,
+    flash_crash_recovery_min_points: usize,
+    flash_crash_recovery_min_ratio: f64,
     confidence_price_drop_max: f64,
     confidence_volume_ratio_min: f64,
     confidence_volume_ratio_max: f64,
@@ -329,6 +338,9 @@ impl From<DynMmCfg> for DynMm {
             manipulation_time_threshold_ms: c.manipulation_time_threshold_ms.unwrap_or(2000),
             manipulation_price_history_min_len: c.manipulation_price_history_min_len.unwrap_or(3),
             manipulation_price_history_max_len: c.manipulation_price_history_max_len.unwrap_or(200),
+            flash_crash_recovery_window_ms: c.flash_crash_recovery_window_ms.unwrap_or(30000),
+            flash_crash_recovery_min_points: c.flash_crash_recovery_min_points.unwrap_or(10),
+            flash_crash_recovery_min_ratio: c.flash_crash_recovery_min_ratio.unwrap_or(0.3),
             confidence_price_drop_max: c.confidence_price_drop_max.unwrap_or(500.0),
             confidence_volume_ratio_min: c.confidence_volume_ratio_min.unwrap_or(5.0),
             confidence_volume_ratio_max: c.confidence_volume_ratio_max.unwrap_or(10.0),
@@ -336,7 +348,7 @@ impl From<DynMmCfg> for DynMm {
             confidence_spread_max: c.confidence_spread_max.unwrap_or(150.0),
             confidence_bonus_multiplier: c.confidence_bonus_multiplier.unwrap_or(0.3),
             confidence_max_multiplier: c.confidence_max_multiplier.unwrap_or(1.5),
-            confidence_min_threshold: c.confidence_min_threshold.unwrap_or(0.75),
+            confidence_min_threshold: c.confidence_min_threshold.unwrap_or(0.70), // 0.75 → 0.70: False positive azalt, gerçek fırsatları kaçırma
             default_confidence: c.default_confidence.unwrap_or(0.7),
             min_confidence_value: c.min_confidence_value.unwrap_or(0.5),
             trend_analysis_min_history: c.trend_analysis_min_history.unwrap_or(10),
@@ -440,6 +452,7 @@ impl DynMm {
     /// KRİTİK DÜZELTME: Gerçek OFI = Δ(bid_vol) - Δ(ask_vol)
     /// Pozitif OFI = bid volume artışı > ask volume artışı (buy pressure)
     /// Negatif OFI = ask volume artışı > bid volume artışı (sell pressure)
+    /// OFI kümülatif olmalı: Her tick'te increment eklenir, window dışındaki eski değerler decay eder
     fn update_ofi(&mut self, bid_vol: Decimal, ask_vol: Decimal, timestamp_ms: u64) {
         if let Some((last_bid_vol, last_ask_vol)) = self.last_volumes {
             // Gerçek OFI: Δ(bid_vol) - Δ(ask_vol)
@@ -451,9 +464,21 @@ impl DynMm {
             // OFI increment: bid volume artışı - ask volume artışı
             let ofi_increment = delta_bid_f64 - delta_ask_f64;
 
-            // KRİTİK DÜZELTME: OFI'yı direkt kullan (EWMA kaldır, daha hassas sinyal)
-            // EWMA zaten volatilite'de yapılıyor, OFI için direkt değer kullan
-            self.ofi_signal = ofi_increment;
+            // KRİTİK DÜZELTME: OFI kümülatif olmalı (her tick'te increment eklenir)
+            // Window dışındaki eski değerler için decay uygula
+            if let Some(last_ts) = self.last_timestamp_ms {
+                let time_diff_ms = timestamp_ms.saturating_sub(last_ts);
+                if time_diff_ms > self.ofi_window_ms {
+                    // Window dışındayız: OFI'yı decay et (eski değerlerin etkisini azalt)
+                    // Exponential decay: ofi_signal *= exp(-time_diff / window)
+                    // Basitleştirilmiş: Linear decay (daha hızlı)
+                    let decay_factor = (self.ofi_window_ms as f64 / time_diff_ms as f64).min(1.0);
+                    self.ofi_signal *= decay_factor;
+                }
+            }
+            
+            // Kümülatif OFI: Her increment'i ekle
+            self.ofi_signal += ofi_increment;
         } else {
             // İlk tick: volumes'ları kaydet, OFI sinyali sıfır
             self.ofi_signal = 0.0;
@@ -485,6 +510,8 @@ impl DynMm {
         if self.price_history.len() < 10 {
             return 0.0; // Yeterli veri yok
         }
+        // KRİTİK DÜZELTME: price_history.iter().rev() ile ters çevrilmiş
+        // recent[0] = en yeni fiyat, recent[9] = en eski fiyat
         let recent: Vec<Decimal> = self
             .price_history
             .iter()
@@ -492,12 +519,17 @@ impl DynMm {
             .take(10)
             .map(|(_, p)| *p)
             .collect();
-        let old_avg: Decimal = recent.iter().take(5).sum::<Decimal>() / Decimal::from(5);
-        let new_avg: Decimal = recent.iter().skip(5).sum::<Decimal>() / Decimal::from(5);
-        if old_avg.is_zero() {
+        // take(5) = en yeni 5 fiyat (recent[0..5])
+        // skip(5) = eski 5 fiyat (recent[5..10])
+        let newer_avg: Decimal = recent.iter().take(5).sum::<Decimal>() / Decimal::from(5);
+        let older_avg: Decimal = recent.iter().skip(5).sum::<Decimal>() / Decimal::from(5);
+        if older_avg.is_zero() {
             return 0.0;
         }
-        ((new_avg - old_avg) / old_avg).to_f64().unwrap_or(0.0) * 10000.0 // bps
+        // Trend = (yeni - eski) / eski
+        // Pozitif = fiyat artıyor (uptrend)
+        // Negatif = fiyat düşüyor (downtrend)
+        ((newer_avg - older_avg) / older_avg).to_f64().unwrap_or(0.0) * 10000.0 // bps
     }
 
     // Funding rate analizi: pozitif funding = long bias, negatif = short bias
@@ -533,24 +565,24 @@ impl DynMm {
     }
 
     // Envanter yönetimi: hedef envantere göre al/sat kararı
-    // Agresif: Daha büyük pozisyonlar için threshold'u düşür
+    // KRİTİK DÜZELTME: Envanter kontrolü etkili hale getirildi
+    // Threshold içindeyse: Market making (her iki taraf)
+    // Threshold dışındaysa: Tek taraflı işlem (hedefe doğru)
     fn inventory_decision(&self, current_inv: Qty, target_inv: Qty) -> (bool, bool) {
         let diff = (current_inv.0 - target_inv.0).abs();
         // Config'den: Envanter threshold oranı
         let threshold = self.inv_cap.0
             * Decimal::from_f64_retain(self.inventory_threshold_ratio).unwrap_or(Decimal::ZERO);
 
-        // KRİTİK DÜZELTME: Daha toleranslı envanter yönetimi (market making için)
-        // Her iki tarafta da quote ver, ama asimetrik (hedefe doğru agresif)
         if diff < threshold {
             // Hedef envantere yakınsa: market making (her iki taraf)
             (true, true)
         } else if current_inv.0 < target_inv.0 {
-            // Mevcut envanter hedeften düşük: Bid agresif, ask pasif (her iki taraf)
-            (true, true) // Her iki taraf ama bid öncelikli
+            // Mevcut envanter hedeften düşük: Sadece bid (almaya zorla)
+            (true, false) // Bid agresif, ask yok
         } else {
-            // Mevcut envanter hedeften yüksek: Ask agresif, bid pasif (her iki taraf)
-            (true, true) // Her iki taraf ama ask öncelikli
+            // Mevcut envanter hedeften yüksek: Sadece ask (satmaya zorla)
+            (false, true) // Ask agresif, bid yok
         }
     }
 }
@@ -633,33 +665,105 @@ impl Strategy for DynMm {
                 let liquidity_stable = spread_bps < self.max_spread_bps * 0.5; // Spread normal seviyede
 
                 // Gelişmiş tespit: Fiyat değişimi + volume artışı + time frame + likidite kontrolü
-                // KRİTİK DÜZELTME: Recovery check'i gevşet - sadece yeterli veri varsa kontrol et
-                // Gerçek flash crash'ler 100ms'den daha uzun sürer, bu yüzden recovery check opsiyonel
-                let recovery_check =
-                    if self.price_history.len() >= self.manipulation_price_history_min_len {
-                        let last_3: Vec<Decimal> = self
-                            .price_history
-                            .iter()
-                            .rev()
-                            .take(3)
-                            .map(|(_, p)| *p)
-                            .collect();
-                        if last_3.len() >= 3 {
-                            if price_change_bps < -self.price_jump_threshold_bps {
-                                // Düşüş sonrası geri yükseliyor mu? (gerçek flash crash)
-                                last_3[0] > last_3[1] && last_3[1] < last_3[2]
-                            } else if price_change_bps > self.price_jump_threshold_bps {
-                                // Yükseliş sonrası geri düşüyor mu? (gerçek flash pump)
-                                last_3[0] < last_3[1] && last_3[1] > last_3[2]
+                // KRİTİK İYİLEŞTİRME: Flash crash recovery check - daha fazla veri ve zaman penceresi
+                // Gerçek flash crash'ler 5-30 saniye sürebilir, bu yüzden:
+                // 1. Son N saniye içindeki fiyatları filtrele
+                // 2. Minimum/maksimum noktayı bul
+                // 3. Recovery var mı kontrol et (en az X% geri yükselme/düşme)
+                let recovery_check = {
+                    let window_start_ms = now_ms.saturating_sub(self.flash_crash_recovery_window_ms);
+                    
+                    // Zaman penceresi içindeki fiyatları filtrele
+                    let recent_prices: Vec<(u64, Decimal)> = self
+                        .price_history
+                        .iter()
+                        .rev()
+                        .filter(|(ts, _)| *ts >= window_start_ms)
+                        .take(self.flash_crash_recovery_min_points * 2) // Yeterli veri için 2x al
+                        .map(|(ts, p)| (*ts, *p))
+                        .collect();
+                    
+                    if recent_prices.len() >= self.flash_crash_recovery_min_points {
+                        if price_change_bps < -self.price_jump_threshold_bps {
+                            // Flash crash: Düşüş sonrası geri yükseliyor mu?
+                            // Minimum noktayı bul
+                            let (min_idx, min_price) = recent_prices
+                                .iter()
+                                .enumerate()
+                                .min_by(|(_, (_, p1)), (_, (_, p2))| p1.cmp(p2))
+                                .map(|(idx, (_, p))| (idx, *p))
+                                .unwrap_or((0, mid));
+                            
+                            // Minimum noktadan sonra recovery var mı?
+                            if min_idx < recent_prices.len() - 1 {
+                                let min_price_f = min_price.to_f64().unwrap_or(0.0);
+                                let current_price_f = mid.to_f64().unwrap_or(0.0);
+                                
+                                // Önceki fiyatı bul (minimum noktadan önce)
+                                let before_min_price = if min_idx > 0 {
+                                    recent_prices[min_idx - 1].1.to_f64().unwrap_or(min_price_f)
+                                } else {
+                                    min_price_f
+                                };
+                                
+                                // Recovery kontrolü: En az %X geri yükselme
+                                if min_price_f > 0.0 && before_min_price > 0.0 {
+                                    let drop_ratio = (before_min_price - min_price_f) / before_min_price;
+                                    let recovery_ratio = (current_price_f - min_price_f) / min_price_f;
+                                    
+                                    // Minimum drop var mı ve recovery yeterli mi?
+                                    drop_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
+                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio
+                                } else {
+                                    false
+                                }
                             } else {
-                                true // Veri yoksa geç (gevşetilmiş kontrol)
+                                false // Minimum nokta en son, recovery yok
+                            }
+                        } else if price_change_bps > self.price_jump_threshold_bps {
+                            // Flash pump: Yükseliş sonrası geri düşüyor mu?
+                            // Maksimum noktayı bul
+                            let (max_idx, max_price) = recent_prices
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, (_, p1)), (_, (_, p2))| p1.cmp(p2))
+                                .map(|(idx, (_, p))| (idx, *p))
+                                .unwrap_or((0, mid));
+                            
+                            // Maksimum noktadan sonra düşüş var mı?
+                            if max_idx < recent_prices.len() - 1 {
+                                let max_price_f = max_price.to_f64().unwrap_or(0.0);
+                                let current_price_f = mid.to_f64().unwrap_or(0.0);
+                                
+                                // Önceki fiyatı bul (maksimum noktadan önce)
+                                let before_max_price = if max_idx > 0 {
+                                    recent_prices[max_idx - 1].1.to_f64().unwrap_or(max_price_f)
+                                } else {
+                                    max_price_f
+                                };
+                                
+                                // Recovery kontrolü: En az %X geri düşme
+                                if max_price_f > 0.0 && before_max_price > 0.0 {
+                                    let rise_ratio = (max_price_f - before_max_price) / before_max_price;
+                                    let recovery_ratio = (max_price_f - current_price_f) / max_price_f;
+                                    
+                                    // Minimum rise var mı ve recovery yeterli mi?
+                                    rise_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
+                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false // Maksimum nokta en son, recovery yok
                             }
                         } else {
-                            true // Yeterli veri yok, ama geç (gevşetilmiş kontrol)
+                            true // Threshold'u geçmedi, recovery check gerekmez
                         }
                     } else {
-                        true // İlk tick'lerde recovery check yok, geç (gevşetilmiş kontrol)
-                    };
+                        // Yeterli veri yok, ama gevşetilmiş kontrol: eğer çok büyük bir değişim varsa geç
+                        price_change_bps.abs() > self.price_jump_threshold_bps * 2.0
+                    }
+                };
 
                 if price_change_bps.abs() > self.price_jump_threshold_bps 
                    && volume_ratio > self.manipulation_volume_ratio_threshold  // Config'den: Volume ratio threshold
@@ -1038,12 +1142,14 @@ impl Strategy for DynMm {
                 _ => 0.7,
             };
 
-            // PATCH: Sadece yüksek güven varsa işlem yap (config'den threshold)
+            // KRİTİK İYİLEŞTİRME: Confidence threshold optimize edildi (0.85 → 0.70)
+            // Çok yüksek threshold (0.85) gerçek fırsatları kaçırıyordu
+            // 0.70 threshold: False positive'leri azaltırken gerçek fırsatları da yakalar
             let min_confidence_threshold = self.confidence_min_threshold;
 
             if confidence < min_confidence_threshold {
-                use tracing::warn;
-                warn!(
+                use tracing::debug; // warn → debug: Çok fazla log spam önleme
+                debug!(
                     confidence,
                     threshold = min_confidence_threshold,
                     "SKIPPING OPPORTUNITY: confidence too low (false positive risk)"
@@ -1263,9 +1369,11 @@ impl Strategy for DynMm {
         let mut adaptive_spread_bps =
             self.calculate_adaptive_spread(base_spread_bps, min_spread_bps);
 
-        // Imbalance'a göre spread ayarla: dengesizlik yüksekse spread'i genişlet
-        let imbalance_adj = (imbalance.abs() * 10.0).min(5.0); // Max 5 bps artış
-        adaptive_spread_bps += imbalance_adj;
+        // KRİTİK DÜZELTME: Imbalance adjustment kaldırıldı (çift sayma önleme)
+        // Imbalance zaten pricing'de imbalance_skew ile kullanılıyor
+        // Spread'e eklemek çift sayma yaratıyordu
+        // Not: Imbalance'a göre spread genişletme risk yönetimi için gerekli değil,
+        // çünkü imbalance_skew zaten fiyatları asimetrik yapıyor (risk yönetimi)
 
         // Likidasyon riski: yakınsa spread'i genişlet
         if c.liq_gap_bps < 300.0 {
@@ -1273,6 +1381,7 @@ impl Strategy for DynMm {
         }
 
         // Order book spread'i kullan (fiyatlama için), adaptive spread'i risk kontrolü için kullan
+        // NOT: Imbalance adjustment kaldırıldı, sadece imbalance_skew pricing'de kullanılıyor
         let spread_bps_for_pricing = adaptive_spread_bps;
 
         // Funding rate skew: pozitif funding'de ask'i yukarı çek (long pozisyon için daha iyi)
@@ -1281,8 +1390,15 @@ impl Strategy for DynMm {
         // Envanter yönüne göre asimetrik spread: envanter varsa o tarafı daha agresif yap
         let inv_skew_bps = inv_direction * inv_bias * 20.0; // Envanter bias'ına göre ekstra skew
 
-        // Imbalance skew: pozitif imbalance (bid heavy) → bid'i yukarı, ask'i aşağı
-        let imbalance_skew_bps = imbalance * 10.0; // Imbalance'a göre skew
+        // KRİTİK DÜZELTME: Imbalance skew mantığı
+        // Microprice zaten imbalance'ı yansıtıyor:
+        //   - Bid heavy (pozitif imbalance) → microprice ask'e yakın
+        //   - Ask heavy (negatif imbalance) → microprice bid'e yakın
+        // Imbalance skew, microprice'ın zaten yaptığı etkiyi TERSİNE çevirmeli:
+        //   - Bid heavy → bid'i yukarı, ask'i aşağı çek (microprice'ı düzelt)
+        //   - Ask heavy → ask'i yukarı, bid'i aşağı çek (microprice'ı düzelt)
+        // Bu yüzden imbalance_skew işareti TERS olmalı: -imbalance
+        let imbalance_skew_bps = -imbalance * 10.0; // Ters işaret: bid heavy → bid yukarı, ask aşağı
 
         let half = Decimal::try_from(spread_bps_for_pricing / 2.0 / 1e4).unwrap_or(Decimal::ZERO);
         let skew = Decimal::try_from(funding_skew / 1e4).unwrap_or(Decimal::ZERO);
@@ -1295,13 +1411,13 @@ impl Strategy for DynMm {
         // Bid: microprice'den aşağı (half + funding_skew + inv_skew + imbalance_skew)
         // Pozitif envanter varsa inv_skew pozitif, bid daha aşağı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, bid daha yukarı (almaya zorla)
-        // Pozitif imbalance (bid heavy) → imbalance_skew negatif, bid yukarı
+        // Pozitif imbalance (bid heavy) → imbalance_skew negatif (ters işaret), bid yukarı (doğru)
         let mut bid_px = Px(pricing_base * (Decimal::ONE - half - skew - inv_skew - imb_skew));
 
         // Ask: microprice'den yukarı (half + funding_skew + inv_skew + imbalance_skew)
         // Pozitif envanter varsa inv_skew pozitif, ask daha yukarı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, ask daha aşağı (almaya zorla)
-        // Pozitif imbalance (bid heavy) → imbalance_skew negatif, ask aşağı
+        // Pozitif imbalance (bid heavy) → imbalance_skew negatif (ters işaret), ask aşağı (doğru)
         let mut ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew));
 
         // --- CROSSING GUARD: Fiyatların best bid/ask'i geçmemesi garantisi ---
@@ -1513,6 +1629,9 @@ mod tests {
             manipulation_time_threshold_ms: None,
             manipulation_price_history_min_len: None,
             manipulation_price_history_max_len: None,
+            flash_crash_recovery_window_ms: None,
+            flash_crash_recovery_min_points: None,
+            flash_crash_recovery_min_ratio: None,
             confidence_price_drop_max: None,
             confidence_volume_ratio_min: None,
             confidence_volume_ratio_max: None,
@@ -1614,7 +1733,7 @@ mod tests {
     #[test]
     fn test_volatility_update() {
         let mut strategy = create_test_strategy();
-        let initial_vol = strategy.ewma_volatility;
+        let _initial_vol = strategy.ewma_volatility;
 
         // First update: should update from initial (bootstrap)
         strategy.update_volatility(dec!(50000));
@@ -1634,7 +1753,7 @@ mod tests {
                 "Volatility should change or remain positive");
 
         // Small price change: volatility should still update but less
-        let vol_before_small = strategy.ewma_volatility;
+        let _vol_before_small = strategy.ewma_volatility;
         strategy.update_volatility(dec!(51010)); // 0.02% increase
         assert!(strategy.ewma_volatility > 0.0, "Volatility should remain positive");
         // Küçük fiyat değişimi için volatility artabilir veya azalabilir (EWMA smoothing)
@@ -1687,11 +1806,11 @@ mod tests {
         // When: Inventory decision is made
         let (should_bid, should_ask) = strategy.inventory_decision(current, target);
 
-        // Then: Should bid and ask (both sides, bid priority for market making)
+        // Then: Should only bid (not ask) to increase inventory towards target
         assert!(should_bid, "Should bid when below target (aggressive bid)");
         assert!(
-            should_ask,
-            "Should ask when below target (both sides for market making)"
+            !should_ask,
+            "Should NOT ask when below target (only bid to increase inventory)"
         );
     }
 
@@ -1706,10 +1825,10 @@ mod tests {
         // When: Inventory decision is made
         let (should_bid, should_ask) = strategy.inventory_decision(current, target);
 
-        // Then: Should bid and ask (both sides, ask priority for market making)
+        // Then: Should only ask (not bid) to decrease inventory towards target
         assert!(
-            should_bid,
-            "Should bid when above target (both sides for market making)"
+            !should_bid,
+            "Should NOT bid when above target (only ask to decrease inventory)"
         );
         assert!(should_ask, "Should ask when above target (aggressive ask)");
     }
@@ -1770,14 +1889,11 @@ mod tests {
             strategy.price_history.push((now + i * 1000, price));
         }
         let trend_up = strategy.detect_trend();
-        // The function compares new_avg (skip(5), older) vs old_avg (take(5), newer)
-        // So if prices increase, newer > older, but function does (new_avg - old_avg) where
-        // new_avg = older prices, old_avg = newer prices
-        // So increasing prices -> negative trend in this implementation
-        // Just verify it's non-zero
+        // DÜZELTME: Function now compares newer_avg (take(5), newest) vs older_avg (skip(5), older)
+        // So if prices increase, newer > older, (newer - older) > 0 → positive trend (correct!)
         assert!(
-            trend_up != 0.0,
-            "Trend should be non-zero with price changes, got: {}",
+            trend_up > 0.0,
+            "Uptrend should be positive, got: {}",
             trend_up
         );
 
@@ -1788,10 +1904,11 @@ mod tests {
             strategy.price_history.push((now + i * 1000, price));
         }
         let trend_down = strategy.detect_trend();
-        // Just verify it's non-zero and different from uptrend
+        // DÜZELTME: Decreasing prices → newer < older → (newer - older) < 0 → negative trend
         assert!(
-            trend_down != 0.0,
-            "Trend should be non-zero with price changes"
+            trend_down < 0.0,
+            "Downtrend should be negative, got: {}",
+            trend_down
         );
         assert!(
             trend_down != trend_up,

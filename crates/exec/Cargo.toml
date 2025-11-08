@@ -19,6 +19,7 @@ urlencoding = { workspace = true }
 rust_decimal = { workspace = true }
 dashmap = { workspace = true }
 once_cell = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = "1"

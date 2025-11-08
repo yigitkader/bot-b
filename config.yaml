@@ -193,6 +193,10 @@ strategy_internal:
   manipulation_time_threshold_ms: 5000        # 5 saniye içinde (2000 → 5000: daha toleranslı)
   manipulation_price_history_min_len: 3        # Minimum fiyat geçmişi uzunluğu
   manipulation_price_history_max_len: 200     # Maximum fiyat geçmişi uzunluğu
+  # Flash crash recovery check (iyileştirilmiş)
+  flash_crash_recovery_window_ms: 30000      # Recovery check için zaman penceresi (30 saniye)
+  flash_crash_recovery_min_points: 10        # Recovery check için minimum fiyat noktası sayısı
+  flash_crash_recovery_min_ratio: 0.3        # Minimum recovery oranı (%30 geri yükselme)
   
   # Confidence hesaplama
   confidence_price_drop_max: 500.0            # Max price drop/rise for confidence (bps)
@@ -202,7 +206,7 @@ strategy_internal:
   confidence_spread_max: 150.0                # Max spread for confidence (bps)
   confidence_bonus_multiplier: 0.3            # Confidence bonus multiplier
   confidence_max_multiplier: 2.0              # Max multiplier cap (1.5 → 2.0: daha agresif)
-  confidence_min_threshold: 0.85              # Minimum confidence threshold (%85+ güven gerekli)
+  confidence_min_threshold: 0.70              # Minimum confidence threshold (%70+ güven gerekli) (0.85 → 0.70: false positive azalt, gerçek fırsatları kaçırma)
   default_confidence: 0.7                     # Default confidence değeri (opportunity türü bilinmediğinde)
   min_confidence_value: 0.5                  # Minimum confidence değeri (clamp için)
   

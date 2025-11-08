@@ -134,6 +134,9 @@ async fn main() -> Result<()> {
         manipulation_time_threshold_ms: Some(cfg.strategy_internal.manipulation_time_threshold_ms),
         manipulation_price_history_min_len: Some(cfg.strategy_internal.manipulation_price_history_min_len),
         manipulation_price_history_max_len: Some(cfg.strategy_internal.manipulation_price_history_max_len),
+        flash_crash_recovery_window_ms: Some(cfg.strategy_internal.flash_crash_recovery_window_ms),
+        flash_crash_recovery_min_points: Some(cfg.strategy_internal.flash_crash_recovery_min_points),
+        flash_crash_recovery_min_ratio: Some(cfg.strategy_internal.flash_crash_recovery_min_ratio),
         confidence_price_drop_max: Some(cfg.strategy_internal.confidence_price_drop_max),
         confidence_volume_ratio_min: Some(cfg.strategy_internal.confidence_volume_ratio_min),
         confidence_volume_ratio_max: Some(cfg.strategy_internal.confidence_volume_ratio_max),
@@ -183,6 +186,9 @@ async fn main() -> Result<()> {
             manipulation_time_threshold_ms: dyn_cfg.manipulation_time_threshold_ms,
             manipulation_price_history_min_len: dyn_cfg.manipulation_price_history_min_len,
             manipulation_price_history_max_len: dyn_cfg.manipulation_price_history_max_len,
+            flash_crash_recovery_window_ms: dyn_cfg.flash_crash_recovery_window_ms,
+            flash_crash_recovery_min_points: dyn_cfg.flash_crash_recovery_min_points,
+            flash_crash_recovery_min_ratio: dyn_cfg.flash_crash_recovery_min_ratio,
             confidence_price_drop_max: dyn_cfg.confidence_price_drop_max,
             confidence_volume_ratio_min: dyn_cfg.confidence_volume_ratio_min,
             confidence_volume_ratio_max: dyn_cfg.confidence_volume_ratio_max,
@@ -628,10 +634,18 @@ async fn main() -> Result<()> {
                 match UserDataStream::connect(client.clone(), &base, &api_key, kind).await {
                     Ok(mut stream) => {
                         info!(?kind, "connected to Binance user data stream");
-                        // Reconnect sonrası ilk event geldiğinde sync trigger gönder
+                        // KRİTİK DÜZELTME: Reconnect callback set et - missed events sync için
+                        let tx_sync = tx.clone();
+                        stream.set_on_reconnect(move || {
+                            // Reconnect sonrası sync event'i gönder (main loop'ta handle edilecek)
+                            let _ = tx_sync.send(UserEvent::Heartbeat); // Heartbeat olarak kullan (sync trigger)
+                            info!("reconnect callback triggered, sync event sent");
+                        });
+                        
+                        // Reconnect sonrası ilk event geldiğinde sync trigger gönder (fallback)
                         let mut first_event_after_reconnect = true;
                         while let Ok(event) = stream.next_event().await {
-                            // Reconnect sonrası ilk event geldiğinde sync flag'i set et
+                            // Reconnect sonrası ilk event geldiğinde sync flag'i set et (fallback)
                             if first_event_after_reconnect {
                                 first_event_after_reconnect = false;
                                 // Reconnect sonrası sync event'i gönder (main loop'ta handle edilecek)

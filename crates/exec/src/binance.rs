@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use urlencoding::encode;
 
@@ -506,10 +506,10 @@ impl BinanceFutures {
             .await
             {
                 Ok(_) => {
-                    // Emir başarılı, pozisyon durumunu kontrol et
-                    // Exchange'in işlemesi için kısa bir bekleme
-                    // Not: exec crate'inde tokio yok, bu yüzden hemen kontrol ediyoruz
-                    // Retry mekanizması zaten var, bu yeterli
+                    // KRİTİK DÜZELTME: Exchange'in işlemesi için bekleme eklendi
+                    // Market order gönderildikten sonra exchange'in işlemesi için zaman gerekir
+                    // Hemen kontrol etmek yanlış sonuçlara yol açabilir (pozisyon henüz kapanmamış olabilir)
+                    tokio::time::sleep(Duration::from_millis(500)).await; // Exchange işlemesi için 500ms bekle
 
                     let verify_pos = self.fetch_position(sym).await?;
                     let verify_qty = verify_pos.qty.0;
@@ -561,8 +561,9 @@ impl BinanceFutures {
                             error = %e,
                             "failed to close position, retrying..."
                         );
-                        // Retry öncesi bekleme - exec crate'inde tokio yok
-                        // Caller tarafında retry yapılacak
+                        // KRİTİK DÜZELTME: Retry öncesi bekleme eklendi
+                        // Hızlı retry'ler exchange'i overload edebilir
+                        tokio::time::sleep(Duration::from_millis(500)).await; // Retry öncesi 500ms bekle
                         continue;
                     } else {
                         return Err(e);

@@ -55,6 +55,9 @@ pub struct UserDataStream {
     listen_key: String,
     ws: WsStream,
     last_keep_alive: Instant,
+    /// Reconnect sonrası missed events sync callback
+    /// Callback reconnect sonrası çağrılır ve missed events'leri sync etmek için kullanılır
+    on_reconnect: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl UserDataStream {
@@ -114,7 +117,7 @@ impl UserDataStream {
     }
 
     /// WS'yi yeni listenKey ile tekrar bağlar (var olan ws kapatılır)
-    /// KRİTİK DÜZELTME: Reconnect sonrası missed events sync gerekiyor
+    /// KRİTİK DÜZELTME: Reconnect sonrası missed events sync eklendi
     async fn reconnect_ws(&mut self) -> Result<()> {
         // 1. Yeni listen key oluştur (eski expire olmuş olabilir)
         let new_key =
@@ -127,10 +130,26 @@ impl UserDataStream {
         self.ws = ws;
         self.last_keep_alive = Instant::now();
 
-        // 3. CRITICAL: Reconnect sırasında kaçırılan emirleri API'den çek
-        warn!(%url, "WebSocket reconnected, missed events should be synced from REST API");
+        // 3. KRİTİK DÜZELTME: Reconnect sonrası missed events sync callback'i çağır
+        // Callback main.rs'de set edilir ve REST API'den missed events'leri sync eder
+        if let Some(ref callback) = self.on_reconnect {
+            callback();
+            info!(%url, "reconnected user data websocket, sync callback triggered");
+        } else {
+            warn!(%url, "WebSocket reconnected, but no sync callback set - missed events may not be synced");
+        }
+        
         info!(%url, "reconnected user data websocket");
         Ok(())
+    }
+    
+    /// Reconnect sonrası missed events sync callback'i set et
+    /// Callback reconnect sonrası çağrılır ve REST API'den missed events'leri sync etmek için kullanılır
+    pub fn set_on_reconnect<F>(&mut self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_reconnect = Some(Box::new(callback));
     }
 
     pub async fn connect(
@@ -157,6 +176,7 @@ impl UserDataStream {
             listen_key,
             ws,
             last_keep_alive: Instant::now(),
+            on_reconnect: None,
         })
     }
 

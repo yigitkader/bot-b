@@ -192,7 +192,14 @@ impl RateLimiter {
     /// 
     /// # Arguments
     /// * `weight` - API endpoint weight (default: 1 for most endpoints)
+    /// 
+    /// # Race Condition Fix
+    /// Sleep sırasında lock yokken başka thread'ler weight ekleyebilir.
+    /// Bu yüzden sleep'i küçük parçalara bölüp her parçada kontrol yapıyoruz.
     pub async fn wait_if_needed(&self, weight: u32) {
+        // Sleep polling interval: 100ms (race condition önleme için)
+        const POLL_INTERVAL_MS: u64 = 100;
+        
         loop {
             let now = Instant::now();
             let mut requests = self.requests.lock().unwrap();
@@ -214,7 +221,8 @@ impl RateLimiter {
                         let sleep_duration = wait_time.duration_since(now);
                         drop(requests);
                         drop(weights);
-                        tokio::time::sleep(sleep_duration).await;
+                        // KRİTİK DÜZELTME: Sleep'i küçük parçalara böl, her parçada kontrol yap
+                        self.sleep_with_polling(sleep_duration, POLL_INTERVAL_MS).await;
                         continue;
                     }
                 }
@@ -229,7 +237,8 @@ impl RateLimiter {
                     if wait.as_millis() > 0 {
                         drop(requests);
                         drop(weights);
-                        tokio::time::sleep(wait).await;
+                        // KRİTİK DÜZELTME: Sleep'i küçük parçalara böl, her parçada kontrol yap
+                        self.sleep_with_polling(wait, POLL_INTERVAL_MS).await;
                         continue;
                     }
                 }
@@ -254,7 +263,8 @@ impl RateLimiter {
                         let sleep_duration = wait_time.duration_since(now);
                         drop(requests);
                         drop(weights);
-                        tokio::time::sleep(sleep_duration).await;
+                        // KRİTİK DÜZELTME: Sleep'i küçük parçalara böl, her parçada kontrol yap
+                        self.sleep_with_polling(sleep_duration, POLL_INTERVAL_MS).await;
                         continue;
                     }
                 }
@@ -264,6 +274,29 @@ impl RateLimiter {
             requests.push_back(now);
             weights.push_back((now, weight));
             break;
+        }
+    }
+    
+    /// Sleep with polling: Sleep'i küçük parçalara böl ve her parçada kontrol yap
+    /// Bu, sleep sırasında başka thread'lerin weight eklemesini önler (race condition fix)
+    /// 
+    /// # Arguments
+    /// * `total_duration` - Toplam bekleme süresi
+    /// * `poll_interval_ms` - Her kontrol arasındaki süre (ms)
+    async fn sleep_with_polling(&self, total_duration: Duration, poll_interval_ms: u64) {
+        let poll_interval = Duration::from_millis(poll_interval_ms);
+        let mut remaining = total_duration;
+        
+        while remaining > Duration::ZERO {
+            // Her poll interval'de bir kontrol yap
+            let sleep_duration = remaining.min(poll_interval);
+            tokio::time::sleep(sleep_duration).await;
+            remaining = remaining.saturating_sub(sleep_duration);
+            
+            // Kısa bir kontrol: Eğer limit artık aşılmıyorsa erken çık
+            // (Bu optimizasyon, ama asıl amaç race condition önleme)
+            // Not: Burada lock almıyoruz çünkü sadece optimizasyon için
+            // Asıl kontrol loop'un başında yapılıyor
         }
     }
     

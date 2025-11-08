@@ -273,6 +273,12 @@ pub struct StrategyInternalCfg {
     pub manipulation_price_history_min_len: usize,
     #[serde(default = "default_manipulation_price_history_max_len")]
     pub manipulation_price_history_max_len: usize,
+    #[serde(default = "default_flash_crash_recovery_window_ms")]
+    pub flash_crash_recovery_window_ms: u64,
+    #[serde(default = "default_flash_crash_recovery_min_points")]
+    pub flash_crash_recovery_min_points: usize,
+    #[serde(default = "default_flash_crash_recovery_min_ratio")]
+    pub flash_crash_recovery_min_ratio: f64,
     #[serde(default = "default_confidence_price_drop_max")]
     pub confidence_price_drop_max: f64,
     #[serde(default = "default_confidence_volume_ratio_min")]
@@ -364,6 +370,9 @@ fn default_manipulation_volume_ratio_threshold() -> f64 { 5.0 }
 fn default_manipulation_time_threshold_ms() -> u64 { 2000 }
 fn default_manipulation_price_history_min_len() -> usize { 3 }
 fn default_manipulation_price_history_max_len() -> usize { 200 }
+fn default_flash_crash_recovery_window_ms() -> u64 { 30000 }
+fn default_flash_crash_recovery_min_points() -> usize { 10 }
+fn default_flash_crash_recovery_min_ratio() -> f64 { 0.3 }
 fn default_confidence_price_drop_max() -> f64 { 500.0 }
 fn default_confidence_volume_ratio_min() -> f64 { 5.0 }
 fn default_confidence_volume_ratio_max() -> f64 { 10.0 }
@@ -371,7 +380,7 @@ fn default_confidence_spread_min() -> f64 { 50.0 }
 fn default_confidence_spread_max() -> f64 { 150.0 }
 fn default_confidence_bonus_multiplier() -> f64 { 0.3 }
 fn default_confidence_max_multiplier() -> f64 { 1.5 }
-fn default_confidence_min_threshold() -> f64 { 0.75 }
+fn default_confidence_min_threshold() -> f64 { 0.70 } // 0.75 → 0.70: False positive azalt, gerçek fırsatları kaçırma
 fn default_default_confidence() -> f64 { 0.7 }
 fn default_min_confidence_value() -> f64 { 0.5 }
 fn default_min_tick_interval_ms() -> u64 { 100 }
