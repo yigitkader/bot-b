@@ -360,7 +360,7 @@ impl BinanceSpot {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         let bal = info.balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
@@ -385,7 +385,7 @@ impl BinanceSpot {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         let mut res = Vec::new();
         for o in orders {
@@ -424,7 +424,7 @@ impl BinanceSpot {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         let mut fills = Vec::new();
         for t in trades {
@@ -473,18 +473,19 @@ impl BinanceSpot {
             Side::Buy
         };
         let rules = self.rules_for(symbol).await?;
-        
+
         // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
         let qty_prec_from_step = scale_from_step(rules.step_size);
         let qty_precision = qty_prec_from_step.min(rules.qty_precision);
-        
+
         // Quantize: step_size'a göre floor
         let qty_quantized = quantize_decimal(qty_dec.abs(), rules.step_size);
-        
+
         // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
         // Bu, "Precision is over the maximum" hatasını önler
-        let qty = qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
-        
+        let qty =
+            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+
         if qty <= Decimal::ZERO {
             warn!(
                 %symbol,
@@ -519,7 +520,7 @@ impl BinanceSpot {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
         Ok(())
     }
 }
@@ -545,7 +546,7 @@ impl Venue for BinanceSpot {
         };
 
         let rules = self.rules_for(sym).await?;
-        
+
         // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
         // Precision'ı tick_size ve step_size ile uyumlu hale getir
         // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
@@ -555,16 +556,18 @@ impl Venue for BinanceSpot {
         // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
         let price_precision = price_prec_from_tick.min(rules.price_precision);
         let qty_precision = qty_prec_from_step.min(rules.qty_precision);
-        
+
         // Quantize: step_size'a göre floor
         let price_quantized = quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
-        
+
         // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
         // Bu, "Precision is over the maximum" hatasını önler
-        let price = price_quantized.round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
-        let qty = qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
-        
+        let price = price_quantized
+            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
+        let qty =
+            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+
         let notional = price * qty;
         if !rules.min_notional.is_zero() && notional < rules.min_notional {
             return Err(anyhow!(
@@ -573,7 +576,7 @@ impl Venue for BinanceSpot {
                 rules.min_notional
             ));
         }
-        
+
         // Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty, qty_precision);
@@ -602,7 +605,7 @@ impl Venue for BinanceSpot {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         info!(
             %sym,
@@ -633,7 +636,7 @@ impl Venue for BinanceSpot {
                 .delete(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         Ok(())
     }
@@ -810,7 +813,7 @@ impl BinanceFutures {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         let bal = balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
@@ -835,7 +838,7 @@ impl BinanceFutures {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
         let mut res = Vec::new();
         for o in orders {
             let price = Decimal::from_str_radix(&o.price, 10)?;
@@ -873,7 +876,7 @@ impl BinanceFutures {
                 .get(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
         let pos = positions
             .drain(..)
             .find(|p| p.symbol.eq_ignore_ascii_case(sym))
@@ -914,7 +917,7 @@ impl BinanceFutures {
     }
 
     /// Close position with reduceOnly guarantee and verification
-    /// 
+    ///
     /// KRİTİK: Futures için pozisyon kapatma garantisi:
     /// 1. reduceOnly=true ile market order gönder
     /// 2. Pozisyon tam olarak kapatıldığını doğrula
@@ -924,21 +927,21 @@ impl BinanceFutures {
         // İlk pozisyon kontrolü
         let initial_pos = self.fetch_position(sym).await?;
         let initial_qty = initial_pos.qty.0;
-        
+
         if initial_qty.is_zero() {
             // Pozisyon zaten kapalı
             return Ok(());
         }
-        
+
         let initial_side = if initial_qty.is_sign_positive() {
-            Side::Sell  // Long pozisyon → Sell ile kapat
+            Side::Sell // Long pozisyon → Sell ile kapat
         } else {
-            Side::Buy   // Short pozisyon → Buy ile kapat
+            Side::Buy // Short pozisyon → Buy ile kapat
         };
-        
+
         let rules = self.rules_for(sym).await?;
         let initial_qty_abs = quantize_decimal(initial_qty.abs(), rules.step_size);
-        
+
         if initial_qty_abs <= Decimal::ZERO {
             warn!(
                 symbol = %sym,
@@ -947,15 +950,15 @@ impl BinanceFutures {
             );
             return Ok(());
         }
-        
+
         // KRİTİK: Pozisyon kapatma retry mekanizması (kısmi kapatma durumunda)
         let max_attempts = 3;
-        
+
         for attempt in 0..max_attempts {
             // Mevcut pozisyonu kontrol et (retry durumunda pozisyon değişmiş olabilir)
             let current_pos = self.fetch_position(sym).await?;
             let current_qty = current_pos.qty.0;
-            
+
             if current_qty.is_zero() {
                 // Pozisyon tamamen kapatıldı
                 if attempt > 0 {
@@ -967,23 +970,23 @@ impl BinanceFutures {
                 }
                 return Ok(());
             }
-            
+
             // Kalan pozisyon miktarını hesapla
             let remaining_qty = quantize_decimal(current_qty.abs(), rules.step_size);
-            
+
             if remaining_qty <= Decimal::ZERO {
                 return Ok(());
             }
-            
+
             // Side belirleme (pozisyon yönüne göre)
             let side = if current_qty.is_sign_positive() {
-                Side::Sell  // Long → Sell
+                Side::Sell // Long → Sell
             } else {
-                Side::Buy   // Short → Buy
+                Side::Buy // Short → Buy
             };
-            
+
             let qty_str = format_decimal_fixed(remaining_qty, rules.qty_precision);
-            
+
             // KRİTİK: reduceOnly=true ve type=MARKET garantisi
             let params = vec![
                 format!("symbol={}", sym),
@@ -995,17 +998,17 @@ impl BinanceFutures {
                         "SELL"
                     }
                 ),
-                "type=MARKET".to_string(),  // Post-only değil, market order
+                "type=MARKET".to_string(), // Post-only değil, market order
                 format!("quantity={}", qty_str),
-                "reduceOnly=true".to_string(),  // KRİTİK: Yeni pozisyon açmayı önle
+                "reduceOnly=true".to_string(), // KRİTİK: Yeni pozisyon açmayı önle
                 format!("timestamp={}", BinanceCommon::ts()),
                 format!("recvWindow={}", self.common.recv_window_ms),
             ];
-            
+
             let qs = params.join("&");
             let sig = self.common.sign(&qs);
             let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-            
+
             // Emir gönder
             match send_void(
                 self.common
@@ -1013,16 +1016,17 @@ impl BinanceFutures {
                     .post(&url)
                     .header("X-MBX-APIKEY", &self.common.api_key),
             )
-            .await {
+            .await
+            {
                 Ok(_) => {
                     // Emir başarılı, pozisyon durumunu kontrol et
                     // Exchange'in işlemesi için kısa bir bekleme
                     // Not: exec crate'inde tokio yok, bu yüzden hemen kontrol ediyoruz
                     // Retry mekanizması zaten var, bu yeterli
-                    
+
                     let verify_pos = self.fetch_position(sym).await?;
                     let verify_qty = verify_pos.qty.0;
-                    
+
                     if verify_qty.is_zero() {
                         // Pozisyon tamamen kapatıldı
                         info!(
@@ -1034,10 +1038,11 @@ impl BinanceFutures {
                         return Ok(());
                     } else {
                         // Kısmi kapatma - retry yap
-                        let remaining_pct = (verify_qty.abs() / initial_qty.abs() * Decimal::from(100))
-                            .to_f64()
-                            .unwrap_or(0.0);
-                        
+                        let remaining_pct = (verify_qty.abs() / initial_qty.abs()
+                            * Decimal::from(100))
+                        .to_f64()
+                        .unwrap_or(0.0);
+
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -1046,7 +1051,7 @@ impl BinanceFutures {
                             remaining_pct = remaining_pct,
                             "position partially closed, retrying..."
                         );
-                        
+
                         if attempt < max_attempts - 1 {
                             // Son deneme değilse devam et
                             continue;
@@ -1078,7 +1083,7 @@ impl BinanceFutures {
                 }
             }
         }
-        
+
         // Buraya gelmemeli (yukarıdaki return'ler ile çıkılmalı)
         Err(anyhow::anyhow!("Unexpected error in flatten_position"))
     }
@@ -1105,7 +1110,7 @@ impl Venue for BinanceFutures {
         };
 
         let rules = self.rules_for(sym).await?;
-        
+
         // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
         // Precision'ı tick_size ve step_size ile uyumlu hale getir
         // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
@@ -1115,16 +1120,18 @@ impl Venue for BinanceFutures {
         // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
         let price_precision = price_prec_from_tick.min(rules.price_precision);
         let qty_precision = qty_prec_from_step.min(rules.qty_precision);
-        
+
         // Quantize: step_size'a göre floor
         let price_quantized = quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
-        
+
         // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
         // Bu, "Precision is over the maximum" hatasını önler
-        let price = price_quantized.round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
-        let qty = qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
-        
+        let price = price_quantized
+            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
+        let qty =
+            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+
         let notional = price * qty;
         if !rules.min_notional.is_zero() && notional < rules.min_notional {
             return Err(anyhow!(
@@ -1133,7 +1140,7 @@ impl Venue for BinanceFutures {
                 rules.min_notional
             ));
         }
-        
+
         // Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty, qty_precision);
@@ -1159,7 +1166,7 @@ impl Venue for BinanceFutures {
                 .post(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
 
         info!(
             %sym,
@@ -1190,7 +1197,7 @@ impl Venue for BinanceFutures {
                 .delete(url)
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
-            .await?;
+        .await?;
         Ok(())
     }
 
@@ -1234,7 +1241,7 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     let ratio = value / step;
     let floored = ratio.floor();
     let result = floored * step;
-    
+
     // Decimal her zaman finite'dir, bu yüzden direkt döndür
     result
 }
@@ -1244,16 +1251,16 @@ fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     // Precision overflow kontrolü (max 28 decimal places)
     let precision = precision.min(28);
     let scale = precision as u32;
-    
+
     // Decimal her zaman finite'dir, bu yüzden direkt işle
-    
+
     // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
     // normalize() trailing zero'ları kaldırır, bu precision hatasına yol açabilir
     // Bu yüzden trailing zero'ları korumalıyız
     // ÖNCE: Decimal'i doğru scale'e truncate et (precision hatasını önlemek için)
     // Her zaman round_dp_with_strategy kullan çünkü set_scale güvenilir değil
     let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
-    
+
     // Trailing zero'ları koru: precision kadar decimal place göster
     if scale == 0 {
         truncated.to_string()
@@ -1352,24 +1359,27 @@ mod tests {
         // format_decimal_fixed trailing zero'ları korur (precision kadar)
         assert_eq!(format_decimal_fixed(dec!(1.2000), 4), "1.2000");
         assert_eq!(format_decimal_fixed(dec!(0.00000001), 8), "0.00000001");
-        
+
         // Yüksek fiyatlı semboller için testler (BNBUSDC gibi)
         assert_eq!(format_decimal_fixed(dec!(950.649470), 2), "950.64");
         assert_eq!(format_decimal_fixed(dec!(950.649470), 3), "950.649");
         assert_eq!(format_decimal_fixed(dec!(956.370530), 2), "956.37");
         assert_eq!(format_decimal_fixed(dec!(956.370530), 3), "956.370");
-        
+
         // Fazla precision'ı kesme testi
         assert_eq!(format_decimal_fixed(dec!(202.129776525), 2), "202.12");
         assert_eq!(format_decimal_fixed(dec!(202.129776525), 3), "202.129");
         assert_eq!(format_decimal_fixed(dec!(0.08082180550260300), 4), "0.0808");
-        assert_eq!(format_decimal_fixed(dec!(0.08082180550260300), 5), "0.08082");
-        
+        assert_eq!(
+            format_decimal_fixed(dec!(0.08082180550260300), 5),
+            "0.08082"
+        );
+
         // Integer precision testi
         assert_eq!(format_decimal_fixed(dec!(100.5), 0), "100");
         assert_eq!(format_decimal_fixed(dec!(1000), 0), "1000");
     }
-    
+
     #[test]
     fn test_scale_from_step() {
         // tick_size'dan precision hesaplama testleri

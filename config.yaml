@@ -19,7 +19,7 @@ min_quote_balance_usd: 1.0
 
 # Kaldıraç (sadece futures)
 # KRİTİK DÜZELTME: 5 → 3 (daha güvenli)
-leverage: 3
+leverage: 5
 
 # Fiyat/lot adımı (quantize için). İstersen exchangeInfo'dan otomatik de çekebiliriz,
 # ama basit ve deterministik olsun diye konfigde tutuyoruz.
@@ -109,6 +109,14 @@ internal:
   rate_limiter_min_interval_ms: 1000
   order_sync_interval_sec: 2
   cancel_stagger_delay_ms: 50
+  min_tick_interval_ms: 100  # Minimum tick interval (ms) - rate limit koruması için
+  symbol_discovery_retry_interval_sec: 30  # Symbol discovery retry interval (seconds)
+  
+  # Logging ve debug parametreleri
+  progress_log_first_n_symbols: 10  # İlk N sembol için progress log
+  progress_log_interval: 50  # Her N sembolde bir progress log
+  debug_symbol_count: 5  # İlk N sembol için debug log
+  max_stale_orders_threshold: 10  # Maksimum stale order threshold
   
   # Fill rate güncelleme katsayıları
   fill_rate_increase_factor: 0.95
@@ -116,6 +124,10 @@ internal:
   fill_rate_decrease_factor: 0.95  # 0.98 → 0.95 (daha agresif düşürme)
   fill_rate_slow_decrease_factor: 0.995
   fill_rate_slow_decrease_bonus: 0.005
+  fill_rate_partial_fill_factor: 0.98  # Partial fill sonrası fill rate artış faktörü
+  fill_rate_partial_fill_bonus: 0.02  # Partial fill sonrası fill rate artış bonusu
+  fill_rate_reconnect_factor: 0.95  # Reconnect sonrası fill rate artış faktörü
+  fill_rate_reconnect_bonus: 0.05  # Reconnect sonrası fill rate artış bonusu
   
   # Emir fiyat mesafesi eşikleri (decimal)
   order_price_distance_with_position: 0.01  # %1 (pozisyon varsa)

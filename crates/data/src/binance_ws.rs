@@ -34,10 +34,10 @@ pub enum UserEvent {
         order_id: String,
         client_order_id: Option<String>, // Idempotency için
         side: Side,
-        qty: Qty, // Last executed qty (incremental)
+        qty: Qty,                   // Last executed qty (incremental)
         cumulative_filled_qty: Qty, // Cumulative filled qty (total filled so far)
         price: Px,
-        is_maker: bool, // true = maker, false = taker
+        is_maker: bool,       // true = maker, false = taker
         order_status: String, // Order status: NEW, PARTIALLY_FILLED, FILLED, CANCELED, etc.
     },
     OrderCanceled {
@@ -136,15 +136,16 @@ impl UserDataStream {
     /// KRİTİK DÜZELTME: Reconnect sonrası missed events sync gerekiyor
     async fn reconnect_ws(&mut self) -> Result<()> {
         // 1. Yeni listen key oluştur (eski expire olmuş olabilir)
-        let new_key = Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
+        let new_key =
+            Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
         self.listen_key = new_key;
-        
+
         // 2. WebSocket'e bağlan
         let url = Self::ws_url_for(self.kind, &self.listen_key);
         let (ws, _) = connect_async(&url).await?;
         self.ws = ws;
         self.last_keep_alive = Instant::now();
-        
+
         // 3. CRITICAL: Reconnect sırasında kaçırılan emirleri API'den çek
         warn!(%url, "WebSocket reconnected, missed events should be synced from REST API");
         info!(%url, "reconnected user data websocket");
@@ -286,8 +287,8 @@ impl UserDataStream {
                     .map(|s| s.to_string());
                 let status = value.get("X").and_then(Value::as_str).unwrap_or_default();
                 if status == "CANCELED" {
-                    return Ok(Some(UserEvent::OrderCanceled { 
-                        symbol, 
+                    return Ok(Some(UserEvent::OrderCanceled {
+                        symbol,
                         order_id,
                         client_order_id,
                     }));
@@ -331,14 +332,11 @@ impl UserDataStream {
                     .and_then(Value::as_i64)
                     .unwrap_or_default()
                     .to_string();
-                let client_order_id = data
-                    .get("c")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string());
+                let client_order_id = data.get("c").and_then(Value::as_str).map(|s| s.to_string());
                 let status = data.get("X").and_then(Value::as_str).unwrap_or_default();
                 if status == "CANCELED" {
-                    return Ok(Some(UserEvent::OrderCanceled { 
-                        symbol, 
+                    return Ok(Some(UserEvent::OrderCanceled {
+                        symbol,
                         order_id,
                         client_order_id,
                     }));

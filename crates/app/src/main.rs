@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use bot_core::types::*;
 use config::load_config;
 use data::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
-use exec::binance::{BinanceCommon, BinanceFutures, BinanceSpot, SymbolMeta};
+use exec::binance::{BinanceCommon, BinanceFutures, SymbolMeta};
 use exec::{decimal_places, Venue};
 use risk::{RiskAction, RiskLimits};
 use rust_decimal::prelude::ToPrimitive;
@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
-use utils::{clamp_qty_by_base, clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot};
+use utils::{clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot};
 
 use std::cmp::max;
 use std::collections::HashMap;
@@ -141,14 +141,14 @@ async fn main() -> Result<()> {
         confidence_spread_max: Some(cfg.strategy_internal.confidence_spread_max),
         confidence_bonus_multiplier: Some(cfg.strategy_internal.confidence_bonus_multiplier),
         confidence_max_multiplier: Some(cfg.strategy_internal.confidence_max_multiplier),
-            confidence_min_threshold: Some(cfg.strategy_internal.confidence_min_threshold),
+        confidence_min_threshold: Some(cfg.strategy_internal.confidence_min_threshold),
             default_confidence: Some(cfg.strategy_internal.default_confidence),
             min_confidence_value: Some(cfg.strategy_internal.min_confidence_value),
-            trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
+        trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
         trend_analysis_threshold_negative: Some(cfg.strategy_internal.trend_analysis_threshold_negative),
         trend_analysis_threshold_strong_negative: Some(cfg.strategy_internal.trend_analysis_threshold_strong_negative),
     };
-    let mode_lower = cfg.mode.to_lowercase();
+    // Always use futures mode
     let strategy_name = cfg.strategy.r#type.clone();
     let build_strategy = |symbol: &str| -> Box<dyn Strategy> {
         // DynMmCfg Clone edilebilir (derive(Clone) ile)
@@ -216,47 +216,25 @@ async fn main() -> Result<()> {
         recv_window_ms: cfg.binance.recv_window_ms,
     };
 
-    enum V {
-        Spot(BinanceSpot),
-        Fut(BinanceFutures),
-    }
+    // Always use futures, no enum needed
     let price_tick_dec = Decimal::from_f64_retain(cfg.price_tick).unwrap_or(Decimal::ZERO);
     let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
     let price_precision = decimal_places(price_tick_dec);
     let qty_precision = decimal_places(qty_step_dec);
-    let is_futures = cfg.mode.to_lowercase().as_str() == "futures";
+    // Initialize rate limiter for futures
+    init_rate_limiter(true);
+    info!("rate limiter initialized for futures");
     
-    // Initialize rate limiter based on mode (spot or futures)
-    init_rate_limiter(is_futures);
-    info!(
-        mode = cfg.mode,
-        is_futures,
-        "rate limiter initialized"
-    );
-    
-    let venue = match cfg.mode.to_lowercase().as_str() {
-        "spot" => V::Spot(BinanceSpot {
-            base: cfg.binance.spot_base.clone(),
-            common: common.clone(),
-            price_tick: price_tick_dec,
-            qty_step: qty_step_dec,
-            price_precision,
-            qty_precision,
-        }),
-        _ => V::Fut(BinanceFutures {
+    let venue = BinanceFutures {
             base: cfg.binance.futures_base.clone(),
             common: common.clone(),
             price_tick: price_tick_dec,
             qty_step: qty_step_dec,
             price_precision,
             qty_precision,
-        }),
     };
 
-    let metadata = match &venue {
-        V::Spot(v) => v.symbol_metadata().await?,
-        V::Fut(v) => v.symbol_metadata().await?,
-    };
+    let metadata = venue.symbol_metadata().await?;
 
     let mut requested: Vec<String> = cfg.symbols.clone();
     if let Some(sym) = cfg.symbol.clone() {
@@ -304,7 +282,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
             }
-            if mode_lower == "futures" {
+            // Only accept PERPETUAL futures contracts
                 match meta.contract_type.as_deref() {
                     Some("PERPETUAL") => {}
                     Some(other) => {
@@ -314,15 +292,12 @@ async fn main() -> Result<()> {
                     None => {
                         warn!(symbol = %sym, "skipping futures symbol with missing contract type metadata");
                         continue;
-                    }
                 }
             }
 
             // --- opsiyonel: başlangıçta bakiye tabanlı ön eleme ---
             let have_min = cfg.min_usd_per_order.unwrap_or(0.0);
-            if mode_lower == "futures" {
-                if let V::Fut(vtmp) = &venue {
-                    let avail = vtmp.available_balance(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
+            let avail = venue.available_balance(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
                     if avail < have_min {
                         warn!(
                             symbol = %sym,
@@ -332,25 +307,6 @@ async fn main() -> Result<()> {
                             "skipping symbol at discovery: zero/low quote balance for futures wallet"
                         );
                         continue;
-                    }
-                }
-            } else {
-                if let V::Spot(vtmp) = &venue {
-                    rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                    let q_free = vtmp.asset_free(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
-                    rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                    let b_free = vtmp.asset_free(&meta.base_asset).await?.to_f64().unwrap_or(0.0);
-                    if q_free < have_min && b_free < cfg.qty_step {
-                        warn!(
-                            symbol = %sym,
-                            quote = %meta.quote_asset,
-                            q_free,
-                            b_free,
-                            "skipping symbol at discovery: no usable balances (spot)"
-                        );
-                        continue;
-                    }
-                }
             }
 
             selected.push(meta.clone());
@@ -390,8 +346,7 @@ async fn main() -> Result<()> {
                 
                 match_quote
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
-                    && (mode_lower != "futures"
-                    || m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false))
+                    && m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false)
             })
             .cloned()
             .collect();
@@ -401,16 +356,14 @@ async fn main() -> Result<()> {
         // Böylece gereksiz işlem yapılmaz
         let mut quote_asset_balances: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         
-        if mode_lower == "futures" {
-            if let V::Fut(vtmp) = &venue {
                 // Tüm benzersiz quote asset'leri bul
                 let unique_quotes: std::collections::HashSet<String> = auto.iter()
                     .map(|m| m.quote_asset.clone())
                     .collect();
                 
-                // Her quote asset için bakiye kontrolü yap
+        // Her quote asset için bakiye kontrolü yap (futures)
                 for quote in unique_quotes {
-                    let balance = vtmp.available_balance(&quote).await.ok()
+            let balance = venue.available_balance(&quote).await.ok()
                         .and_then(|b| b.to_f64())
                         .unwrap_or(0.0);
                     quote_asset_balances.insert(quote.clone(), balance);
@@ -422,33 +375,6 @@ async fn main() -> Result<()> {
                             min_required = cfg.min_quote_balance_usd,
                             "FILTERING: quote asset balance insufficient, removing all symbols with this quote asset"
                         );
-                    }
-                }
-            }
-        } else {
-            if let V::Spot(vtmp) = &venue {
-                // Tüm benzersiz quote asset'leri bul
-                let unique_quotes: std::collections::HashSet<String> = auto.iter()
-                    .map(|m| m.quote_asset.clone())
-                    .collect();
-                
-                // Her quote asset için bakiye kontrolü yap
-                for quote in unique_quotes {
-                    rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                    let balance = vtmp.asset_free(&quote).await.ok()
-                        .and_then(|b| b.to_f64())
-                        .unwrap_or(0.0);
-                    quote_asset_balances.insert(quote.clone(), balance);
-                    
-                    if balance < cfg.min_quote_balance_usd {
-                        info!(
-                            quote_asset = %quote,
-                            balance,
-                            min_required = cfg.min_quote_balance_usd,
-                            "FILTERING: quote asset balance insufficient, removing all symbols with this quote asset"
-                        );
-                    }
-                }
             }
         }
         
@@ -498,7 +424,7 @@ async fn main() -> Result<()> {
         // Bakiye gelene kadar döngüde bekle
         loop {
             use tokio::time::{sleep, Duration};
-            sleep(Duration::from_secs(30)).await; // 30 saniye bekle
+            sleep(Duration::from_secs(cfg.internal.symbol_discovery_retry_interval_sec)).await;
             
             // Tekrar sembol keşfi yap
             let mut retry_selected: Vec<SymbolMeta> = Vec::new();
@@ -532,39 +458,22 @@ async fn main() -> Result<()> {
                         
                         match_quote
                             && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
-                            && (mode_lower != "futures"
-                            || m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false))
+                            && m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false)
                     })
                     .cloned()
                     .collect();
                 
                 // Bakiye kontrolü
                 let mut retry_quote_balances: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-                if mode_lower == "futures" {
-                    if let V::Fut(vtmp) = &venue {
+                // Futures only - spot removed
                         let unique_quotes: std::collections::HashSet<String> = retry_auto.iter()
                             .map(|m| m.quote_asset.clone())
                             .collect();
                         for quote in unique_quotes {
-                            let balance = vtmp.available_balance(&quote).await.ok()
+                    let balance = venue.available_balance(&quote).await.ok()
                                 .and_then(|b| b.to_f64())
                                 .unwrap_or(0.0);
                             retry_quote_balances.insert(quote.clone(), balance);
-                        }
-                    }
-                } else {
-                    if let V::Spot(vtmp) = &venue {
-                        let unique_quotes: std::collections::HashSet<String> = retry_auto.iter()
-                            .map(|m| m.quote_asset.clone())
-                            .collect();
-                        for quote in unique_quotes {
-                            rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                            let balance = vtmp.asset_free(&quote).await.ok()
-                                .and_then(|b| b.to_f64())
-                                .unwrap_or(0.0);
-                            retry_quote_balances.insert(quote.clone(), balance);
-                        }
-                    }
                 }
                 
                 retry_auto.retain(|m| {
@@ -590,32 +499,16 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                         }
-                        if mode_lower == "futures" {
+                        // Only accept PERPETUAL futures contracts
                             match meta.contract_type.as_deref() {
                                 Some("PERPETUAL") => {}
                                 _ => continue,
-                            }
                         }
                         
-                        // Bakiye kontrolü
-                        let has_balance = if mode_lower == "futures" {
-                            if let V::Fut(vtmp) = &venue {
-                                vtmp.available_balance(&meta.quote_asset).await.ok()
+                        // Bakiye kontrolü (futures only)
+                        let has_balance = venue.available_balance(&meta.quote_asset).await.ok()
                                     .and_then(|b| b.to_f64())
-                                    .unwrap_or(0.0) >= cfg.min_quote_balance_usd
-                            } else {
-                                false
-                            }
-                        } else {
-                            if let V::Spot(vtmp) = &venue {
-                                rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                                vtmp.asset_free(&meta.quote_asset).await.ok()
-                                    .and_then(|b| b.to_f64())
-                                    .unwrap_or(0.0) >= cfg.min_quote_balance_usd
-                            } else {
-                                false
-                            }
-                        };
+                            .unwrap_or(0.0) >= cfg.min_quote_balance_usd;
                         
                         if has_balance {
                             retry_selected.push(meta.clone());
@@ -656,10 +549,7 @@ async fn main() -> Result<()> {
         );
         
         // Per-symbol metadata çek (fallback: global cfg değerleri)
-        let symbol_rules = match &venue {
-            V::Spot(v) => v.rules_for(&meta.symbol).await.ok(),
-            V::Fut(v) => v.rules_for(&meta.symbol).await.ok(),
-        };
+        let symbol_rules = venue.rules_for(&meta.symbol).await.ok();
         if let Some(ref rules) = symbol_rules {
             info!(
                 symbol = %meta.symbol,
@@ -701,7 +591,7 @@ async fn main() -> Result<()> {
             // Gelişmiş risk ve kazanç takibi
             daily_pnl: Decimal::ZERO,
             total_funding_cost: Decimal::ZERO,
-            position_size_notional_history: Vec::with_capacity(100),
+            position_size_notional_history: Vec::with_capacity(cfg.internal.position_size_history_max_len),
             last_pnl_alert: None,
             cumulative_pnl: Decimal::ZERO,
         });
@@ -722,14 +612,10 @@ async fn main() -> Result<()> {
     if cfg.websocket.enabled {
         let client = common.client.clone();
         let api_key = cfg.binance.api_key.clone();
-        let spot_base = cfg.binance.spot_base.clone();
         let futures_base = cfg.binance.futures_base.clone();
         let reconnect_delay = Duration::from_millis(cfg.websocket.reconnect_delay_ms);
         let tx = event_tx.clone();
-        let kind = match &venue {
-            V::Spot(_) => UserStreamKind::Spot,
-            V::Fut(_) => UserStreamKind::Futures,
-        };
+        let kind = UserStreamKind::Futures;
         info!(
             reconnect_delay_ms = cfg.websocket.reconnect_delay_ms,
             ping_interval_ms = cfg.websocket.ping_interval_ms,
@@ -737,10 +623,7 @@ async fn main() -> Result<()> {
             "launching user data stream task"
         );
         tokio::spawn(async move {
-            let base = match kind {
-                UserStreamKind::Spot => spot_base,
-                UserStreamKind::Futures => futures_base,
-            };
+            let base = futures_base;
             loop {
                 match UserDataStream::connect(client.clone(), &base, &api_key, kind).await {
                     Ok(mut stream) => {
@@ -772,12 +655,10 @@ async fn main() -> Result<()> {
     struct Caps {
         buy_notional: f64,      // tek emir için USD üst sınır (örn 100)
         sell_notional: f64,     // tek emir için USD üst sınır
-        sell_base: Option<f64>, // SPOT için base miktar üst sınırı
         buy_total: f64,         // toplam kullanılabilir quote USD (örn 140)
-        sell_total_base: f64,   // toplam satılabilir base (SPOT)
     }
 
-    let tick_ms = max(100, cfg.exec.cancel_replace_interval_ms);
+    let tick_ms = max(cfg.internal.min_tick_interval_ms, cfg.exec.cancel_replace_interval_ms);
     let min_usd_per_order = cfg.min_usd_per_order.unwrap_or(0.0);
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now(),
@@ -818,10 +699,7 @@ async fn main() -> Result<()> {
                     // Hayalet emirleri önlemek için full sync yap
                     for state in &mut states {
                         rate_limit_guard(3).await; // GET /api/v3/openOrders: Weight 3
-                        let sync_result = match &venue {
-                            V::Spot(v) => v.get_open_orders(&state.meta.symbol).await,
-                            V::Fut(v) => v.get_open_orders(&state.meta.symbol).await,
-                        };
+                        let sync_result = venue.get_open_orders(&state.meta.symbol).await;
                         
                         match sync_result {
                             Ok(api_orders) => {
@@ -843,7 +721,7 @@ async fn main() -> Result<()> {
                                 
                                 if removed_count > 0 {
                                     state.consecutive_no_fills = 0;
-                                    state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                                    state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_reconnect_factor + cfg.internal.fill_rate_reconnect_bonus).min(1.0);
                                     info!(
                                         symbol = %state.meta.symbol,
                                         removed_orders = removed_count,
@@ -945,23 +823,23 @@ async fn main() -> Result<()> {
                             
                             // Eğer order tamamen fill olduysa (FILLED status), active_orders'dan kaldır
                             if order_status == "FILLED" || remaining_qty.is_zero() {
-                                update_fill_rate_on_fill(
-                                    state,
-                                    cfg.internal.fill_rate_increase_factor,
-                                    cfg.internal.fill_rate_increase_bonus,
-                                );
+                        update_fill_rate_on_fill(
+                            state,
+                            cfg.internal.fill_rate_increase_factor,
+                            cfg.internal.fill_rate_increase_bonus,
+                        );
                                 true // Remove order
                             } else {
                                 // Partial fill - sadece fill rate'i hafifçe artır
-                                state.order_fill_rate = (state.order_fill_rate * 0.98 + 0.02).min(1.0);
+                                state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_partial_fill_factor + cfg.internal.fill_rate_partial_fill_bonus).min(1.0);
                                 false // Keep order
                             }
                         } else {
                             // Order local state'de yok (reconnect sonrası olabilir)
                             // API'den order bilgisini al ve state'e ekle
                             warn!(
-                                %symbol,
-                                order_id = %order_id,
+                            %symbol,
+                            order_id = %order_id,
                                 "fill event for unknown order (reconnect?), will sync from API"
                             );
                             // Reconnect sonrası sync yapılacak, burada sadece inventory güncelle
@@ -1012,9 +890,9 @@ async fn main() -> Result<()> {
                         };
                         
                         if was_removed {
-                            state.active_orders.remove(&order_id);
+                        state.active_orders.remove(&order_id);
                             state.last_order_price_update.remove(&order_id);
-                            update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
                             
                             info!(
                                 %symbol,
@@ -1063,19 +941,9 @@ async fn main() -> Result<()> {
         let mut quote_balances: HashMap<String, f64> = HashMap::new();
         for quote_asset in &unique_quote_assets {
             rate_limit_guard(10).await; // GET /api/v3/account or /fapi/v2/balance: Weight 10/5
-            let balance = match &venue {
-                V::Spot(v) => {
-                    match tokio::time::timeout(Duration::from_secs(5), v.asset_free(quote_asset)).await {
+            let balance = match tokio::time::timeout(Duration::from_secs(5), venue.available_balance(quote_asset)).await {
                         Ok(Ok(b)) => b.to_f64().unwrap_or(0.0),
                         _ => 0.0,
-                    }
-                }
-                V::Fut(v) => {
-                    match tokio::time::timeout(Duration::from_secs(5), v.available_balance(quote_asset)).await {
-                        Ok(Ok(b)) => b.to_f64().unwrap_or(0.0),
-                        _ => 0.0,
-                    }
-                }
             };
             quote_balances.insert(quote_asset.clone(), balance);
         }
@@ -1124,8 +992,8 @@ async fn main() -> Result<()> {
             }
             symbol_index += 1;
             
-            // Progress log: Her 50 sembolde bir veya ilk 10 sembolde
-            if symbol_index <= 10 || symbol_index % 50 == 0 {
+            // Progress log: Her N sembolde bir veya ilk N sembolde
+            if symbol_index <= cfg.internal.progress_log_first_n_symbols || symbol_index % cfg.internal.progress_log_interval == 0 {
                 info!(
                     progress = format!("{}/{}", symbol_index, total_symbols),
                     processed_so_far = processed_count,
@@ -1148,52 +1016,13 @@ async fn main() -> Result<()> {
             // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
             // KRİTİK DÜZELTME: Cache'den oku (race condition önlendi)
             // DEBUG: İlk birkaç sembol için detaylı log
-            let is_debug_symbol = symbol_index <= 5;
+            let is_debug_symbol = symbol_index <= cfg.internal.debug_symbol_count;
             
             // Cache'den bakiye oku (loop başında çekildi)
             let q_free = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
             
-            let has_balance = match &venue {
-                V::Spot(v) => {
-                    // Spot için: quote veya base bakiyesi yeterli mi?
-                    if is_debug_symbol {
-                        info!(
-                            %symbol,
-                            quote_asset = %quote_asset,
-                            available_balance = q_free,
-                            min_required = min_usd_per_order,
-                            "balance check for debug symbol (spot, from cache)"
-                        );
-                    }
-                    
-                    // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
-                    if q_free < cfg.min_quote_balance_usd {
-                        if is_debug_symbol {
-                            info!(
-                                %symbol,
-                                quote_asset = %quote_asset,
-                                available_balance = q_free,
-                                "SKIPPING: quote asset balance < 1 USD, will try other quote assets if available"
-                            );
-                        }
-                        // Base bakiyesi kontrolü (yaklaşık kontrol, gerçek fiyat bilinmiyor)
-                        // NOT: Base bakiyesi cache'de yok, bu yüzden sadece gerektiğinde çek
-                        rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                        match tokio::time::timeout(Duration::from_secs(2), v.asset_free(base_asset)).await {
-                            Ok(Ok(b)) => {
-                                let b_free = b.to_f64().unwrap_or(0.0);
-                                // Base varsa devam et (daha sonra gerçek fiyatla kontrol edilecek)
-                                b_free >= cfg.qty_step
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        // Quote bakiyesi yeterliyse devam et
-                        q_free >= min_usd_per_order
-                    }
-                }
-                V::Fut(_) => {
                     // Futures için: leverage ile toplam kullanılabilir miktar
+            let has_balance = {
                     if is_debug_symbol {
                         info!(
                             %symbol,
@@ -1221,7 +1050,6 @@ async fn main() -> Result<()> {
                             );
                         }
                         has_enough
-                    }
                 }
             };
             
@@ -1257,10 +1085,7 @@ async fn main() -> Result<()> {
             if should_sync_orders {
                 // API Rate Limit koruması
                 rate_limit_guard(3).await; // GET /api/v3/openOrders: Weight 3
-                let sync_result = match &venue {
-                    V::Spot(v) => v.get_open_orders(&symbol).await,
-                    V::Fut(v) => v.get_open_orders(&symbol).await,
-                };
+                let sync_result = venue.get_open_orders(&symbol).await;
                 
                 match sync_result {
                     Ok(api_orders) => {
@@ -1358,23 +1183,11 @@ async fn main() -> Result<()> {
                         );
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1
-                        match &venue {
-                            V::Spot(v) => {
-                                if v.cancel(&order.order_id, &symbol).await.is_ok() {
-                                    canceled_count += 1;
-                                    state.active_orders.remove(&order.order_id);
-                                } else {
-                                    warn!(%symbol, order_id = %order.order_id, "failed to cancel stale spot order");
-                                }
-                            }
-                            V::Fut(v) => {
-                                if v.cancel(&order.order_id, &symbol).await.is_ok() {
+                        if venue.cancel(&order.order_id, &symbol).await.is_ok() {
                                     canceled_count += 1;
                                     state.active_orders.remove(&order.order_id);
                                 } else {
                                     warn!(%symbol, order_id = %order.order_id, "failed to cancel stale futures order");
-                                }
-                            }
                         }
                     }
                 }
@@ -1390,7 +1203,7 @@ async fn main() -> Result<()> {
                 }
                 
                 // Eğer çok fazla stale emir varsa, hepsini temizle
-                if stale_count > 0 && state.active_orders.len() > 10 {
+                if stale_count > 0 && state.active_orders.len() > cfg.internal.max_stale_orders_threshold {
                     warn!(
                         %symbol,
                         total_orders = state.active_orders.len(),
@@ -1399,55 +1212,32 @@ async fn main() -> Result<()> {
                     // API Rate Limit koruması
                     // cancel_all multiple calls yapabilir, her biri Weight 1
                     rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
-                    match &venue {
-                        V::Spot(v) => {
-                            if let Err(err) = v.cancel_all(&symbol).await {
+                    if let Err(err) = venue.cancel_all(&symbol).await {
                                 warn!(%symbol, ?err, "failed to cancel all orders");
                             } else {
                                 state.active_orders.clear();
-                            }
-                        }
-                        V::Fut(v) => {
-                            if let Err(err) = v.cancel_all(&symbol).await {
-                                warn!(%symbol, ?err, "failed to cancel all orders");
-                            } else {
-                                state.active_orders.clear();
-                            }
-                        }
                     }
                 }
             }
 
             // API Rate Limit koruması
-            // best_prices: Weight 2 (Spot), Weight 1 (Futures)
-            let best_prices_weight = if is_futures { 1 } else { 2 };
-            rate_limit_guard(best_prices_weight).await;
-            let (bid, ask) = match &venue {
-                V::Spot(v) => match v.best_prices(&symbol).await {
+            // best_prices: Weight 1 (Futures)
+            rate_limit_guard(1).await;
+            let (bid, ask) = match venue.best_prices(&symbol).await {
                     Ok(prices) => prices,
                     Err(err) => {
                         warn!(%symbol, ?err, "failed to fetch best prices, skipping tick");
                         continue;
                     }
-                },
-                V::Fut(v) => match v.best_prices(&symbol).await {
-                    Ok(prices) => prices,
-                    Err(err) => {
-                        warn!(%symbol, ?err, "failed to fetch best prices, skipping tick");
-                        continue;
-                    }
-                },
             };
             info!(%symbol, ?bid, ?ask, "fetched best prices");
             
             // Pozisyon bilgisini al (bir kere, tüm analizler için kullanılacak)
             // KRİTİK DÜZELTME: Bakiye yoksa bile pozisyon kontrolü yap (açık pozisyon olabilir)
             // API Rate Limit koruması
-            // get_position: Weight 10 (Spot account), Weight 5 (Futures positionRisk)
-            let position_weight = if is_futures { 5 } else { 10 };
-            rate_limit_guard(position_weight).await;
-            let pos = match &venue {
-                V::Spot(v) => match v.get_position(&symbol).await {
+            // get_position: Weight 5 (Futures positionRisk)
+            rate_limit_guard(5).await;
+            let pos = match venue.get_position(&symbol).await {
                     Ok(pos) => pos,
                     Err(err) => {
                         // Pozisyon fetch hatası: Eğer açık emir varsa devam et, yoksa atla
@@ -1466,27 +1256,6 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                },
-                V::Fut(v) => match v.get_position(&symbol).await {
-                    Ok(pos) => pos,
-                    Err(err) => {
-                        // Pozisyon fetch hatası: Eğer açık emir varsa devam et, yoksa atla
-                        if state.active_orders.is_empty() && !has_balance {
-                            warn!(%symbol, ?err, "failed to fetch position, no open orders, and no balance, skipping tick");
-                            continue;
-                        } else {
-                            warn!(%symbol, ?err, "failed to fetch position but has open orders/balance, continuing with default position");
-                            // Default pozisyon (qty=0) kullan
-                            Position {
-                                symbol: symbol.clone(),
-                                qty: Qty(Decimal::ZERO),
-                                entry: Px(Decimal::ZERO),
-                                leverage: 1,
-                                liq_px: None,
-                            }
-                        }
-                    }
-                },
             };
             
             // KRİTİK DÜZELTME: Pozisyon varsa (qty != 0) veya açık emir varsa, bakiye kontrolünü atla
@@ -1501,26 +1270,15 @@ async fn main() -> Result<()> {
             
             // Mark price ve funding rate'i al (bir kere, tüm analizler için kullanılacak)
             // API Rate Limit koruması
-            // mark_price: Weight 1 (Futures), Weight 2 (Spot best_prices)
-            let mark_price_weight = if is_futures { 1 } else { 2 };
-            rate_limit_guard(mark_price_weight).await;
-            let (mark_px, funding_rate, next_funding_time) = match &venue {
-                V::Spot(v) => match v.mark_price(&symbol).await {
-                    Ok(px) => (px, None, None),
-                    Err(_) => {
-                        // Fallback: bid/ask mid price
-                        let mid = (bid.0 + ask.0) / Decimal::from(2u32);
-                        (Px(mid), None, None)
-                    }
-                },
-                V::Fut(v) => match v.fetch_premium_index(&symbol).await {
+            // mark_price: Weight 1 (Futures)
+            rate_limit_guard(1).await;
+            let (mark_px, funding_rate, next_funding_time) = match venue.fetch_premium_index(&symbol).await {
                     Ok((mark, funding, next_time)) => (mark, funding, next_time),
                     Err(_) => {
                         // Fallback: bid/ask mid price
                         let mid = (bid.0 + ask.0) / Decimal::from(2u32);
                         (Px(mid), None, None)
                     }
-                },
             };
             
             // Pozisyon boyutu hesapla (order analizi ve pozisyon analizi için kullanılacak)
@@ -1626,23 +1384,11 @@ async fn main() -> Result<()> {
                     }
                     // API Rate Limit koruması
                     rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1
-                    match &venue {
-                        V::Spot(v) => {
-                            if let Err(err) = v.cancel(order_id, &symbol).await {
+                    if let Err(err) = venue.cancel(order_id, &symbol).await {
                                 warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order");
                             } else {
                                 state.active_orders.remove(order_id);
                                 state.last_order_price_update.remove(order_id);
-                            }
-                        }
-                        V::Fut(v) => {
-                            if let Err(err) = v.cancel(order_id, &symbol).await {
-                                warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order");
-                            } else {
-                                state.active_orders.remove(order_id);
-                                state.last_order_price_update.remove(order_id);
-                            }
-                        }
                     }
                 }
             }
@@ -1790,47 +1536,27 @@ async fn main() -> Result<()> {
                 match position_size_risk_level {
                     "hard" => {
                         // KRİTİK: Hard limit - Force-close
-                        warn!(
-                            %symbol,
+                warn!(
+                    %symbol,
                             position_size_notional = position_size_notional_mark,
                             total_exposure_notional,
-                            max_allowed = max_position_size_usd,
+                    max_allowed = max_position_size_usd,
                             hard_limit,
                             active_orders_count = state.active_orders.len(),
                             active_orders_notional = total_active_orders_notional,
                             "OPPORTUNITY MODE HARD LIMIT: position + orders exceed hard limit, force closing"
                         );
                         // Önce tüm emirleri iptal et
-                        rate_limit_guard(1).await;
-                        match &venue {
-                            V::Spot(v) => {
-                                if let Err(err) = v.cancel_all(&symbol).await {
-                                    warn!(%symbol, ?err, "failed to cancel all orders before force-close");
-                                }
-                            }
-                            V::Fut(v) => {
-                                if let Err(err) = v.cancel_all(&symbol).await {
-                                    warn!(%symbol, ?err, "failed to cancel all orders before force-close");
-                                }
-                            }
+                rate_limit_guard(1).await;
+                        if let Err(err) = venue.cancel_all(&symbol).await {
+                            warn!(%symbol, ?err, "failed to cancel all orders before force-close");
                         }
                         // Sonra pozisyonu kapat
                         rate_limit_guard(1).await;
-                        match &venue {
-                            V::Spot(v) => {
-                                if let Err(err) = v.close_position(&symbol).await {
-                                    error!(%symbol, ?err, "failed to close position due to hard limit");
-                                } else {
-                                    info!(%symbol, "closed position due to hard limit");
-                                }
-                            }
-                            V::Fut(v) => {
-                                if let Err(err) = v.close_position(&symbol).await {
-                                    error!(%symbol, ?err, "failed to close position due to hard limit");
-                                } else {
-                                    info!(%symbol, "closed position due to hard limit");
-                                }
-                            }
+                        if let Err(err) = venue.close_position(&symbol).await {
+                            error!(%symbol, ?err, "failed to close position due to hard limit");
+                        } else {
+                            info!(%symbol, "closed position due to hard limit");
                         }
                         continue; // Bu tick'i atla
                     }
@@ -1860,23 +1586,11 @@ async fn main() -> Result<()> {
                         
                         for order_id in &orders_to_cancel {
                             rate_limit_guard(1).await;
-                            match &venue {
-                                V::Spot(v) => {
-                                    if let Err(err) = v.cancel(order_id, &symbol).await {
-                                        warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order in medium limit");
-                                    } else {
-                                        state.active_orders.remove(order_id);
-                                        state.last_order_price_update.remove(order_id);
-                                    }
-                                }
-                                V::Fut(v) => {
-                                    if let Err(err) = v.cancel(order_id, &symbol).await {
-                                        warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order in medium limit");
-                                    } else {
-                                        state.active_orders.remove(order_id);
-                                        state.last_order_price_update.remove(order_id);
-                                    }
-                                }
+                            if let Err(err) = venue.cancel(order_id, &symbol).await {
+                                warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order in medium limit");
+                        } else {
+                                state.active_orders.remove(order_id);
+                                state.last_order_price_update.remove(order_id);
                             }
                         }
                         // Yeni emirleri de durdur (soft limit davranışı)
@@ -1910,24 +1624,13 @@ async fn main() -> Result<()> {
                         max_allowed = max_position_size_usd,
                         "POSITION SIZE RISK: position too large, force closing (normal mode)"
                     );
-                    rate_limit_guard(1).await;
-                    match &venue {
-                        V::Spot(v) => {
-                            if let Err(err) = v.close_position(&symbol).await {
-                                error!(%symbol, ?err, "failed to close position due to size risk");
-                            } else {
-                                info!(%symbol, "closed position due to size risk");
-                            }
-                        }
-                        V::Fut(v) => {
-                            if let Err(err) = v.close_position(&symbol).await {
-                                error!(%symbol, ?err, "failed to close position due to size risk");
-                            } else {
-                                info!(%symbol, "closed position due to size risk");
-                            }
-                        }
-                    }
-                    continue; // Bu tick'i atla
+                rate_limit_guard(1).await;
+                if let Err(err) = venue.close_position(&symbol).await {
+                    error!(%symbol, ?err, "failed to close position due to size risk");
+                } else {
+                    info!(%symbol, "closed position due to size risk");
+                }
+                continue; // Bu tick'i atla
                 }
             }
             
@@ -2070,10 +1773,7 @@ async fn main() -> Result<()> {
                     // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
                     // API Rate Limit koruması
                     rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
-                    let cancel_result = match &venue {
-                        V::Spot(v) => v.cancel_all(&symbol).await,
-                        V::Fut(v) => v.cancel_all(&symbol).await,
-                    };
+                    let cancel_result = venue.cancel_all(&symbol).await;
                     if let Err(err) = cancel_result {
                         warn!(%symbol, ?err, "failed to cancel orders before position close");
                     }
@@ -2085,51 +1785,46 @@ async fn main() -> Result<()> {
                     // 3. Pozisyon kapatma sonrası doğrulama
                     // 4. Kısmi kapatma durumunda otomatik retry (3 deneme)
                     rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                    let close_result = match &venue {
-                        V::Spot(v) => v.close_position(&symbol).await,
-                        V::Fut(v) => {
-                            // Futures için özel kontrol: Pozisyon kapatma sonrası doğrulama
-                            let result = v.close_position(&symbol).await;
-                            
-                            // KRİTİK: Pozisyon kapatma sonrası doğrulama
-                            if result.is_ok() {
-                                // Kısa bir bekleme (exchange'in işlemesi için)
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                                
-                                // Pozisyon durumunu kontrol et
-                                rate_limit_guard(5).await; // GET /fapi/v2/positionRisk: Weight 5
-                                match v.get_position(&symbol).await {
-                                    Ok(verify_pos) => {
-                                        if !verify_pos.qty.0.is_zero() {
-                                            warn!(
-                                                %symbol,
-                                                remaining_qty = %verify_pos.qty.0,
-                                                "position not fully closed after close_position call, this should not happen (retry mechanism should handle this)"
-                                            );
-                                            // close_position içinde retry mekanizması var, burada sadece log
-                                        } else {
-                                            info!(
-                                                %symbol,
-                                                "position fully closed and verified"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            %symbol,
-                                            error = %e,
-                                            "failed to verify position closure"
-                                        );
-                                    }
+                    // Futures için özel kontrol: Pozisyon kapatma sonrası doğrulama
+                    let result = venue.close_position(&symbol).await;
+                    
+                    // KRİTİK: Pozisyon kapatma sonrası doğrulama
+                    if result.is_ok() {
+                        // Kısa bir bekleme (exchange'in işlemesi için)
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        
+                        // Pozisyon durumunu kontrol et
+                        rate_limit_guard(5).await; // GET /fapi/v2/positionRisk: Weight 5
+                        match venue.get_position(&symbol).await {
+                            Ok(verify_pos) => {
+                                if !verify_pos.qty.0.is_zero() {
+                                    warn!(
+                                        %symbol,
+                                        remaining_qty = %verify_pos.qty.0,
+                                        "position not fully closed after close_position call, this should not happen (retry mechanism should handle this)"
+                                    );
+                                    // close_position içinde retry mekanizması var, burada sadece log
+                                } else {
+                                    info!(
+                                        %symbol,
+                                        "position fully closed and verified"
+                                    );
                                 }
                             }
-                            
-                            result
+                            Err(e) => {
+                                warn!(
+                                    %symbol,
+                                    error = %e,
+                                    "failed to verify position closure"
+                                );
+                            }
                         }
-                    };
+                    }
                     
-                    match close_result {
-                        Ok(_) => {
+                    let close_result = result;
+                    
+                        match close_result {
+                            Ok(_) => {
                             // JSON log: Position closed
                             if let Ok(logger) = json_logger.lock() {
                                 let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
@@ -2157,18 +1852,18 @@ async fn main() -> Result<()> {
                                 );
                             }
                             
-                            info!(
-                                %symbol,
-                                reason,
-                                final_pnl = pnl_f64,
+                                info!(
+                                    %symbol,
+                                    reason,
+                                    final_pnl = pnl_f64,
                                 entry_price = %pos.entry.0,
                                 exit_price = %mark_px.0,
                                 quantity = %pos.qty.0,
                                 leverage = pos.leverage,
                                 "position closed successfully with reduceOnly guarantee"
                             );
-                        }
-                        Err(err) => {
+                            }
+                            Err(err) => {
                             error!(
                                 %symbol,
                                 error = %err,
@@ -2288,25 +1983,12 @@ async fn main() -> Result<()> {
                 warn!(%symbol, "risk halt triggered, cancelling and flattening");
                 // API Rate Limit koruması
                 rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
-                match &venue {
-                    V::Spot(v) => {
-                        if let Err(err) = v.cancel_all(&symbol).await {
-                            warn!(%symbol, ?err, "failed to cancel all orders during halt");
-                        }
-                        rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
-                        if let Err(err) = v.close_position(&symbol).await {
-                            warn!(%symbol, ?err, "failed to close position during halt");
-                        }
-                    }
-                    V::Fut(v) => {
-                        if let Err(err) = v.cancel_all(&symbol).await {
+                if let Err(err) = venue.cancel_all(&symbol).await {
                             warn!(%symbol, ?err, "failed to cancel all orders during halt");
                         }
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        if let Err(err) = v.close_position(&symbol).await {
+                if let Err(err) = venue.close_position(&symbol).await {
                             warn!(%symbol, ?err, "failed to close position during halt");
-                        }
-                    }
                 }
                 continue;
             }
@@ -2374,55 +2056,9 @@ async fn main() -> Result<()> {
             }
 
             // ---- CAP HESABI (sembolün kendi quote'u ile) ----
-            let caps = match &venue {
-                V::Spot(v) => {
-                    rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                    let quote_free = match v.asset_free(&quote_asset).await {
-                        Ok(q) => {
-                            let q_f64 = q.to_f64().unwrap_or(0.0);
-                            // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
-                            // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
-                            if q_f64 < cfg.min_quote_balance_usd {
-                                info!(
-                                    %symbol,
-                                    quote_asset = %quote_asset,
-                                    available_balance = q_f64,
-                                    min_required = cfg.min_quote_balance_usd,
-                                    "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
-                                );
-                                0.0
-                            } else {
-                                q_f64
-                            }
-                        },
-                        Err(err) => {
-                            warn!(%symbol, ?err, "failed to fetch quote asset balance, using zero");
-                            0.0
-                        }
-                    };
-                    rate_limit_guard(10).await; // GET /api/v3/account: Weight 10
-                    let base_free = match v.asset_free(&base_asset).await {
-                        Ok(b) => b.to_f64().unwrap_or(0.0),
-                        Err(err) => {
-                            warn!(%symbol, ?err, "failed to fetch base asset balance, using zero");
-                            0.0
-                        }
-                    };
-                    // Spot için: Tüm quote_free kullanılabilir, ama her emir max 100 USD
-                    // Örnek: 20 USD varsa → buy_total=20 (tamamı kullanılır)
-                    // Örnek: 100 USD varsa → buy_total=100 (tamamı kullanılır)
-                    // Örnek: 200 USD varsa → buy_total=200, ama her emir max 100 USD
-                    // Kalan 100 USD başka emirler için kullanılabilir (loop ile)
-                    Caps {
-                        buy_notional: cfg.max_usd_per_order.min(quote_free), // Her emir max 100 USD (veya mevcut bakiye, hangisi düşükse)
-                        sell_notional: cfg.max_usd_per_order, // Her emir max 100 USD
-                        sell_base: Some(base_free),
-                        buy_total: quote_free, // Tüm bakiye kullanılabilir (20 varsa 20, 100 varsa 100, 200 varsa 200)
-                        sell_total_base: base_free,
-                    }
-                }
-                V::Fut(v) => {
-                    let avail = match v.available_balance(&quote_asset).await {
+            // Futures only - spot removed
+            let caps = {
+                    let avail = match venue.available_balance(&quote_asset).await {
                         Ok(a) => {
                             let avail_f64 = a.to_f64().unwrap_or(0.0);
                             // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
@@ -2511,14 +2147,11 @@ async fn main() -> Result<()> {
                     Caps {
                         buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
                         sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
-                        sell_base: None,
                         // buy_total: Hesaptan giden para (margin)
                         // - 20 USD varsa → 20 USD kullanılır (tamamı)
                         // - 100 USD varsa → 100 USD kullanılır (tamamı)
                         // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
                         buy_total: max_usable_from_account,
-                        sell_total_base: 0.0,
-                    }
                 }
             };
 
@@ -2531,9 +2164,7 @@ async fn main() -> Result<()> {
                 %symbol,
                 buy_notional = caps.buy_notional,
                 sell_notional = caps.sell_notional,
-                sell_base = ?caps.sell_base,
                 buy_total = caps.buy_total,
-                sell_total_base = caps.sell_total_base,
                 "calculated order caps"
             );
 
@@ -2570,17 +2201,11 @@ async fn main() -> Result<()> {
             let px_ask_f = ask.0.to_f64().unwrap_or(0.0);
             let buy_cap_ok = caps.buy_notional >= min_usd_per_order;
             let mut sell_cap_ok = caps.sell_notional >= min_usd_per_order;
-            if let Some(base_free) = caps.sell_base {
-                let ref_px = if px_ask_f > 0.0 { px_ask_f } else { px_bid_f };
-                if ref_px > 0.0 {
-                    sell_cap_ok = sell_cap_ok && (base_free * ref_px >= min_usd_per_order);
-                }
-            }
+            // Futures only - no base balance check needed
             if !buy_cap_ok && !sell_cap_ok {
                 info!(
                     %symbol,
                     buy_total = caps.buy_total,
-                    sell_total_base = caps.sell_total_base,
                     min_usd_per_order,
                     "skip tick: zero/insufficient balance for this symbol"
                 );
@@ -2644,7 +2269,7 @@ async fn main() -> Result<()> {
             let qty_step_f64 = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
             let qty_step_dec = Decimal::from_f64_retain(qty_step_f64).unwrap_or(Decimal::ZERO);
             
-            // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Base clamp (spot sell), 3) Quantize, 4) Min notional check
+            // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Quantize, 3) Min notional check
             // min_usd_per_order > 0 doğrulaması zaten yukarıda yapıldı, burada sadece notional kontrolü yapıyoruz
             
             // KRİTİK DÜZELTME: Bakiye yoksa ama pozisyon/emir varsa, yeni emir verme (sadece mevcut pozisyon/emirleri yönet)
@@ -2667,13 +2292,9 @@ async fn main() -> Result<()> {
                 } else {
                     // 1. USD clamp
                     // KRİTİK DÜZELTME: Futures için gerçek kullanılabilir notional (margin * leverage) kullan
-                    // Spot için: caps.buy_notional = caps.buy_total (aynı)
                     // Futures için: caps.buy_notional = per_order_notional (300), ama gerçek kullanılabilir = buy_total * leverage (26.63 * 3 = 79.89)
-                    let effective_buy_notional = if is_futures {
-                        caps.buy_total * effective_leverage // Gerçek kullanılabilir pozisyon boyutu (margin * leverage)
-                    } else {
-                        caps.buy_notional // Spot için aynı
-                    };
+                    // Futures için gerçek kullanılabilir notional (margin * leverage)
+                    let effective_buy_notional = caps.buy_total * effective_leverage;
                     let nq = clamp_qty_by_usd(q, px, effective_buy_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
@@ -2710,22 +2331,14 @@ async fn main() -> Result<()> {
                     warn!(%symbol, ?px, "dropping ask quote with non-positive price");
                     quotes.ask = None;
                 } else {
-                    // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Base clamp (spot sell), 3) Quantize, 4) Min notional check
+                    // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Quantize, 3) Min notional check
                     // 1. USD clamp
                     // KRİTİK DÜZELTME: Futures için gerçek kullanılabilir notional (margin * leverage) kullan
-                    // Spot için: caps.sell_notional = caps.sell_total_base * price (aynı mantık)
                     // Futures için: caps.sell_notional = per_order_notional (300), ama gerçek kullanılabilir = buy_total * leverage (26.63 * 3 = 79.89)
-                    let effective_sell_notional = if is_futures {
-                        caps.buy_total * effective_leverage // Futures için ask de aynı margin'i kullanır
-                    } else {
-                        caps.sell_notional // Spot için aynı
-                    };
-                    let mut nq = clamp_qty_by_usd(q, px, effective_sell_notional, qty_step_f64);
-                    // 2. Base clamp (spot sell için)
-                    if let Some(max_base) = caps.sell_base {
-                        nq = clamp_qty_by_base(nq, max_base, qty_step_f64);
-                    }
-                    // 3. Quantize kontrolü
+                    // Futures için gerçek kullanılabilir notional (margin * leverage)
+                    let effective_sell_notional = caps.buy_total * effective_leverage;
+                    let nq = clamp_qty_by_usd(q, px, effective_sell_notional, qty_step_f64);
+                    // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
                         && nq.0 != Decimal::ZERO;
@@ -2739,7 +2352,6 @@ async fn main() -> Result<()> {
                             %symbol,
                             ?px,
                             original_qty = ?q,
-                            sell_base = ?caps.sell_base,
                             qty_step = qty_step_f64,
                             quantized_to_zero,
                             notional,
@@ -2756,147 +2368,6 @@ async fn main() -> Result<()> {
                 info!(%symbol, "no ask quote generated for this tick");
             }
 
-            match &venue {
-                V::Spot(v) => {
-                    // ---- SPOT BID ----
-                    if let Some((px, qty)) = quotes.bid {
-                        info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot bid order");
-                        // API Rate Limit koruması
-                        rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
-                        match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
-                            Ok(order_id) => {
-                                let info = OrderInfo { 
-                                    order_id: order_id.clone(), 
-                                    client_order_id: None, // TODO: clientOrderId ekle
-                                    side: Side::Buy, 
-                                    price: px, 
-                                    qty, 
-                                    filled_qty: Qty(Decimal::ZERO),
-                                    remaining_qty: qty,
-                                    created_at: Instant::now(),
-                                    last_fill_time: None,
-                                };
-                                state.active_orders.insert(order_id.clone(), info);
-                                // Fiyat güncellemesini kaydet (akıllı emir analizi için)
-                                state.last_order_price_update.insert(order_id, px);
-                            }
-                            Err(err) => {
-                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot bid order");
-                            }
-                        }
-
-                        // Kalan USD ile ikinci emir
-                        let spent = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
-                        let remaining = (caps.buy_total - spent).max(0.0);
-                        if remaining >= min_usd_per_order && px.0 > Decimal::ZERO {
-                            let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
-                            let qty2 = clamp_qty_by_usd(qty, px, remaining, qty_step_local);
-                            if qty2.0 > Decimal::ZERO {
-                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, "placing extra spot bid with leftover USD");
-                                // API Rate Limit koruması
-                                rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
-                                match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
-                                    Ok(order_id2) => {
-                                        let info2 = OrderInfo { 
-                                            order_id: order_id2.clone(), 
-                                            client_order_id: None,
-                                            side: Side::Buy, 
-                                            price: px, 
-                                            qty: qty2, 
-                                            filled_qty: Qty(Decimal::ZERO),
-                                            remaining_qty: qty2,
-                                            created_at: Instant::now(),
-                                            last_fill_time: None,
-                                        };
-                                        state.active_orders.insert(order_id2.clone(), info2);
-                                        state.last_order_price_update.insert(order_id2, px);
-                                    }
-                                    Err(err) => {
-                                        warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra spot bid order");
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // ---- SPOT ASK ----
-                    if let Some((px, qty)) = quotes.ask {
-                        info!(%symbol, ?px, ?qty, tif = ?tif, "placing spot ask order");
-                        // API Rate Limit koruması
-                        rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
-                        match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
-                            Ok(order_id) => {
-                                let info = OrderInfo { 
-                                    order_id: order_id.clone(), 
-                                    client_order_id: None, // TODO: clientOrderId ekle
-                                    side: Side::Sell, 
-                                    price: px, 
-                                    qty, 
-                                    filled_qty: Qty(Decimal::ZERO),
-                                    remaining_qty: qty,
-                                    created_at: Instant::now(),
-                                    last_fill_time: None,
-                                };
-                                state.active_orders.insert(order_id.clone(), info);
-                                // Fiyat güncellemesini kaydet (akıllı emir analizi için)
-                                state.last_order_price_update.insert(order_id.clone(), px);
-                                
-                                // JSON log: Order created
-                                if let Ok(logger) = json_logger.lock() {
-                                    logger.log_order_created(
-                                        symbol,
-                                        &order_id,
-                                        Side::Sell,
-                                        px,
-                                        qty,
-                                        "spread_opportunity",
-                                        &cfg.exec.tif,
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot ask order");
-                            }
-                        }
-
-                        // Kalan base ile ikinci ask (opsiyonel)
-                        if let Some(base_total) = caps.sell_base {
-                            let spent_base = qty.0.to_f64().unwrap_or(0.0);
-                            let remaining_base = (base_total - spent_base).max(0.0);
-                            let remaining_notional = remaining_base * px.0.to_f64().unwrap_or(0.0);
-                            if remaining_notional >= min_usd_per_order && px.0 > Decimal::ZERO {
-                                let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
-                                let qty2 = clamp_qty_by_base(qty, remaining_base, qty_step_local);
-                                if qty2.0 > Decimal::ZERO {
-                                    info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining_base, "placing extra spot ask with leftover base");
-                                    // API Rate Limit koruması
-                                    rate_limit_guard(1).await; // POST /api/v3/order: Weight 1
-                                    match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
-                                        Ok(order_id2) => {
-                                            let info2 = OrderInfo { 
-                                            order_id: order_id2.clone(), 
-                                            client_order_id: None,
-                                            side: Side::Sell, 
-                                            price: px, 
-                                            qty: qty2, 
-                                            filled_qty: Qty(Decimal::ZERO),
-                                            remaining_qty: qty2,
-                                            created_at: Instant::now(),
-                                            last_fill_time: None,
-                                        };
-                                        state.active_orders.insert(order_id2.clone(), info2);
-                                        state.last_order_price_update.insert(order_id2, px);
-                                        }
-                                        Err(err) => {
-                                            warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra spot ask order");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                V::Fut(v) => {
                     // ---- FUTURES BID ----
                     // Her bid emri bağımsız, max 100 USD, toplam varlık paylaşılır
                     // ÖNEMLİ: total_spent_on_bids = hesaptan giden para (margin), pozisyon boyutu değil
@@ -2909,37 +2380,37 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
+                match venue.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo { 
-                                    order_id: order_id.clone(), 
-                                    client_order_id: None, // TODO: clientOrderId ekle
-                                    side: Side::Buy, 
-                                    price: px, 
-                                    qty, 
-                                    filled_qty: Qty(Decimal::ZERO),
-                                    remaining_qty: qty,
-                                    created_at: Instant::now(),
-                                    last_fill_time: None,
-                                };
-                                state.active_orders.insert(order_id.clone(), info);
+                let info = OrderInfo { 
+                    order_id: order_id.clone(), 
+                    client_order_id: None, // TODO: clientOrderId ekle
+                    side: Side::Buy, 
+                    price: px, 
+                    qty, 
+                    filled_qty: Qty(Decimal::ZERO),
+                    remaining_qty: qty,
+                    created_at: Instant::now(),
+                    last_fill_time: None,
+                };
+                state.active_orders.insert(order_id.clone(), info);
                                 // Başarılı emir için spent hesapla (hesaptan giden para = margin)
                                 // Notional (pozisyon boyutu) / leverage = hesaptan giden para
                                 let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
                                 total_spent_on_bids = notional / effective_leverage;
-                                
-                                // JSON log: Order created
-                                if let Ok(logger) = json_logger.lock() {
-                                    logger.log_order_created(
-                                        symbol,
-                                        &order_id,
-                                        Side::Buy,
-                                        px,
-                                        qty,
-                                        "spread_opportunity",
-                                        &cfg.exec.tif,
-                                    );
-                                }
+                
+                // JSON log: Order created
+                if let Ok(logger) = json_logger.lock() {
+                    logger.log_order_created(
+                symbol,
+                &order_id,
+                Side::Buy,
+                px,
+                qty,
+                "spread_opportunity",
+                &cfg.exec.tif,
+                    );
+                }
                             }
                             Err(err) => {
                                 let msg = err.to_string();
@@ -2985,7 +2456,7 @@ async fn main() -> Result<()> {
                                             // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
                                             // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
                                             let effective_leverage_for_qty_bid = if state.strategy.is_opportunity_mode() {
-                                                effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
+                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
                                             } else {
                                                 effective_leverage
                                             };
@@ -3026,19 +2497,19 @@ async fn main() -> Result<()> {
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures bid with exchange min notional");
                                             // API Rate Limit koruması
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                                            match v.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
+                    match venue.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
-                                                    let info = OrderInfo { 
-                                                        order_id: order_id.clone(), 
-                                                        client_order_id: None,
-                                                        side: Side::Buy, 
-                                                        price: px, 
-                                                        qty: retry_qty, 
-                                                        filled_qty: Qty(Decimal::ZERO),
-                                                        remaining_qty: retry_qty,
-                                                        created_at: Instant::now(),
-                                                        last_fill_time: None,
-                                                    };
+                            let info = OrderInfo { 
+                                order_id: order_id.clone(), 
+                                client_order_id: None,
+                                side: Side::Buy, 
+                                price: px, 
+                                qty: retry_qty, 
+                                filled_qty: Qty(Decimal::ZERO),
+                                remaining_qty: retry_qty,
+                                created_at: Instant::now(),
+                                last_fill_time: None,
+                            };
                                                     state.active_orders.insert(order_id.clone(), info);
                                                     state.last_order_price_update.insert(order_id, px);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
@@ -3083,19 +2554,19 @@ async fn main() -> Result<()> {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures bid with leftover notional");
                                 // API Rate Limit koruması
                                 rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                                match v.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
+                        match venue.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo { 
-                                            order_id: order_id2.clone(), 
-                                            client_order_id: None,
-                                            side: Side::Buy, 
-                                            price: px, 
-                                            qty: qty2, 
-                                            filled_qty: Qty(Decimal::ZERO),
-                                            remaining_qty: qty2,
-                                            created_at: Instant::now(),
-                                            last_fill_time: None,
-                                        };
+                                let info2 = OrderInfo { 
+                                    order_id: order_id2.clone(), 
+                                    client_order_id: None,
+                                    side: Side::Buy, 
+                                    price: px, 
+                                    qty: qty2, 
+                                    filled_qty: Qty(Decimal::ZERO),
+                                    remaining_qty: qty2,
+                                    created_at: Instant::now(),
+                                    last_fill_time: None,
+                                };
                                         state.active_orders.insert(order_id2, info2);
                                         // Spent güncelle (hesaptan giden para = margin)
                                         // Notional / leverage = hesaptan giden para
@@ -3123,33 +2594,33 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
+                match venue.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
-                                let info = OrderInfo { 
-                                    order_id: order_id.clone(), 
-                                    client_order_id: None, // TODO: clientOrderId ekle
-                                    side: Side::Sell, 
-                                    price: px, 
-                                    qty, 
-                                    filled_qty: Qty(Decimal::ZERO),
-                                    remaining_qty: qty,
-                                    created_at: Instant::now(),
-                                    last_fill_time: None,
-                                };
-                                state.active_orders.insert(order_id.clone(), info);
-                                
-                                // JSON log: Order created
-                                if let Ok(logger) = json_logger.lock() {
-                                    logger.log_order_created(
-                                        symbol,
-                                        &order_id,
-                                        Side::Sell,
-                                        px,
-                                        qty,
-                                        "spread_opportunity",
-                                        &cfg.exec.tif,
-                                    );
-                                }
+                        let info = OrderInfo { 
+                            order_id: order_id.clone(), 
+                            client_order_id: None, // TODO: clientOrderId ekle
+                            side: Side::Sell, 
+                            price: px, 
+                            qty, 
+                            filled_qty: Qty(Decimal::ZERO),
+                            remaining_qty: qty,
+                            created_at: Instant::now(),
+                            last_fill_time: None,
+                            };
+                            state.active_orders.insert(order_id.clone(), info);
+                            
+                            // JSON log: Order created
+                            if let Ok(logger) = json_logger.lock() {
+                            logger.log_order_created(
+                            symbol,
+                            &order_id,
+                            Side::Sell,
+                            px,
+                            qty,
+                            "spread_opportunity",
+                            &cfg.exec.tif,
+                            );
+                            }
                                 // Başarılı emir için spent hesapla (hesaptan giden para = margin)
                                 // Notional (pozisyon boyutu) / leverage = hesaptan giden para
                                 let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
@@ -3199,7 +2670,7 @@ async fn main() -> Result<()> {
                                             // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
                                             // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
                                             let effective_leverage_for_qty_ask = if state.strategy.is_opportunity_mode() {
-                                                effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
+                            effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
                                             } else {
                                                 effective_leverage_ask
                                             };
@@ -3240,19 +2711,19 @@ async fn main() -> Result<()> {
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures ask with exchange min notional");
                                             // API Rate Limit koruması
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                                            match v.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
+                            match venue.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
                                                 Ok(order_id) => {
-                                                    let info = OrderInfo { 
-                                                        order_id: order_id.clone(), 
-                                                        client_order_id: None,
-                                                        side: Side::Sell, 
-                                                        price: px, 
-                                                        qty: retry_qty, 
-                                                        filled_qty: Qty(Decimal::ZERO),
-                                                        remaining_qty: retry_qty,
-                                                        created_at: Instant::now(),
-                                                        last_fill_time: None,
-                                                    };
+                                let info = OrderInfo { 
+                                    order_id: order_id.clone(), 
+                                    client_order_id: None,
+                                    side: Side::Sell, 
+                                    price: px, 
+                                    qty: retry_qty, 
+                                    filled_qty: Qty(Decimal::ZERO),
+                                    remaining_qty: retry_qty,
+                                    created_at: Instant::now(),
+                                    last_fill_time: None,
+                                };
                                                     state.active_orders.insert(order_id.clone(), info);
                                                     state.last_order_price_update.insert(order_id, px);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
@@ -3297,19 +2768,19 @@ async fn main() -> Result<()> {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures ask with leftover notional");
                                 // API Rate Limit koruması
                                 rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                                match v.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
+                    match venue.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
                                     Ok(order_id2) => {
-                                        let info2 = OrderInfo { 
-                                            order_id: order_id2.clone(), 
-                                            client_order_id: None,
-                                            side: Side::Sell, 
-                                            price: px, 
-                                            qty: qty2, 
-                                            filled_qty: Qty(Decimal::ZERO),
-                                            remaining_qty: qty2,
-                                            created_at: Instant::now(),
-                                            last_fill_time: None,
-                                        };
+                            let info2 = OrderInfo { 
+                                order_id: order_id2.clone(), 
+                                client_order_id: None,
+                                side: Side::Sell, 
+                                price: px, 
+                                qty: qty2, 
+                                filled_qty: Qty(Decimal::ZERO),
+                                remaining_qty: qty2,
+                                created_at: Instant::now(),
+                                last_fill_time: None,
+                            };
                                         state.active_orders.insert(order_id2, info2);
                                         // Spent güncelle (hesaptan giden para = margin)
                                         // Notional / leverage = hesaptan giden para
@@ -3325,9 +2796,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                }
-            }
-        }
+        } // Close for loop: for state_idx in prioritized_indices
         
         // Loop sonu: İstatistikleri logla (her 10 tick'te bir veya ilk 5 tick)
         // tick_num zaten yukarıda hesaplandı, scope'ta hala erişilebilir
@@ -3350,26 +2819,15 @@ async fn main() -> Result<()> {
 // Trading Loop Helper Functions
 // ============================================================================
 
-pub enum VenueType {
-    Spot(BinanceSpot),
-    Futures(BinanceFutures),
-}
-
-/// Fetch balance for a quote asset from venue
+// VenueType enum removed - futures only
+// Fetch balance for a quote asset from venue (futures only)
 #[allow(dead_code)]
 async fn fetch_quote_balance(
-    venue: &VenueType,
+    venue: &BinanceFutures,
     quote_asset: &str,
 ) -> f64 {
-    rate_limit_guard(10).await; // GET /api/v3/account or /fapi/v2/balance: Weight 10/5
-    let result = match venue {
-        VenueType::Spot(v) => {
-            timeout(Duration::from_secs(5), v.asset_free(quote_asset)).await
-        }
-        VenueType::Futures(v) => {
-            timeout(Duration::from_secs(5), v.available_balance(quote_asset)).await
-        }
-    };
+    rate_limit_guard(5).await; // GET /fapi/v2/balance: Weight 5
+    let result = timeout(Duration::from_secs(5), venue.available_balance(quote_asset)).await;
     
     match result {
         Ok(Ok(balance)) => balance.to_f64().unwrap_or(0.0),
@@ -3390,7 +2848,7 @@ fn collect_unique_quote_assets(states: &[SymbolState]) -> Vec<String> {
 /// Fetch balances for all unique quote assets
 #[allow(dead_code)]
 async fn fetch_all_quote_balances(
-    venue: &VenueType,
+    venue: &BinanceFutures,
     quote_assets: &[String],
 ) -> HashMap<String, f64> {
     let mut balances = HashMap::new();

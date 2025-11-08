@@ -84,7 +84,7 @@ mod tests {
                 qty: Qty(dec!(0.1)),
             }),
         };
-        
+
         assert!(ob.best_bid.is_some());
         assert!(ob.best_ask.is_some());
         assert_eq!(ob.best_bid.unwrap().px.0, dec!(50000));
@@ -104,7 +104,7 @@ mod tests {
             bid: Some((Px(dec!(50000)), Qty(dec!(0.1)))),
             ask: Some((Px(dec!(50010)), Qty(dec!(0.1)))),
         };
-        
+
         assert!(quotes.bid.is_some());
         assert!(quotes.ask.is_some());
     }
@@ -125,7 +125,7 @@ mod tests {
             leverage: 5,
             liq_px: Some(Px(dec!(45000))),
         };
-        
+
         assert_eq!(pos.symbol, "BTCUSDT");
         assert_eq!(pos.qty.0, dec!(0.1));
         assert_eq!(pos.entry.0, dec!(50000));
@@ -149,11 +149,11 @@ mod tests {
             leverage: 5,
             liq_px: Some(Px(dec!(45000))),
         };
-        
+
         // Test that serialization works
         let json = serde_json::to_string(&pos).unwrap();
         let deserialized: Position = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(pos.symbol, deserialized.symbol);
         assert_eq!(pos.qty.0, deserialized.qty.0);
         assert_eq!(pos.entry.0, deserialized.entry.0);

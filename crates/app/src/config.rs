@@ -197,6 +197,26 @@ pub struct InternalCfg {
     pub min_fill_rate: f64,
     #[serde(default = "default_spread_widen_factor")]
     pub spread_widen_factor: f64,
+    #[serde(default = "default_min_tick_interval_ms")]
+    pub min_tick_interval_ms: u64,
+    #[serde(default = "default_symbol_discovery_retry_interval_sec")]
+    pub symbol_discovery_retry_interval_sec: u64,
+    #[serde(default = "default_progress_log_first_n_symbols")]
+    pub progress_log_first_n_symbols: usize,
+    #[serde(default = "default_progress_log_interval")]
+    pub progress_log_interval: usize,
+    #[serde(default = "default_debug_symbol_count")]
+    pub debug_symbol_count: usize,
+    #[serde(default = "default_max_stale_orders_threshold")]
+    pub max_stale_orders_threshold: usize,
+    #[serde(default = "default_fill_rate_partial_fill_factor")]
+    pub fill_rate_partial_fill_factor: f64,
+    #[serde(default = "default_fill_rate_partial_fill_bonus")]
+    pub fill_rate_partial_fill_bonus: f64,
+    #[serde(default = "default_fill_rate_reconnect_factor")]
+    pub fill_rate_reconnect_factor: f64,
+    #[serde(default = "default_fill_rate_reconnect_bonus")]
+    pub fill_rate_reconnect_bonus: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,6 +375,16 @@ fn default_confidence_max_multiplier() -> f64 { 1.5 }
 fn default_confidence_min_threshold() -> f64 { 0.75 }
 fn default_default_confidence() -> f64 { 0.7 }
 fn default_min_confidence_value() -> f64 { 0.5 }
+fn default_min_tick_interval_ms() -> u64 { 100 }
+fn default_symbol_discovery_retry_interval_sec() -> u64 { 30 }
+fn default_progress_log_first_n_symbols() -> usize { 10 }
+fn default_progress_log_interval() -> usize { 50 }
+fn default_debug_symbol_count() -> usize { 5 }
+fn default_max_stale_orders_threshold() -> usize { 10 }
+fn default_fill_rate_partial_fill_factor() -> f64 { 0.98 }
+fn default_fill_rate_partial_fill_bonus() -> f64 { 0.02 }
+fn default_fill_rate_reconnect_factor() -> f64 { 0.95 }
+fn default_fill_rate_reconnect_bonus() -> f64 { 0.05 }
 fn default_trend_analysis_min_history() -> usize { 10 }
 fn default_trend_analysis_threshold_negative() -> f64 { -0.15 }
 fn default_trend_analysis_threshold_strong_negative() -> f64 { -0.20 }
