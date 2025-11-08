@@ -97,8 +97,8 @@ pub struct DynMmCfg {
 // Default değerler
 fn default_min_spread_bps() -> f64 { 3.0 }
 fn default_max_spread_bps() -> f64 { 100.0 }
-fn default_spread_arbitrage_min_bps() -> f64 { 30.0 }
-fn default_spread_arbitrage_max_bps() -> f64 { 200.0 }
+fn default_spread_arbitrage_min_bps() -> f64 { 50.0 }
+fn default_spread_arbitrage_max_bps() -> f64 { 150.0 }
 fn default_strong_trend_bps() -> f64 { 100.0 }
 fn default_momentum_strong_bps() -> f64 { 50.0 }
 fn default_trend_bias_multiplier() -> f64 { 1.0 }
@@ -113,8 +113,8 @@ fn default_inventory_threshold_ratio() -> f64 { 0.05 }
 fn default_volatility_coefficient() -> f64 { 0.5 }
 fn default_ofi_coefficient() -> f64 { 0.5 }
 fn default_min_liquidity_required() -> f64 { 0.01 }
-fn default_opportunity_size_multiplier() -> f64 { 5.0 }
-fn default_strong_trend_multiplier() -> f64 { 3.0 }
+fn default_opportunity_size_multiplier() -> f64 { 2.0 }
+fn default_strong_trend_multiplier() -> f64 { 1.5 }
 
 pub struct DynMm {
     pub a: f64,
@@ -427,10 +427,19 @@ impl Strategy for DynMm {
             return Quotes::default();
         }
         
+        // Spread hesapla (manipülasyon tespiti için gerekli)
+        let spread = ask - bid;
+        let spread_bps = if mid_f > 0.0 {
+            (spread / mid).to_f64().unwrap_or(0.0) * 10000.0
+        } else {
+            0.0
+        };
+        
         // --- MANİPÜLASYON FIRSAT ANALİZİ: Manipülasyonu avantaja çevir ---
         self.manipulation_opportunity = None;
         
         // 1. FLASH CRASH/PUMP DETECTION: Ani fiyat değişimleri → LONG/SHORT fırsatı
+        // KRİTİK İYİLEŞTİRME: Volume ve time frame kontrolü ekle (false positive önleme)
         if !self.price_history.is_empty() {
             let last_price = self.price_history.last().map(|(_, p)| *p).unwrap_or(mid);
             if !last_price.is_zero() {
@@ -438,8 +447,43 @@ impl Strategy for DynMm {
                 let price_change_bps = price_change.to_f64().unwrap_or(0.0) * 10000.0;
                 self.flash_crash_direction = price_change_bps;
                 
-                // Ani değişim tespiti: 200 bps (2%) veya daha fazla
-                if price_change_bps.abs() > self.price_jump_threshold_bps {
+                // Time frame kontrolü: Son 5 saniye içinde mi?
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let time_elapsed_ms = if let Some((last_ts, _)) = self.price_history.last() {
+                    now_ms.saturating_sub(*last_ts)
+                } else {
+                    0
+                };
+                
+                // Volume kontrolü: Volume artışı var mı?
+                let volume_ratio = if self.volume_history.len() >= 10 {
+                    let recent_avg: f64 = self.volume_history.iter().rev().take(5).sum::<f64>() / 5.0;
+                    let older_avg: f64 = if self.volume_history.len() >= 10 {
+                        self.volume_history.iter().rev().skip(5).take(5).sum::<f64>() / 5.0
+                    } else {
+                        recent_avg
+                    };
+                    if older_avg > 0.0 {
+                        recent_avg / older_avg
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                };
+                
+                // Likidite stabil mi? (spread çok geniş değil)
+                let liquidity_stable = spread_bps < self.max_spread_bps * 0.5; // Spread normal seviyede
+                
+                // Gelişmiş tespit: Fiyat değişimi + volume artışı + time frame + likidite kontrolü
+                if price_change_bps.abs() > self.price_jump_threshold_bps 
+                   && volume_ratio > 3.0              // Volume 3x veya daha fazla arttı
+                   && time_elapsed_ms < 5000          // 5 saniye içinde
+                   && liquidity_stable {              // Likidite stabil
                     self.flash_crash_detected = true;
                     
                     // FIRSAT: Flash crash → LONG, Flash pump → SHORT
@@ -451,7 +495,9 @@ impl Strategy for DynMm {
                         use tracing::info;
                         info!(
                             price_drop_bps = price_change_bps.abs(),
-                            "FLASH CRASH OPPORTUNITY: going LONG (buying the dip)"
+                            volume_ratio,
+                            time_elapsed_ms,
+                            "FLASH CRASH OPPORTUNITY: going LONG (buying the dip) - verified with volume and time frame"
                         );
                     } else if price_change_bps > self.price_jump_threshold_bps {
                         // Fiyat anormal yükseldi → SHORT fırsatı (tepe satış)
@@ -461,24 +507,22 @@ impl Strategy for DynMm {
                         use tracing::info;
                         info!(
                             price_rise_bps = price_change_bps,
-                            "FLASH PUMP OPPORTUNITY: going SHORT (selling the top)"
+                            volume_ratio,
+                            time_elapsed_ms,
+                            "FLASH PUMP OPPORTUNITY: going SHORT (selling the top) - verified with volume and time frame"
                         );
                     }
                 } else {
-                    // Normal piyasa, flash crash yok
+                    // Normal piyasa, flash crash yok (veya false positive)
                     self.flash_crash_detected = false;
                 }
             }
         }
         
-        // 2. SPREAD ARBITRAGE: Geniş spread → Market maker fırsatı
-        let spread = ask - bid;
-        let spread_bps = if mid_f > 0.0 {
-            (spread / mid).to_f64().unwrap_or(0.0) * 10000.0
-        } else {
-            0.0
-        };
+        // Spread'i kaydet (zaten yukarıda hesaplandı)
         self.last_spread_bps = spread_bps;
+        
+        // 2. SPREAD ARBITRAGE: Geniş spread → Market maker fırsatı
         
         // FIRSAT: Geniş spread varsa market maker olarak spread'den kazanç
         // Config'den: Spread arbitraj eşikleri
@@ -967,17 +1011,17 @@ impl Strategy for DynMm {
             pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)
         });
         
-        // Bid: best_bid'den düşük veya eşit olmalı (pasif emir)
+        // Bid: best_bid'den ASLA yüksek olmamalı (eşitlik dahil) - pasif emir garantisi
         if let Some(best_bid) = c.ob.best_bid {
-            if bid_px.0 > best_bid.px.0 {
-                // Bid best bid'i geçiyor → best_bid'in 1 tick altına çek
+            if bid_px.0 >= best_bid.px.0 {
+                // Bid best bid'e eşit veya yüksek → best_bid'in 1 tick altına çek
                 bid_px = Px((best_bid.px.0 - tick).max(Decimal::ZERO));
             }
         }
-        // Ask: best_ask'den yüksek veya eşit olmalı (pasif emir)
+        // Ask: best_ask'den ASLA düşük olmamalı (eşitlik dahil) - pasif emir garantisi
         if let Some(best_ask) = c.ob.best_ask {
-            if ask_px.0 < best_ask.px.0 {
-                // Ask best ask'i geçiyor → best_ask'in 1 tick üstüne çek
+            if ask_px.0 <= best_ask.px.0 {
+                // Ask best ask'e eşit veya düşük → best_ask'in 1 tick üstüne çek
                 ask_px = Px(best_ask.px.0 + tick);
             }
         }

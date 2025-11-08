@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use strategy::{Context, DynMm, DynMmCfg, Strategy};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use std::cmp::max;
@@ -477,8 +477,8 @@ async fn main() -> Result<()> {
         volatility_coefficient: cfg.strategy.volatility_coefficient.unwrap_or(0.5),
         ofi_coefficient: cfg.strategy.ofi_coefficient.unwrap_or(0.5),
         min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
-        opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(5.0),
-        strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(3.0),
+        opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(2.0), // 5.0 → 2.0: daha güvenli
+        strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.5), // 3.0 → 1.5: daha güvenli
     };
     let mode_lower = cfg.mode.to_lowercase();
     let strategy_name = cfg.strategy.r#type.clone();
@@ -603,7 +603,9 @@ async fn main() -> Result<()> {
                 }
             } else {
                 if let V::Spot(vtmp) = &venue {
+                    rate_limit_guard().await;
                     let q_free = vtmp.asset_free(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
+                    rate_limit_guard().await;
                     let b_free = vtmp.asset_free(&meta.base_asset).await?.to_f64().unwrap_or(0.0);
                     if q_free < have_min && b_free < cfg.qty_step {
                         warn!(
@@ -681,6 +683,7 @@ async fn main() -> Result<()> {
                 
                 // Her quote asset için bakiye kontrolü yap
                 for quote in unique_quotes {
+                    rate_limit_guard().await;
                     let balance = vtmp.asset_free(&quote).await.ok()
                         .and_then(|b| b.to_f64())
                         .unwrap_or(0.0);
@@ -900,6 +903,7 @@ async fn main() -> Result<()> {
                             .map(|m| m.quote_asset.clone())
                             .collect();
                         for quote in unique_quotes {
+                            rate_limit_guard().await;
                             let balance = vtmp.asset_free(&quote).await.ok()
                                 .and_then(|b| b.to_f64())
                                 .unwrap_or(0.0);
@@ -949,6 +953,7 @@ async fn main() -> Result<()> {
                             }
                         } else {
                             if let V::Spot(vtmp) = &venue {
+                                rate_limit_guard().await;
                                 vtmp.asset_free(&meta.quote_asset).await.ok()
                                     .and_then(|b| b.to_f64())
                                     .unwrap_or(0.0) >= cfg.min_quote_balance_usd
@@ -1204,7 +1209,6 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                _ => {}
             }
         }
 
@@ -1225,6 +1229,7 @@ async fn main() -> Result<()> {
         // Her unique quote asset için bakiyeyi bir kere çek ve cache'e al
         let mut quote_balances: HashMap<String, f64> = HashMap::new();
         for quote_asset in &unique_quote_assets {
+            rate_limit_guard().await;
             let balance = match &venue {
                 V::Spot(v) => {
                     match tokio::time::timeout(Duration::from_secs(5), v.asset_free(quote_asset)).await {
@@ -1306,6 +1311,7 @@ async fn main() -> Result<()> {
                         }
                         // Base bakiyesi kontrolü (yaklaşık kontrol, gerçek fiyat bilinmiyor)
                         // NOT: Base bakiyesi cache'de yok, bu yüzden sadece gerektiğinde çek
+                        rate_limit_guard().await;
                         match tokio::time::timeout(Duration::from_secs(2), v.asset_free(base_asset)).await {
                             Ok(Ok(b)) => {
                                 let b_free = b.to_f64().unwrap_or(0.0);
@@ -1379,10 +1385,15 @@ async fn main() -> Result<()> {
             // ÖNEMLİ: Saniyelik değişimler olduğu için her tick'te kontrol etmeliyiz
             // Ama rate limit koruması için minimum 2 saniye bekle (çok sık API çağrısı yapma)
             // WebSocket zaten real-time güncellemeleri sağlıyor, API sadece doğrulama için
-            // KRİTİK DÜZELTME: Reconnect sonrası tüm semboller için sync yap
-            let should_sync_orders = force_sync_all || state.last_order_sync
-                .map(|last| last.elapsed().as_secs() >= 2) // Her 2 saniyede bir senkronize et (rate limit koruması + hızlı güncelleme)
-                .unwrap_or(true); // İlk çalıştırmada mutlaka senkronize et
+            // KRİTİK DÜZELTME: Reconnect sonrası tüm semboller için HEMEN sync yap
+            // force_sync_all true ise hemen sync yap (reconnect sonrası), normal durumda 2 saniyede bir
+            let should_sync_orders = if force_sync_all {
+                true // Reconnect sonrası hemen sync - tüm semboller için
+            } else {
+                state.last_order_sync
+                    .map(|last| last.elapsed().as_secs() >= 2) // Her 2 saniyede bir senkronize et (rate limit koruması + hızlı güncelleme)
+                    .unwrap_or(true) // İlk çalıştırmada mutlaka senkronize et
+            };
             if should_sync_orders {
                 // API Rate Limit koruması
                 rate_limit_guard().await;
@@ -1542,6 +1553,8 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // API Rate Limit koruması
+            rate_limit_guard().await;
             let (bid, ask) = match &venue {
                 V::Spot(v) => match v.best_prices(&symbol).await {
                     Ok(prices) => prices,
@@ -1823,8 +1836,27 @@ async fn main() -> Result<()> {
                     %symbol,
                     position_size_notional,
                     max_allowed = max_position_size_usd,
-                    "POSITION SIZE RISK: position too large, consider reducing"
+                    "POSITION SIZE RISK: position too large, force closing"
                 );
+                // KRİTİK DÜZELTME: Risk limiti aşılınca pozisyonu kapat
+                rate_limit_guard().await;
+                match &venue {
+                    V::Spot(v) => {
+                        if let Err(err) = v.close_position(&symbol).await {
+                            error!(%symbol, ?err, "failed to close position due to size risk");
+                        } else {
+                            info!(%symbol, "closed position due to size risk");
+                        }
+                    }
+                    V::Fut(v) => {
+                        if let Err(err) = v.close_position(&symbol).await {
+                            error!(%symbol, ?err, "failed to close position due to size risk");
+                        } else {
+                            info!(%symbol, "closed position due to size risk");
+                        }
+                    }
+                }
+                continue; // Bu tick'i atla
             }
             
             // 6. Real-time PnL alerts: Kritik seviyelerde uyarı
@@ -1918,7 +1950,8 @@ async fn main() -> Result<()> {
                 // Küçük kazançlar için erken kar alma, büyük kazançlar için daha uzun tut
                 let take_profit_threshold_small = 0.01; // %1 kar (küçük pozisyonlar için)
                 let take_profit_threshold_large = 0.05; // %5 kar (büyük pozisyonlar/fırsat modu için)
-                let trailing_stop_threshold = 0.02; // %2 trailing stop (peak'ten düşerse, optimize: 0.01 → 0.02)
+                // Dinamik trailing stop: Kar büyüdükçe genişlet
+                let base_trailing_stop_threshold = 0.02; // %2 base trailing stop
                 
                 // Pozisyon boyutuna göre eşik seç
                 let is_large_position = position_size_notional > 200.0; // 200 USD'den büyük = büyük pozisyon
@@ -1947,18 +1980,20 @@ async fn main() -> Result<()> {
                     false
                 };
                 
-                // Trailing stop: Peak'ten %2 düşerse kapat (optimize: %1 → %2, daha büyük kazançlar için)
+                // Dinamik trailing stop: Peak'ten düşerse kapat, kar büyüdükçe genişlet
                 let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
                 let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
                 let should_trailing_stop = if peak_pnl_f64 > 0.0 && current_pnl_f64 < peak_pnl_f64 {
                     let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
-                    // Büyük kazançlar için daha geniş trailing stop
-                    let adjusted_threshold = if peak_pnl_f64 > 10.0 {
-                        trailing_stop_threshold * 1.5 // %3 trailing stop (büyük kazançlar için)
+                    // Dinamik trailing stop: Kar büyüdükçe genişlet
+                    let trailing_stop = if peak_pnl_f64 > 50.0 {
+                        0.05 // %5 (büyük karlar için)
+                    } else if peak_pnl_f64 > 20.0 {
+                        0.03 // %3 (orta karlar için)
                     } else {
-                        trailing_stop_threshold
+                        base_trailing_stop_threshold // %2 (küçük karlar için)
                     };
-                    drawdown_from_peak >= adjusted_threshold
+                    drawdown_from_peak >= trailing_stop
                 } else {
                     false
                 };
@@ -2205,6 +2240,7 @@ async fn main() -> Result<()> {
             // ---- CAP HESABI (sembolün kendi quote'u ile) ----
             let caps = match &venue {
                 V::Spot(v) => {
+                    rate_limit_guard().await;
                     let quote_free = match v.asset_free(&quote_asset).await {
                         Ok(q) => {
                             let q_f64 = q.to_f64().unwrap_or(0.0);
@@ -2229,6 +2265,7 @@ async fn main() -> Result<()> {
                             0.0
                         }
                     };
+                    rate_limit_guard().await;
                     let base_free = match v.asset_free(&base_asset).await {
                         Ok(b) => b.to_f64().unwrap_or(0.0),
                         Err(err) => {
@@ -2682,8 +2719,12 @@ async fn main() -> Result<()> {
                                             }
                                             
                                             // Min notional garantisi: Eğer mevcut bakiyeyle minimum notional'ı karşılayabiliyorsak, onu garanti et
-                                            // Ama karşılayamıyorsak, mevcut bakiyeyle ne kadar yapılabilirse o kadar yap
-                                            if max_qty_by_margin * price_quantized >= min_notional {
+                                            // KRİTİK DÜZELTME: Bakiye yetersizse min notional'ı karşılayamayan emir yapma, skip et
+                                            if max_qty_by_margin * price_quantized < min_notional {
+                                                // Bakiye yetersiz, min notional'ı karşılayamıyoruz → Skip et, retry yapma
+                                                warn!(%symbol, ?px, required_min = ?min_notional, available_notional = max_qty_by_margin * price_quantized, "skip bid: insufficient balance for min_notional, skipping order");
+                                                new_qty = 0.0; // Skip et
+                                            } else {
                                                 // Mevcut bakiyeyle minimum notional'ı karşılayabiliyoruz, garanti et
                                                 let mut attempts = 0;
                                                 let max_attempts = 20; // Maksimum 20 step artır
@@ -2712,10 +2753,6 @@ async fn main() -> Result<()> {
                                                     new_qty += step;
                                                     attempts += 1;
                                                 }
-                                            } else {
-                                                // Mevcut bakiyeyle minimum notional'ı karşılayamıyoruz
-                                                // Mevcut bakiyeyle maksimum ne kadar yapılabilirse o kadar yap
-                                                new_qty = max_qty_by_margin;
                                             }
                                         }
                                         if new_qty > 0.0 {
@@ -2874,8 +2911,12 @@ async fn main() -> Result<()> {
                                             }
                                             
                                             // Min notional garantisi: Eğer mevcut bakiyeyle minimum notional'ı karşılayabiliyorsak, onu garanti et
-                                            // Ama karşılayamıyorsak, mevcut bakiyeyle ne kadar yapılabilirse o kadar yap
-                                            if max_qty_by_margin * price_quantized >= min_notional {
+                                            // KRİTİK DÜZELTME: Bakiye yetersizse min notional'ı karşılayamayan emir yapma, skip et
+                                            if max_qty_by_margin * price_quantized < min_notional {
+                                                // Bakiye yetersiz, min notional'ı karşılayamıyoruz → Skip et, retry yapma
+                                                warn!(%symbol, ?px, required_min = ?min_notional, available_notional = max_qty_by_margin * price_quantized, "skip ask: insufficient balance for min_notional, skipping order");
+                                                new_qty = 0.0; // Skip et
+                                            } else {
                                                 // Mevcut bakiyeyle minimum notional'ı karşılayabiliyoruz, garanti et
                                                 let mut attempts = 0;
                                                 let max_attempts = 20; // Maksimum 20 step artır
@@ -2904,10 +2945,6 @@ async fn main() -> Result<()> {
                                                     new_qty += step;
                                                     attempts += 1;
                                                 }
-                                            } else {
-                                                // Mevcut bakiyeyle minimum notional'ı karşılayamıyoruz
-                                                // Mevcut bakiyeyle maksimum ne kadar yapılabilirse o kadar yap
-                                                new_qty = max_qty_by_margin;
                                             }
                                         }
                                         if new_qty > 0.0 {
