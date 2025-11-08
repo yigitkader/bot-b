@@ -93,3 +93,81 @@ websocket:
   enabled: true
   reconnect_delay_ms: 5000
   ping_interval_ms: 30000
+
+# --- İç Mantık Parametreleri ---
+internal:
+  # PnL ve geçmiş takibi
+  pnl_history_max_len: 1024
+  position_size_history_max_len: 100
+  
+  # Rate limiting ve işlem yönetimi
+  max_symbols_per_tick: 8
+  rate_limiter_safety_factor: 0.8
+  rate_limiter_min_interval_ms: 1000
+  order_sync_interval_sec: 2
+  cancel_stagger_delay_ms: 50
+  
+  # Fill rate güncelleme katsayıları
+  fill_rate_increase_factor: 0.95
+  fill_rate_increase_bonus: 0.05
+  fill_rate_decrease_factor: 0.98
+  fill_rate_slow_decrease_factor: 0.995
+  fill_rate_slow_decrease_bonus: 0.005
+  
+  # Emir fiyat mesafesi eşikleri (decimal)
+  order_price_distance_with_position: 0.01  # %1 (pozisyon varsa)
+  order_price_distance_no_position: 0.005     # %0.5 (pozisyon yoksa)
+  order_price_change_threshold: 0.0001        # %0.01 fiyat değişimi eşiği
+  
+  # Envanter uyumsuzluğu eşiği
+  inventory_reconcile_threshold: 0.00000001  # Decimal::new(1, 8)
+  position_qty_threshold: 0.00000001         # Decimal::new(1, 8)
+  
+  # PnL alert eşikleri
+  pnl_alert_interval_sec: 10
+  pnl_alert_threshold_positive: 0.05  # %5 kar
+  pnl_alert_threshold_negative: -0.03 # %3 zarar
+  
+  # Take profit eşikleri
+  take_profit_threshold_small: 0.01   # %1 (küçük pozisyonlar)
+  take_profit_threshold_large: 0.05   # %5 (büyük pozisyonlar)
+  take_profit_time_threshold_ms: 600000  # 10 dakika
+  take_profit_min_profit_threshold: 0.10  # %10
+  
+  # Trailing stop eşikleri
+  trailing_stop_peak_threshold_large: 100.0  # USD (büyük karlar)
+  trailing_stop_peak_threshold_medium: 20.0   # USD (orta karlar)
+  trailing_stop_drawdown_large: 0.03    # %3 (büyük karlar için)
+  trailing_stop_drawdown_medium: 0.015  # %1.5 (orta karlar için)
+  trailing_stop_drawdown_small: 0.01     # %1 (küçük karlar için)
+  trailing_stop_min_peak: 0.01           # Minimum peak (USD)
+  
+  # Stop loss eşikleri
+  stop_loss_threshold: -0.005  # %0.5 zarar
+  stop_loss_time_threshold_ms: 120000  # 2 dakika
+  stop_loss_trend_threshold: -0.2       # %20 trend düşüşü
+  
+  # Pozisyon boyutu risk kontrolü
+  max_position_size_buffer: 5.0  # 5x buffer
+
+# --- Strateji İç Mantık Parametreleri ---
+strategy_internal:
+  # Manipülasyon tespiti
+  manipulation_volume_ratio_threshold: 5.0    # 5x volume artışı
+  manipulation_time_threshold_ms: 2000        # 2 saniye içinde
+  manipulation_price_history_min_len: 3        # Minimum fiyat geçmişi uzunluğu
+  manipulation_price_history_max_len: 200     # Maximum fiyat geçmişi uzunluğu
+  
+  # Confidence hesaplama
+  confidence_price_drop_max: 500.0            # Max price drop/rise for confidence (bps)
+  confidence_volume_ratio_min: 5.0            # Min volume ratio for confidence
+  confidence_volume_ratio_max: 10.0           # Max volume ratio for confidence
+  confidence_spread_min: 50.0                 # Min spread for confidence (bps)
+  confidence_spread_max: 150.0                # Max spread for confidence (bps)
+  confidence_bonus_multiplier: 0.3            # Confidence bonus multiplier
+  confidence_max_multiplier: 1.5              # Max multiplier cap
+  
+  # Trend analizi
+  trend_analysis_min_history: 10              # Minimum geçmiş uzunluğu
+  trend_analysis_threshold_negative: -0.15    # %15 trend düşüşü
+  trend_analysis_threshold_strong_negative: -0.20  # %20 güçlü trend düşüşü

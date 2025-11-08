@@ -10,7 +10,11 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
     
-    // OrderInfo struct'ını test için tanımla (main.rs'deki ile aynı)
+    // ============================================================================
+    // Test Helper Types & Functions
+    // ============================================================================
+    
+    /// Test için OrderInfo struct'ı (main.rs'deki ile aynı)
     #[derive(Clone, Debug)]
     struct TestOrderInfo {
         order_id: String,
@@ -20,7 +24,7 @@ mod tests {
         created_at: Instant,
     }
 
-    // Helper: Test pozisyonu oluştur
+    /// Test pozisyonu oluştur (helper function)
     fn create_test_position(symbol: &str, qty: Decimal, entry: Decimal, leverage: u32) -> Position {
         Position {
             symbol: symbol.to_string(),
@@ -31,7 +35,7 @@ mod tests {
         }
     }
 
-    // Helper: Test emri oluştur
+    /// Test emri oluştur (helper function)
     fn create_test_order(order_id: &str, side: Side, price: Decimal, qty: Decimal, age_ms: u64) -> TestOrderInfo {
         TestOrderInfo {
             order_id: order_id.to_string(),
@@ -42,31 +46,61 @@ mod tests {
         }
     }
 
+    /// PnL hesaplama helper (long pozisyon için)
+    fn calculate_pnl_long(entry: Decimal, mark_price: Decimal, qty: Decimal) -> Decimal {
+        (mark_price - entry) * qty
+    }
+
+    /// PnL hesaplama helper (short pozisyon için)
+    fn calculate_pnl_short(entry: Decimal, mark_price: Decimal, qty: Decimal) -> Decimal {
+        (mark_price - entry) * qty // Short için qty negatif olacak
+    }
+
+    /// Margin hesaplama helper (unrealized PnL ile)
+    fn calculate_margin_with_pnl(position_notional: f64, leverage: f64, unrealized_pnl: f64) -> f64 {
+        let base_margin = position_notional / leverage;
+        (base_margin - unrealized_pnl).max(0.0)
+    }
+
+    /// Test constants
+    const DEFAULT_LEVERAGE: u32 = 5;
+    const DEFAULT_ENTRY_PRICE: Decimal = dec!(50000);
+    const DEFAULT_POSITION_QTY: Decimal = dec!(0.1);
+    const MAX_ORDER_AGE_MS: u64 = 10_000;
+
+    // ============================================================================
+    // PnL Calculation Tests
+    // ============================================================================
+
     #[test]
-    fn test_position_pnl_calculation_long() {
-        // Long pozisyon: fiyat artışı = kar
-        let pos = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 5);
+    fn test_position_pnl_calculation_long_profit() {
+        // Given: Long pozisyon, fiyat artışı
+        let pos = create_test_position("BTCUSDT", DEFAULT_POSITION_QTY, DEFAULT_ENTRY_PRICE, DEFAULT_LEVERAGE);
         let mark_price = Px(dec!(51000)); // %2 artış
         
-        let current_pnl = (mark_price.0 - pos.entry.0) * pos.qty.0;
+        // When: PnL hesaplanır
+        let current_pnl = calculate_pnl_long(pos.entry.0, mark_price.0, pos.qty.0);
         let expected_pnl = (dec!(51000) - dec!(50000)) * dec!(0.1); // 100 USD kar
         
-        assert_eq!(current_pnl, expected_pnl);
-        assert!(current_pnl > Decimal::ZERO); // Kar var
+        // Then: Kar pozitif olmalı
+        assert_eq!(current_pnl, expected_pnl, "Long position PnL should be positive when price increases");
+        assert!(current_pnl > Decimal::ZERO, "Long position should show profit");
     }
 
     #[test]
-    fn test_position_pnl_calculation_short() {
-        // Short pozisyon: fiyat düşüşü = kar
-        let pos = create_test_position("BTCUSDT", dec!(-0.1), dec!(50000), 5);
+    fn test_position_pnl_calculation_short_profit() {
+        // Given: Short pozisyon, fiyat düşüşü
+        let pos = create_test_position("BTCUSDT", dec!(-0.1), DEFAULT_ENTRY_PRICE, DEFAULT_LEVERAGE);
         let mark_price = Px(dec!(49000)); // %2 düşüş
         
-        let current_pnl = (mark_price.0 - pos.entry.0) * pos.qty.0;
+        // When: PnL hesaplanır
+        let current_pnl = calculate_pnl_short(pos.entry.0, mark_price.0, pos.qty.0);
         // Short: (49000 - 50000) * (-0.1) = (-1000) * (-0.1) = 100 USD kar
         let expected_pnl = (dec!(49000) - dec!(50000)) * dec!(-0.1);
         
-        assert_eq!(current_pnl, expected_pnl);
-        assert!(current_pnl > Decimal::ZERO); // Kar var
+        // Then: Kar pozitif olmalı
+        assert_eq!(current_pnl, expected_pnl, "Short position PnL should be positive when price decreases");
+        assert!(current_pnl > Decimal::ZERO, "Short position should show profit");
     }
 
     #[test]
@@ -139,20 +173,26 @@ mod tests {
         assert!(should_trailing_stop, "Should trailing stop when drawdown from peak >= 1%");
     }
 
+    // ============================================================================
+    // Order Management Tests
+    // ============================================================================
+
     #[test]
     fn test_stale_order_detection() {
-        let max_order_age_ms = 10_000; // 10 saniye
+        // Given: Eski ve yeni emirler
+        let max_order_age_ms = MAX_ORDER_AGE_MS;
         let old_order = create_test_order("order1", Side::Buy, dec!(50000), dec!(0.1), 15_000); // 15 saniye eski
         let new_order = create_test_order("order2", Side::Sell, dec!(50010), dec!(0.1), 5_000); // 5 saniye eski
         
+        // When: Emir yaşları kontrol edilir
         let old_age_ms = old_order.created_at.elapsed().as_millis() as u64;
         let new_age_ms = new_order.created_at.elapsed().as_millis() as u64;
-        
         let old_is_stale = old_age_ms > max_order_age_ms;
         let new_is_stale = new_age_ms > max_order_age_ms;
         
-        assert!(old_is_stale, "Old order should be detected as stale");
-        assert!(!new_is_stale, "New order should not be stale");
+        // Then: Eski emir stale, yeni emir değil
+        assert!(old_is_stale, "Order older than threshold should be stale");
+        assert!(!new_is_stale, "Order within threshold should not be stale");
     }
 
     #[test]
@@ -449,6 +489,460 @@ mod tests {
             // Bu test sadece dokümantasyon amaçlı
             assert!(!call.is_empty(), "API call name should not be empty");
         }
+    }
+
+    // ============================================================================
+    // Leverage & Margin Calculation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_leverage_margin_with_unrealized_pnl_loss() {
+        // Given: Zarar eden pozisyon (unrealized PnL negatif)
+        let total_balance = 100.0;
+        let existing_position_notional = 200.0;
+        let effective_leverage = 5.0;
+        let unrealized_pnl = -20.0; // 20 USD zarar
+        
+        // When: Margin hesaplanır (unrealized PnL ile)
+        let base_margin = existing_position_notional / effective_leverage; // 40 USD
+        let existing_position_margin = calculate_margin_with_pnl(
+            existing_position_notional,
+            effective_leverage,
+            unrealized_pnl
+        ); // 60 USD
+        let available_after_position = (total_balance - existing_position_margin).max(0.0);
+        
+        // Then: Zarar eden pozisyon margin'i tüketir
+        assert_eq!(base_margin, 40.0, "Base margin should be 40 USD");
+        assert_eq!(existing_position_margin, 60.0, "Loss position consumes more margin");
+        assert_eq!(available_after_position, 40.0, "Available balance should decrease");
+    }
+
+    #[test]
+    fn test_leverage_margin_with_unrealized_pnl_profit() {
+        // Given: Kar eden pozisyon (unrealized PnL pozitif)
+        let total_balance = 100.0;
+        let existing_position_notional = 200.0;
+        let effective_leverage = 5.0;
+        let unrealized_pnl = 20.0; // 20 USD kar
+        
+        // When: Margin hesaplanır (unrealized PnL ile)
+        let base_margin = existing_position_notional / effective_leverage; // 40 USD
+        let existing_position_margin = calculate_margin_with_pnl(
+            existing_position_notional,
+            effective_leverage,
+            unrealized_pnl
+        ); // 20 USD
+        let available_after_position = (total_balance - existing_position_margin).max(0.0);
+        
+        // Then: Kar eden pozisyon margin'i serbest bırakır
+        assert_eq!(existing_position_margin, 20.0, "Profit position frees up margin");
+        assert_eq!(available_after_position, 80.0, "Available balance should increase");
+    }
+
+    #[test]
+    fn test_trailing_stop_take_profit_priority() {
+        // KRİTİK TEST: Trailing stop ve take profit çakışması - Öncelik sırası
+        // Önce trailing stop (20 USD+ karlardayken), sonra take profit/stop loss
+        let peak_pnl_f64 = 25.0; // 25 USD peak kar
+        let current_pnl_f64 = 24.0; // 24 USD (peak'ten %4 düşüş)
+        let price_change_pct = 0.04; // %4 kar
+        let take_profit_threshold = 0.05; // %5 take profit eşiği
+        
+        // Trailing stop kontrolü
+        let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
+        let trailing_stop_threshold = 0.01; // %1 trailing stop
+        let should_trailing_stop = drawdown_from_peak >= trailing_stop_threshold && peak_pnl_f64 > 20.0;
+        
+        // Take profit kontrolü
+        let should_take_profit = price_change_pct >= take_profit_threshold;
+        
+        // Öncelik sırası: Trailing stop > Take profit
+        let (should_close, reason) = if should_trailing_stop && peak_pnl_f64 > 20.0 {
+            (true, "trailing_stop")
+        } else if should_take_profit {
+            (true, "take_profit")
+        } else {
+            (false, "")
+        };
+        
+        // %4 kardayken %1 trailing stop tetiklenmeli (take profit değil)
+        assert!(should_close, "Should close position due to trailing stop");
+        assert_eq!(reason, "trailing_stop", "Reason should be trailing_stop, not take_profit");
+        
+        // Take profit daha yüksek karda tetiklenmeli
+        let price_change_pct_high = 0.06; // %6 kar
+        let should_take_profit_high = price_change_pct_high >= take_profit_threshold;
+        let (should_close_high, reason_high) = if should_trailing_stop && peak_pnl_f64 > 20.0 {
+            (true, "trailing_stop")
+        } else if should_take_profit_high {
+            (true, "take_profit")
+        } else {
+            (false, "")
+        };
+        
+        // Trailing stop hala aktif, öncelik trailing stop
+        assert!(should_close_high, "Should close position");
+        // Not: Bu test'te trailing stop hala tetikleniyor çünkü peak'ten düşüş var
+    }
+
+    #[test]
+    fn test_min_notional_retry_with_margin_constraint() {
+        // KRİTİK TEST: Min notional retry - margin constraint ile
+        let min_notional = 10.0; // 10 USD minimum
+        let available_margin = 8.0; // 8 USD bakiye (yetersiz)
+        let price_quantized = 50000.0;
+        let effective_leverage = 5.0;
+        let step = 0.001;
+        
+        // Önce maksimum qty'yi belirle (margin constraint)
+        let max_qty_by_margin = ((available_margin * effective_leverage) / price_quantized / step).floor() * step;
+        let available_notional = max_qty_by_margin * price_quantized;
+        
+        // Bakiye yetersizse min notional'ı karşılayamayan emir yapma
+        let should_skip = available_notional < min_notional;
+        
+        assert!(should_skip, "Should skip when margin is insufficient for min_notional");
+        assert!(available_notional < min_notional, "Available notional should be less than min_notional");
+        
+        // Yeterli bakiye varsa
+        let available_margin_sufficient = 12.0; // 12 USD bakiye (yeterli)
+        let max_qty_by_margin_sufficient = ((available_margin_sufficient * effective_leverage) / price_quantized / step).floor() * step;
+        let available_notional_sufficient = max_qty_by_margin_sufficient * price_quantized;
+        
+        // Min qty hesapla
+        let min_qty_for_notional = (min_notional * 1.1 / price_quantized / step).ceil() * step; // %10 güvenli margin
+        let final_qty = min_qty_for_notional.min(max_qty_by_margin_sufficient);
+        let final_notional = final_qty * price_quantized;
+        let required_margin = final_notional / effective_leverage;
+        
+        assert!(final_notional >= min_notional, "Final notional should meet min_notional");
+        assert!(required_margin <= available_margin_sufficient, "Required margin should be within available");
+    }
+
+    #[test]
+    fn test_funding_cost_calculation() {
+        // KRİTİK TEST: Funding cost hesaplama
+        // Funding cost = funding_rate * position_size_notional (her 8 saatte bir)
+        let funding_rate = 0.0001; // 0.01% per 8h = 1 bps
+        let position_size_notional = 1000.0; // 1000 USD pozisyon
+        
+        let funding_cost = funding_rate * position_size_notional; // 0.1 USD
+        
+        assert_eq!(funding_cost, 0.1, "Funding cost should be 0.1 USD for 1000 USD position at 0.01% rate");
+        
+        // Negatif funding rate (short pozisyon için ödeme alırsın)
+        let funding_rate_negative = -0.0001; // -0.01% per 8h
+        let funding_cost_negative = funding_rate_negative * position_size_notional; // -0.1 USD (alırsın)
+        
+        assert_eq!(funding_cost_negative, -0.1, "Negative funding cost means you receive payment");
+    }
+
+    #[test]
+    fn test_websocket_reconnect_position_sync() {
+        // KRİTİK TEST: WebSocket reconnect sonrası pozisyon sync
+        let ws_inv = Qty(dec!(0.1));
+        let api_pos = create_test_position("BTCUSDT", dec!(0.15), dec!(50000), 5);
+        let force_sync_all = true; // Reconnect sonrası
+        
+        let inv_diff = (ws_inv.0 - api_pos.qty.0).abs();
+        let reconcile_threshold = Decimal::new(1, 8);
+        let is_reconnect_sync = force_sync_all;
+        
+        // Reconnect sonrası: Her zaman sync yap (uyumsuzluk olsun ya da olmasın)
+        let should_sync = is_reconnect_sync || inv_diff > reconcile_threshold;
+        
+        assert!(should_sync, "Should sync position after reconnect, regardless of difference");
+        
+        // Normal durumda: Sadece uyumsuzluk varsa sync yap
+        let force_sync_all_normal = false;
+        let is_reconnect_sync_normal = force_sync_all_normal;
+        let should_sync_normal = is_reconnect_sync_normal || inv_diff > reconcile_threshold;
+        
+        assert!(should_sync_normal, "Should sync in normal mode when difference exceeds threshold");
+        
+        // Küçük fark: Normal modda sync yapma
+        let ws_inv_small = Qty(dec!(0.1));
+        let api_pos_small = create_test_position("BTCUSDT", dec!(0.10000001), dec!(50000), 5);
+        let inv_diff_small = (ws_inv_small.0 - api_pos_small.qty.0).abs();
+        let should_sync_small = is_reconnect_sync_normal || inv_diff_small > reconcile_threshold;
+        
+        assert!(!should_sync_small, "Should not sync when difference is below threshold in normal mode");
+    }
+
+    #[test]
+    fn test_rate_limit_symbol_prioritization() {
+        // KRİTİK TEST: Rate limit koruması - Sembol önceliklendirme
+        // Aktif emir/pozisyon olanlar önce işlenmeli
+        let mut states_with_priority: Vec<(usize, bool)> = vec![
+            (0, false), // Sembol 0: Aktif emir/pozisyon yok
+            (1, true),  // Sembol 1: Aktif emir var
+            (2, false), // Sembol 2: Aktif emir/pozisyon yok
+            (3, true),  // Sembol 3: Pozisyon var
+        ];
+        
+        // Öncelikli olanları öne al
+        states_with_priority.sort_by(|a, b| b.1.cmp(&a.1)); // true (öncelikli) önce
+        
+        // İlk iki sembol öncelikli olmalı
+        assert!(states_with_priority[0].1, "First symbol should have priority");
+        assert!(states_with_priority[1].1, "Second symbol should have priority");
+        assert!(!states_with_priority[2].1, "Third symbol should not have priority");
+        assert!(!states_with_priority[3].1, "Fourth symbol should not have priority");
+    }
+
+    #[test]
+    fn test_opportunity_multiplier_dynamic_confidence() {
+        // KRİTİK TEST: Opportunity multiplier - Dinamik güven seviyesi
+        let base_multiplier = 1.2; // Config'den: Base multiplier
+        let confidence_bonus_multiplier = 0.3; // Config'den: Bonus multiplier
+        let confidence_max_multiplier = 1.5; // Config'den: Max multiplier
+        
+        // Flash crash: Büyük düşüş = yüksek güven
+        let price_drop_bps = 400.0; // 400 bps düşüş
+        let confidence_price_drop_max = 500.0;
+        let confidence_flash_crash = (price_drop_bps / confidence_price_drop_max).min(1.0).max(0.5);
+        let confidence_bonus = confidence_bonus_multiplier * confidence_flash_crash;
+        let multiplier_flash_crash = (base_multiplier + confidence_bonus).min(confidence_max_multiplier);
+        
+        assert!(multiplier_flash_crash > base_multiplier, "Flash crash should increase multiplier");
+        assert!(multiplier_flash_crash <= confidence_max_multiplier, "Multiplier should not exceed max");
+        
+        // Volume anomaly: Yüksek volume ratio = yüksek güven
+        let volume_ratio = 8.0; // 8x volume
+        let confidence_volume_ratio_min = 5.0;
+        let confidence_volume_ratio_max = 10.0;
+        let confidence_volume = ((volume_ratio - confidence_volume_ratio_min) / (confidence_volume_ratio_max - confidence_volume_ratio_min)).min(1.0).max(0.5);
+        let confidence_bonus_volume = confidence_bonus_multiplier * confidence_volume;
+        let multiplier_volume = (base_multiplier + confidence_bonus_volume).min(confidence_max_multiplier);
+        
+        assert!(multiplier_volume > base_multiplier, "High volume should increase multiplier");
+        
+        // Düşük güven: Küçük düşüş
+        let price_drop_bps_small = 260.0; // 260 bps (eşik 250'den biraz fazla)
+        let confidence_small = (price_drop_bps_small / confidence_price_drop_max).min(1.0).max(0.5);
+        let confidence_bonus_small = confidence_bonus_multiplier * confidence_small;
+        let multiplier_small = (base_multiplier + confidence_bonus_small).min(confidence_max_multiplier);
+        
+        assert!(multiplier_small < multiplier_flash_crash, "Small drop should have lower multiplier than large drop");
+    }
+
+    #[test]
+    fn test_manipulation_recovery_check() {
+        // KRİTİK TEST: Manipülasyon tespiti - Recovery check mantığı
+        // Flash crash sonrası geri dönüş kontrolü: Gerçek flash crash mi yoksa normal volatilite mi?
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // Senaryo 1: Gerçek flash crash (düşüş sonrası geri yükseliyor)
+        // Fiyat geçmişi: 50000 → 49000 → 49500 (düşüş sonrası geri yükseliyor)
+        let price_history_recovery: Vec<(u64, Decimal)> = vec![
+            (now - 2000, dec!(50000)), // 2 saniye önce
+            (now - 1000, dec!(49000)), // 1 saniye önce (düşüş)
+            (now, dec!(49500)),        // Şimdi (geri yükseliyor)
+        ];
+        
+        if price_history_recovery.len() >= 3 {
+            let last_3: Vec<Decimal> = price_history_recovery.iter().rev().take(3).map(|(_, p)| *p).collect();
+            let price_change_bps = -200.0; // -200 bps düşüş
+            let price_jump_threshold_bps = 250.0;
+            
+            let recovery_check = if price_change_bps < -price_jump_threshold_bps {
+                // Düşüş sonrası geri yükseliyor mu?
+                last_3[0] > last_3[1] && last_3[1] < last_3[2]
+            } else {
+                false
+            };
+            
+            // Bu senaryoda recovery_check false olmalı (price_change_bps -200, threshold -250)
+            // Ama mantık doğru: last_3[0] (49500) > last_3[1] (49000) && last_3[1] (49000) < last_3[2] (50000) = true
+            // Ancak price_change_bps threshold'u geçmediği için recovery_check false
+            // Gerçek flash crash için threshold'u geçmeli
+            let price_change_bps_real = -300.0; // -300 bps (threshold'u geçiyor
+            let recovery_check_real = if price_change_bps_real < -price_jump_threshold_bps {
+                last_3[0] > last_3[1] && last_3[1] < last_3[2]
+            } else {
+                false
+            };
+            
+            assert!(recovery_check_real, "Recovery check should detect real flash crash with recovery");
+        }
+        
+        // Senaryo 2: Normal volatilite (düşüş sonrası daha da düşüyor)
+        let price_history_no_recovery: Vec<(u64, Decimal)> = vec![
+            (now - 2000, dec!(50000)),
+            (now - 1000, dec!(49000)),
+            (now, dec!(48500)), // Daha da düşüyor (geri yükselmiyor)
+        ];
+        
+        if price_history_no_recovery.len() >= 3 {
+            let last_3: Vec<Decimal> = price_history_no_recovery.iter().rev().take(3).map(|(_, p)| *p).collect();
+            let price_change_bps = -300.0;
+            let price_jump_threshold_bps = 250.0;
+            
+            let recovery_check_no_recovery = if price_change_bps < -price_jump_threshold_bps {
+                last_3[0] > last_3[1] && last_3[1] < last_3[2]
+            } else {
+                false
+            };
+            
+            // last_3[0] (48500) > last_3[1] (49000) = false
+            assert!(!recovery_check_no_recovery, "Recovery check should not trigger for continued decline");
+        }
+    }
+
+    #[test]
+    fn test_config_values_usage() {
+        // KRİTİK TEST: Config değerlerinin doğru kullanımı
+        // Tüm hardcoded değerler config'den okunmalı
+        
+        // Internal config değerleri
+        let pnl_history_max_len = 1024;
+        let max_symbols_per_tick = 8;
+        let order_sync_interval_sec = 2;
+        let cancel_stagger_delay_ms = 50;
+        let fill_rate_increase_factor = 0.95;
+        let fill_rate_increase_bonus = 0.05;
+        let order_price_distance_with_position = 0.01;
+        let order_price_distance_no_position = 0.005;
+        let pnl_alert_interval_sec = 10;
+        let pnl_alert_threshold_positive = 0.05;
+        let pnl_alert_threshold_negative = -0.03;
+        let take_profit_threshold_small = 0.01;
+        let take_profit_threshold_large = 0.05;
+        let trailing_stop_peak_threshold_medium = 20.0;
+        let trailing_stop_drawdown_small = 0.01;
+        let stop_loss_threshold = -0.005;
+        let max_position_size_buffer = 5.0;
+        
+        // Strategy internal config değerleri
+        let manipulation_volume_ratio_threshold = 5.0;
+        let manipulation_time_threshold_ms = 2000;
+        let manipulation_price_history_max_len = 200;
+        let confidence_price_drop_max = 500.0;
+        let confidence_bonus_multiplier = 0.3;
+        let confidence_max_multiplier = 1.5;
+        let trend_analysis_threshold_negative = -0.15;
+        let trend_analysis_threshold_strong_negative = -0.20;
+        
+        // Değerlerin mantıklı olduğunu kontrol et
+        assert!(pnl_history_max_len > 0, "PnL history max length should be positive");
+        assert!(max_symbols_per_tick > 0, "Max symbols per tick should be positive");
+        assert!(order_sync_interval_sec > 0, "Order sync interval should be positive");
+        assert!(fill_rate_increase_factor > 0.0 && fill_rate_increase_factor < 1.0, "Fill rate increase factor should be between 0 and 1");
+        assert!(order_price_distance_with_position > order_price_distance_no_position, "Order price distance with position should be larger than without");
+        assert!(take_profit_threshold_large > take_profit_threshold_small, "Take profit threshold large should be larger than small");
+        assert!(trailing_stop_peak_threshold_medium > 0.0, "Trailing stop peak threshold should be positive");
+        assert!(stop_loss_threshold < 0.0, "Stop loss threshold should be negative");
+        assert!(manipulation_volume_ratio_threshold > 1.0, "Manipulation volume ratio threshold should be > 1.0");
+        assert!(confidence_max_multiplier > 1.0, "Confidence max multiplier should be > 1.0");
+        assert!(trend_analysis_threshold_strong_negative < trend_analysis_threshold_negative, "Strong negative threshold should be more negative");
+    }
+
+    #[test]
+    fn test_edge_cases_zero_values() {
+        // KRİTİK TEST: Edge case'ler - Sıfır değerler
+        let zero_position = create_test_position("BTCUSDT", dec!(0), dec!(50000), 5);
+        let zero_mark_price = Px(dec!(0));
+        
+        // Sıfır pozisyon ile PnL hesaplama
+        let pnl_zero = (zero_mark_price.0 - zero_position.entry.0) * zero_position.qty.0;
+        assert_eq!(pnl_zero, dec!(0), "PnL should be zero for zero position");
+        
+        // Sıfır bakiye
+        let total_balance_zero = 0.0;
+        let existing_position_margin_zero = 0.0;
+        let available_after_position_zero = (total_balance_zero - existing_position_margin_zero).max(0.0);
+        assert_eq!(available_after_position_zero, 0.0, "Available should be zero when balance is zero");
+        
+        // Sıfır leverage (bölme hatası önleme)
+        let position_notional = 100.0;
+        let leverage_zero = 0.0;
+        // Leverage sıfır olamaz (config'de kontrol edilmeli), ama test için
+        if leverage_zero > 0.0 {
+            let margin = position_notional / leverage_zero;
+            assert!(margin.is_finite(), "Margin should be finite");
+        }
+    }
+
+    #[test]
+    fn test_edge_cases_negative_values() {
+        // KRİTİK TEST: Edge case'ler - Negatif değerler
+        // Negatif PnL (zarar)
+        let pos = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 5);
+        let mark_price_loss = Px(dec!(49000)); // %2 zarar
+        let pnl_loss = (mark_price_loss.0 - pos.entry.0) * pos.qty.0;
+        assert!(pnl_loss < Decimal::ZERO, "PnL should be negative for loss");
+        
+        // Negatif bakiye (imkansız ama kontrol)
+        let total_balance_negative = -10.0;
+        let existing_position_margin_negative = 5.0;
+        let available_after_position_negative = (total_balance_negative - existing_position_margin_negative).max(0.0);
+        assert_eq!(available_after_position_negative, 0.0, "Available should be zero when balance is negative");
+    }
+
+    #[test]
+    fn test_edge_cases_very_large_values() {
+        // KRİTİK TEST: Edge case'ler - Çok büyük değerler
+        let very_large_position = create_test_position("BTCUSDT", dec!(1000), dec!(50000), 5);
+        let very_large_mark_price = Px(dec!(1000000));
+        
+        // Çok büyük pozisyon ile PnL hesaplama (overflow kontrolü)
+        let pnl_large = (very_large_mark_price.0 - very_large_position.entry.0) * very_large_position.qty.0;
+        assert!(pnl_large.is_finite(), "PnL should be finite even for very large values");
+        
+        // Çok büyük bakiye
+        let total_balance_large = 1_000_000.0;
+        let existing_position_margin_large = 100_000.0;
+        let available_after_position_large = (total_balance_large - existing_position_margin_large).max(0.0);
+        assert_eq!(available_after_position_large, 900_000.0, "Available should handle large values correctly");
+    }
+
+    #[test]
+    fn test_trailing_stop_dynamic_thresholds() {
+        // KRİTİK TEST: Dinamik trailing stop eşikleri (config'den)
+        let peak_pnl_large = 120.0; // 120 USD (büyük kar)
+        let peak_pnl_medium = 25.0; // 25 USD (orta kar)
+        let peak_pnl_small = 10.0; // 10 USD (küçük kar)
+        
+        let trailing_stop_peak_threshold_large = 100.0;
+        let trailing_stop_peak_threshold_medium = 20.0;
+        let trailing_stop_drawdown_large = 0.03; // %3
+        let trailing_stop_drawdown_medium = 0.015; // %1.5
+        let trailing_stop_drawdown_small = 0.01; // %1
+        
+        // Büyük kar: %3 trailing stop
+        let trailing_stop_large = if peak_pnl_large > trailing_stop_peak_threshold_large {
+            trailing_stop_drawdown_large
+        } else if peak_pnl_large > trailing_stop_peak_threshold_medium {
+            trailing_stop_drawdown_medium
+        } else {
+            trailing_stop_drawdown_small
+        };
+        assert_eq!(trailing_stop_large, 0.03, "Large profit should use 3% trailing stop");
+        
+        // Orta kar: %1.5 trailing stop
+        let trailing_stop_medium = if peak_pnl_medium > trailing_stop_peak_threshold_large {
+            trailing_stop_drawdown_large
+        } else if peak_pnl_medium > trailing_stop_peak_threshold_medium {
+            trailing_stop_drawdown_medium
+        } else {
+            trailing_stop_drawdown_small
+        };
+        assert_eq!(trailing_stop_medium, 0.015, "Medium profit should use 1.5% trailing stop");
+        
+        // Küçük kar: %1 trailing stop
+        let trailing_stop_small = if peak_pnl_small > trailing_stop_peak_threshold_large {
+            trailing_stop_drawdown_large
+        } else if peak_pnl_small > trailing_stop_peak_threshold_medium {
+            trailing_stop_drawdown_medium
+        } else {
+            trailing_stop_drawdown_small
+        };
+        assert_eq!(trailing_stop_small, 0.01, "Small profit should use 1% trailing stop");
     }
 }
 

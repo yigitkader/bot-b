@@ -1,346 +1,51 @@
 //location: /crates/app/src/main.rs
+// Main application entry point and trading loop
+
+mod config;
+mod rate_limiter;
+mod trading_loop;
+mod types;
+mod utils;
 
 use anyhow::{anyhow, Result};
 use bot_core::types::*;
+use config::load_config;
 use data::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
 use exec::binance::{BinanceCommon, BinanceFutures, BinanceSpot, SymbolMeta};
 use exec::{decimal_places, Venue};
+use rate_limiter::rate_limit_guard;
 use risk::{RiskAction, RiskLimits};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use strategy::{Context, DynMm, DynMmCfg, Strategy};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use trading_loop::{
+    calculate_effective_leverage, collect_unique_quote_assets, fetch_all_quote_balances,
+    should_close_position, should_process_symbol, update_fill_rate_on_cancel,
+    update_fill_rate_on_fill, VenueType,
+};
+use types::{OrderInfo, SymbolState};
+use utils::{clamp_qty_by_base, clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, is_usd_stable, record_pnl_snapshot};
 
 use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// --- API RATE LIMIT KORUMASI: Binance limitleri ---
-// Spot: 1200 req/min (20 req/sec)
-// Futures: 2400 req/min (40 req/sec)
-// KRİTİK: En güvenli limit kullan (Spot: 20 req/sec)
-// Sliding window rate limiter: Son 1 saniyede kaç request yapıldığını takip et
-use std::sync::Mutex;
-use std::collections::VecDeque;
+// ============================================================================
+// Constants
+// ============================================================================
 
-struct RateLimiter {
-    requests: Mutex<VecDeque<Instant>>,
-    max_requests_per_sec: u32,
-    min_interval_ms: u64,
-}
+/// Default tick interval in milliseconds
+const DEFAULT_TICK_INTERVAL_MS: u64 = 500;
 
-impl RateLimiter {
-    fn new(max_requests_per_sec: u32) -> Self {
-        // Güvenlik için %20 margin ekle (20 req/sec → 16 req/sec kullan)
-        let safe_limit = (max_requests_per_sec as f64 * 0.8) as u32;
-        let min_interval_ms = 1000 / safe_limit as u64;
-        Self {
-            requests: Mutex::new(VecDeque::new()),
-            max_requests_per_sec: safe_limit,
-            min_interval_ms,
-        }
-    }
-    
-    async fn wait_if_needed(&self) {
-        loop {
-            let now = Instant::now();
-            let mut requests = self.requests.lock().unwrap();
-            
-            // Son 1 saniyede yapılan request'leri temizle
-            let one_sec_ago = now.checked_sub(Duration::from_secs(1)).unwrap_or(Instant::now());
-            while requests.front().map_or(false, |&t| t < one_sec_ago) {
-                requests.pop_front();
-            }
-            
-            // Eğer limit aşıldıysa bekle
-            if requests.len() >= self.max_requests_per_sec as usize {
-                if let Some(oldest) = requests.front().copied() {
-                    let wait_time = oldest + Duration::from_secs(1);
-                    if wait_time > now {
-                        let sleep_duration = wait_time.duration_since(now);
-                        drop(requests); // Lock'u bırak
-                        tokio::time::sleep(sleep_duration).await;
-                        continue; // Tekrar kontrol et
-                    }
-                }
-            }
-            
-            // Minimum interval kontrolü (her request arasında minimum bekleme)
-            if let Some(last) = requests.back() {
-                let elapsed = now.duration_since(*last);
-                if elapsed.as_millis() < self.min_interval_ms as u128 {
-                    let wait = Duration::from_millis(self.min_interval_ms).saturating_sub(elapsed);
-                    if wait.as_millis() > 0 {
-                        drop(requests);
-                        tokio::time::sleep(wait).await;
-                        continue; // Tekrar kontrol et
-                    }
-                }
-            }
-            
-            // Request'i kaydet ve çık
-            requests.push_back(now);
-            break;
-        }
-    }
-}
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
-// Global rate limiter (Spot limit kullan - en güvenli)
-use std::sync::OnceLock;
-static RATE_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
-
-fn get_rate_limiter() -> &'static RateLimiter {
-    RATE_LIMITER.get_or_init(|| {
-        RateLimiter::new(20) // Spot: 20 req/sec, güvenlik için 16 req/sec kullan
-    })
-}
-
-async fn rate_limit_guard() {
-    get_rate_limiter().wait_if_needed().await;
-}
-
-struct SymbolState {
-    meta: SymbolMeta,
-    inv: Qty,
-    strategy: Box<dyn Strategy>,
-    active_orders: HashMap<String, OrderInfo>,
-    pnl_history: Vec<Decimal>,
-    // --- eklendi: min notional öğrenme ve devre dışı bırakma ---
-    min_notional_req: Option<f64>, // borsa min notional (quote cinsinden)
-    disabled: bool,                // min_notional > max_usd_per_order => kalıcı disable
-    // --- PER-SYMBOL METADATA: Exchange'den çekilen tick_size ve step_size ---
-    symbol_rules: Option<std::sync::Arc<exec::binance::SymbolRules>>, // Per-symbol metadata (fallback: global cfg)
-    // --- AKILLI TAKİP: Pozisyon ve emir durumu analizi ---
-    last_position_check: Option<Instant>, // Son pozisyon kontrol zamanı
-    last_order_sync: Option<Instant>,     // Son emir senkronizasyon zamanı
-    order_fill_rate: f64,                 // Emir fill oranı (0.0-1.0)
-    consecutive_no_fills: u32,            // Ardışık fill olmayan tick sayısı
-    // --- AKILLI POZİSYON YÖNETİMİ: Zeka bazlı karar verme ---
-    position_entry_time: Option<Instant>,  // Pozisyon açılış zamanı
-    peak_pnl: Decimal,                     // En yüksek PnL (kar al için)
-    position_hold_duration_ms: u64,        // Pozisyon tutma süresi (ms)
-    last_order_price_update: HashMap<String, Px>, // Son emir fiyat güncellemesi (fiyat değişikliği kontrolü için)
-    // --- GELİŞMİŞ RİSK VE KAZANÇ TAKİBİ: Detaylı analiz ---
-    daily_pnl: Decimal,                    // Günlük PnL (reset edilebilir)
-    total_funding_cost: Decimal,           // Toplam funding maliyeti (futures)
-    position_size_notional_history: Vec<f64>, // Pozisyon boyutu geçmişi (risk analizi için)
-    last_pnl_alert: Option<Instant>,       // Son PnL uyarısı zamanı (spam önleme)
-    cumulative_pnl: Decimal,               // Kümülatif PnL (bot başlangıcından beri)
-}
-
-#[derive(Clone, Debug)]
-struct OrderInfo {
-    order_id: String,
-    side: Side,
-    price: Px,
-    qty: Qty,
-    created_at: Instant,
-}
-
-fn compute_drawdown_bps(history: &[Decimal]) -> i64 {
-    if history.is_empty() {
-        return 0;
-    }
-    let mut peak = history[0];
-    let mut max_drawdown = Decimal::ZERO;
-    for value in history {
-        if *value > peak {
-            peak = *value;
-        }
-        if peak > Decimal::ZERO {
-            let drawdown = ((*value - peak) / peak) * Decimal::from(10_000i32);
-            if drawdown < max_drawdown {
-                max_drawdown = drawdown;
-            }
-        }
-    }
-    max_drawdown.to_i64().unwrap_or(0)
-}
-
-const PNL_HISTORY_MAX_LEN: usize = 1_024;
-
-fn record_pnl_snapshot(history: &mut Vec<Decimal>, pos: &Position, mark_px: Px) {
-    let pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
-    let mut equity = Decimal::ONE + pnl;
-    if equity <= Decimal::ZERO {
-        // Keep the history strictly positive so drawdown math remains stable.
-        equity = Decimal::new(1, 4);
-    }
-    history.push(equity);
-    if history.len() > PNL_HISTORY_MAX_LEN {
-        let excess = history.len() - PNL_HISTORY_MAX_LEN;
-        history.drain(0..excess);
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct RiskCfg {
-    inv_cap: String,
-    min_liq_gap_bps: f64,
-    dd_limit_bps: i64,
-    max_leverage: u32,
-}
-
-#[derive(Debug, Deserialize)]
-struct StratCfg {
-    r#type: String,
-    a: f64,
-    b: f64,
-    base_size: String,
-    #[serde(default)]
-    inv_cap: Option<String>,
-    // --- Spread ve Fiyatlama Eşikleri ---
-    #[serde(default)]
-    min_spread_bps: Option<f64>,
-    #[serde(default)]
-    max_spread_bps: Option<f64>,
-    #[serde(default)]
-    spread_arbitrage_min_bps: Option<f64>,
-    #[serde(default)]
-    spread_arbitrage_max_bps: Option<f64>,
-    // --- Trend Takibi Eşikleri ---
-    #[serde(default)]
-    strong_trend_bps: Option<f64>,
-    #[serde(default)]
-    momentum_strong_bps: Option<f64>,
-    #[serde(default)]
-    trend_bias_multiplier: Option<f64>,
-    // --- Adverse Selection Eşikleri ---
-    #[serde(default)]
-    adverse_selection_threshold_on: Option<f64>,
-    #[serde(default)]
-    adverse_selection_threshold_off: Option<f64>,
-    // --- Fırsat Modu Eşikleri ---
-    #[serde(default)]
-    opportunity_threshold_on: Option<f64>,
-    #[serde(default)]
-    opportunity_threshold_off: Option<f64>,
-    // --- Manipülasyon Tespit Eşikleri ---
-    #[serde(default)]
-    price_jump_threshold_bps: Option<f64>,
-    #[serde(default)]
-    fake_breakout_threshold_bps: Option<f64>,
-    #[serde(default)]
-    liquidity_drop_threshold: Option<f64>,
-    // --- Envanter Yönetimi ---
-    #[serde(default)]
-    inventory_threshold_ratio: Option<f64>,
-    // --- Adaptif Spread Katsayıları ---
-    #[serde(default)]
-    volatility_coefficient: Option<f64>,
-    #[serde(default)]
-    ofi_coefficient: Option<f64>,
-    // --- Diğer ---
-    #[serde(default)]
-    min_liquidity_required: Option<f64>,
-    #[serde(default)]
-    opportunity_size_multiplier: Option<f64>,
-    #[serde(default)]
-    strong_trend_multiplier: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ExecCfg {
-    tif: String,
-    venue: String,
-    #[serde(default = "default_cancel_interval")]
-    cancel_replace_interval_ms: u64,
-    #[serde(default = "default_max_order_age")]
-    max_order_age_ms: u64,
-}
-
-fn default_cancel_interval() -> u64 {
-    1_000
-}
-
-fn default_max_order_age() -> u64 {
-    10_000
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct WebsocketCfg {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default = "default_ws_reconnect_delay")]
-    reconnect_delay_ms: u64,
-    #[serde(default = "default_ws_ping_interval")]
-    ping_interval_ms: u64,
-}
-
-fn default_ws_reconnect_delay() -> u64 {
-    5_000
-}
-
-fn default_ws_ping_interval() -> u64 {
-    30_000
-}
-
-#[derive(Debug, Deserialize)]
-struct BinanceCfg {
-    spot_base: String,
-    futures_base: String,
-    api_key: String,
-    secret_key: String,
-    recv_window_ms: u64,
-}
-
-fn default_quote_asset() -> String {
-    "USDC".to_string()
-}
-
-fn default_min_quote_balance_usd() -> f64 {
-    1.0 // Default: 1 USD minimum quote asset balance
-}
-
-#[derive(Debug, Deserialize)]
-struct AppCfg {
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    symbols: Vec<String>,
-    #[serde(default, alias = "auto_discover_usdt")]
-    auto_discover_quote: bool,
-    #[serde(default = "default_quote_asset")]
-    quote_asset: String,
-    mode: String,
-    metrics_port: Option<u16>,
-    max_usd_per_order: f64,
-    #[serde(default)]
-    min_usd_per_order: Option<f64>,
-    #[serde(default = "default_min_quote_balance_usd")]
-    min_quote_balance_usd: f64, // Quote asset minimum bakiye eşiği (USD)
-    leverage: Option<u32>,
-    price_tick: f64,
-    qty_step: f64,
-    binance: BinanceCfg,
-    risk: RiskCfg,
-    strategy: StratCfg,
-    exec: ExecCfg,
-    #[serde(default)]
-    websocket: WebsocketCfg,
-}
-
-fn load_cfg() -> Result<AppCfg> {
-    let args: Vec<String> = std::env::args().collect();
-    let path = args
-        .windows(2)
-        .find_map(|w| {
-            if w[0] == "--config" {
-                Some(w[1].clone())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "./config.yaml".to_string());
-    let s = std::fs::read_to_string(&path)?;
-    let cfg: AppCfg = serde_yaml::from_str(&s)?;
-    Ok(cfg)
-}
-
+/// Convert TIF string from config to Tif enum
 fn tif_from_cfg(s: &str) -> Tif {
     match s.to_lowercase().as_str() {
         "gtc" => Tif::Gtc,
@@ -350,63 +55,7 @@ fn tif_from_cfg(s: &str) -> Tif {
     }
 }
 
-/// Per-symbol step_size kullanır, yoksa fallback olarak global qty_step kullanır
-fn get_qty_step(symbol_rules: Option<&std::sync::Arc<exec::binance::SymbolRules>>, fallback: f64) -> f64 {
-    symbol_rules
-        .map(|r| r.step_size.to_f64().unwrap_or(fallback))
-        .unwrap_or(fallback)
-}
 
-/// Per-symbol tick_size kullanır, yoksa fallback olarak global price_tick kullanır
-fn get_price_tick(symbol_rules: Option<&std::sync::Arc<exec::binance::SymbolRules>>, fallback: f64) -> f64 {
-    symbol_rules
-        .map(|r| r.tick_size.to_f64().unwrap_or(fallback))
-        .unwrap_or(fallback)
-}
-
-fn clamp_qty_by_usd(qty: Qty, px: Px, max_usd: f64, qty_step: f64) -> Qty {
-    let p = px.0.to_f64().unwrap_or(0.0);
-    if p <= 0.0 || max_usd <= 0.0 {
-        return Qty(Decimal::ZERO);
-    }
-    let max_qty = (max_usd / p).floor_div_step(qty_step);
-    let wanted = qty.0.to_f64().unwrap_or(0.0);
-    let q = wanted.min(max_qty);
-    Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
-}
-
-fn clamp_qty_by_base(qty: Qty, max_base: f64, qty_step: f64) -> Qty {
-    if max_base <= 0.0 {
-        return Qty(Decimal::ZERO);
-    }
-    let max_qty = max_base.floor_div_step(qty_step);
-    let wanted = qty.0.to_f64().unwrap_or(0.0);
-    let q = wanted.min(max_qty);
-    Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
-}
-
-// küçük helper: floor step
-trait FloorStep {
-    fn floor_div_step(self, step: f64) -> f64;
-}
-impl FloorStep for f64 {
-    fn floor_div_step(self, step: f64) -> f64 {
-        if step <= 0.0 {
-            return self;
-        }
-        (self / step).floor() * step
-    }
-}
-
-/// USD-family stablecoin kontrolü (quote eşleştirme için)
-/// Bot USDT, USDC, USD ve diğer USD-stablecoin'leri destekler
-/// Her sembol kendi quote asset'ini kullanır (ADAUSDT → USDT, ADAUSDC → USDC)
-fn is_usd_stable(asset: &str) -> bool {
-    matches!(
-        asset.to_uppercase().as_str(),
-        "USD" | "USDT" | "USDC" | "BUSD" | "TUSD" | "FDUSD" | "USDA"
-    )
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -417,7 +66,7 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let cfg = load_cfg()?;
+    let cfg = load_config()?;
     if cfg.price_tick <= 0.0 {
         return Err(anyhow!("price_tick must be positive"));
     }
@@ -479,6 +128,21 @@ async fn main() -> Result<()> {
         min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
         opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(2.0), // 5.0 → 2.0: daha güvenli
         strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.5), // 3.0 → 1.5: daha güvenli
+        // Strategy internal config (config.yaml'den strategy_internal bölümünden)
+        manipulation_volume_ratio_threshold: Some(cfg.strategy_internal.manipulation_volume_ratio_threshold),
+        manipulation_time_threshold_ms: Some(cfg.strategy_internal.manipulation_time_threshold_ms),
+        manipulation_price_history_min_len: Some(cfg.strategy_internal.manipulation_price_history_min_len),
+        manipulation_price_history_max_len: Some(cfg.strategy_internal.manipulation_price_history_max_len),
+        confidence_price_drop_max: Some(cfg.strategy_internal.confidence_price_drop_max),
+        confidence_volume_ratio_min: Some(cfg.strategy_internal.confidence_volume_ratio_min),
+        confidence_volume_ratio_max: Some(cfg.strategy_internal.confidence_volume_ratio_max),
+        confidence_spread_min: Some(cfg.strategy_internal.confidence_spread_min),
+        confidence_spread_max: Some(cfg.strategy_internal.confidence_spread_max),
+        confidence_bonus_multiplier: Some(cfg.strategy_internal.confidence_bonus_multiplier),
+        confidence_max_multiplier: Some(cfg.strategy_internal.confidence_max_multiplier),
+        trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
+        trend_analysis_threshold_negative: Some(cfg.strategy_internal.trend_analysis_threshold_negative),
+        trend_analysis_threshold_strong_negative: Some(cfg.strategy_internal.trend_analysis_threshold_strong_negative),
     };
     let mode_lower = cfg.mode.to_lowercase();
     let strategy_name = cfg.strategy.r#type.clone();
@@ -720,133 +384,13 @@ async fn main() -> Result<()> {
             "filtered symbols by quote asset balance"
         );
         
-        // AKILLI SEÇİM: Hangi USD-stable asset'te daha fazla para varsa onu önceliklendir
-        // Not: Yetersiz bakiye olan quote asset'ler zaten filtrelenmiş durumda
-        if want_group && mode_lower == "futures" {
-            if let V::Fut(_) = &venue {
-                // USDT ve USDC bakiyelerini kontrol et (zaten quote_asset_balances'da var)
-                let usdt_bal = quote_asset_balances.get("USDT").copied().unwrap_or(0.0);
-                let usdc_bal = quote_asset_balances.get("USDC").copied().unwrap_or(0.0);
-                
-                // Hangi asset'te daha fazla para varsa, o asset'in sembollerini önceliklendir
-                // (Her iki asset de zaten yeterli bakiyeye sahip, çünkü filtrelenmiş)
-                if usdt_bal >= cfg.min_quote_balance_usd && usdt_bal > usdc_bal {
-                    // USDT öncelikli
-                    auto.sort_by(|a, b| {
-                        let a_usdt = a.quote_asset.eq_ignore_ascii_case("USDT");
-                        let b_usdt = b.quote_asset.eq_ignore_ascii_case("USDT");
-                        match (a_usdt, b_usdt) {
-                            (true, false) => std::cmp::Ordering::Less, // USDT önce
-                            (false, true) => std::cmp::Ordering::Greater, // USDT önce
-                            _ => a.symbol.cmp(&b.symbol),
-                        }
-                    });
-                    info!(
-                        count = auto.len(),
-                        quote_asset = %cfg.quote_asset,
-                        usdt_balance = usdt_bal,
-                        usdc_balance = usdc_bal,
-                        "auto-discovered symbols: USDT prioritized (more balance)"
-                    );
-                } else if usdc_bal >= cfg.min_quote_balance_usd && usdc_bal > usdt_bal {
-                    // USDC öncelikli
-                    auto.sort_by(|a, b| {
-                        let a_usdc = a.quote_asset.eq_ignore_ascii_case("USDC");
-                        let b_usdc = b.quote_asset.eq_ignore_ascii_case("USDC");
-                        match (a_usdc, b_usdc) {
-                            (true, false) => std::cmp::Ordering::Less, // USDC önce
-                            (false, true) => std::cmp::Ordering::Greater, // USDC önce
-                            _ => a.symbol.cmp(&b.symbol),
-                        }
-                    });
-                    info!(
-                        count = auto.len(),
-                        quote_asset = %cfg.quote_asset,
-                        usdt_balance = usdt_bal,
-                        usdc_balance = usdc_bal,
-                        "auto-discovered symbols: USDC prioritized (more balance)"
-                    );
-                } else {
-                    // Eşit veya ikisi de yetersiz, alfabetik sırala
-                    auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-                    info!(
-                        count = auto.len(),
-                        quote_asset = %cfg.quote_asset,
-                        usdt_balance = usdt_bal,
-                        usdc_balance = usdc_bal,
-                        "auto-discovered symbols: equal balance or insufficient, alphabetical order"
-                    );
-                }
-            } else {
-                // Spot için de aynı önceliklendirme mantığı
-                if want_group {
-                    // USDT ve USDC bakiyelerini kontrol et (zaten quote_asset_balances'da var)
-                    let usdt_bal = quote_asset_balances.get("USDT").copied().unwrap_or(0.0);
-                    let usdc_bal = quote_asset_balances.get("USDC").copied().unwrap_or(0.0);
-                    
-                    if usdt_bal >= cfg.min_quote_balance_usd && usdt_bal > usdc_bal {
-                        auto.sort_by(|a, b| {
-                            let a_usdt = a.quote_asset.eq_ignore_ascii_case("USDT");
-                            let b_usdt = b.quote_asset.eq_ignore_ascii_case("USDT");
-                            match (a_usdt, b_usdt) {
-                                (true, false) => std::cmp::Ordering::Less,
-                                (false, true) => std::cmp::Ordering::Greater,
-                                _ => a.symbol.cmp(&b.symbol),
-                            }
-                        });
-                        info!(
-                            count = auto.len(),
-                            quote_asset = %cfg.quote_asset,
-                            usdt_balance = usdt_bal,
-                            usdc_balance = usdc_bal,
-                            "auto-discovered symbols (spot): USDT prioritized (more balance)"
-                        );
-                    } else if usdc_bal >= cfg.min_quote_balance_usd && usdc_bal > usdt_bal {
-                        auto.sort_by(|a, b| {
-                            let a_usdc = a.quote_asset.eq_ignore_ascii_case("USDC");
-                            let b_usdc = b.quote_asset.eq_ignore_ascii_case("USDC");
-                            match (a_usdc, b_usdc) {
-                                (true, false) => std::cmp::Ordering::Less,
-                                (false, true) => std::cmp::Ordering::Greater,
-                                _ => a.symbol.cmp(&b.symbol),
-                            }
-                        });
-                        info!(
-                            count = auto.len(),
-                            quote_asset = %cfg.quote_asset,
-                            usdt_balance = usdt_bal,
-                            usdc_balance = usdc_bal,
-                            "auto-discovered symbols (spot): USDC prioritized (more balance)"
-                        );
-                    } else {
-                        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-                        info!(
-                            count = auto.len(),
-                            quote_asset = %cfg.quote_asset,
-                            usdt_balance = usdt_bal,
-                            usdc_balance = usdc_bal,
-                            "auto-discovered symbols (spot): equal balance or insufficient, alphabetical order"
-                        );
-                    }
-                } else {
-                    auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-                    info!(
-                        count = auto.len(),
-                        quote_asset = %cfg.quote_asset,
-                        grouped = want_group,
-                        "auto-discovered symbols for quote asset (group-aware)"
-                    );
-                }
-            }
-        } else {
-            auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-            info!(
-                count = auto.len(),
-                quote_asset = %cfg.quote_asset,
-                grouped = want_group,
-                "auto-discovered symbols for quote asset (group-aware)"
-            );
-        }
+        // USDC ve USDT eşit muamele görmeli - alfabetik sırala
+        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        info!(
+            count = auto.len(),
+            quote_asset = %cfg.quote_asset,
+            "auto-discovered symbols"
+        );
         selected = auto;
     }
 
@@ -1154,9 +698,8 @@ async fn main() -> Result<()> {
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 UserEvent::Heartbeat => {
-                    // Reconnect sonrası sync trigger (WebSocket reconnect'ten sonra gönderilir)
                     force_sync_all = true;
-                    info!("WebSocket reconnect detected, will sync all symbols on next tick");
+                    info!("websocket reconnect detected, will sync all symbols");
                 }
                 UserEvent::OrderFill {
                     symbol,
@@ -1175,12 +718,11 @@ async fn main() -> Result<()> {
                         }
                         state.inv = Qty(inv);
                         state.active_orders.remove(&order_id);
-                        
-                        // AKILLI TAKİP: Fill oranını güncelle
-                        state.consecutive_no_fills = 0; // Fill oldu, sıfırla
-                        // Fill oranı: Son 20 tick'te fill olan emir sayısı / toplam emir sayısı
-                        // Basit yaklaşım: Her fill'de artır, her tick'te azalt
-                        state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                        update_fill_rate_on_fill(
+                            state,
+                            cfg.internal.fill_rate_increase_factor,
+                            cfg.internal.fill_rate_increase_bonus,
+                        );
                         
                         info!(
                             %symbol,
@@ -1197,9 +739,7 @@ async fn main() -> Result<()> {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         let state = &mut states[*idx];
                         state.active_orders.remove(&order_id);
-                        
-                        // AKILLI TAKİP: Cancel oldu, fill oranını düşür
-                        state.order_fill_rate = (state.order_fill_rate * 0.98).max(0.0);
+                        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
                         
                         info!(
                             %symbol,
@@ -1212,21 +752,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Ana trading loop: Her sembol için işlem yap
-        // PERFORMANS: 571 sembol sıralı işlenirse çok uzun sürer, bu yüzden progress log ekliyoruz
-        // NOT: effective_leverage config'den geliyor ve değişmiyor, bu yüzden loop başında hesaplamak mantıklı
-        // Ama pozisyon, fiyat, funding rate gibi saniyelik değişen veriler her tick'te alınıyor (cache yok)
-        let effective_leverage = cfg.leverage.unwrap_or(cfg.risk.max_leverage).max(1) as f64;
-        let effective_leverage_ask = effective_leverage; // Aynı değer, tekrar hesaplamaya gerek yok
+        let effective_leverage = calculate_effective_leverage(cfg.leverage, cfg.risk.max_leverage);
+        let effective_leverage_ask = effective_leverage;
         
-        // --- KRİTİK DÜZELTME: Bakiye kontrolü race condition'ını önle ---
-        // Loop başında tüm unique quote asset'leri topla ve bakiyelerini bir kere çek
-        let mut unique_quote_assets: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for state in states.iter() {
-            unique_quote_assets.insert(state.meta.quote_asset.clone());
-        }
+        let unique_quote_assets: std::collections::HashSet<String> = states
+            .iter()
+            .map(|s| s.meta.quote_asset.clone())
+            .collect();
         
-        // Her unique quote asset için bakiyeyi bir kere çek ve cache'e al
         let mut quote_balances: HashMap<String, f64> = HashMap::new();
         for quote_asset in &unique_quote_assets {
             rate_limit_guard().await;
@@ -1254,20 +787,15 @@ async fn main() -> Result<()> {
         let total_symbols = states.len();
         let mut symbol_index = 0;
         
-        // KRİTİK DÜZELTME: Rate limit koruması - Her tick'te maksimum sembol sayısı + önceliklendirme
-        // 16 req/sec limit ile: Her tick'te max 8 sembol işle (güvenli margin)
-        // 500ms tick interval: 8 sembol/tick = 16 sembol/saniye = güvenli
-        const MAX_SYMBOLS_PER_TICK: usize = 8;
+        let max_symbols_per_tick = cfg.internal.max_symbols_per_tick;
         let mut symbols_processed_this_tick = 0;
         
-        // KRİTİK DÜZELTME: Sembol önceliklendirme - Aktif pozisyon/emir olanlar önce
-        // Round-robin offset: Her tick'te farklı sembollerden başla (adil dağılım)
         use std::sync::atomic::{AtomicUsize, Ordering};
         static ROUND_ROBIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
         let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % states.len().max(1);
         
-        // Önceliklendirme: Aktif emir/pozisyon olanlar önce
-        let mut states_with_priority: Vec<(usize, bool)> = states.iter()
+        let mut states_with_priority: Vec<(usize, bool)> = states
+            .iter()
             .enumerate()
             .map(|(idx, state)| {
                 let has_priority = !state.active_orders.is_empty() || !state.inv.0.is_zero();
@@ -1275,10 +803,8 @@ async fn main() -> Result<()> {
             })
             .collect();
         
-        // Öncelikli olanları öne al
-        states_with_priority.sort_by(|a, b| b.1.cmp(&a.1)); // true (öncelikli) önce
+        states_with_priority.sort_by(|a, b| b.1.cmp(&a.1));
         
-        // Round-robin: Offset'ten başla
         let prioritized_indices: Vec<usize> = states_with_priority
             .iter()
             .map(|(idx, _)| *idx)
@@ -1291,7 +817,7 @@ async fn main() -> Result<()> {
             let state = &mut states[state_idx];
             
             // Rate limit koruması: Her tick'te maksimum sembol sayısı
-            if symbols_processed_this_tick >= MAX_SYMBOLS_PER_TICK {
+            if symbols_processed_this_tick >= max_symbols_per_tick {
                 // Bu tick'te yeterli sembol işlendi, kalan semboller bir sonraki tick'te işlenecek
                 skipped_count += 1;
                 continue;
@@ -1322,7 +848,7 @@ async fn main() -> Result<()> {
             // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
             // KRİTİK DÜZELTME: Cache'den oku (race condition önlendi)
             // DEBUG: İlk birkaç sembol için detaylı log
-            let is_debug_symbol = symbol_index <= 5 || symbol == "BTCUSDT" || symbol == "ETHUSDT" || symbol == "BNBUSDT";
+            let is_debug_symbol = symbol_index <= 5;
             
             // Cache'den bakiye oku (loop başında çekildi)
             let q_free = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
@@ -1423,19 +949,11 @@ async fn main() -> Result<()> {
             processed_count += 1;
             symbols_processed_this_tick += 1;
 
-            // --- AKILLI EMİR SENKRONİZASYONU: API'den gerçek durumu kontrol et ---
-            // ÖNEMLİ: Saniyelik değişimler olduğu için her tick'te kontrol etmeliyiz
-            // Ama rate limit koruması için minimum 2 saniye bekle (çok sık API çağrısı yapma)
-            // WebSocket zaten real-time güncellemeleri sağlıyor, API sadece doğrulama için
-            // KRİTİK DÜZELTME: Reconnect sonrası tüm semboller için HEMEN sync yap
-            // force_sync_all true ise hemen sync yap (reconnect sonrası), normal durumda 2 saniyede bir
-            let should_sync_orders = if force_sync_all {
-                true // Reconnect sonrası hemen sync - tüm semboller için
-            } else {
-                state.last_order_sync
-                    .map(|last| last.elapsed().as_secs() >= 2) // Her 2 saniyede bir senkronize et (rate limit koruması + hızlı güncelleme)
-                    .unwrap_or(true) // İlk çalıştırmada mutlaka senkronize et
-            };
+            let should_sync_orders = trading_loop::should_sync_orders(
+                force_sync_all,
+                state.last_order_sync,
+                cfg.internal.order_sync_interval_sec,
+            );
             if should_sync_orders {
                 // API Rate Limit koruması
                 rate_limit_guard().await;
@@ -1467,7 +985,7 @@ async fn main() -> Result<()> {
                             // KRİTİK DÜZELTME: Fill olan emirler varsa consecutive_no_fills sıfırla
                             state.consecutive_no_fills = 0;
                             // Fill oranını artır
-                            state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05 * (removed_count as f64).min(1.0)).min(1.0);
+                            state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_increase_factor + cfg.internal.fill_rate_increase_bonus * (removed_count as f64).min(1.0)).min(1.0);
                             info!(
                                 %symbol,
                                 removed_orders = removed_count,
@@ -1733,9 +1251,9 @@ async fn main() -> Result<()> {
                     // Akıllı karar: Emir çok uzakta mı?
                     // Pozisyon varsa daha toleranslı ol (pozisyon kapatmak için emir gerekebilir)
                     let max_distance_pct = if position_size_notional > 0.0 {
-                        0.01 // %1 (pozisyon varsa daha toleranslı)
+                        cfg.internal.order_price_distance_with_position // Config'den: %1 (pozisyon varsa daha toleranslı)
                     } else {
-                        0.005 // %0.5 (pozisyon yoksa daha sıkı)
+                        cfg.internal.order_price_distance_no_position // Config'den: %0.5 (pozisyon yoksa daha sıkı)
                     };
                     let should_cancel_far = market_distance_pct.abs() > max_distance_pct;
                     
@@ -1758,7 +1276,7 @@ async fn main() -> Result<()> {
                             } else {
                                 Decimal::ZERO
                             };
-                            price_diff_pct > Decimal::new(1, 4) // %0.01'den fazla değişmiş
+                            price_diff_pct > Decimal::from_f64_retain(cfg.internal.order_price_change_threshold).unwrap_or(Decimal::new(1, 4)) // Config'den: %0.01'den fazla değişmiş
                         })
                         .unwrap_or(true); // İlk kez görülüyorsa güncelle
                     
@@ -1789,7 +1307,7 @@ async fn main() -> Result<()> {
                 }
                 
                 // İptal edilecek emirleri iptal et (STAGGER: Her iptal arasında kısa gecikme)
-                let stagger_delay_ms = 50; // Her iptal arasında 50ms bekle
+                let stagger_delay_ms = cfg.internal.cancel_stagger_delay_ms; // Config'den: Her iptal arasında bekleme süresi
                 for (idx, order_id) in orders_to_cancel.iter().enumerate() {
                     if idx > 0 {
                         // İlk iptal hariç, her iptal arasında bekle (stagger)
@@ -1835,7 +1353,8 @@ async fn main() -> Result<()> {
             // Reconnect sonrası sadece emirleri değil, pozisyonları da sync et
             // force_sync_all true ise TAM sync yap (reconnect sonrası)
             let inv_diff = (state.inv.0 - pos.qty.0).abs();
-            let reconcile_threshold = Decimal::new(1, 8);
+            let reconcile_threshold = Decimal::from_str_radix(&cfg.internal.inventory_reconcile_threshold, 10)
+                .unwrap_or(Decimal::new(1, 8));
             let is_reconnect_sync = force_sync_all;
             
             // Reconnect sonrası veya normal durumda uyumsuzluk varsa sync yap
@@ -1863,7 +1382,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px);
+            record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px, cfg.internal.pnl_history_max_len);
             
             // --- AKILLI POZİSYON ANALİZİ: Durumu detaylı incele ---
             let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
@@ -1887,7 +1406,7 @@ async fn main() -> Result<()> {
             
             // 3. Pozisyon boyutu geçmişi (risk analizi için)
             state.position_size_notional_history.push(position_size_notional);
-            if state.position_size_notional_history.len() > 100 {
+            if state.position_size_notional_history.len() > cfg.internal.position_size_history_max_len {
                 state.position_size_notional_history.remove(0);
             }
             
@@ -1895,7 +1414,7 @@ async fn main() -> Result<()> {
             state.cumulative_pnl = current_pnl; // Şimdilik current, ileride gerçek kümülatif hesaplanabilir
             
             // 5. Pozisyon boyutu risk kontrolü: Çok büyük pozisyonlar riskli
-            let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * 5.0; // 5x buffer
+            let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer; // Config'den: Buffer multiplier
             if position_size_notional > max_position_size_usd {
                 warn!(
                     %symbol,
@@ -1926,10 +1445,10 @@ async fn main() -> Result<()> {
             
             // 6. Real-time PnL alerts: Kritik seviyelerde uyarı
             // ÖNEMLİ: PnL her tick'te kontrol ediliyor, sadece alert spam'ini önle
-            let pnl_alert_threshold_positive = 0.05; // %5 kar
-            let pnl_alert_threshold_negative = -0.03; // %3 zarar
+            let pnl_alert_threshold_positive = cfg.internal.pnl_alert_threshold_positive; // Config'den: %5 kar
+            let pnl_alert_threshold_negative = cfg.internal.pnl_alert_threshold_negative; // Config'den: %3 zarar
             let should_alert = state.last_pnl_alert
-                .map(|last| last.elapsed().as_secs() >= 10) // Her 10 saniyede bir alert (spam önleme, ama hızlı tepki)
+                .map(|last| last.elapsed().as_secs() >= cfg.internal.pnl_alert_interval_sec) // Config'den: Alert interval
                 .unwrap_or(true);
             
             if should_alert {
@@ -1967,7 +1486,9 @@ async fn main() -> Result<()> {
             }
             
             // Pozisyon tutma süresi takibi
-            if pos.qty.0.abs() > Decimal::new(1, 8) {
+            let position_qty_threshold = Decimal::from_str_radix(&cfg.internal.position_qty_threshold, 10)
+                .unwrap_or(Decimal::new(1, 8));
+            if pos.qty.0.abs() > position_qty_threshold {
                 // Pozisyon var
                 if state.position_entry_time.is_none() {
                     state.position_entry_time = Some(Instant::now());
@@ -2013,93 +1534,23 @@ async fn main() -> Result<()> {
                 
                 // Kar al mantığı: Daha büyük kazançlar için optimize edildi
                 // Küçük kazançlar için erken kar alma, büyük kazançlar için daha uzun tut
-                let take_profit_threshold_small = 0.01; // %1 kar (küçük pozisyonlar için)
-                let take_profit_threshold_large = 0.05; // %5 kar (büyük pozisyonlar/fırsat modu için)
-                
-                // Pozisyon boyutuna göre eşik seç
-                let is_large_position = position_size_notional > 200.0; // 200 USD'den büyük = büyük pozisyon
-                let take_profit_threshold = if is_large_position {
-                    take_profit_threshold_large // Büyük pozisyonlar için daha yüksek eşik
-                } else {
-                    take_profit_threshold_small // Küçük pozisyonlar için düşük eşik
-                };
-                
-                let should_take_profit = if price_change_pct >= take_profit_threshold {
-                    // Kar var, trend analizi yap
-                    if pnl_trend < -0.15 {
-                        // Trend tersine dönüyor (%15'ten fazla), kar al
-                        true
-                    } else if state.position_hold_duration_ms > 600_000 && price_change_pct < 0.10 {
-                        // 10 dakikadan fazla tutuldu ve %10'dan az kar varsa, kısmi kar al
-                        true
-                    } else if price_change_pct >= 0.10 {
-                        // %10+ kar varsa, trend hala iyiyse tut (daha büyük kazançlar için)
-                        // Sadece trend çok kötüyse kar al
-                        pnl_trend < -0.20
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                
-                // Dinamik trailing stop: Peak'ten düşerse kapat, kar büyüdükçe genişlet
-                // KRİTİK DÜZELTME: Daha sıkı trailing stop (fill rate artır)
                 let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
                 let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
-                let should_trailing_stop = if peak_pnl_f64 > 0.0 && current_pnl_f64 < peak_pnl_f64 {
-                    let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
-                    // Dinamik trailing stop: Kar büyüdükçe genişlet (daha sıkı eşikler)
-                    let trailing_stop = if peak_pnl_f64 > 100.0 {
-                        0.03 // %3 (büyük karlar için, 0.05 → 0.03)
-                    } else if peak_pnl_f64 > 20.0 {
-                        0.015 // %1.5 (orta karlar için, 0.03 → 0.015)
-                    } else {
-                        0.01 // %1 (küçük karlar için, 0.02 → 0.01)
-                    };
-                    drawdown_from_peak >= trailing_stop
-                } else {
-                    false
-                };
                 
-                // Peak PnL güncelle
                 if current_pnl_f64 > peak_pnl_f64 {
                     state.peak_pnl = current_pnl;
                 }
                 
-                // Zarar durdur: %0.5'den fazla zarar varsa ve trend kötüleşiyorsa kapat
-                // KRİTİK DÜZELTME: Daha sıkı zarar durdurma (-0.01 → -0.005)
-                let stop_loss_threshold = -0.005; // %0.5 zarar (daha erken kes)
-                let should_stop_loss = if price_change_pct <= stop_loss_threshold {
-                    // Zarar var, trend analizi yap
-                    // KRİTİK DÜZELTME: 10 dakika → 2 dakika (600_000 → 120_000)
-                    if pnl_trend < -0.2 || state.position_hold_duration_ms > 120_000 {
-                        // Trend kötüleşiyor veya 2 dakikadan fazla zararda, kapat
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                
-                // KRİTİK DÜZELTME: Trailing stop ve take profit çakışması - Öncelik sırası
-                // Önce trailing stop (20 USD+ karlardayken), sonra take profit/stop loss
-                // Trailing stop peak'ten %1-3 düşerse tetikleniyor, take profit %5+ kar istiyor
-                // Çakışma: %4 kardayken %1 trailing stop tetiklenebilir (erken kapanış) → Öncelik trailing stop
-                let (should_close, reason) = if should_trailing_stop && peak_pnl_f64 > 20.0 {
-                    // Trailing stop (sadece 20 USD+ karlardayken, erken kapanış önle)
-                    (true, "trailing_stop")
-                } else if should_take_profit {
-                    // Take profit (trailing stop tetiklenmediyse)
-                    (true, "take_profit")
-                } else if should_stop_loss {
-                    // Stop loss (en son, zarar durdurma)
-                    (true, "stop_loss")
-                } else {
-                    // Pozisyonu koru
-                    (false, "")
-                };
+                let (should_close, reason) = should_close_position(
+                    current_pnl,
+                    state.peak_pnl,
+                    price_change_pct,
+                    position_size_notional,
+                    state.position_hold_duration_ms,
+                    pnl_trend,
+                    &cfg.internal,
+                    &cfg.strategy_internal,
+                );
                 
                 // Akıllı karar: Pozisyonu kapat
                 if should_close {
@@ -2220,7 +1671,7 @@ async fn main() -> Result<()> {
             } else {
                 // Emir yoksa, consecutive_no_fills sıfırla ve fill oranını yavaşça normale döndür
                 state.consecutive_no_fills = 0;
-                state.order_fill_rate = (state.order_fill_rate * 0.995 + 0.005).min(1.0);
+                state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_slow_decrease_factor + cfg.internal.fill_rate_slow_decrease_bonus).min(1.0);
             }
             
             // --- AKILLI POZİSYON YÖNETİMİ: Fill oranına göre strateji ayarla ---
@@ -2294,7 +1745,7 @@ async fn main() -> Result<()> {
 
             match risk_action {
                 RiskAction::Reduce => {
-                    let widen = Decimal::from_f64_retain(0.005).unwrap_or(Decimal::ZERO);
+                    let widen = Decimal::from_f64_retain(cfg.internal.order_price_distance_no_position).unwrap_or(Decimal::ZERO);
                     quotes.bid = quotes
                         .bid
                         .map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
@@ -2323,7 +1774,6 @@ async fn main() -> Result<()> {
                         Ok(q) => {
                             let q_f64 = q.to_f64().unwrap_or(0.0);
                             // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
-                            // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
                             // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
                             if q_f64 < cfg.min_quote_balance_usd {
                                 info!(
@@ -2369,7 +1819,6 @@ async fn main() -> Result<()> {
                         Ok(a) => {
                             let avail_f64 = a.to_f64().unwrap_or(0.0);
                             // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
-                            // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
                             // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
                             if avail_f64 < cfg.min_quote_balance_usd {
                                 info!(
@@ -2481,10 +1930,7 @@ async fn main() -> Result<()> {
                 "calculated order caps"
             );
 
-            // --- QUOTE ASSET BAKİYE KONTROLÜ: Eğer quote asset'te bakiye yoksa skip et ---
-            // Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
-            // Eğer o quote asset'te bakiye yoksa (config'deki eşikten az), bu sembolü skip et
-            // Diğer quote asset'li semboller (örn: BTCUSDC) devam edebilir
+            // Quote asset bakiye kontrolü: Yetersiz bakiye varsa skip et
             if caps.buy_total < cfg.min_quote_balance_usd {
                 info!(
                     %symbol,

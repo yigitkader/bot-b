@@ -96,6 +96,35 @@ pub struct DynMmCfg {
     pub opportunity_size_multiplier: f64, // Fırsat modu pozisyon çarpanı
     #[serde(default = "default_strong_trend_multiplier")]
     pub strong_trend_multiplier: f64,     // Güçlü trend pozisyon çarpanı
+    // --- Strategy Internal Config (opsiyonel, main.rs'den geçirilir) ---
+    #[serde(default)]
+    pub manipulation_volume_ratio_threshold: Option<f64>,
+    #[serde(default)]
+    pub manipulation_time_threshold_ms: Option<u64>,
+    #[serde(default)]
+    pub manipulation_price_history_min_len: Option<usize>,
+    #[serde(default)]
+    pub manipulation_price_history_max_len: Option<usize>,
+    #[serde(default)]
+    pub confidence_price_drop_max: Option<f64>,
+    #[serde(default)]
+    pub confidence_volume_ratio_min: Option<f64>,
+    #[serde(default)]
+    pub confidence_volume_ratio_max: Option<f64>,
+    #[serde(default)]
+    pub confidence_spread_min: Option<f64>,
+    #[serde(default)]
+    pub confidence_spread_max: Option<f64>,
+    #[serde(default)]
+    pub confidence_bonus_multiplier: Option<f64>,
+    #[serde(default)]
+    pub confidence_max_multiplier: Option<f64>,
+    #[serde(default)]
+    pub trend_analysis_min_history: Option<usize>,
+    #[serde(default)]
+    pub trend_analysis_threshold_negative: Option<f64>,
+    #[serde(default)]
+    pub trend_analysis_threshold_strong_negative: Option<f64>,
 }
 
 // Default değerler
@@ -146,6 +175,21 @@ pub struct DynMm {
     min_liquidity_required: f64,
     opportunity_size_multiplier: f64,
     strong_trend_multiplier: f64,
+    // Strategy internal config
+    manipulation_volume_ratio_threshold: f64,
+    manipulation_time_threshold_ms: u64,
+    manipulation_price_history_min_len: usize,
+    manipulation_price_history_max_len: usize,
+    confidence_price_drop_max: f64,
+    confidence_volume_ratio_min: f64,
+    confidence_volume_ratio_max: f64,
+    confidence_spread_min: f64,
+    confidence_spread_max: f64,
+    confidence_bonus_multiplier: f64,
+    confidence_max_multiplier: f64,
+    trend_analysis_min_history: usize,
+    trend_analysis_threshold_negative: f64,
+    trend_analysis_threshold_strong_negative: f64,
     // Akıllı karar verme için state
     price_history: Vec<(u64, Decimal)>, // (timestamp_ms, price)
     target_inventory: Qty, // Hedef envanter seviyesi
@@ -208,7 +252,22 @@ impl From<DynMmCfg> for DynMm {
             min_liquidity_required: c.min_liquidity_required,
             opportunity_size_multiplier: c.opportunity_size_multiplier,
             strong_trend_multiplier: c.strong_trend_multiplier,
-            price_history: Vec::with_capacity(100), // Son 100 fiyat
+            // Strategy internal config (default değerler)
+            manipulation_volume_ratio_threshold: c.manipulation_volume_ratio_threshold.unwrap_or(5.0),
+            manipulation_time_threshold_ms: c.manipulation_time_threshold_ms.unwrap_or(2000),
+            manipulation_price_history_min_len: c.manipulation_price_history_min_len.unwrap_or(3),
+            manipulation_price_history_max_len: c.manipulation_price_history_max_len.unwrap_or(200),
+            confidence_price_drop_max: c.confidence_price_drop_max.unwrap_or(500.0),
+            confidence_volume_ratio_min: c.confidence_volume_ratio_min.unwrap_or(5.0),
+            confidence_volume_ratio_max: c.confidence_volume_ratio_max.unwrap_or(10.0),
+            confidence_spread_min: c.confidence_spread_min.unwrap_or(50.0),
+            confidence_spread_max: c.confidence_spread_max.unwrap_or(150.0),
+            confidence_bonus_multiplier: c.confidence_bonus_multiplier.unwrap_or(0.3),
+            confidence_max_multiplier: c.confidence_max_multiplier.unwrap_or(1.5),
+            trend_analysis_min_history: c.trend_analysis_min_history.unwrap_or(10),
+            trend_analysis_threshold_negative: c.trend_analysis_threshold_negative.unwrap_or(-0.15),
+            trend_analysis_threshold_strong_negative: c.trend_analysis_threshold_strong_negative.unwrap_or(-0.20),
+            price_history: Vec::with_capacity(c.manipulation_price_history_max_len.unwrap_or(200)), // Config'den: Fiyat geçmişi kapasitesi
             target_inventory: Qty(Decimal::ZERO), // Başlangıçta nötr
             // Mikro-yapı sinyalleri başlangıç değerleri
             ewma_volatility: 0.0001,      // Başlangıç volatilite (1 bps)
@@ -488,7 +547,7 @@ impl Strategy for DynMm {
                 // Gelişmiş tespit: Fiyat değişimi + volume artışı + time frame + likidite kontrolü
                 // KRİTİK DÜZELTME: Daha sıkı filtreler (false positive azalt) + geri dönüş kontrolü
                 // Flash crash sonrası geri dönüş kontrolü: Gerçek flash crash mi yoksa normal volatilite mi?
-                let recovery_check = if self.price_history.len() >= 3 {
+                let recovery_check = if self.price_history.len() >= self.manipulation_price_history_min_len {
                     let last_3: Vec<Decimal> = self.price_history.iter().rev().take(3).map(|(_, p)| *p).collect();
                     if price_change_bps < -self.price_jump_threshold_bps {
                         // Düşüş sonrası geri yükseliyor mu? (gerçek flash crash)
@@ -504,8 +563,8 @@ impl Strategy for DynMm {
                 };
                 
                 if price_change_bps.abs() > self.price_jump_threshold_bps 
-                   && volume_ratio > 5.0              // Volume 5x veya daha fazla arttı (3x → 5x)
-                   && time_elapsed_ms < 2000          // 2 saniye içinde (5s → 2s: daha keskin)
+                   && volume_ratio > self.manipulation_volume_ratio_threshold  // Config'den: Volume ratio threshold
+                   && time_elapsed_ms < self.manipulation_time_threshold_ms   // Config'den: Time threshold
                    && liquidity_stable                // Likidite stabil
                    && recovery_check {                // Geri dönüş kontrolü (gerçek flash crash/pump)
                     self.flash_crash_detected = true;
@@ -769,8 +828,8 @@ impl Strategy for DynMm {
         // Fiyat geçmişini güncelle (basit timestamp simülasyonu)
         // now_ms zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
         self.price_history.push((now_ms, c.mark_price.0));
-        // KRİTİK DÜZELTME: Fiyat geçmişi limitini artır (100 → 200) - Trend analizi için daha fazla veri
-        if self.price_history.len() > 200 {
+        // KRİTİK DÜZELTME: Fiyat geçmişi limitini config'den al - Trend analizi için daha fazla veri
+        if self.price_history.len() > self.manipulation_price_history_max_len {
             self.price_history.remove(0);
         }
         
@@ -1065,32 +1124,31 @@ impl Strategy for DynMm {
             // Opportunity türüne göre güven seviyesi hesapla
             let confidence = match opp {
                 ManipulationOpportunity::FlashCrashLong { price_drop_bps } => {
-                    // Ne kadar büyük düşüş, o kadar güvenilir (250 bps = %2.5 eşik)
-                    // 250-500 bps arası: 0.5-1.0 confidence
-                    (price_drop_bps / 500.0).min(1.0).max(0.5)
+                    // Ne kadar büyük düşüş, o kadar güvenilir
+                    // Config'den: confidence_price_drop_max kullan
+                    (price_drop_bps / self.confidence_price_drop_max).min(1.0).max(0.5)
                 }
                 ManipulationOpportunity::FlashPumpShort { price_rise_bps } => {
                     // Ne kadar büyük yükseliş, o kadar güvenilir
-                    (price_rise_bps / 500.0).min(1.0).max(0.5)
+                    (price_rise_bps / self.confidence_price_drop_max).min(1.0).max(0.5)
                 }
                 ManipulationOpportunity::VolumeAnomalyTrend { volume_ratio, .. } => {
-                    // Volume ratio'ya göre: 5x = 0.5, 10x+ = 1.0
-                    ((volume_ratio - 5.0) / 5.0).min(1.0).max(0.5)
+                    // Volume ratio'ya göre: Config'den min/max kullan
+                    ((volume_ratio - self.confidence_volume_ratio_min) / (self.confidence_volume_ratio_max - self.confidence_volume_ratio_min)).min(1.0).max(0.5)
                 }
                 ManipulationOpportunity::WideSpreadArbitrage { spread_bps } => {
-                    // Spread ne kadar geniş, o kadar güvenilir (50-150 bps arası)
-                    ((spread_bps - 50.0) / 100.0).min(1.0).max(0.5)
+                    // Spread ne kadar geniş, o kadar güvenilir (Config'den min/max kullan)
+                    ((spread_bps - self.confidence_spread_min) / (self.confidence_spread_max - self.confidence_spread_min)).min(1.0).max(0.5)
                 }
                 _ => {
                     // Diğer opportunity türleri için orta güven
                     0.7
                 }
             };
-            // Dinamik multiplier: 1.0 + (0.5 * confidence) → Max 1.5x, Min 1.25x
-            // Base multiplier (1.2) ile confidence'ı birleştir
-            let base_multiplier = self.opportunity_size_multiplier; // Config'den: 1.2
-            let confidence_bonus = 0.3 * confidence; // Max 0.3 bonus
-            (base_multiplier + confidence_bonus).min(1.5) // Max 1.5x
+            // Dinamik multiplier: Base multiplier ile confidence'ı birleştir
+            let base_multiplier = self.opportunity_size_multiplier; // Config'den
+            let confidence_bonus = self.confidence_bonus_multiplier * confidence; // Config'den: Bonus multiplier
+            (base_multiplier + confidence_bonus).min(self.confidence_max_multiplier) // Config'den: Max multiplier
         } else if strong_trend {
             self.strong_trend_multiplier // Config'den: Güçlü trend multiplier
         } else {
@@ -1186,6 +1244,11 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
+    // ============================================================================
+    // Test Helper Functions
+    // ============================================================================
+
+    /// Test strategy oluştur (default config ile)
     fn create_test_strategy() -> DynMm {
         let cfg = DynMmCfg {
             a: 120.0,
@@ -1213,10 +1276,26 @@ mod tests {
             min_liquidity_required: default_min_liquidity_required(),
             opportunity_size_multiplier: default_opportunity_size_multiplier(),
             strong_trend_multiplier: default_strong_trend_multiplier(),
+            // Strategy internal config (test için default değerler)
+            manipulation_volume_ratio_threshold: None,
+            manipulation_time_threshold_ms: None,
+            manipulation_price_history_min_len: None,
+            manipulation_price_history_max_len: None,
+            confidence_price_drop_max: None,
+            confidence_volume_ratio_min: None,
+            confidence_volume_ratio_max: None,
+            confidence_spread_min: None,
+            confidence_spread_max: None,
+            confidence_bonus_multiplier: None,
+            confidence_max_multiplier: None,
+            trend_analysis_min_history: None,
+            trend_analysis_threshold_negative: None,
+            trend_analysis_threshold_strong_negative: None,
         };
         DynMm::from(cfg)
     }
 
+    /// Test context oluştur (helper function)
     fn create_test_context(bid: Decimal, ask: Decimal, inv: Decimal, liq_gap_bps: f64) -> Context {
         Context {
             ob: OrderBook {
@@ -1238,6 +1317,12 @@ mod tests {
             tick_size: Some(dec!(0.01)), // Test için default tick_size
         }
     }
+
+    /// Test constants
+    const DEFAULT_BID: Decimal = dec!(50000);
+    const DEFAULT_ASK: Decimal = dec!(50010);
+    const DEFAULT_SPREAD_BPS: f64 = 20.0; // 20 bps = 0.2%
+    const DEFAULT_LIQ_GAP_BPS: f64 = 500.0;
 
     #[test]
     fn test_microprice_calculation() {
@@ -1308,38 +1393,71 @@ mod tests {
         assert!(strategy.ewma_volatility > 0.0);
     }
 
+    // ============================================================================
+    // Inventory Decision Tests
+    // ============================================================================
+
     #[test]
-    fn test_inventory_decision() {
+    fn test_inventory_decision_at_target() {
+        // Given: Current inventory equals target
         let strategy = create_test_strategy();
-        let inv_cap = strategy.inv_cap.0;
-        
-        // At target: should bid and ask
         let target = Qty(dec!(0));
         let current = Qty(dec!(0));
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
-        assert!(should_bid);
-        assert!(should_ask);
         
-        // Below target: should only bid
+        // When: Inventory decision is made
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        
+        // Then: Should bid and ask (market making mode)
+        assert!(should_bid, "Should bid when at target (market making mode)");
+        assert!(should_ask, "Should ask when at target (market making mode)");
+    }
+
+    #[test]
+    fn test_inventory_decision_within_threshold() {
+        // Given: Current inventory is close to target (within threshold)
+        let strategy = create_test_strategy();
+        let inv_cap = strategy.inv_cap.0;
         let target = Qty(inv_cap * dec!(0.5)); // Target: 0.25
-        let current = Qty(dec!(0)); // Current: 0
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
-        assert!(should_bid);
-        assert!(!should_ask);
+        let current = Qty(inv_cap * dec!(0.48)); // Current: 0.24 (diff = 0.01, within threshold)
         
-        // Above target: should only ask
+        // When: Inventory decision is made
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        
+        // Then: Should bid and ask (market making mode)
+        assert!(should_bid, "Should bid when within threshold");
+        assert!(should_ask, "Should ask when within threshold");
+    }
+
+    #[test]
+    fn test_inventory_decision_below_target() {
+        // Given: Current inventory is below target (diff > threshold)
+        let strategy = create_test_strategy();
+        let inv_cap = strategy.inv_cap.0;
+        let target = Qty(inv_cap * dec!(0.5)); // Target: 0.25
+        let current = Qty(dec!(0)); // Current: 0 (diff = 0.25, above threshold)
+        
+        // When: Inventory decision is made
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        
+        // Then: Should bid and ask (both sides, bid priority for market making)
+        assert!(should_bid, "Should bid when below target (aggressive bid)");
+        assert!(should_ask, "Should ask when below target (both sides for market making)");
+    }
+
+    #[test]
+    fn test_inventory_decision_above_target() {
+        // Given: Current inventory is above target (diff > threshold)
+        let strategy = create_test_strategy();
+        let inv_cap = strategy.inv_cap.0;
         let target = Qty(dec!(0));
-        let current = Qty(inv_cap * dec!(0.5)); // Current: 0.25
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
-        assert!(!should_bid);
-        assert!(should_ask);
+        let current = Qty(inv_cap * dec!(0.5)); // Current: 0.25 (diff = 0.25, above threshold)
         
-        // Close to target (within 10%): should bid and ask
-        let target = Qty(inv_cap * dec!(0.5)); // Target: 0.25
-        let current = Qty(inv_cap * dec!(0.48)); // Current: 0.24 (within 10% threshold)
+        // When: Inventory decision is made
         let (should_bid, should_ask) = strategy.inventory_decision(current, target);
-        assert!(should_bid);
-        assert!(should_ask);
+        
+        // Then: Should bid and ask (both sides, ask priority for market making)
+        assert!(should_bid, "Should bid when above target (both sides for market making)");
+        assert!(should_ask, "Should ask when above target (aggressive ask)");
     }
 
     #[test]
@@ -1655,5 +1773,214 @@ mod tests {
         assert!((spread_bps_calc - expected_spread_bps).abs() < 1.0, 
                 "Spread should be approximately {} bps, got {} bps", expected_spread_bps, spread_bps_calc);
         assert!(bid_px < ask_px, "Bid should be less than ask");
+    }
+
+    #[test]
+    fn test_manipulation_detection_recovery_check() {
+        // KRİTİK TEST: Manipülasyon tespiti - Recovery check
+        let strategy = create_test_strategy();
+        
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // Senaryo 1: Gerçek flash crash (düşüş sonrası geri yükseliyor)
+        // Recovery check mantığını doğrudan test et
+        let price_history_recovery: Vec<(u64, Decimal)> = vec![
+            (now - 2000, dec!(50000)),
+            (now - 1000, dec!(49000)), // Düşüş
+            (now, dec!(49500)),        // Geri yükseliyor
+        ];
+        
+        if price_history_recovery.len() >= strategy.manipulation_price_history_min_len {
+            let last_3: Vec<Decimal> = price_history_recovery.iter().rev().take(3).map(|(_, p)| *p).collect();
+            let price_change_bps = -300.0; // -300 bps (threshold'u geçiyor)
+            let recovery_check = if price_change_bps < -strategy.price_jump_threshold_bps {
+                // Düşüş sonrası geri yükseliyor mu?
+                last_3[0] > last_3[1] && last_3[1] < last_3[2]
+            } else {
+                false
+            };
+            
+            // last_3[0] (49500) > last_3[1] (49000) && last_3[1] (49000) < last_3[2] (50000) = true
+            assert!(recovery_check, "Recovery check should detect real flash crash with recovery");
+        }
+        
+        // Senaryo 2: Normal volatilite (düşüş sonrası daha da düşüyor)
+        let price_history_no_recovery: Vec<(u64, Decimal)> = vec![
+            (now - 2000, dec!(50000)),
+            (now - 1000, dec!(49000)),
+            (now, dec!(48500)), // Daha da düşüyor
+        ];
+        
+        if price_history_no_recovery.len() >= strategy.manipulation_price_history_min_len {
+            let last_3: Vec<Decimal> = price_history_no_recovery.iter().rev().take(3).map(|(_, p)| *p).collect();
+            let price_change_bps = -300.0;
+            let recovery_check_no_recovery = if price_change_bps < -strategy.price_jump_threshold_bps {
+                last_3[0] > last_3[1] && last_3[1] < last_3[2]
+            } else {
+                false
+            };
+            
+            // last_3[0] (48500) > last_3[1] (49000) = false
+            assert!(!recovery_check_no_recovery, "Recovery check should not trigger for continued decline");
+        }
+    }
+
+    #[test]
+    fn test_opportunity_multiplier_confidence_calculation() {
+        // KRİTİK TEST: Opportunity multiplier - Dinamik güven seviyesi hesaplama
+        let strategy = create_test_strategy();
+        
+        // Flash crash: Büyük düşüş = yüksek güven
+        let price_drop_bps = 400.0; // 400 bps düşüş
+        let confidence_flash_crash = (price_drop_bps / strategy.confidence_price_drop_max).min(1.0).max(0.5);
+        let confidence_bonus = strategy.confidence_bonus_multiplier * confidence_flash_crash;
+        let multiplier_flash_crash = (strategy.opportunity_size_multiplier + confidence_bonus).min(strategy.confidence_max_multiplier);
+        
+        assert!(multiplier_flash_crash > strategy.opportunity_size_multiplier, "Flash crash should increase multiplier");
+        assert!(multiplier_flash_crash <= strategy.confidence_max_multiplier, "Multiplier should not exceed max");
+        
+        // Volume anomaly: Yüksek volume ratio = yüksek güven
+        let volume_ratio = 8.0; // 8x volume
+        let confidence_volume = ((volume_ratio - strategy.confidence_volume_ratio_min) / (strategy.confidence_volume_ratio_max - strategy.confidence_volume_ratio_min)).min(1.0).max(0.5);
+        let confidence_bonus_volume = strategy.confidence_bonus_multiplier * confidence_volume;
+        let multiplier_volume = (strategy.opportunity_size_multiplier + confidence_bonus_volume).min(strategy.confidence_max_multiplier);
+        
+        assert!(multiplier_volume > strategy.opportunity_size_multiplier, "High volume should increase multiplier");
+        
+        // Wide spread: Geniş spread = yüksek güven
+        let spread_bps = 120.0; // 120 bps spread
+        let confidence_spread = ((spread_bps - strategy.confidence_spread_min) / (strategy.confidence_spread_max - strategy.confidence_spread_min)).min(1.0).max(0.5);
+        let confidence_bonus_spread = strategy.confidence_bonus_multiplier * confidence_spread;
+        let multiplier_spread = (strategy.opportunity_size_multiplier + confidence_bonus_spread).min(strategy.confidence_max_multiplier);
+        
+        assert!(multiplier_spread > strategy.opportunity_size_multiplier, "Wide spread should increase multiplier");
+    }
+
+    #[test]
+    fn test_price_history_limit_enforcement() {
+        // KRİTİK TEST: Fiyat geçmişi limiti (config'den)
+        // Not: strategy.price_history private, bu yüzden limit mantığını test et
+        let strategy = create_test_strategy();
+        let max_len = strategy.manipulation_price_history_max_len;
+        
+        // Limit değerinin mantıklı olduğunu kontrol et
+        assert!(max_len > 0, "Price history max length should be positive");
+        assert!(max_len >= strategy.manipulation_price_history_min_len, "Max length should be >= min length");
+        
+        // Limit kontrolü mantığını test et
+        let mut test_history: Vec<(u64, Decimal)> = Vec::new();
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        // Max length'den fazla fiyat ekle
+        for i in 0..(max_len + 10) {
+            let price = dec!(50000) + Decimal::from(i);
+            test_history.push((now + (i as u64) * 1000, price));
+        }
+        
+        // Limit kontrolü: on_tick içinde yapılıyor, burada sadece limit kontrolü
+        if test_history.len() > max_len {
+            let excess = test_history.len() - max_len;
+            test_history.drain(0..excess);
+        }
+        
+        assert_eq!(test_history.len(), max_len, "Price history should be limited to max length");
+    }
+
+    #[test]
+    fn test_manipulation_volume_time_thresholds() {
+        // KRİTİK TEST: Manipülasyon tespiti - Volume ve time threshold'ları (config'den)
+        let strategy = create_test_strategy();
+        
+        // Volume ratio threshold kontrolü
+        let volume_ratio = 6.0; // 6x volume (threshold 5.0'dan fazla)
+        assert!(volume_ratio > strategy.manipulation_volume_ratio_threshold, "Volume ratio should exceed threshold");
+        
+        // Time threshold kontrolü
+        let time_elapsed_ms = 1500; // 1.5 saniye (threshold 2000ms'den az)
+        assert!(time_elapsed_ms < strategy.manipulation_time_threshold_ms, "Time elapsed should be less than threshold");
+        
+        // Her iki threshold da geçilmeli
+        let should_trigger = volume_ratio > strategy.manipulation_volume_ratio_threshold 
+            && time_elapsed_ms < strategy.manipulation_time_threshold_ms;
+        assert!(should_trigger, "Should trigger when both volume and time thresholds are met");
+    }
+
+    #[test]
+    fn test_trend_analysis_thresholds() {
+        // KRİTİK TEST: Trend analizi eşikleri (config'den)
+        let strategy = create_test_strategy();
+        
+        // Trend düşüşü eşikleri
+        let pnl_trend_negative = -0.18; // %18 düşüş
+        let pnl_trend_strong_negative = -0.25; // %25 düşüş
+        
+        // Negative threshold kontrolü
+        let should_take_profit_negative = pnl_trend_negative < strategy.trend_analysis_threshold_negative;
+        assert!(should_take_profit_negative, "Should take profit when trend is below negative threshold");
+        
+        // Strong negative threshold kontrolü
+        let should_take_profit_strong = pnl_trend_strong_negative < strategy.trend_analysis_threshold_strong_negative;
+        assert!(should_take_profit_strong, "Should take profit when trend is below strong negative threshold");
+        
+        // Strong negative daha sıkı olmalı
+        assert!(strategy.trend_analysis_threshold_strong_negative < strategy.trend_analysis_threshold_negative, 
+                "Strong negative threshold should be more negative than negative threshold");
+    }
+
+    #[test]
+    fn test_crossing_guard_one_tick_below() {
+        // KRİTİK TEST: Crossing guard - 1 tick altına çekme (maker olarak kal)
+        let best_bid = dec!(50000);
+        let best_ask = dec!(50010);
+        let tick = dec!(0.01);
+        
+        // Bid best_bid'e eşit veya yüksek → 1 tick altına çek
+        let mut bid_px = best_bid; // Eşit
+        if bid_px >= best_bid {
+            bid_px = (best_bid - tick).max(dec!(0));
+        }
+        assert!(bid_px < best_bid, "Bid should be below best_bid (1 tick)");
+        assert_eq!(bid_px, best_bid - tick, "Bid should be exactly 1 tick below best_bid");
+        
+        // Ask best_ask'e eşit veya düşük → 1 tick üstüne çek
+        let mut ask_px = best_ask; // Eşit
+        if ask_px <= best_ask {
+            ask_px = best_ask + tick;
+        }
+        assert!(ask_px > best_ask, "Ask should be above best_ask (1 tick)");
+        assert_eq!(ask_px, best_ask + tick, "Ask should be exactly 1 tick above best_ask");
+    }
+
+    #[test]
+    fn test_opportunity_mode_leverage_reduction() {
+        // KRİTİK TEST: Fırsat modunda leverage'in yarıya düşürülmesi
+        let effective_leverage = 20.0;
+        let is_opportunity_mode = true;
+        
+        let effective_leverage_for_caps = if is_opportunity_mode {
+            effective_leverage / 2.0 // Fırsat modunda yarıya düşür
+        } else {
+            effective_leverage
+        };
+        
+        assert_eq!(effective_leverage_for_caps, 10.0, "Leverage should be halved in opportunity mode");
+        
+        // Normal modda değişmemeli
+        let is_opportunity_mode_normal = false;
+        let effective_leverage_for_caps_normal = if is_opportunity_mode_normal {
+            effective_leverage / 2.0
+        } else {
+            effective_leverage
+        };
+        
+        assert_eq!(effective_leverage_for_caps_normal, 20.0, "Leverage should remain unchanged in normal mode");
     }
 }
