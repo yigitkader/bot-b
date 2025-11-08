@@ -49,8 +49,8 @@ strategy:
   # --- Spread ve Fiyatlama Eşikleri ---
   min_spread_bps: 3.0              # Minimum spread (bps)
   max_spread_bps: 100.0            # Maksimum spread (bps)
-  spread_arbitrage_min_bps: 30.0   # Spread arbitraj minimum eşiği (bps)
-  spread_arbitrage_max_bps: 200.0  # Spread arbitraj maksimum eşiği (bps)
+  spread_arbitrage_min_bps: 50.0   # Spread arbitraj minimum eşiği (bps) (30 → 50: daha gerçekçi)
+  spread_arbitrage_max_bps: 150.0  # Spread arbitraj maksimum eşiği (bps) (200 → 150: çok geniş spread riskli)
   
   # --- Trend Takibi Eşikleri ---
   strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
@@ -79,8 +79,8 @@ strategy:
   
   # --- Diğer ---
   min_liquidity_required: 0.01     # Minimum likidite gereksinimi
-  opportunity_size_multiplier: 5.0 # Fırsat modu pozisyon çarpanı
-  strong_trend_multiplier: 3.0     # Güçlü trend pozisyon çarpanı
+  opportunity_size_multiplier: 2.0 # Fırsat modu pozisyon çarpanı (5.0 → 2.0: daha güvenli)
+  strong_trend_multiplier: 1.5     # Güçlü trend pozisyon çarpanı (3.0 → 1.5: daha güvenli)
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
