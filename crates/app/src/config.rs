@@ -225,7 +225,6 @@ pub struct BinanceCfg {
     pub secret_key: String,
     #[serde(default = "default_recv_window")]
     pub recv_window_ms: u64,
-    pub spot_base: String,
     pub futures_base: String,
 }
 
@@ -472,7 +471,6 @@ mod tests {
             price_tick: 0.001,
             qty_step: 0.001,
             binance: BinanceCfg {
-                spot_base: "https://api.binance.com".to_string(),
                 futures_base: "https://fapi.binance.com".to_string(),
                 api_key: "6WkI51B0dbz9gbtRm5PphsWYFmr3oaoagJECl0UiGX13ySnLxXlhuEoR5brk74ZU".to_string(),
                 secret_key: "8N3PxGEp1CTrirTbmkM42mHaNTo5jbyamUFgatfeueHHkH5RBsDgGLCh3b6Ki3nw".to_string(),

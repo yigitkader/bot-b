@@ -27,7 +27,7 @@ use utils::{clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step
 use std::cmp::max;
 use std::collections::HashMap;
 // Removed unused Ordering import
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Constants
@@ -222,7 +222,7 @@ async fn main() -> Result<()> {
     let price_precision = decimal_places(price_tick_dec);
     let qty_precision = decimal_places(qty_step_dec);
     // Initialize rate limiter for futures
-    init_rate_limiter(true);
+    init_rate_limiter();
     info!("rate limiter initialized for futures");
     
     let venue = BinanceFutures {
@@ -2380,11 +2380,36 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                match venue.place_limit(&symbol, Side::Buy, px, qty, tif).await {
-                            Ok(order_id) => {
+                        
+                        // ClientOrderId oluştur (idempotency için)
+                        // Format: {symbol}_{side}_{timestamp_ms}_{random}
+                        // Binance: max 36 karakter, alphanumeric, '-' ve '_' kullanılabilir
+                        let timestamp_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                        let random_suffix = (timestamp_ms % 10000) as u64; // Son 4 haneli random
+                        let client_order_id = format!("{}_{}_{}_{}", 
+                            symbol.replace("-", "_").replace("/", "_"), // Symbol'deki özel karakterleri değiştir
+                            "B", // Buy
+                            timestamp_ms,
+                            random_suffix
+                        );
+                        // 36 karakter limit kontrolü
+                        let client_order_id = if client_order_id.len() > 36 {
+                            // Kısalt: symbol'ü kısalt
+                            let symbol_short = symbol.chars().take(8).collect::<String>();
+                            format!("{}_{}_{}_{}", symbol_short, "B", timestamp_ms, random_suffix)
+                                .chars().take(36).collect::<String>()
+                        } else {
+                            client_order_id
+                        };
+                        
+                match venue.place_limit_with_client_id(&symbol, Side::Buy, px, qty, tif, &client_order_id).await {
+                            Ok((order_id, returned_client_id)) => {
                 let info = OrderInfo { 
                     order_id: order_id.clone(), 
-                    client_order_id: None, // TODO: clientOrderId ekle
+                    client_order_id: returned_client_id.or(Some(client_order_id)),
                     side: Side::Buy, 
                     price: px, 
                     qty, 
@@ -2497,11 +2522,21 @@ async fn main() -> Result<()> {
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures bid with exchange min notional");
                                             // API Rate Limit koruması
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                    match venue.place_limit(&symbol, Side::Buy, px, retry_qty, tif).await {
-                                                Ok(order_id) => {
+                                            // Retry için clientOrderId
+                                            let retry_timestamp_ms = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_millis();
+                                            let retry_client_order_id = format!("{}_{}_R_{}", 
+                                                symbol.replace("-", "_").replace("/", "_"),
+                                                "B",
+                                                retry_timestamp_ms
+                                            ).chars().take(36).collect::<String>();
+                    match venue.place_limit_with_client_id(&symbol, Side::Buy, px, retry_qty, tif, &retry_client_order_id).await {
+                                                Ok((order_id, returned_client_id)) => {
                             let info = OrderInfo { 
                                 order_id: order_id.clone(), 
-                                client_order_id: None,
+                                client_order_id: returned_client_id.or(Some(retry_client_order_id)),
                                 side: Side::Buy, 
                                 price: px, 
                                 qty: retry_qty, 
@@ -2554,11 +2589,21 @@ async fn main() -> Result<()> {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures bid with leftover notional");
                                 // API Rate Limit koruması
                                 rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        match venue.place_limit(&symbol, Side::Buy, px, qty2, tif).await {
-                                    Ok(order_id2) => {
+                        // Extra bid için clientOrderId
+                        let extra_timestamp_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                        let extra_client_order_id = format!("{}_{}_E_{}", 
+                            symbol.replace("-", "_").replace("/", "_"),
+                            "B",
+                            extra_timestamp_ms
+                        ).chars().take(36).collect::<String>();
+                        match venue.place_limit_with_client_id(&symbol, Side::Buy, px, qty2, tif, &extra_client_order_id).await {
+                            Ok((order_id2, returned_client_id2)) => {
                                 let info2 = OrderInfo { 
                                     order_id: order_id2.clone(), 
-                                    client_order_id: None,
+                                    client_order_id: returned_client_id2.or(Some(extra_client_order_id)),
                                     side: Side::Buy, 
                                     price: px, 
                                     qty: qty2, 
@@ -2594,11 +2639,33 @@ async fn main() -> Result<()> {
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                match venue.place_limit(&symbol, Side::Sell, px, qty, tif).await {
-                            Ok(order_id) => {
+                        
+                        // ClientOrderId oluştur (idempotency için)
+                        let timestamp_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                        let random_suffix = (timestamp_ms % 10000) as u64;
+                        let client_order_id = format!("{}_{}_{}_{}", 
+                            symbol.replace("-", "_").replace("/", "_"),
+                            "S", // Sell
+                            timestamp_ms,
+                            random_suffix
+                        );
+                        // 36 karakter limit kontrolü
+                        let client_order_id = if client_order_id.len() > 36 {
+                            let symbol_short = symbol.chars().take(8).collect::<String>();
+                            format!("{}_{}_{}_{}", symbol_short, "S", timestamp_ms, random_suffix)
+                                .chars().take(36).collect::<String>()
+                        } else {
+                            client_order_id
+                        };
+                        
+                match venue.place_limit_with_client_id(&symbol, Side::Sell, px, qty, tif, &client_order_id).await {
+                            Ok((order_id, returned_client_id)) => {
                         let info = OrderInfo { 
                             order_id: order_id.clone(), 
-                            client_order_id: None, // TODO: clientOrderId ekle
+                            client_order_id: returned_client_id.or(Some(client_order_id)),
                             side: Side::Sell, 
                             price: px, 
                             qty, 
@@ -2711,11 +2778,21 @@ async fn main() -> Result<()> {
                                             info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures ask with exchange min notional");
                                             // API Rate Limit koruması
                                             rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                            match venue.place_limit(&symbol, Side::Sell, px, retry_qty, tif).await {
-                                                Ok(order_id) => {
+                            // Retry için clientOrderId
+                            let retry_timestamp_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis();
+                            let retry_client_order_id = format!("{}_{}_R_{}", 
+                                symbol.replace("-", "_").replace("/", "_"),
+                                "S",
+                                retry_timestamp_ms
+                            ).chars().take(36).collect::<String>();
+                            match venue.place_limit_with_client_id(&symbol, Side::Sell, px, retry_qty, tif, &retry_client_order_id).await {
+                                                Ok((order_id, returned_client_id)) => {
                                 let info = OrderInfo { 
                                     order_id: order_id.clone(), 
-                                    client_order_id: None,
+                                    client_order_id: returned_client_id.or(Some(retry_client_order_id)),
                                     side: Side::Sell, 
                                     price: px, 
                                     qty: retry_qty, 
@@ -2768,11 +2845,21 @@ async fn main() -> Result<()> {
                                 info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures ask with leftover notional");
                                 // API Rate Limit koruması
                                 rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                    match venue.place_limit(&symbol, Side::Sell, px, qty2, tif).await {
-                                    Ok(order_id2) => {
+                    // Extra ask için clientOrderId
+                    let extra_timestamp_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    let extra_client_order_id = format!("{}_{}_E_{}", 
+                        symbol.replace("-", "_").replace("/", "_"),
+                        "S",
+                        extra_timestamp_ms
+                    ).chars().take(36).collect::<String>();
+                    match venue.place_limit_with_client_id(&symbol, Side::Sell, px, qty2, tif, &extra_client_order_id).await {
+                        Ok((order_id2, returned_client_id2)) => {
                             let info2 = OrderInfo { 
                                 order_id: order_id2.clone(), 
-                                client_order_id: None,
+                                client_order_id: returned_client_id2.or(Some(extra_client_order_id)),
                                 side: Side::Sell, 
                                 price: px, 
                                 qty: qty2, 

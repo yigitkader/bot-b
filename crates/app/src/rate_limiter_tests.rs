@@ -14,26 +14,26 @@ mod tests {
     #[tokio::test]
     async fn test_safety_factor_clamp_min() {
         // Test: Safety factor 0.5'ten küçükse 0.5'e clamp edilmeli
-        let limiter = RateLimiter::new(20, 1200, 0.3);
-        // 0.3 * 20 = 6, ama clamp sonrası 0.5 * 20 = 10 olmalı
-        assert!(limiter.max_requests_per_sec >= 10, "safety factor should be clamped to minimum 0.5");
+        let limiter = RateLimiter::new(40, 2400, 0.3);
+        // 0.3 * 40 = 12, ama clamp sonrası 0.5 * 40 = 20 olmalı
+        assert!(limiter.max_requests_per_sec >= 20, "safety factor should be clamped to minimum 0.5");
     }
 
     #[tokio::test]
     async fn test_safety_factor_clamp_max() {
         // Test: Safety factor 0.95'ten büyükse 0.95'e clamp edilmeli
-        let limiter = RateLimiter::new(20, 1200, 0.99);
-        // 0.99 * 20 = 19.8, ama clamp sonrası 0.95 * 20 = 19 olmalı
-        assert!(limiter.max_requests_per_sec <= 19, "safety factor should be clamped to maximum 0.95");
+        let limiter = RateLimiter::new(40, 2400, 0.99);
+        // 0.99 * 40 = 39.6, ama clamp sonrası 0.95 * 40 = 38 olmalı
+        assert!(limiter.max_requests_per_sec <= 38, "safety factor should be clamped to maximum 0.95");
     }
 
     #[tokio::test]
     async fn test_safety_factor_production_config() {
         // Test: Production config'deki safety factor (0.7) doğru çalışmalı
-        let limiter = RateLimiter::new(20, 1200, 0.7);
-        // Spot: 20 * 0.7 = 14 req/sec, 1200 * 0.7 = 840 weight/min
-        assert_eq!(limiter.max_requests_per_sec, 14);
-        assert_eq!(limiter.max_weight_per_minute, 840);
+        let limiter = RateLimiter::new(40, 2400, 0.7);
+        // Futures: 40 * 0.7 = 28 req/sec, 2400 * 0.7 = 1680 weight/min
+        assert_eq!(limiter.max_requests_per_sec, 28);
+        assert_eq!(limiter.max_weight_per_minute, 1680);
     }
 
     #[tokio::test]
@@ -110,8 +110,8 @@ mod tests {
     #[tokio::test]
     async fn test_burst_protection_per_second() {
         // Test: Per-second limit burst koruması
-        let limiter = RateLimiter::new(20, 1200, 0.7);
-        // Max: 20 * 0.7 = 14 req/sec
+        let limiter = RateLimiter::new(40, 2400, 0.7);
+        // Max: 40 * 0.7 = 28 req/sec
         
         // 20 request'i hızlıca gönder (burst)
         let start = Instant::now();
@@ -120,8 +120,8 @@ mod tests {
         }
         let elapsed = start.elapsed();
         
-        // İlk 14 request hızlı geçmeli, sonrası beklemeli
-        // Toplam süre en az 1 saniye olmalı (14 req/sec limit)
+        // İlk 28 request hızlı geçmeli, sonrası beklemeli
+        // Toplam süre en az 1 saniye olmalı (28 req/sec limit)
         assert!(elapsed.as_secs() >= 1, "burst should be throttled to per-second limit");
     }
 
@@ -205,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_if_needed_no_delay_first_call() {
         // Test: İlk çağrıda delay olmamalı
-        let limiter = RateLimiter::new(20, 1200, 0.7);
+        let limiter = RateLimiter::new(40, 2400, 0.7);
         
         let start = Instant::now();
         limiter.wait_if_needed(1).await;
@@ -217,8 +217,8 @@ mod tests {
     #[tokio::test]
     async fn test_wait_if_needed_min_interval_enforcement() {
         // Test: Minimum interval enforcement
-        let limiter = RateLimiter::new(20, 1200, 0.7);
-        // min_interval_ms = 1000 / 14 ≈ 71ms
+        let limiter = RateLimiter::new(40, 2400, 0.7);
+        // min_interval_ms = 1000 / 28 ≈ 36ms
         
         let start = Instant::now();
         limiter.wait_if_needed(1).await;
@@ -256,22 +256,22 @@ mod tests {
     #[tokio::test]
     async fn test_wait_if_needed_per_second_limit_delay() {
         // Test: Per-second limit aşıldığında doğru delay hesaplanmalı
-        let limiter = RateLimiter::new(20, 1200, 0.7);
-        // Max: 14 req/sec
+        let limiter = RateLimiter::new(40, 2400, 0.7);
+        // Max: 28 req/sec
         
-        // 14 request'i hızlıca gönder
-        for _ in 0..14 {
+        // 28 request'i hızlıca gönder
+        for _ in 0..28 {
             limiter.wait_if_needed(1).await;
         }
         
-        // 15. request beklemeli (ama minimum interval de uygulanabilir)
+        // 29. request beklemeli (ama minimum interval de uygulanabilir)
         let start = Instant::now();
         limiter.wait_if_needed(1).await;
         let elapsed = start.elapsed();
         
         // En eski request'ten 1 saniye sonra geçmeli veya minimum interval kadar beklemeli
-        // Not: İlk 14 request çok hızlı gönderildi, bu yüzden 15. request beklemeli
-        assert!(elapsed.as_millis() >= 50, "should wait for per-second limit or minimum interval");
+        // Not: İlk 28 request çok hızlı gönderildi, bu yüzden 29. request beklemeli
+        assert!(elapsed.as_millis() >= 30, "should wait for per-second limit or minimum interval");
     }
 
     // ============================================================================
@@ -335,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn test_zero_weight_request() {
         // Test: Zero weight request (edge case)
-        let limiter = RateLimiter::new(20, 1200, 0.7);
+        let limiter = RateLimiter::new(40, 2400, 0.7);
         
         let start = Instant::now();
         limiter.wait_if_needed(0).await;

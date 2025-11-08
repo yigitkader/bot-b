@@ -134,22 +134,18 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Weight-based rate limiter for Binance API calls
+/// Weight-based rate limiter for Binance Futures API calls
 /// 
-/// Binance API Limits:
-/// - Spot: 1200 requests/minute (20 req/sec) - weight-based
+/// Binance Futures API Limits:
 /// - Futures: 2400 requests/minute (40 req/sec) - weight-based
 /// 
 /// Common endpoint weights:
-/// - GET /api/v3/ticker/bookTicker (best_prices): Weight 2
-/// - POST /api/v3/order (place_limit): Weight 1
-/// - DELETE /api/v3/order (cancel): Weight 1
-/// - GET /api/v3/openOrders: Weight 3
-/// - GET /api/v3/account: Weight 10
-/// - GET /fapi/v1/ticker/bookTicker: Weight 1
-/// - POST /fapi/v1/order: Weight 1
-/// - DELETE /fapi/v1/order: Weight 1
+/// - GET /fapi/v1/depth (best_prices): Weight 5
+/// - POST /fapi/v1/order (place_limit): Weight 1
+/// - DELETE /fapi/v1/order (cancel): Weight 1
+/// - GET /fapi/v1/openOrders: Weight 1
 /// - GET /fapi/v2/positionRisk: Weight 5
+/// - GET /fapi/v2/balance: Weight 5
 #[cfg_attr(test, derive(Debug))]
 pub struct RateLimiter {
     /// Per-second request timestamps (for burst protection)
@@ -173,8 +169,8 @@ impl RateLimiter {
     /// Create a new rate limiter with safety margin
     /// 
     /// # Arguments
-    /// * `max_requests_per_sec` - Maximum requests per second (Spot: 20, Futures: 40)
-    /// * `max_weight_per_minute` - Maximum weight per minute (Spot: 1200, Futures: 2400)
+    /// * `max_requests_per_sec` - Maximum requests per second (Futures: 40)
+    /// * `max_weight_per_minute` - Maximum weight per minute (Futures: 2400)
     /// * `safety_factor` - Safety margin (0.0-1.0). 0.6 = use only 60% of limit (very safe)
     pub fn new(max_requests_per_sec: u32, max_weight_per_minute: u32, safety_factor: f64) -> Self {
         let safety_factor = safety_factor.clamp(0.5, 0.95); // En az %50, en fazla %95 kullan
@@ -299,20 +295,17 @@ impl RateLimiter {
 
 /// Global rate limiter instance
 /// 
-/// Mode'a göre limit seçilir:
-/// - Spot: 20 req/sec, 1200 weight/min → 12 req/sec, 720 weight/min (60% safety)
-/// - Futures: 40 req/sec, 2400 weight/min → 24 req/sec, 1440 weight/min (60% safety)
+/// Futures limits:
+/// - Futures: 40 req/sec, 2400 weight/min → 28 req/sec, 1680 weight/min (70% safety)
 static RATE_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
 
-/// Initialize rate limiter based on mode (spot or futures)
-pub fn init_rate_limiter(is_futures: bool) {
-    let (max_req_per_sec, max_weight_per_min) = if is_futures {
-        (40, 2400) // Futures: 40 req/sec, 2400 weight/min
-    } else {
-        (20, 1200) // Spot: 20 req/sec, 1200 weight/min
-    };
+/// Initialize rate limiter for futures
+pub fn init_rate_limiter() {
+    // Futures: 40 req/sec, 2400 weight/min
+    let max_req_per_sec = 40;
+    let max_weight_per_min = 2400;
     
-    // PATCH: Safety factor 0.6 → 0.7 (daha agresif, ban riski hala minimal)
+    // Safety factor 0.7 (daha agresif, ban riski hala minimal)
     let safety_factor = 0.7;
     
     RATE_LIMITER.set(RateLimiter::new(
@@ -322,11 +315,11 @@ pub fn init_rate_limiter(is_futures: bool) {
     )).ok();
 }
 
-/// Get or initialize the global rate limiter (default: Spot limits)
+/// Get or initialize the global rate limiter (default: Futures limits)
 pub fn get_rate_limiter() -> &'static RateLimiter {
     RATE_LIMITER.get_or_init(|| {
-        // Default: Spot limits with 60% safety factor
-        RateLimiter::new(20, 1200, 0.6)
+        // Default: Futures limits with 70% safety factor
+        RateLimiter::new(40, 2400, 0.7)
     })
 }
 

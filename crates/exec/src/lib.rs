@@ -23,6 +23,17 @@ pub trait Venue: Send + Sync {
         qty: Qty,
         tif: Tif,
     ) -> Result<String>;
+    
+    /// Place limit order with client order ID (for futures idempotency)
+    async fn place_limit_with_client_id(
+        &self,
+        sym: &str,
+        side: Side,
+        px: Px,
+        qty: Qty,
+        tif: Tif,
+        client_order_id: &str,
+    ) -> Result<(String, Option<String>)>; // Returns (order_id, client_order_id)
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()>;
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)>;
     async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>>;

@@ -64,29 +64,7 @@ struct FutExchangeSymbol {
     qty_precision: Option<usize>,
 }
 
-#[derive(Deserialize)]
-struct SpotExchangeInfo {
-    symbols: Vec<SpotExchangeSymbol>,
-}
-
-#[derive(Deserialize)]
-struct SpotExchangeSymbol {
-    symbol: String,
-    #[serde(rename = "baseAsset")]
-    base_asset: String,
-    #[serde(rename = "quoteAsset")]
-    quote_asset: String,
-    status: String,
-    #[serde(default)]
-    filters: Vec<serde_json::Value>,
-    #[serde(rename = "pricePrecision", default)]
-    price_precision: Option<usize>,
-    #[serde(rename = "quantityPrecision", default)]
-    qty_precision: Option<usize>,
-}
-
 static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
-static SPOT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
 
 fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
     Decimal::from_str_radix(s.as_ref(), 10).unwrap_or(Decimal::ZERO)
@@ -105,53 +83,6 @@ fn scale_from_step(step: Decimal) -> usize {
     // Bu bizim için doğru precision'ı verir
     let scale = step.scale() as usize;
     scale
-}
-
-fn rules_from_spot_symbol(sym: SpotExchangeSymbol) -> SymbolRules {
-    let mut tick = Decimal::ZERO;
-    let mut step = Decimal::ZERO;
-    let mut min_notional = Decimal::ZERO;
-
-    for f in sym.filters {
-        if let Some(ft) = f.get("filterType").and_then(|v| v.as_str()) {
-            match ft {
-                "PRICE_FILTER" => {
-                    tick = str_dec(f.get("tickSize").and_then(|v| v.as_str()).unwrap_or("0"));
-                }
-                "LOT_SIZE" => {
-                    step = str_dec(f.get("stepSize").and_then(|v| v.as_str()).unwrap_or("0"));
-                }
-                "MIN_NOTIONAL" | "NOTIONAL" => {
-                    min_notional = str_dec(
-                        f.get("minNotional")
-                            .or_else(|| f.get("notional"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0"),
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let p_prec = sym.price_precision.unwrap_or_else(|| scale_from_step(tick));
-    let q_prec = sym.qty_precision.unwrap_or_else(|| scale_from_step(step));
-
-    SymbolRules {
-        tick_size: if tick.is_zero() {
-            Decimal::new(1, 2)
-        } else {
-            tick
-        },
-        step_size: if step.is_zero() {
-            Decimal::new(1, 3)
-        } else {
-            step
-        },
-        price_precision: p_prec,
-        qty_precision: q_prec,
-        min_notional,
-    }
 }
 
 fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
@@ -225,452 +156,6 @@ impl BinanceCommon {
     }
 }
 
-// ---- SPOT ----
-
-#[derive(Clone)]
-pub struct BinanceSpot {
-    pub base: String, // e.g. https://api.binance.com
-    pub common: BinanceCommon,
-    pub price_tick: Decimal,
-    pub qty_step: Decimal,
-    pub price_precision: usize,
-    pub qty_precision: usize,
-}
-
-#[derive(Deserialize)]
-struct BookTickerSpot {
-    #[serde(rename = "bidPrice")]
-    bid_price: String,
-    #[serde(rename = "askPrice")]
-    ask_price: String,
-}
-
-#[derive(Deserialize)]
-struct SpotPlacedOrder {
-    #[serde(rename = "orderId")]
-    order_id: u64,
-}
-
-#[derive(Deserialize)]
-struct SpotOpenOrder {
-    #[serde(rename = "orderId")]
-    order_id: u64,
-    #[serde(rename = "price")]
-    price: String,
-    #[serde(rename = "origQty")]
-    orig_qty: String,
-    #[serde(rename = "side")]
-    side: String,
-}
-
-#[derive(Deserialize)]
-struct SpotTrade {
-    #[serde(rename = "id")]
-    id: i64,
-    #[serde(rename = "qty")]
-    qty: String,
-    #[serde(rename = "price")]
-    price: String,
-    #[serde(rename = "isBuyer")]
-    is_buyer: bool,
-    #[serde(rename = "time")]
-    time: u64,
-}
-
-impl BinanceSpot {
-    /// Per-symbol metadata (tick_size, step_size) alır, fallback olarak global değerleri kullanır
-    pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
-        if let Some(r) = SPOT_RULES.get(sym) {
-            return Ok(r.clone());
-        }
-
-        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
-        match send_json::<SpotExchangeInfo>(self.common.client.get(url)).await {
-            Ok(info) => {
-                let sym_rec = info
-                    .symbols
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("symbol info missing"))?;
-                let rules = Arc::new(rules_from_spot_symbol(sym_rec));
-                SPOT_RULES.insert(sym.to_string(), rules.clone());
-                Ok(rules)
-            }
-            Err(err) => {
-                warn!(error = ?err, %sym, "failed to fetch spot symbol rules, using fallbacks");
-                Ok(Arc::new(SymbolRules {
-                    tick_size: self.price_tick,
-                    step_size: self.qty_step,
-                    price_precision: self.price_precision,
-                    qty_precision: self.qty_precision,
-                    min_notional: Decimal::ZERO,
-                }))
-            }
-        }
-    }
-
-    pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
-        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base, encode(sym));
-        let info: SpotExchangeInfo = send_json(self.common.client.get(url)).await?;
-        let sym = info
-            .symbols
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("symbol info missing"))?;
-        Ok((sym.base_asset, sym.quote_asset))
-    }
-
-    pub async fn symbol_metadata(&self) -> Result<Vec<SymbolMeta>> {
-        let url = format!("{}/api/v3/exchangeInfo", self.base);
-        let info: SpotExchangeInfo = send_json(self.common.client.get(url)).await?;
-        Ok(info
-            .symbols
-            .into_iter()
-            .map(|s| SymbolMeta {
-                symbol: s.symbol,
-                base_asset: s.base_asset,
-                quote_asset: s.quote_asset,
-                status: Some(s.status),
-                contract_type: None,
-            })
-            .collect())
-    }
-
-    pub async fn asset_free(&self, asset: &str) -> Result<Decimal> {
-        #[derive(Deserialize)]
-        struct SpotBalance {
-            asset: String,
-            free: String,
-        }
-        #[derive(Deserialize)]
-        struct SpotAccountInfo {
-            balances: Vec<SpotBalance>,
-        }
-
-        let qs = format!(
-            "timestamp={}&recvWindow={}",
-            BinanceCommon::ts(),
-            self.common.recv_window_ms
-        );
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/api/v3/account?{}&signature={}", self.base, qs, sig);
-        let info: SpotAccountInfo = send_json(
-            self.common
-                .client
-                .get(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
-
-        let bal = info.balances.into_iter().find(|b| b.asset == asset);
-        let amt = match bal {
-            Some(b) => Decimal::from_str_radix(&b.free, 10)?,
-            None => Decimal::ZERO,
-        };
-        Ok(amt)
-    }
-
-    pub async fn fetch_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
-        let qs = format!(
-            "symbol={}&timestamp={}&recvWindow={}",
-            sym,
-            BinanceCommon::ts(),
-            self.common.recv_window_ms
-        );
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/api/v3/openOrders?{}&signature={}", self.base, qs, sig);
-        let orders: Vec<SpotOpenOrder> = send_json(
-            self.common
-                .client
-                .get(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
-
-        let mut res = Vec::new();
-        for o in orders {
-            let price = Decimal::from_str_radix(&o.price, 10)?;
-            let qty = Decimal::from_str_radix(&o.orig_qty, 10)?;
-            let side = if o.side.eq_ignore_ascii_case("buy") {
-                Side::Buy
-            } else {
-                Side::Sell
-            };
-            res.push(VenueOrder {
-                order_id: o.order_id.to_string(),
-                side,
-                price: Px(price),
-                qty: Qty(qty),
-            });
-        }
-        Ok(res)
-    }
-
-    pub async fn get_fills_since(&self, symbol: &str, from_id: Option<i64>) -> Result<Vec<Fill>> {
-        let mut params = vec![
-            format!("symbol={}", symbol),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-        ];
-        if let Some(id) = from_id {
-            params.push(format!("fromId={}", id));
-        }
-        let qs = params.join("&");
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/api/v3/myTrades?{}&signature={}", self.base, qs, sig);
-        let trades: Vec<SpotTrade> = send_json(
-            self.common
-                .client
-                .get(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
-
-        let mut fills = Vec::new();
-        for t in trades {
-            let qty = Decimal::from_str_radix(&t.qty, 10)?;
-            let price = Decimal::from_str_radix(&t.price, 10)?;
-            let side = if t.is_buyer { Side::Buy } else { Side::Sell };
-            fills.push(Fill {
-                id: t.id,
-                symbol: symbol.to_string(),
-                side,
-                qty: Qty(qty),
-                price: Px(price),
-                timestamp: t.time,
-            });
-        }
-        Ok(fills)
-    }
-
-    pub async fn fetch_position(&self, symbol: &str) -> Result<Position> {
-        let (base, _) = self.symbol_assets(symbol).await?;
-        let qty = self.asset_free(&base).await?;
-        Ok(Position {
-            symbol: symbol.to_string(),
-            qty: Qty(qty),
-            entry: Px(Decimal::ZERO),
-            leverage: 1,
-            liq_px: None,
-        })
-    }
-
-    pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
-        let (bid, ask) = self.best_prices(sym).await?;
-        let mid = (bid.0 + ask.0) / Decimal::from(2);
-        Ok(Px(mid))
-    }
-
-    pub async fn flatten_position(&self, symbol: &str) -> Result<()> {
-        let pos = self.fetch_position(symbol).await?;
-        let qty_dec = pos.qty.0;
-        if qty_dec.is_zero() {
-            return Ok(());
-        }
-        let side = if qty_dec > Decimal::ZERO {
-            Side::Sell
-        } else {
-            Side::Buy
-        };
-        let rules = self.rules_for(symbol).await?;
-
-        // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
-        let qty_prec_from_step = scale_from_step(rules.step_size);
-        let qty_precision = qty_prec_from_step.min(rules.qty_precision);
-
-        // Quantize: step_size'a göre floor
-        let qty_quantized = quantize_decimal(qty_dec.abs(), rules.step_size);
-
-        // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
-        // Bu, "Precision is over the maximum" hatasını önler
-        let qty =
-            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
-
-        if qty <= Decimal::ZERO {
-            warn!(
-                %symbol,
-                original_qty = %qty_dec,
-                "quantized position size is zero, skipping close"
-            );
-            return Ok(());
-        }
-        let qty_str = format_decimal_fixed(qty, qty_precision);
-
-        let params = vec![
-            format!("symbol={}", symbol),
-            format!(
-                "side={}",
-                if matches!(side, Side::Buy) {
-                    "BUY"
-                } else {
-                    "SELL"
-                }
-            ),
-            "type=MARKET".to_string(),
-            format!("quantity={}", qty_str),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-        ];
-        let qs = params.join("&");
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
-        send_void(
-            self.common
-                .client
-                .post(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Venue for BinanceSpot {
-    async fn place_limit(
-        &self,
-        sym: &str,
-        side: Side,
-        px: Px,
-        qty: Qty,
-        tif: Tif,
-    ) -> Result<String> {
-        let s_side = match side {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
-        };
-        let (order_type, tif_str) = match tif {
-            Tif::PostOnly => ("LIMIT_MAKER", None), // Post-only SPOT
-            Tif::Gtc => ("LIMIT", Some("GTC")),
-            Tif::Ioc => ("LIMIT", Some("IOC")),
-        };
-
-        let rules = self.rules_for(sym).await?;
-
-        // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
-        // Precision'ı tick_size ve step_size ile uyumlu hale getir
-        // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
-        let price_prec_from_tick = scale_from_step(rules.tick_size);
-        let qty_prec_from_step = scale_from_step(rules.step_size);
-        // tick_size'dan hesaplanan precision'ı kullan (exchange'in verdiği precision yanlış olabilir)
-        // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
-        let price_precision = price_prec_from_tick.min(rules.price_precision);
-        let qty_precision = qty_prec_from_step.min(rules.qty_precision);
-
-        // Quantize: step_size'a göre floor
-        let price_quantized = quantize_decimal(px.0, rules.tick_size);
-        let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
-
-        // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
-        // Bu, "Precision is over the maximum" hatasını önler
-        let price = price_quantized
-            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
-        let qty =
-            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
-
-        let notional = price * qty;
-        if !rules.min_notional.is_zero() && notional < rules.min_notional {
-            return Err(anyhow!(
-                "below min notional after clamps ({} < {})",
-                notional,
-                rules.min_notional
-            ));
-        }
-
-        // Format: precision'a göre string'e çevir
-        let price_str = format_decimal_fixed(price, price_precision);
-        let qty_str = format_decimal_fixed(qty, qty_precision);
-
-        let mut params = vec![
-            format!("symbol={}", sym),
-            format!("side={}", s_side),
-            format!("type={}", order_type),
-            format!("price={}", price_str),
-            format!("quantity={}", qty_str),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-            "newOrderRespType=RESULT".to_string(),
-        ];
-        if let Some(t) = tif_str {
-            params.push(format!("timeInForce={}", t));
-        }
-
-        let qs = params.join("&");
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
-
-        let order: SpotPlacedOrder = send_json(
-            self.common
-                .client
-                .post(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
-
-        info!(
-            %sym,
-            ?side,
-            price = %price,
-            qty = %qty,
-            tif = ?tif,
-            order_id = order.order_id,
-            "spot place_limit ok"
-        );
-        Ok(order.order_id.to_string())
-    }
-
-    async fn cancel(&self, order_id: &str, sym: &str) -> Result<()> {
-        let qs = format!(
-            "symbol={}&orderId={}&timestamp={}&recvWindow={}",
-            sym,
-            order_id,
-            BinanceCommon::ts(),
-            self.common.recv_window_ms
-        );
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/api/v3/order?{}&signature={}", self.base, qs, sig);
-
-        send_void(
-            self.common
-                .client
-                .delete(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn best_prices(&self, sym: &str) -> Result<(Px, Px)> {
-        let url = format!(
-            "{}/api/v3/ticker/bookTicker?symbol={}",
-            self.base,
-            encode(sym)
-        );
-        let t: BookTickerSpot = send_json(self.common.client.get(url)).await?;
-        use rust_decimal::Decimal;
-        let bid = Px(Decimal::from_str_radix(&t.bid_price, 10)?);
-        let ask = Px(Decimal::from_str_radix(&t.ask_price, 10)?);
-        Ok((bid, ask))
-    }
-
-    async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
-        self.fetch_open_orders(sym).await
-    }
-
-    async fn get_position(&self, sym: &str) -> Result<Position> {
-        self.fetch_position(sym).await
-    }
-
-    async fn mark_price(&self, sym: &str) -> Result<Px> {
-        self.fetch_mark_price(sym).await
-    }
-
-    async fn close_position(&self, sym: &str) -> Result<()> {
-        self.flatten_position(sym).await
-    }
-}
-
 // ---- USDT-M Futures ----
 
 #[derive(Clone)]
@@ -693,6 +178,8 @@ struct OrderBookTop {
 struct FutPlacedOrder {
     #[serde(rename = "orderId")]
     order_id: u64,
+    #[serde(rename = "clientOrderId")]
+    client_order_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1099,6 +586,19 @@ impl Venue for BinanceFutures {
         qty: Qty,
         tif: Tif,
     ) -> Result<String> {
+        // Futures için clientOrderId olmadan eski davranış
+        self.place_limit_with_client_id(sym, side, px, qty, tif, "").await.map(|(order_id, _)| order_id)
+    }
+    
+    async fn place_limit_with_client_id(
+        &self,
+        sym: &str,
+        side: Side,
+        px: Px,
+        qty: Qty,
+        tif: Tif,
+        client_order_id: &str,
+    ) -> Result<(String, Option<String>)> {
         let s_side = match side {
             Side::Buy => "BUY",
             Side::Sell => "SELL",
@@ -1145,7 +645,7 @@ impl Venue for BinanceFutures {
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty, qty_precision);
 
-        let params = vec![
+        let mut params = vec![
             format!("symbol={}", sym),
             format!("side={}", s_side),
             "type=LIMIT".to_string(),
@@ -1156,6 +656,20 @@ impl Venue for BinanceFutures {
             format!("recvWindow={}", self.common.recv_window_ms),
             "newOrderRespType=RESULT".to_string(),
         ];
+        
+        // ClientOrderId ekle (idempotency için) - sadece boş değilse
+        if !client_order_id.is_empty() {
+            // Binance: max 36 karakter, alphanumeric
+            if client_order_id.len() <= 36 && client_order_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                params.push(format!("newClientOrderId={}", client_order_id));
+            } else {
+                warn!(
+                    %sym,
+                    client_order_id = client_order_id,
+                    "invalid clientOrderId format (max 36 chars, alphanumeric), skipping"
+                );
+            }
+        }
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
@@ -1175,9 +689,10 @@ impl Venue for BinanceFutures {
             qty = %qty,
             tif = ?tif,
             order_id = order.order_id,
+            client_order_id = ?order.client_order_id,
             "futures place_limit ok"
         );
-        Ok(order.order_id.to_string())
+        Ok((order.order_id.to_string(), order.client_order_id))
     }
 
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()> {

@@ -23,7 +23,6 @@ struct ListenKeyResp {
 
 #[derive(Clone, Copy, Debug)]
 pub enum UserStreamKind {
-    Spot,
     Futures,
 }
 
@@ -60,17 +59,9 @@ pub struct UserDataStream {
 
 impl UserDataStream {
     #[inline]
-    fn ws_url_for(kind: UserStreamKind, listen_key: &str) -> String {
-        match kind {
-            UserStreamKind::Spot => {
-                // Spot user data
-                format!("wss://stream.binance.com:9443/ws/{}", listen_key)
-            }
-            UserStreamKind::Futures => {
-                // USDⓈ-M Futures user data
-                format!("wss://fstream.binance.com/ws/{}", listen_key)
-            }
-        }
+    fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
+        // USDⓈ-M Futures user data
+        format!("wss://fstream.binance.com/ws/{}", listen_key)
     }
 
     async fn create_listen_key(
@@ -80,10 +71,7 @@ impl UserDataStream {
         kind: UserStreamKind,
     ) -> Result<String> {
         let base = base.trim_end_matches('/');
-        let endpoint = match kind {
-            UserStreamKind::Spot => format!("{}/api/v3/userDataStream", base),
-            UserStreamKind::Futures => format!("{}/fapi/v1/listenKey", base),
-        };
+        let endpoint = format!("{}/fapi/v1/listenKey", base);
 
         let resp = client
             .post(&endpoint)
@@ -105,14 +93,7 @@ impl UserDataStream {
 
     async fn keepalive_listen_key(&self, listen_key: &str) -> Result<()> {
         let base = self.base.trim_end_matches('/');
-        let endpoint = match self.kind {
-            UserStreamKind::Spot => {
-                format!("{}/api/v3/userDataStream?listenKey={}", base, listen_key)
-            }
-            UserStreamKind::Futures => {
-                format!("{}/fapi/v1/listenKey?listenKey={}", base, listen_key)
-            }
-        };
+        let endpoint = format!("{}/fapi/v1/listenKey?listenKey={}", base, listen_key);
 
         let resp = self
             .client
@@ -269,7 +250,7 @@ impl UserDataStream {
     fn map_event(value: &Value) -> Result<Option<UserEvent>> {
         let event_type = value.get("e").and_then(Value::as_str).unwrap_or_default();
         match event_type {
-            // SPOT executionReport
+            // Futures executionReport
             "executionReport" => {
                 let symbol = value
                     .get("s")
