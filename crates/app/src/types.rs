@@ -26,6 +26,10 @@ pub struct SymbolState {
     
     // Per-symbol metadata
     pub symbol_rules: Option<std::sync::Arc<exec::binance::SymbolRules>>,
+    // KRİTİK: ExchangeInfo fetch durumu - başarısızsa trade etme
+    pub rules_fetch_failed: bool, // ExchangeInfo çekilemediyse true (trade etme)
+    pub last_rules_retry: Option<Instant>, // Son retry zamanı (periyodik retry için)
+    pub test_order_passed: bool, // İlk emir öncesi test order başarılı mı?
     
     // Position and order tracking
     pub last_position_check: Option<Instant>,

@@ -13,7 +13,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use urlencoding::encode;
 
 use super::{Venue, VenueOrder};
@@ -737,41 +737,26 @@ impl Venue for BinanceFutures {
 
         let rules = self.rules_for(sym).await?;
 
-        // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
-        // KRİTİK İYİLEŞTİRME: Exchange'in precision'ını önceliklendir
-        // Exchange'in verdiği precision'ı kullan (SymbolRules'da zaten exchange precision varsa kullanılıyor,
-        // yoksa tick_size'dan hesaplanmış oluyor - bu mantık SymbolRules oluşturulurken yapılıyor)
-        // Exchange'in precision'ını override etmeye gerek yok, çünkü exchange kurallarına uyum önemli
-        let price_precision = rules.price_precision;
-        let qty_precision = rules.qty_precision;
+        // KRİTİK DÜZELTME: Validation guard - tek nokta kontrol
+        // Bu fonksiyon -1111 hatasını imkânsız hale getirir
+        let (price_str, qty_str, price_quantized, qty_quantized) = 
+            Self::validate_and_format_order_params(px, qty, &rules, sym)?;
 
-        // Quantize: step_size'a göre floor
-        let price_quantized = quantize_decimal(px.0, rules.tick_size);
-        let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
-
-        // KRİTİK: Quantize sonrası precision'a göre round et (internal precision'ı temizle)
-        // Bu, "Precision is over the maximum" hatasını önler
-        // ÖNEMLİ: round_dp_with_strategy ile kesinlikle precision'a kadar yuvarla
-        // format_decimal_fixed içinde tekrar kontrol edilecek ama burada da doğru yapmalıyız
-        let price = price_quantized
-            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
-        let qty =
-            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
-
-        let notional = price * qty;
-        if !rules.min_notional.is_zero() && notional < rules.min_notional {
-            return Err(anyhow!(
-                "below min notional after clamps ({} < {})",
-                notional,
-                rules.min_notional
-            ));
-        }
-
-        // Format: precision'a göre string'e çevir
-        // KRİTİK: format_decimal_fixed içinde tekrar round yapılıyor ama yine de güvenli tarafta olmak için
-        // normalize() ile temizlenmiş değerleri kullanıyoruz
-        let price_str = format_decimal_fixed(price, price_precision);
-        let qty_str = format_decimal_fixed(qty, qty_precision);
+        // KRİTİK: Log'ları zenginleştir - gönderilen değerleri logla
+        info!(
+            %sym,
+            side = ?side,
+            price_original = %px.0,
+            price_quantized = %price_quantized,
+            price_str,
+            qty_original = %qty.0,
+            qty_quantized = %qty_quantized,
+            qty_str,
+            price_precision = rules.price_precision,
+            qty_precision = rules.qty_precision,
+            endpoint = "/fapi/v1/order",
+            "order validation guard passed, submitting order"
+        );
 
         let mut params = vec![
             format!("symbol={}", sym),
@@ -842,6 +827,57 @@ impl Venue for BinanceFutures {
                     } else {
                         // Status code hata
                         let body = resp.text().await.unwrap_or_default();
+                        let body_lower = body.to_lowercase();
+                        
+                        // KRİTİK DÜZELTME: -1111 (precision) hatası - rules'ı yeniden çek ve retry
+                        if body_lower.contains("precision is over") || body_lower.contains("-1111") {
+                            if attempt < MAX_RETRIES {
+                                // Rules'ı yeniden çek
+                                warn!(%sym, attempt = attempt + 1, "precision error (-1111), refreshing rules and retrying");
+                                match self.rules_for(sym).await {
+                                    Ok(new_rules) => {
+                                        // Yeni rules ile yeniden validate et
+                                        match Self::validate_and_format_order_params(px, qty, &new_rules, sym) {
+                                            Ok((new_price_str, new_qty_str, _, _)) => {
+                                                // Yeni değerlerle retry
+                                                let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                                
+                                                // Params'ı güncelle
+                                                params = vec![
+                                                    format!("symbol={}", sym),
+                                                    format!("side={}", s_side),
+                                                    "type=LIMIT".to_string(),
+                                                    format!("timeInForce={}", tif_str),
+                                                    format!("price={}", new_price_str),
+                                                    format!("quantity={}", new_qty_str),
+                                                    format!("timestamp={}", BinanceCommon::ts()),
+                                                    format!("recvWindow={}", self.common.recv_window_ms),
+                                                    "newOrderRespType=RESULT".to_string(),
+                                                ];
+                                                if !client_order_id.is_empty() {
+                                                    params.push(format!("newClientOrderId={}", client_order_id));
+                                                }
+                                                
+                                                last_error = Some(anyhow!("precision error, retrying with refreshed rules"));
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                error!(%sym, error = %e, "validation failed after rules refresh, giving up");
+                                                return Err(anyhow!("precision error, validation failed after rules refresh: {}", e));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!(%sym, error = %e, "failed to refresh rules, giving up");
+                                        return Err(anyhow!("precision error, failed to refresh rules: {}", e));
+                                    }
+                                }
+                            } else {
+                                error!(%sym, attempt, "precision error (-1111) after max retries, symbol should be quarantined");
+                                return Err(anyhow!("binance api error: {} - {} (precision error, max retries)", status, body));
+                            }
+                        }
                         
                         // Kalıcı hata kontrolü
                         if is_permanent_error(status.as_u16(), &body) {
@@ -887,8 +923,10 @@ impl Venue for BinanceFutures {
         info!(
             %sym,
             ?side,
-            price = %price,
-            qty = %qty,
+            price_quantized = %price_quantized,
+            qty_quantized = %qty_quantized,
+            price_str,
+            qty_str,
             tif = ?tif,
             order_id = order.order_id,
             client_order_id = ?order.client_order_id,
@@ -944,6 +982,157 @@ impl Venue for BinanceFutures {
 
     async fn close_position(&self, sym: &str) -> Result<()> {
         self.flatten_position(sym, self.hedge_mode).await
+    }
+}
+
+impl BinanceFutures {
+    /// Test order endpoint - İlk emir öncesi doğrulama
+    /// /fapi/v1/order/test endpoint'i ile emir parametrelerini test et
+    /// -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek
+    pub async fn test_order(
+        &self,
+        sym: &str,
+        side: Side,
+        px: Px,
+        qty: Qty,
+        tif: Tif,
+    ) -> Result<()> {
+        let s_side = match side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        };
+        let tif_str = match tif {
+            Tif::PostOnly => "GTX",
+            Tif::Gtc => "GTC",
+            Tif::Ioc => "IOC",
+        };
+
+        let rules = self.rules_for(sym).await?;
+        
+        // Validation guard ile format et
+        let (price_str, qty_str, _, _) = 
+            Self::validate_and_format_order_params(px, qty, &rules, sym)?;
+
+        let params = vec![
+            format!("symbol={}", sym),
+            format!("side={}", s_side),
+            "type=LIMIT".to_string(),
+            format!("timeInForce={}", tif_str),
+            format!("price={}", price_str),
+            format!("quantity={}", qty_str),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/order/test?{}&signature={}", self.base, qs, sig);
+
+        match send_void(
+            self.common
+                .client
+                .post(&url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(%sym, price_str, qty_str, "test order passed");
+                Ok(())
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let error_lower = error_str.to_lowercase();
+                
+                // -1111 hatası gelirse sembolü disable et
+                if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                    warn!(
+                        %sym,
+                        price_str,
+                        qty_str,
+                        error = %e,
+                        "test order failed with -1111 (precision error), symbol should be disabled and rules refreshed"
+                    );
+                    Err(anyhow!("test order failed with precision error: {}", e))
+                } else {
+                    warn!(%sym, price_str, qty_str, error = %e, "test order failed");
+                    Err(e)
+                }
+            }
+        }
+    }
+    
+    /// Validation guard: Emir gönderiminden önce son doğrulama
+    /// Bu fonksiyon -1111 hatasını imkânsız hale getirir
+    /// price = floor_to_step(price, tick_size)
+    /// qty = floor_to_step(abs(qty), step_size)
+    /// price_str = format_to_precision(price, price_precision)
+    /// qty_str = format_to_precision(qty, qty_precision)
+    /// Son kontrol: fractional_digits(price_str) <= price_precision
+    pub fn validate_and_format_order_params(
+        px: Px,
+        qty: Qty,
+        rules: &SymbolRules,
+        sym: &str,
+    ) -> Result<(String, String, Decimal, Decimal)> {
+        let price_precision = rules.price_precision;
+        let qty_precision = rules.qty_precision;
+
+        // 1. Quantize: step_size'a göre floor
+        let price_quantized = quantize_decimal(px.0, rules.tick_size);
+        let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
+
+        // 2. Round: precision'a göre round et
+        let price = price_quantized
+            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
+        let qty_rounded =
+            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+
+        // 3. Format: precision'a göre string'e çevir
+        let price_str = format_decimal_fixed(price, price_precision);
+        let qty_str = format_decimal_fixed(qty_rounded, qty_precision);
+
+        // 4. KRİTİK: Son kontrol - fractional_digits kontrolü
+        let price_fractional = if let Some(dot_pos) = price_str.find('.') {
+            price_str[dot_pos + 1..].len()
+        } else {
+            0
+        };
+        let qty_fractional = if let Some(dot_pos) = qty_str.find('.') {
+            qty_str[dot_pos + 1..].len()
+        } else {
+            0
+        };
+
+        if price_fractional > price_precision {
+            let error_msg = format!(
+                "CRITICAL: price_str fractional digits ({}) > price_precision ({}) for {}",
+                price_fractional, price_precision, sym
+            );
+            tracing::error!(%sym, price_str, price_precision, price_fractional, %error_msg);
+            return Err(anyhow!(error_msg));
+        }
+
+        if qty_fractional > qty_precision {
+            let error_msg = format!(
+                "CRITICAL: qty_str fractional digits ({}) > qty_precision ({}) for {}",
+                qty_fractional, qty_precision, sym
+            );
+            tracing::error!(%sym, qty_str, qty_precision, qty_fractional, %error_msg);
+            return Err(anyhow!(error_msg));
+        }
+
+        // 5. Min notional kontrolü
+        let notional = price * qty_rounded;
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            return Err(anyhow!(
+                "below min notional after validation ({} < {})",
+                notional,
+                rules.min_notional
+            ));
+        }
+
+        Ok((price_str, qty_str, price, qty_rounded))
     }
 }
 
@@ -1050,9 +1239,13 @@ fn is_transient_error(status: u16, _body: &str) -> bool {
 fn is_permanent_error(status: u16, body: &str) -> bool {
     if status == 400 {
         let body_lower = body.to_lowercase();
+        // KRİTİK DÜZELTME: -1111 (precision) hatası permanent değil, retry edilebilir
+        // Çünkü girdiyi düzelterek geçilebilir
+        if body_lower.contains("precision is over") || body_lower.contains("-1111") {
+            return false; // Precision hatası retry edilebilir
+        }
         body_lower.contains("invalid") ||
         body_lower.contains("margin") ||
-        body_lower.contains("precision") ||
         body_lower.contains("insufficient balance") ||
         body_lower.contains("min notional") ||
         body_lower.contains("below min notional")
@@ -1060,6 +1253,7 @@ fn is_permanent_error(status: u16, body: &str) -> bool {
         false
     }
 }
+
 
 async fn send_json<T>(builder: RequestBuilder) -> Result<T>
 where

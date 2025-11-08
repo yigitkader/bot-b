@@ -565,8 +565,10 @@ async fn main() -> Result<()> {
             "bot initialized assets"
         );
         
-        // Per-symbol metadata çek (fallback: global cfg değerleri)
+        // KRİTİK: Eager warmup - Per-symbol metadata çek (exchangeInfo)
+        // Başarısız olursa sembolü disable et (kuralsız sembolde trade etme)
         let symbol_rules = venue.rules_for(&meta.symbol).await.ok();
+        let rules_fetch_failed = symbol_rules.is_none();
         if let Some(ref rules) = symbol_rules {
             info!(
                 symbol = %meta.symbol,
@@ -574,12 +576,13 @@ async fn main() -> Result<()> {
                 step_size = %rules.step_size,
                 price_precision = rules.price_precision,
                 qty_precision = rules.qty_precision,
-                "fetched per-symbol metadata"
+                min_notional = %rules.min_notional,
+                "fetched per-symbol metadata (eager warmup)"
             );
         } else {
             warn!(
                 symbol = %meta.symbol,
-                "failed to fetch per-symbol metadata, will use global fallback"
+                "CRITICAL: failed to fetch per-symbol metadata, symbol DISABLED (will not trade)"
             );
         }
         
@@ -593,8 +596,11 @@ async fn main() -> Result<()> {
             active_orders: HashMap::new(),
             pnl_history: Vec::new(),
             min_notional_req: None,
-            disabled: false,
+            disabled: rules_fetch_failed, // KRİTİK: ExchangeInfo başarısızsa disable et
             symbol_rules, // Per-symbol metadata (fallback: None, global cfg kullanılır)
+            rules_fetch_failed, // ExchangeInfo fetch durumu
+            last_rules_retry: None, // Periyodik retry için
+            test_order_passed: false, // İlk emir öncesi test order henüz yapılmadı
             last_position_check: None,
             last_order_sync: None,
             order_fill_rate: cfg.internal.initial_fill_rate,
@@ -2440,6 +2446,31 @@ async fn main() -> Result<()> {
                 continue;
             }
 
+            // KRİTİK: Kuralsız sembolde trade etme - disabled veya rules_fetch_failed ise skip
+            if state.disabled || state.rules_fetch_failed {
+                // Periyodik retry: 30-60 saniyede bir rules'ı yeniden çek
+                let should_retry = state.last_rules_retry
+                    .map(|last| last.elapsed().as_secs() >= 45) // 45 saniye
+                    .unwrap_or(true); // İlk kez
+                
+                if should_retry {
+                    state.last_rules_retry = Some(std::time::Instant::now());
+                    info!(%symbol, "retrying exchangeInfo fetch for disabled symbol");
+                    match venue.rules_for(&symbol).await {
+                        Ok(new_rules) => {
+                            state.symbol_rules = Some(new_rules);
+                            state.disabled = false;
+                            state.rules_fetch_failed = false;
+                            info!(%symbol, "exchangeInfo fetch succeeded, symbol re-enabled");
+                        }
+                        Err(e) => {
+                            debug!(%symbol, error = %e, "exchangeInfo fetch still failed, will retry later");
+                        }
+                    }
+                }
+                continue; // Bu tick'te trade etme
+            }
+            
             // Per-symbol tick_size'ı Context'e geç (crossing guard için)
             let tick_size_f64 = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
             let tick_size_decimal = Decimal::from_f64_retain(tick_size_f64);
@@ -2833,6 +2864,63 @@ async fn main() -> Result<()> {
                         
                         // İlk bid emri (max 100 USD)
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
+                        
+                        // KRİTİK: Test order - İlk emir öncesi doğrulama
+                        // Eğer test_order_passed false ise, test order yap
+                        if !state.test_order_passed {
+                            rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                            match venue.test_order(&symbol, Side::Buy, px, qty, tif).await {
+                                Ok(_) => {
+                                    state.test_order_passed = true;
+                                    info!(%symbol, "test order passed, proceeding with real order");
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    let error_lower = error_str.to_lowercase();
+                                    
+                                    // -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek
+                                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                                        error!(%symbol, error = %e, "test order failed with -1111, disabling symbol and refreshing rules");
+                                        
+                                        // Rules'ı yeniden çek
+                                        match venue.rules_for(&symbol).await {
+                                            Ok(new_rules) => {
+                                                state.symbol_rules = Some(new_rules);
+                                                state.rules_fetch_failed = false;
+                                                state.disabled = false;
+                                                info!(%symbol, "rules refreshed after test order -1111, symbol re-enabled");
+                                                // Test order'ı tekrar dene (bir kez daha)
+                                                rate_limit_guard(1).await;
+                                                match venue.test_order(&symbol, Side::Buy, px, qty, tif).await {
+                                                    Ok(_) => {
+                                                        state.test_order_passed = true;
+                                                        info!(%symbol, "test order passed after rules refresh");
+                                                    }
+                                                    Err(e2) => {
+                                                        error!(%symbol, error = %e2, "test order still failed after rules refresh, disabling symbol");
+                                                        state.disabled = true;
+                                                        state.rules_fetch_failed = true;
+                                                        continue; // Bu sembolü skip et
+                                                    }
+                                                }
+                                            }
+                                            Err(e2) => {
+                                                error!(%symbol, error = %e2, "failed to refresh rules after test order -1111, disabling symbol");
+                                                state.disabled = true;
+                                                state.rules_fetch_failed = true;
+                                                continue; // Bu sembolü skip et
+                                            }
+                                        }
+                                    } else {
+                                        // Diğer hatalar için sembolü disable et ama rules'ı yeniden çekme
+                                        warn!(%symbol, error = %e, "test order failed (non-precision error), disabling symbol");
+                                        state.disabled = true;
+                                        continue; // Bu sembolü skip et
+                                    }
+                                }
+                            }
+                        }
+                        
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                         
@@ -3115,6 +3203,63 @@ async fn main() -> Result<()> {
                         
                         // İlk ask emri (max 100 USD)
                         info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
+                        
+                        // KRİTİK: Test order - İlk emir öncesi doğrulama (ask için de)
+                        // Eğer test_order_passed false ise, test order yap
+                        if !state.test_order_passed {
+                            rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                            match venue.test_order(&symbol, Side::Sell, px, qty, tif).await {
+                                Ok(_) => {
+                                    state.test_order_passed = true;
+                                    info!(%symbol, "test order passed (ask), proceeding with real order");
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    let error_lower = error_str.to_lowercase();
+                                    
+                                    // -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek
+                                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                                        error!(%symbol, error = %e, "test order failed with -1111 (ask), disabling symbol and refreshing rules");
+                                        
+                                        // Rules'ı yeniden çek
+                                        match venue.rules_for(&symbol).await {
+                                            Ok(new_rules) => {
+                                                state.symbol_rules = Some(new_rules);
+                                                state.rules_fetch_failed = false;
+                                                state.disabled = false;
+                                                info!(%symbol, "rules refreshed after test order -1111 (ask), symbol re-enabled");
+                                                // Test order'ı tekrar dene (bir kez daha)
+                                                rate_limit_guard(1).await;
+                                                match venue.test_order(&symbol, Side::Sell, px, qty, tif).await {
+                                                    Ok(_) => {
+                                                        state.test_order_passed = true;
+                                                        info!(%symbol, "test order passed after rules refresh (ask)");
+                                                    }
+                                                    Err(e2) => {
+                                                        error!(%symbol, error = %e2, "test order still failed after rules refresh (ask), disabling symbol");
+                                                        state.disabled = true;
+                                                        state.rules_fetch_failed = true;
+                                                        continue; // Bu sembolü skip et
+                                                    }
+                                                }
+                                            }
+                                            Err(e2) => {
+                                                error!(%symbol, error = %e2, "failed to refresh rules after test order -1111 (ask), disabling symbol");
+                                                state.disabled = true;
+                                                state.rules_fetch_failed = true;
+                                                continue; // Bu sembolü skip et
+                                            }
+                                        }
+                                    } else {
+                                        // Diğer hatalar için sembolü disable et ama rules'ı yeniden çekme
+                                        warn!(%symbol, error = %e, "test order failed (ask, non-precision error), disabling symbol");
+                                        state.disabled = true;
+                                        continue; // Bu sembolü skip et
+                                    }
+                                }
+                            }
+                        }
+                        
                         // API Rate Limit koruması
                         rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                         
