@@ -386,6 +386,234 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.max_usd_per_order <= 0.0 {
         return Err(anyhow!("max_usd_per_order must be positive"));
     }
+    
+    // Quote asset validasyonu: Sadece USDC veya USDT kabul edilir
+    let quote_upper = cfg.quote_asset.to_uppercase();
+    if quote_upper != "USDC" && quote_upper != "USDT" {
+        return Err(anyhow!("quote_asset must be either 'USDC' or 'USDT', got '{}'. Only USDC and USDT are supported.", cfg.quote_asset));
+    }
+    
+    // API key validasyonu
+    if cfg.binance.api_key.trim().is_empty() {
+        return Err(anyhow!("binance.api_key is required but is empty. Please set your API key in config.yaml"));
+    }
+    if cfg.binance.secret_key.trim().is_empty() {
+        return Err(anyhow!("binance.secret_key is required but is empty. Please set your secret key in config.yaml"));
+    }
+    
+    // API key format kontrolü (Binance API key'leri genellikle 64 karakter)
+    if cfg.binance.api_key.len() < 20 {
+        return Err(anyhow!("binance.api_key appears to be invalid (too short). Binance API keys are typically 64 characters long"));
+    }
+    if cfg.binance.secret_key.len() < 20 {
+        return Err(anyhow!("binance.secret_key appears to be invalid (too short). Binance secret keys are typically 64 characters long"));
+    }
+    
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+
+    fn create_test_config() -> AppCfg {
+        AppCfg {
+            symbols: vec![],
+            auto_discover_quote: true,
+            quote_asset: "USDC".to_string(),
+            allow_usdt_quote: true,
+            mode: "futures".to_string(),
+            metrics_port: Some(9000),
+            max_usd_per_order: 100.0,
+            min_usd_per_order: 20.0,
+            min_quote_balance_usd: 1.0,
+            leverage: Some(3),
+            price_tick: 0.001,
+            qty_step: 0.001,
+            binance: BinanceCfg {
+                spot_base: "https://api.binance.com".to_string(),
+                futures_base: "https://fapi.binance.com".to_string(),
+                api_key: "6WkI51B0dbz9gbtRm5PphsWYFmr3oaoagJECl0UiGX13ySnLxXlhuEoR5brk74ZU".to_string(),
+                secret_key: "8N3PxGEp1CTrirTbmkM42mHaNTo5jbyamUFgatfeueHHkH5RBsDgGLCh3b6Ki3nw".to_string(),
+                recv_window_ms: 5000,
+            },
+            risk: RiskCfg {
+                inv_cap: "0.50".to_string(),
+                min_liq_gap_bps: 300.0,
+                dd_limit_bps: 2000,
+                max_leverage: 20,
+            },
+            strategy: StratCfg {
+                r#type: "dyn_mm".to_string(),
+                a: 100.0,
+                b: 35.0,
+                base_size: "20.0".to_string(),
+                inv_cap: None,
+                min_spread_bps: Some(30.0),
+                max_spread_bps: Some(200.0),
+                spread_arbitrage_min_bps: Some(5.0),
+                spread_arbitrage_max_bps: Some(100.0),
+                strong_trend_bps: Some(100.0),
+                momentum_strong_bps: Some(50.0),
+                trend_bias_multiplier: Some(1.0),
+                adverse_selection_threshold_on: Some(0.6),
+                adverse_selection_threshold_off: Some(0.4),
+                opportunity_threshold_on: Some(0.5),
+                opportunity_threshold_off: Some(0.2),
+                price_jump_threshold_bps: Some(500.0),
+                fake_breakout_threshold_bps: Some(100.0),
+                liquidity_drop_threshold: Some(0.5),
+                inventory_threshold_ratio: Some(0.10),
+                volatility_coefficient: Some(0.5),
+                ofi_coefficient: Some(0.5),
+                min_liquidity_required: Some(0.001),
+                min_24h_volume_usd: Some(0.0),
+                min_book_depth_usd: Some(0.0),
+                opportunity_size_multiplier: Some(1.05),
+                strong_trend_multiplier: Some(1.0),
+            },
+            exec: ExecCfg {
+                tif: "post_only".to_string(),
+                venue: "binance".to_string(),
+                cancel_replace_interval_ms: 1500,
+                max_order_age_ms: 10000,
+            },
+            websocket: WsCfg {
+                enabled: true,
+                reconnect_delay_ms: 5000,
+                ping_interval_ms: 30000,
+            },
+            internal: InternalCfg::default(),
+            strategy_internal: StrategyInternalCfg::default(),
+        }
+    }
+
+    #[test]
+    fn test_validate_config_valid() {
+        let cfg = create_test_config();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_invalid_price_tick() {
+        let mut cfg = create_test_config();
+        cfg.price_tick = 0.0;
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.price_tick = -1.0;
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_invalid_qty_step() {
+        let mut cfg = create_test_config();
+        cfg.qty_step = 0.0;
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.qty_step = -1.0;
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_invalid_max_usd_per_order() {
+        let mut cfg = create_test_config();
+        cfg.max_usd_per_order = 0.0;
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.max_usd_per_order = -1.0;
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_invalid_quote_asset() {
+        let mut cfg = create_test_config();
+        cfg.quote_asset = "BUSD".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.quote_asset = "BTC".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.quote_asset = "".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.quote_asset = "EUR".to_string();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_valid_quote_asset_usdc() {
+        let mut cfg = create_test_config();
+        cfg.quote_asset = "USDC".to_string();
+        assert!(validate_config(&cfg).is_ok());
+        
+        cfg.quote_asset = "usdc".to_string();
+        assert!(validate_config(&cfg).is_ok());
+        
+        cfg.quote_asset = "UsDc".to_string();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_valid_quote_asset_usdt() {
+        let mut cfg = create_test_config();
+        cfg.quote_asset = "USDT".to_string();
+        assert!(validate_config(&cfg).is_ok());
+        
+        cfg.quote_asset = "usdt".to_string();
+        assert!(validate_config(&cfg).is_ok());
+        
+        cfg.quote_asset = "UsDt".to_string();
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_validate_config_empty_api_key() {
+        let mut cfg = create_test_config();
+        cfg.binance.api_key = "".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.binance.api_key = "   ".to_string();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_empty_secret_key() {
+        let mut cfg = create_test_config();
+        cfg.binance.secret_key = "".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.binance.secret_key = "   ".to_string();
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_short_api_key() {
+        let mut cfg = create_test_config();
+        cfg.binance.api_key = "short".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.binance.api_key = "1234567890123456789".to_string(); // 19 chars
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_short_secret_key() {
+        let mut cfg = create_test_config();
+        cfg.binance.secret_key = "short".to_string();
+        assert!(validate_config(&cfg).is_err());
+        
+        cfg.binance.secret_key = "1234567890123456789".to_string(); // 19 chars
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_valid_api_keys() {
+        let mut cfg = create_test_config();
+        // 20+ character keys should pass
+        cfg.binance.api_key = "12345678901234567890".to_string(); // 20 chars
+        cfg.binance.secret_key = "12345678901234567890".to_string(); // 20 chars
+        assert!(validate_config(&cfg).is_ok());
+    }
 }
 

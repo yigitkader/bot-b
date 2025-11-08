@@ -2,6 +2,7 @@
 // Main application entry point and trading loop
 
 mod config;
+mod logger;
 mod types;
 mod utils;
 
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use logger::create_logger;
 use types::{OrderInfo, SymbolState};
 use utils::{clamp_qty_by_base, clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot};
 
@@ -72,6 +74,10 @@ async fn main() -> Result<()> {
     if let Some(port) = cfg.metrics_port {
         monitor::init_prom(port);
     }
+
+    // Initialize JSON logger
+    let json_logger = create_logger("logs/trading_events.json")
+        .map_err(|e| anyhow!("Failed to initialize JSON logger: {}", e))?;
 
     info!(
         inv_cap = %cfg.risk.inv_cap,
@@ -366,14 +372,21 @@ async fn main() -> Result<()> {
                     m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                 };
                 
-                // USDT seçeneği: allow_usdt_quote true ise USDT'yi de dahil et
-                let match_usdt = if cfg.allow_usdt_quote && cfg.quote_asset.to_uppercase() == "USDC" {
-                    m.quote_asset.eq_ignore_ascii_case("USDT")
+                // USDT/USDC seçeneği: allow_usdt_quote true ise karşılıklı olarak ekle
+                let match_cross_quote = if cfg.allow_usdt_quote {
+                    let cfg_quote_upper = cfg.quote_asset.to_uppercase();
+                    if cfg_quote_upper == "USDC" {
+                        m.quote_asset.eq_ignore_ascii_case("USDT")
+                    } else if cfg_quote_upper == "USDT" {
+                        m.quote_asset.eq_ignore_ascii_case("USDC")
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 };
                 
-                let match_quote = match_primary_quote || match_usdt;
+                let match_quote = match_primary_quote || match_cross_quote;
                 
                 match_quote
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
@@ -501,14 +514,21 @@ async fn main() -> Result<()> {
                             m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                         };
                         
-                        // USDT seçeneği: allow_usdt_quote true ise USDT'yi de dahil et
-                        let match_usdt = if cfg.allow_usdt_quote && cfg.quote_asset.to_uppercase() == "USDC" {
-                            m.quote_asset.eq_ignore_ascii_case("USDT")
+                        // USDT/USDC seçeneği: allow_usdt_quote true ise karşılıklı olarak ekle
+                        let match_cross_quote = if cfg.allow_usdt_quote {
+                            let cfg_quote_upper = cfg.quote_asset.to_uppercase();
+                            if cfg_quote_upper == "USDC" {
+                                m.quote_asset.eq_ignore_ascii_case("USDT")
+                            } else if cfg_quote_upper == "USDT" {
+                                m.quote_asset.eq_ignore_ascii_case("USDC")
+                            } else {
+                                false
+                            }
                         } else {
                             false
                         };
                         
-                        let match_quote = match_primary_quote || match_usdt;
+                        let match_quote = match_primary_quote || match_cross_quote;
                         
                         match_quote
                             && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
@@ -876,6 +896,20 @@ async fn main() -> Result<()> {
                             cfg.internal.fill_rate_increase_bonus,
                         );
                         
+                        // JSON log: Order filled
+                        if let Ok(logger) = json_logger.lock() {
+                            logger.log_order_filled(
+                                &symbol,
+                                &order_id,
+                                side,
+                                price,
+                                qty,
+                                is_maker,
+                                state.inv,
+                                state.order_fill_rate,
+                            );
+                        }
+                        
                         info!(
                             %symbol,
                             order_id = %order_id,
@@ -893,6 +927,16 @@ async fn main() -> Result<()> {
                         let state = &mut states[*idx];
                         state.active_orders.remove(&order_id);
                         update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                        
+                        // JSON log: Order canceled
+                        if let Ok(logger) = json_logger.lock() {
+                            logger.log_order_canceled(
+                                &symbol,
+                                &order_id,
+                                "price_update_or_timeout",
+                                state.order_fill_rate,
+                            );
+                        }
                         
                         info!(
                             %symbol,
@@ -1672,6 +1716,19 @@ async fn main() -> Result<()> {
                 // Pozisyon var
                 if state.position_entry_time.is_none() {
                     state.position_entry_time = Some(Instant::now());
+                    
+                    // JSON log: Position opened
+                    if let Ok(logger) = json_logger.lock() {
+                        let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+                        logger.log_position_opened(
+                            symbol,
+                            side,
+                            pos.entry,
+                            pos.qty,
+                            pos.leverage,
+                            "order_filled",
+                        );
+                    }
                 }
                 if let Some(entry_time) = state.position_entry_time {
                     state.position_hold_duration_ms = entry_time.elapsed().as_millis() as u64;
@@ -1770,6 +1827,34 @@ async fn main() -> Result<()> {
                         match close_result {
                             Ok(_) => {
                                 position_closed = true;
+                                
+                                // JSON log: Position closed
+                                if let Ok(logger) = json_logger.lock() {
+                                    let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+                                    let leverage = pos.leverage;
+                                    logger.log_position_closed(
+                                        symbol,
+                                        side,
+                                        pos.entry,
+                                        mark_px,
+                                        pos.qty,
+                                        leverage,
+                                        &reason,
+                                    );
+                                    
+                                    // Also log as completed trade
+                                    let fees = 0.0; // Fees calculated separately if needed
+                                    logger.log_trade_completed(
+                                        symbol,
+                                        side,
+                                        pos.entry,
+                                        mark_px,
+                                        pos.qty,
+                                        fees,
+                                        leverage,
+                                    );
+                                }
+                                
                                 info!(
                                     %symbol,
                                     reason,
@@ -1808,7 +1893,20 @@ async fn main() -> Result<()> {
                 .map(|last| last.elapsed().as_secs() >= 30) // Her 30 saniyede bir log (log spam'ini önle)
                 .unwrap_or(true);
             
-            if should_log_position {
+            if should_log_position && has_position {
+                // JSON log: Position updated
+                if let Ok(logger) = json_logger.lock() {
+                    let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+                    logger.log_position_updated(
+                        symbol,
+                        side,
+                        pos.entry,
+                        pos.qty,
+                        mark_px,
+                        pos.leverage,
+                    );
+                }
+                
                 info!(
                     %symbol,
                     position_qty = %pos.qty.0,
@@ -2206,6 +2304,17 @@ async fn main() -> Result<()> {
                 );
                 
                 if !should_place {
+                    // JSON log: Trade rejected
+                    if let Ok(logger) = json_logger.lock() {
+                        logger.log_trade_rejected(
+                            symbol,
+                            reason,
+                            spread_bps,
+                            position_size_usd,
+                            min_spread_bps,
+                        );
+                    }
+                    
                     use tracing::debug;
                     debug!(
                         %symbol,
@@ -2373,7 +2482,20 @@ async fn main() -> Result<()> {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
                                 state.active_orders.insert(order_id.clone(), info);
                                 // Fiyat güncellemesini kaydet (akıllı emir analizi için)
-                                state.last_order_price_update.insert(order_id, px);
+                                state.last_order_price_update.insert(order_id.clone(), px);
+                                
+                                // JSON log: Order created
+                                if let Ok(logger) = json_logger.lock() {
+                                    logger.log_order_created(
+                                        symbol,
+                                        &order_id,
+                                        Side::Sell,
+                                        px,
+                                        qty,
+                                        "spread_opportunity",
+                                        &cfg.exec.tif,
+                                    );
+                                }
                             }
                             Err(err) => {
                                 warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place spot ask order");
@@ -2423,11 +2545,24 @@ async fn main() -> Result<()> {
                         match v.place_limit(&symbol, Side::Buy, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Buy, price: px, qty, created_at: Instant::now() };
-                                state.active_orders.insert(order_id, info);
+                                state.active_orders.insert(order_id.clone(), info);
                                 // Başarılı emir için spent hesapla (hesaptan giden para = margin)
                                 // Notional (pozisyon boyutu) / leverage = hesaptan giden para
                                 let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
                                 total_spent_on_bids = notional / effective_leverage;
+                                
+                                // JSON log: Order created
+                                if let Ok(logger) = json_logger.lock() {
+                                    logger.log_order_created(
+                                        symbol,
+                                        &order_id,
+                                        Side::Buy,
+                                        px,
+                                        qty,
+                                        "spread_opportunity",
+                                        &cfg.exec.tif,
+                                    );
+                                }
                             }
                             Err(err) => {
                                 let msg = err.to_string();
@@ -2594,7 +2729,20 @@ async fn main() -> Result<()> {
                         match v.place_limit(&symbol, Side::Sell, px, qty, tif).await {
                             Ok(order_id) => {
                                 let info = OrderInfo { order_id: order_id.clone(), side: Side::Sell, price: px, qty, created_at: Instant::now() };
-                                state.active_orders.insert(order_id, info);
+                                state.active_orders.insert(order_id.clone(), info);
+                                
+                                // JSON log: Order created
+                                if let Ok(logger) = json_logger.lock() {
+                                    logger.log_order_created(
+                                        symbol,
+                                        &order_id,
+                                        Side::Sell,
+                                        px,
+                                        qty,
+                                        "spread_opportunity",
+                                        &cfg.exec.tif,
+                                    );
+                                }
                                 // Başarılı emir için spent hesapla (hesaptan giden para = margin)
                                 // Notional (pozisyon boyutu) / leverage = hesaptan giden para
                                 let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));

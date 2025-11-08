@@ -6,6 +6,7 @@ use exec::binance::SymbolRules;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
+
 // ============================================================================
 // Quantity and Price Helpers
 // ============================================================================
@@ -67,11 +68,11 @@ pub fn clamp_qty_by_base(qty: Qty, max_base: f64, qty_step: f64) -> Qty {
     Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
 }
 
-/// Check if asset is a USD stablecoin
+/// Check if asset is a USD stablecoin (only USDC and USDT allowed)
 pub fn is_usd_stable(asset: &str) -> bool {
     matches!(
         asset.to_uppercase().as_str(),
-        "USDT" | "USDC" | "BUSD"
+        "USDT" | "USDC"
     )
 }
 

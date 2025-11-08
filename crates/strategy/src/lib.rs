@@ -1353,7 +1353,12 @@ mod tests {
             min_liquidity_required: default_min_liquidity_required(),
             opportunity_size_multiplier: default_opportunity_size_multiplier(),
             strong_trend_multiplier: default_strong_trend_multiplier(),
+            min_24h_volume_usd: default_min_24h_volume_usd(),
+            min_book_depth_usd: default_min_book_depth_usd(),
             // Strategy internal config (test için default değerler)
+            confidence_min_threshold: None,
+            default_confidence: None,
+            min_confidence_value: None,
             manipulation_volume_ratio_threshold: None,
             manipulation_time_threshold_ms: None,
             manipulation_price_history_min_len: None,

@@ -19,7 +19,7 @@ Bu proje, Binance borsasında (Spot ve Futures) otomatik market making yapan bir
 **Sembol Seçimi:**
 - Manuel sembol listesi varsa kullanılır
 - `auto_discover_quote=true` ise, belirtilen quote asset (örn: USDC) ile tüm işlem yapılabilir semboller otomatik bulunur
-- USD-stablecoin grubu (USDT, USDC, BUSD, vb.) birbirine eşdeğer kabul edilir
+- USD-stablecoin grubu: Sadece USDC ve USDT kabul edilir (birbirine eşdeğer kabul edilir)
 - Sadece "TRADING" durumundaki semboller seçilir
 - Futures modunda sadece "PERPETUAL" kontratlar kabul edilir
 - Başlangıç bakiyesi kontrolü yapılır (yetersiz bakiye olan semboller atlanır)
