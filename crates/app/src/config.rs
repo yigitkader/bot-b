@@ -70,6 +70,10 @@ pub struct StratCfg {
     #[serde(default)]
     pub min_liquidity_required: Option<f64>,
     #[serde(default)]
+    pub min_24h_volume_usd: Option<f64>,
+    #[serde(default)]
+    pub min_book_depth_usd: Option<f64>,
+    #[serde(default)]
     pub opportunity_size_multiplier: Option<f64>,
     #[serde(default)]
     pub strong_trend_multiplier: Option<f64>,
@@ -129,6 +133,8 @@ pub struct InternalCfg {
     pub order_price_distance_no_position: f64,
     #[serde(default = "default_order_price_change_threshold")]
     pub order_price_change_threshold: f64,
+    #[serde(default = "default_min_quote_life_ms")]
+    pub min_quote_life_ms: u64,
     #[serde(default = "default_inventory_reconcile_threshold")]
     pub inventory_reconcile_threshold: String,
     #[serde(default = "default_position_qty_threshold")]
@@ -167,6 +173,24 @@ pub struct InternalCfg {
     pub stop_loss_trend_threshold: f64,
     #[serde(default = "default_max_position_size_buffer")]
     pub max_position_size_buffer: f64,
+    #[serde(default = "default_opportunity_mode_position_multiplier")]
+    pub opportunity_mode_position_multiplier: f64,
+    #[serde(default = "default_opportunity_mode_leverage_reduction")]
+    pub opportunity_mode_leverage_reduction: f64,
+    #[serde(default = "default_min_risk_reward_ratio")]
+    pub min_risk_reward_ratio: f64,
+    #[serde(default = "default_take_profit_position_size_threshold")]
+    pub take_profit_position_size_threshold: f64,
+    #[serde(default = "default_initial_fill_rate")]
+    pub initial_fill_rate: f64,
+    #[serde(default = "default_no_fill_threshold_sec")]
+    pub no_fill_threshold_sec: f64,
+    #[serde(default = "default_fill_rate_decrease_on_no_fill")]
+    pub fill_rate_decrease_on_no_fill: f64,
+    #[serde(default = "default_min_fill_rate")]
+    pub min_fill_rate: f64,
+    #[serde(default = "default_spread_widen_factor")]
+    pub spread_widen_factor: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +213,8 @@ pub struct AppCfg {
     pub auto_discover_quote: bool,
     #[serde(default = "default_quote_asset")]
     pub quote_asset: String,
+    #[serde(default = "default_allow_usdt_quote")]
+    pub allow_usdt_quote: bool,
     pub mode: String,
     #[serde(default)]
     pub metrics_port: Option<u16>,
@@ -238,6 +264,10 @@ pub struct StrategyInternalCfg {
     pub confidence_max_multiplier: f64,
     #[serde(default = "default_confidence_min_threshold")]
     pub confidence_min_threshold: f64,
+    #[serde(default = "default_default_confidence")]
+    pub default_confidence: f64,
+    #[serde(default = "default_min_confidence_value")]
+    pub min_confidence_value: f64,
     #[serde(default = "default_trend_analysis_min_history")]
     pub trend_analysis_min_history: usize,
     #[serde(default = "default_trend_analysis_threshold_negative")]
@@ -268,7 +298,8 @@ fn default_fill_rate_slow_decrease_factor() -> f64 { 0.995 }
 fn default_fill_rate_slow_decrease_bonus() -> f64 { 0.005 }
 fn default_order_price_distance_with_position() -> f64 { 0.01 }
 fn default_order_price_distance_no_position() -> f64 { 0.005 }
-fn default_order_price_change_threshold() -> f64 { 0.0001 }
+fn default_order_price_change_threshold() -> f64 { 0.001 }
+fn default_min_quote_life_ms() -> u64 { 1500 }
 fn default_inventory_reconcile_threshold() -> String { "0.00000001".to_string() }
 fn default_position_qty_threshold() -> String { "0.00000001".to_string() }
 fn default_pnl_alert_interval_sec() -> u64 { 10 }
@@ -288,8 +319,18 @@ fn default_stop_loss_threshold() -> f64 { -0.005 }
 fn default_stop_loss_time_threshold_ms() -> u64 { 120_000 }
 fn default_stop_loss_trend_threshold() -> f64 { -0.2 }
 fn default_max_position_size_buffer() -> f64 { 5.0 }
+fn default_opportunity_mode_position_multiplier() -> f64 { 2.0 }
+fn default_opportunity_mode_leverage_reduction() -> f64 { 0.5 }
+fn default_min_risk_reward_ratio() -> f64 { 2.0 }
+fn default_take_profit_position_size_threshold() -> f64 { 100.0 }
+fn default_initial_fill_rate() -> f64 { 0.5 }
+fn default_no_fill_threshold_sec() -> f64 { 5.0 }
+fn default_fill_rate_decrease_on_no_fill() -> f64 { 0.90 }
+fn default_min_fill_rate() -> f64 { 0.1 }
+fn default_spread_widen_factor() -> f64 { 0.001 }
 fn default_recv_window() -> u64 { 5_000 }
 fn default_quote_asset() -> String { "USDC".to_string() }
+fn default_allow_usdt_quote() -> bool { true }
 fn default_min_quote_balance_usd() -> f64 { 1.0 }
 fn default_manipulation_volume_ratio_threshold() -> f64 { 5.0 }
 fn default_manipulation_time_threshold_ms() -> u64 { 2000 }
@@ -303,6 +344,8 @@ fn default_confidence_spread_max() -> f64 { 150.0 }
 fn default_confidence_bonus_multiplier() -> f64 { 0.3 }
 fn default_confidence_max_multiplier() -> f64 { 1.5 }
 fn default_confidence_min_threshold() -> f64 { 0.75 }
+fn default_default_confidence() -> f64 { 0.7 }
+fn default_min_confidence_value() -> f64 { 0.5 }
 fn default_trend_analysis_min_history() -> usize { 10 }
 fn default_trend_analysis_threshold_negative() -> f64 { -0.15 }
 fn default_trend_analysis_threshold_strong_negative() -> f64 { -0.20 }

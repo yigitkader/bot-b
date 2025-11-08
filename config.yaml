@@ -3,6 +3,7 @@
 symbols: []            # Manuel semboller; boş bırakırsan auto discovery devrede
 auto_discover_quote: true
 quote_asset: "USDC"
+allow_usdt_quote: true  # USDC yanında USDT'yi de dahil et (daha fazla likidite ve sembol)
 mode: "futures"       # "spot" | "futures"
 metrics_port: 9000
 
@@ -45,10 +46,10 @@ strategy:
   type: "dyn_mm"
   a: 100.0   # Gerçekçi: 80.0 → 100.0 (spread'i biraz genişlet, kazanç için)
   b: 35.0    # Gerçekçi: 30.0 → 35.0 (spread'i biraz genişlet)
-  base_size: "50.0"  # 20 → 50 (daha fazla kazanç/işlem)
+  base_size: "20.0"  # 20 → 50 (daha fazla kazanç/işlem)
   
   # --- Spread ve Fiyatlama Eşikleri ---
-  min_spread_bps: 60.0              # Minimum spread (bps) (2.0 → 60.0: fee + kar garantisi)
+  min_spread_bps: 30.0              # Minimum spread (bps) (60.0 → 30.0: fill oranını artır, dinamik spread ile fee+kar garantisi korunur)
   max_spread_bps: 200.0            # Maksimum spread (bps) (150 → 200: daha toleranslı)
   spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
   spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)
@@ -80,14 +81,16 @@ strategy:
   
   # --- Diğer ---
   min_liquidity_required: 0.001    # Minimum likidite gereksinimi (0.01 → 0.001: daha fazla sembol için trade yapılabilir)
+  min_24h_volume_usd: 0.0         # Minimum 24h volume (USD) - 0.0 = devre dışı (rate limit riski nedeniyle opsiyonel)
+  min_book_depth_usd: 0.0         # Minimum book depth (USD) - 0.0 = devre dışı (mevcut min_liquidity_required yeterli)
   opportunity_size_multiplier: 1.05 # Fırsat modu pozisyon çarpanı (1.1 → 1.05: konservatif)
   strong_trend_multiplier: 1.0     # Güçlü trend pozisyon çarpanı (1.5 → 1.0: normal boyut)
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
   venue: "binance"     # sabit
-  cancel_replace_interval_ms: 500  # Optimize: 1000 → 500 (2x daha sık güncelleme, daha fazla işlem)
-  max_order_age_ms: 5000  # Optimize: 10000 → 5000 (daha hızlı yenileme)
+  cancel_replace_interval_ms: 1500  # Rate limit koruması: 500 → 1500 (daha az churn, rate limit riski azalır)
+  max_order_age_ms: 10000  # 5000 → 10000 (daha uzun emir ömrü, daha az cancel/replace)
 
 websocket:
   enabled: true
@@ -117,7 +120,8 @@ internal:
   # Emir fiyat mesafesi eşikleri (decimal)
   order_price_distance_with_position: 0.01  # %1 (pozisyon varsa)
   order_price_distance_no_position: 0.005     # %0.5 (pozisyon yoksa)
-  order_price_change_threshold: 0.0001        # %0.01 fiyat değişimi eşiği
+  order_price_change_threshold: 0.001         # %0.1 fiyat değişimi eşiği (0.0001 → 0.001: gereksiz güncellemeleri azalt)
+  min_quote_life_ms: 1500                    # Minimum quote ömrü (ms) - rate limit koruması için
   
   # Envanter uyumsuzluğu eşiği
   inventory_reconcile_threshold: 0.00000001  # Decimal::new(1, 8)
@@ -140,7 +144,7 @@ internal:
   trailing_stop_drawdown_large: 0.01    # %1 (büyük karlar için) (0.03 → 0.01: sıkı)
   trailing_stop_drawdown_medium: 0.005  # %0.5 (orta karlar için) (0.015 → 0.005: sıkı)
   trailing_stop_drawdown_small: 0.003   # %0.3 (küçük karlar için) (0.001 → 0.003: sıkı)
-  trailing_stop_min_peak: 0.01           # Minimum peak (USD)
+  trailing_stop_min_peak: 1.0            # Minimum peak (USD) (0.01 → 1.0: mikro dalgalanmaları önler)
   
   # Stop loss eşikleri
   stop_loss_threshold: -0.01  # %1 zarar (-0.005 → -0.01: daha erken kes)
@@ -149,6 +153,21 @@ internal:
   
   # Pozisyon boyutu risk kontrolü
   max_position_size_buffer: 5.0  # 5x buffer
+  opportunity_mode_position_multiplier: 2.0  # Fırsat modunda pozisyon çarpanı (normal 1x)
+  opportunity_mode_leverage_reduction: 0.5  # Fırsat modunda leverage azaltma faktörü (0.5 = yarıya düşür)
+  
+  # Risk/Reward ve Profit Guarantee
+  min_risk_reward_ratio: 2.0  # Minimum risk/reward oranı (2:1)
+  take_profit_position_size_threshold: 100.0  # Take profit için pozisyon boyutu eşiği (USD)
+  
+  # Fill rate yönetimi
+  initial_fill_rate: 0.5  # Başlangıç fill rate (%50)
+  no_fill_threshold_sec: 5.0  # Fill olmayan emir threshold'u (saniye)
+  fill_rate_decrease_on_no_fill: 0.90  # Fill olmayınca düşürme faktörü
+  min_fill_rate: 0.1  # Minimum fill rate (%10)
+  
+  # Spread yönetimi
+  spread_widen_factor: 0.001  # Spread genişletme faktörü (0.1%)
 
 # --- Strateji İç Mantık Parametreleri ---
 strategy_internal:
@@ -167,6 +186,8 @@ strategy_internal:
   confidence_bonus_multiplier: 0.3            # Confidence bonus multiplier
   confidence_max_multiplier: 2.0              # Max multiplier cap (1.5 → 2.0: daha agresif)
   confidence_min_threshold: 0.85              # Minimum confidence threshold (%85+ güven gerekli)
+  default_confidence: 0.7                     # Default confidence değeri (opportunity türü bilinmediğinde)
+  min_confidence_value: 0.5                  # Minimum confidence değeri (clamp için)
   
   # Trend analizi
   trend_analysis_min_history: 10              # Minimum geçmiş uzunluğu

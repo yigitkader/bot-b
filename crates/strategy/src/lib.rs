@@ -92,6 +92,10 @@ pub struct DynMmCfg {
     // --- Diğer ---
     #[serde(default = "default_min_liquidity_required")]
     pub min_liquidity_required: f64,       // Minimum likidite gereksinimi
+    #[serde(default = "default_min_24h_volume_usd")]
+    pub min_24h_volume_usd: f64,          // Minimum 24h volume (USD) - 0.0 = devre dışı
+    #[serde(default = "default_min_book_depth_usd")]
+    pub min_book_depth_usd: f64,           // Minimum book depth (USD) - 0.0 = devre dışı
     #[serde(default = "default_opportunity_size_multiplier")]
     pub opportunity_size_multiplier: f64, // Fırsat modu pozisyon çarpanı
     #[serde(default = "default_strong_trend_multiplier")]
@@ -127,6 +131,10 @@ pub struct DynMmCfg {
     pub trend_analysis_threshold_negative: Option<f64>,
     #[serde(default)]
     pub trend_analysis_threshold_strong_negative: Option<f64>,
+    #[serde(default)]
+    pub default_confidence: Option<f64>,
+    #[serde(default)]
+    pub min_confidence_value: Option<f64>,
 }
 
 // Default değerler
@@ -148,6 +156,8 @@ fn default_inventory_threshold_ratio() -> f64 { 0.15 } // 0.05 → 0.15: daha to
 fn default_volatility_coefficient() -> f64 { 0.5 }
 fn default_ofi_coefficient() -> f64 { 0.5 }
 fn default_min_liquidity_required() -> f64 { 0.01 }
+fn default_min_24h_volume_usd() -> f64 { 0.0 }
+fn default_min_book_depth_usd() -> f64 { 0.0 }
 fn default_opportunity_size_multiplier() -> f64 { 1.2 } // 1.5 → 1.2: daha güvenli, false positive riski azalt
 fn default_strong_trend_multiplier() -> f64 { 1.2 } // 1.5 → 1.2: daha güvenli
 
@@ -175,6 +185,8 @@ pub struct DynMm {
     volatility_coefficient: f64,
     ofi_coefficient: f64,
     min_liquidity_required: f64,
+    min_24h_volume_usd: f64,
+    min_book_depth_usd: f64,
     opportunity_size_multiplier: f64,
     strong_trend_multiplier: f64,
     // Strategy internal config
@@ -190,6 +202,8 @@ pub struct DynMm {
     confidence_bonus_multiplier: f64,
     confidence_max_multiplier: f64,
     confidence_min_threshold: f64,
+    default_confidence: f64,
+    min_confidence_value: f64,
     #[allow(dead_code)]
     trend_analysis_min_history: usize,
     #[allow(dead_code)]
@@ -257,6 +271,8 @@ impl From<DynMmCfg> for DynMm {
             volatility_coefficient: c.volatility_coefficient,
             ofi_coefficient: c.ofi_coefficient,
             min_liquidity_required: c.min_liquidity_required,
+            min_24h_volume_usd: c.min_24h_volume_usd,
+            min_book_depth_usd: c.min_book_depth_usd,
             opportunity_size_multiplier: c.opportunity_size_multiplier,
             strong_trend_multiplier: c.strong_trend_multiplier,
             // Strategy internal config (default değerler)
@@ -272,6 +288,8 @@ impl From<DynMmCfg> for DynMm {
             confidence_bonus_multiplier: c.confidence_bonus_multiplier.unwrap_or(0.3),
             confidence_max_multiplier: c.confidence_max_multiplier.unwrap_or(1.5),
             confidence_min_threshold: c.confidence_min_threshold.unwrap_or(0.75),
+            default_confidence: c.default_confidence.unwrap_or(0.7),
+            min_confidence_value: c.min_confidence_value.unwrap_or(0.5),
             trend_analysis_min_history: c.trend_analysis_min_history.unwrap_or(10),
             trend_analysis_threshold_negative: c.trend_analysis_threshold_negative.unwrap_or(-0.15),
             trend_analysis_threshold_strong_negative: c.trend_analysis_threshold_strong_negative.unwrap_or(-0.20),
@@ -1185,23 +1203,23 @@ impl Strategy for DynMm {
                 ManipulationOpportunity::FlashCrashLong { price_drop_bps } => {
                     // Ne kadar büyük düşüş, o kadar güvenilir
                     // Config'den: confidence_price_drop_max kullan
-                    (price_drop_bps / self.confidence_price_drop_max).min(1.0).max(0.5)
+                    (price_drop_bps / self.confidence_price_drop_max).min(1.0).max(self.min_confidence_value)
                 }
                 ManipulationOpportunity::FlashPumpShort { price_rise_bps } => {
                     // Ne kadar büyük yükseliş, o kadar güvenilir
-                    (price_rise_bps / self.confidence_price_drop_max).min(1.0).max(0.5)
+                    (price_rise_bps / self.confidence_price_drop_max).min(1.0).max(self.min_confidence_value)
                 }
                 ManipulationOpportunity::VolumeAnomalyTrend { volume_ratio, .. } => {
                     // Volume ratio'ya göre: Config'den min/max kullan
-                    ((volume_ratio - self.confidence_volume_ratio_min) / (self.confidence_volume_ratio_max - self.confidence_volume_ratio_min)).min(1.0).max(0.5)
+                    ((volume_ratio - self.confidence_volume_ratio_min) / (self.confidence_volume_ratio_max - self.confidence_volume_ratio_min)).min(1.0).max(self.min_confidence_value)
                 }
                 ManipulationOpportunity::WideSpreadArbitrage { spread_bps } => {
                     // Spread ne kadar geniş, o kadar güvenilir (Config'den min/max kullan)
-                    ((spread_bps - self.confidence_spread_min) / (self.confidence_spread_max - self.confidence_spread_min)).min(1.0).max(0.5)
+                    ((spread_bps - self.confidence_spread_min) / (self.confidence_spread_max - self.confidence_spread_min)).min(1.0).max(self.min_confidence_value)
                 }
                 _ => {
-                    // Diğer opportunity türleri için orta güven
-                    0.7
+                    // Diğer opportunity türleri için default güven
+                    self.default_confidence
                 }
             };
             // Dinamik multiplier: Base multiplier ile confidence'ı birleştir

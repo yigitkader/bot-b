@@ -119,6 +119,8 @@ async fn main() -> Result<()> {
         volatility_coefficient: cfg.strategy.volatility_coefficient.unwrap_or(0.5),
         ofi_coefficient: cfg.strategy.ofi_coefficient.unwrap_or(0.5),
         min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
+        min_24h_volume_usd: cfg.strategy.min_24h_volume_usd.unwrap_or(0.0),
+        min_book_depth_usd: cfg.strategy.min_book_depth_usd.unwrap_or(0.0),
         opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(1.05), // Config'den: 1.05 (konservatif)
         strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.0), // Config'den: 1.0 (normal boyut)
         // Strategy internal config (config.yaml'den strategy_internal bölümünden)
@@ -133,8 +135,10 @@ async fn main() -> Result<()> {
         confidence_spread_max: Some(cfg.strategy_internal.confidence_spread_max),
         confidence_bonus_multiplier: Some(cfg.strategy_internal.confidence_bonus_multiplier),
         confidence_max_multiplier: Some(cfg.strategy_internal.confidence_max_multiplier),
-        confidence_min_threshold: Some(cfg.strategy_internal.confidence_min_threshold),
-        trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
+            confidence_min_threshold: Some(cfg.strategy_internal.confidence_min_threshold),
+            default_confidence: Some(cfg.strategy_internal.default_confidence),
+            min_confidence_value: Some(cfg.strategy_internal.min_confidence_value),
+            trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
         trend_analysis_threshold_negative: Some(cfg.strategy_internal.trend_analysis_threshold_negative),
         trend_analysis_threshold_strong_negative: Some(cfg.strategy_internal.trend_analysis_threshold_strong_negative),
     };
@@ -165,6 +169,8 @@ async fn main() -> Result<()> {
             volatility_coefficient: dyn_cfg.volatility_coefficient,
             ofi_coefficient: dyn_cfg.ofi_coefficient,
             min_liquidity_required: dyn_cfg.min_liquidity_required,
+            min_24h_volume_usd: dyn_cfg.min_24h_volume_usd,
+            min_book_depth_usd: dyn_cfg.min_book_depth_usd,
             opportunity_size_multiplier: dyn_cfg.opportunity_size_multiplier,
             strong_trend_multiplier: dyn_cfg.strong_trend_multiplier,
             manipulation_volume_ratio_threshold: dyn_cfg.manipulation_volume_ratio_threshold,
@@ -179,6 +185,8 @@ async fn main() -> Result<()> {
             confidence_bonus_multiplier: dyn_cfg.confidence_bonus_multiplier,
             confidence_max_multiplier: dyn_cfg.confidence_max_multiplier,
             confidence_min_threshold: dyn_cfg.confidence_min_threshold,
+            default_confidence: dyn_cfg.default_confidence,
+            min_confidence_value: dyn_cfg.min_confidence_value,
             trend_analysis_min_history: dyn_cfg.trend_analysis_min_history,
             trend_analysis_threshold_negative: dyn_cfg.trend_analysis_threshold_negative,
             trend_analysis_threshold_strong_negative: dyn_cfg.trend_analysis_threshold_strong_negative,
@@ -346,16 +354,27 @@ async fn main() -> Result<()> {
     }
 
     if selected.is_empty() && cfg.auto_discover_quote {
-        // --- auto-discover: USD-stable grup kuralı ---
+        // --- auto-discover: USD-stable grup kuralı + USDT seçeneği ---
         let want_group = is_usd_stable(&cfg.quote_asset);
         let mut auto: Vec<SymbolMeta> = metadata
             .iter()
             .filter(|m| {
-                let match_quote = if want_group {
+                // Ana quote asset kontrolü
+                let match_primary_quote = if want_group {
                     is_usd_stable(&m.quote_asset)
                 } else {
                     m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                 };
+                
+                // USDT seçeneği: allow_usdt_quote true ise USDT'yi de dahil et
+                let match_usdt = if cfg.allow_usdt_quote && cfg.quote_asset.to_uppercase() == "USDC" {
+                    m.quote_asset.eq_ignore_ascii_case("USDT")
+                } else {
+                    false
+                };
+                
+                let match_quote = match_primary_quote || match_usdt;
+                
                 match_quote
                     && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                     && (mode_lower != "futures"
@@ -475,11 +494,22 @@ async fn main() -> Result<()> {
                 let mut retry_auto: Vec<SymbolMeta> = metadata
                     .iter()
                     .filter(|m| {
-                        let match_quote = if want_group {
+                        // Ana quote asset kontrolü
+                        let match_primary_quote = if want_group {
                             is_usd_stable(&m.quote_asset)
                         } else {
                             m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
                         };
+                        
+                        // USDT seçeneği: allow_usdt_quote true ise USDT'yi de dahil et
+                        let match_usdt = if cfg.allow_usdt_quote && cfg.quote_asset.to_uppercase() == "USDC" {
+                            m.quote_asset.eq_ignore_ascii_case("USDT")
+                        } else {
+                            false
+                        };
+                        
+                        let match_quote = match_primary_quote || match_usdt;
+                        
                         match_quote
                             && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
                             && (mode_lower != "futures"
@@ -640,7 +670,7 @@ async fn main() -> Result<()> {
             symbol_rules, // Per-symbol metadata (fallback: None, global cfg kullanılır)
             last_position_check: None,
             last_order_sync: None,
-            order_fill_rate: 0.5, // Başlangıçta %50 varsay
+            order_fill_rate: cfg.internal.initial_fill_rate,
             consecutive_no_fills: 0,
             last_fill_time: None, // Zaman bazlı fill rate için
             last_inventory_update: None, // Envanter güncelleme race condition önleme için
@@ -812,10 +842,25 @@ async fn main() -> Result<()> {
                     order_id,
                     side,
                     qty,
-                    ..
+                    price,
+                    is_maker,
                 } => {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         let state = &mut states[*idx];
+                        
+                        // Post-Only doğrulaması: Post-only emirler maker olarak fill olmalı
+                        let is_post_only = cfg.exec.tif.to_lowercase() == "post_only";
+                        if is_post_only && !is_maker {
+                            warn!(
+                                %symbol,
+                                order_id = %order_id,
+                                side = ?side,
+                                "POST-ONLY VIOLATION: order filled as taker (should be maker), this should not happen with post-only orders"
+                            );
+                            // Post-only emir taker olarak fill olduysa, bu bir sorun
+                            // Ancak fill zaten oldu, sadece uyarı veriyoruz
+                        }
+                        
                         let mut inv = state.inv.0;
                         if side == Side::Buy {
                             inv += qty.0;
@@ -836,6 +881,7 @@ async fn main() -> Result<()> {
                             order_id = %order_id,
                             side = ?side,
                             qty = %qty.0,
+                            is_maker,
                             new_inventory = %state.inv.0,
                             fill_rate = state.order_fill_rate,
                             "order filled: updating inventory and fill rate"
@@ -1541,7 +1587,7 @@ async fn main() -> Result<()> {
             // PATCH: Fırsat modunda bile max position size sınırı
             let is_opportunity_mode = state.strategy.is_opportunity_mode();
             let max_position_multiplier = if is_opportunity_mode {
-                2.0 // Fırsat modunda 2x (normal 1x)
+                cfg.internal.opportunity_mode_position_multiplier
             } else {
                 1.0
             };
@@ -1808,10 +1854,9 @@ async fn main() -> Result<()> {
                     .unwrap_or(f64::MAX);
                 
                 // Eğer emirler 5 saniyeden fazla açıksa ve son fill'den 5 saniye geçtiyse, fill rate'i düşür
-                let no_fill_threshold_sec = 5.0; // 5 saniye
+                let no_fill_threshold_sec = cfg.internal.no_fill_threshold_sec;
                 if oldest_order_age > no_fill_threshold_sec && time_since_last_fill > no_fill_threshold_sec {
-                    // PATCH: Daha agresif düşür (0.99 → 0.90)
-                    state.order_fill_rate = (state.order_fill_rate * 0.90).max(0.1);
+                    state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_decrease_on_no_fill).max(cfg.internal.min_fill_rate);
                     state.consecutive_no_fills += 1; // Geriye dönük uyumluluk için
                     
                     warn!(
@@ -1907,7 +1952,7 @@ async fn main() -> Result<()> {
                         .map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
                 }
                 RiskAction::Widen => {
-                    let widen = Decimal::from_f64_retain(0.001).unwrap_or(Decimal::ZERO);
+                    let widen = Decimal::from_f64_retain(cfg.internal.spread_widen_factor).unwrap_or(Decimal::ZERO);
                     quotes.bid = quotes
                         .bid
                         .map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
@@ -2027,7 +2072,7 @@ async fn main() -> Result<()> {
                     // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
                     let is_opportunity_mode = state.strategy.is_opportunity_mode();
                     let effective_leverage_for_caps = if is_opportunity_mode {
-                        effective_leverage / 2.0 // Fırsat modunda yarıya düşür
+                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
                     } else {
                         effective_leverage
                     };
@@ -2150,7 +2195,7 @@ async fn main() -> Result<()> {
                 
                 let min_spread_bps = cfg.strategy.min_spread_bps.unwrap_or(60.0);
                 let stop_loss_threshold = cfg.internal.stop_loss_threshold;
-                let min_risk_reward_ratio = 2.0; // 2:1 minimum risk/reward
+                let min_risk_reward_ratio = cfg.internal.min_risk_reward_ratio;
                 
                 let (should_place, reason) = utils::should_place_trade(
                     spread_bps,
@@ -2428,7 +2473,7 @@ async fn main() -> Result<()> {
                                             // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
                                             // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
                                             let effective_leverage_for_qty_bid = if state.strategy.is_opportunity_mode() {
-                                                effective_leverage / 2.0
+                                                effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
                                             } else {
                                                 effective_leverage
                                             };
@@ -2599,7 +2644,7 @@ async fn main() -> Result<()> {
                                             // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
                                             // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
                                             let effective_leverage_for_qty_ask = if state.strategy.is_opportunity_mode() {
-                                                effective_leverage_ask / 2.0
+                                                effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
                                             } else {
                                                 effective_leverage_ask
                                             };
@@ -2868,7 +2913,7 @@ fn should_close_position(
     let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
     let peak_pnl_f64 = peak_pnl.to_f64().unwrap_or(0.0);
     
-    let take_profit_threshold = if position_size_notional > 100.0 {
+    let take_profit_threshold = if position_size_notional > cfg.take_profit_position_size_threshold {
         cfg.take_profit_threshold_large
     } else {
         cfg.take_profit_threshold_small
@@ -2919,10 +2964,11 @@ fn should_close_position(
 }
 
 /// Calculate effective leverage
+/// Risk katmanı her zaman kazanır: max_leverage hard cap olarak uygulanır
 fn calculate_effective_leverage(config_leverage: Option<u32>, max_leverage: u32) -> f64 {
-    config_leverage
-        .unwrap_or(max_leverage)
-        .max(1) as f64
+    let requested = config_leverage.unwrap_or(max_leverage).max(1);
+    // Risk katmanı kazansın: max_leverage hard cap
+    requested.min(max_leverage).max(1) as f64
 }
 
 #[cfg(test)]

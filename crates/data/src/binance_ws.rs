@@ -35,6 +35,7 @@ pub enum UserEvent {
         side: Side,
         qty: Qty,
         price: Px,
+        is_maker: bool, // true = maker, false = taker
     },
     OrderCanceled {
         symbol: String,
@@ -287,12 +288,15 @@ impl UserDataStream {
                 let price = Self::parse_decimal(value, "L"); // last executed price
                 let side =
                     Self::parse_side(value.get("S").and_then(Value::as_str).unwrap_or("SELL"));
+                // Maker flag: "m" field (true = maker, false = taker)
+                let is_maker = value.get("m").and_then(Value::as_bool).unwrap_or(false);
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
                     side,
                     qty: Qty(qty),
                     price: Px(price),
+                    is_maker,
                 }));
             }
 
@@ -323,12 +327,15 @@ impl UserDataStream {
                 let price = Self::parse_decimal(data, "L"); // last price
                 let side =
                     Self::parse_side(data.get("S").and_then(Value::as_str).unwrap_or("SELL"));
+                // Maker flag: "m" field (true = maker, false = taker)
+                let is_maker = data.get("m").and_then(Value::as_bool).unwrap_or(false);
                 return Ok(Some(UserEvent::OrderFill {
                     symbol,
                     order_id,
                     side,
                     qty: Qty(qty),
                     price: Px(price),
+                    is_maker,
                 }));
             }
 
