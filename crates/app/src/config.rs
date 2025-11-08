@@ -77,6 +77,15 @@ pub struct StratCfg {
     pub opportunity_size_multiplier: Option<f64>,
     #[serde(default)]
     pub strong_trend_multiplier: Option<f64>,
+    // Profit guarantee ve fee ayarları
+    #[serde(default)]
+    pub min_profit_usd: Option<f64>, // Minimum kar hedefi (USD) - default: 0.50
+    #[serde(default)]
+    pub maker_fee_rate: Option<f64>, // Maker fee oranı (default: 0.0002 = 2 bps)
+    #[serde(default)]
+    pub taker_fee_rate: Option<f64>, // Taker fee oranı (default: 0.0004 = 4 bps)
+    #[serde(default)]
+    pub slippage_bps_reserve: Option<f64>, // Slipaj tamponu (bps) - default: 2.0
 }
 
 #[derive(Debug, Deserialize)]

@@ -54,6 +54,12 @@ strategy:
   spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
   spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)
   
+  # --- Profit Guarantee ve Fee Ayarları (KRİTİK) ---
+  min_profit_usd: 0.50              # Minimum kar hedefi (USD) - default: 0.50 (50 cent)
+  maker_fee_rate: 0.0002            # Maker fee oranı (0.0002 = 2 bps = 0.02%) - Binance Futures default
+  taker_fee_rate: 0.0004            # Taker fee oranı (0.0004 = 4 bps = 0.04%) - Binance Futures default
+  slippage_bps_reserve: 2.0         # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
+  
   # --- Trend Takibi Eşikleri ---
   strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
   momentum_strong_bps: 50.0         # Momentum güçlü eşiği (bps)

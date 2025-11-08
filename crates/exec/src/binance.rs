@@ -645,8 +645,10 @@ impl Venue for BinanceFutures {
         let price_quantized = quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
 
-        // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
+        // KRİTİK: Quantize sonrası precision'a göre round et (internal precision'ı temizle)
         // Bu, "Precision is over the maximum" hatasını önler
+        // ÖNEMLİ: round_dp_with_strategy ile kesinlikle precision'a kadar yuvarla
+        // format_decimal_fixed içinde tekrar kontrol edilecek ama burada da doğru yapmalıyız
         let price = price_quantized
             .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
         let qty =
@@ -662,6 +664,8 @@ impl Venue for BinanceFutures {
         }
 
         // Format: precision'a göre string'e çevir
+        // KRİTİK: format_decimal_fixed içinde tekrar round yapılıyor ama yine de güvenli tarafta olmak için
+        // normalize() ile temizlenmiş değerleri kullanıyoruz
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty, qty_precision);
 
@@ -790,30 +794,38 @@ fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     // Decimal her zaman finite'dir, bu yüzden direkt işle
 
     // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
-    // normalize() trailing zero'ları kaldırır, bu precision hatasına yol açabilir
-    // Bu yüzden trailing zero'ları korumalıyız
-    // ÖNCE: Decimal'i doğru scale'e truncate et (precision hatasını önlemek için)
-    // Her zaman round_dp_with_strategy kullan çünkü set_scale güvenilir değil
+    // KRİTİK: round_dp_with_strategy ile kesinlikle precision'a kadar yuvarla
+    // ToZero strategy kullanarak fazla basamakları kes
     let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
 
-    // Trailing zero'ları koru: precision kadar decimal place göster
+    // KRİTİK: String formatlamada kesinlikle precision'dan fazla basamak gösterme
+    // Decimal'in to_string() metodu bazen internal precision'ı gösterebilir
+    // Bu yüzden manuel olarak string'i kontrol edip kesmeliyiz
     if scale == 0 {
-        truncated.to_string()
+        // Integer kısmı al (nokta varsa kes)
+        let s = truncated.to_string();
+        if let Some(dot_pos) = s.find('.') {
+            s[..dot_pos].to_string()
+        } else {
+            s
+        }
     } else {
         let s = truncated.to_string();
         if let Some(dot_pos) = s.find('.') {
-            let current_decimals = s.len() - dot_pos - 1;
+            let integer_part = &s[..dot_pos];
+            let decimal_part = &s[dot_pos + 1..];
+            let current_decimals = decimal_part.len();
+            
             if current_decimals < scale as usize {
                 // Eksik trailing zero'ları ekle
-                format!("{}{}", s, "0".repeat(scale as usize - current_decimals))
+                format!("{}.{}{}", integer_part, decimal_part, "0".repeat(scale as usize - current_decimals))
             } else if current_decimals > scale as usize {
-                // Fazla decimal varsa kes (precision hatasını önle)
-                // String'i kes - kesinlikle precision'dan fazla basamak gösterme
-                let integer_part = &s[..dot_pos];
-                let decimal_part = &s[dot_pos + 1..];
+                // KRİTİK: Fazla decimal varsa kes - kesinlikle precision'dan fazla basamak gösterme
+                // String'i kes - bu "Precision is over the maximum" hatasını önler
                 let truncated_decimal = &decimal_part[..scale as usize];
                 format!("{}.{}", integer_part, truncated_decimal)
             } else {
+                // Tam precision - olduğu gibi döndür
                 s
             }
         } else {

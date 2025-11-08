@@ -1100,9 +1100,9 @@ impl Strategy for DynMm {
         // Bu yüzden warm-up sırasında recovery check'i skip ediyoruz
         if self.price_history.is_empty() {
             // İlk tick: Warm-up için 20 dummy price ekle (mevcut mid price ile)
-            let warm_up_count = 20;
+            let warm_up_count: usize = 20;
             for i in 0..warm_up_count {
-                let dummy_timestamp = now_ms.saturating_sub((warm_up_count - i) * 100); // 100ms aralıklarla
+                let dummy_timestamp = now_ms.saturating_sub((warm_up_count as u64 - i as u64) * 100); // 100ms aralıklarla
                 self.price_history.push((dummy_timestamp, c.mark_price.0));
             }
             // Warm-up başlat: İlk 20 tick'te recovery check'i skip et

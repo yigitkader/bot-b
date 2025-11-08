@@ -345,14 +345,16 @@ mod tests {
         // Spread: 10 bps, min: 5 bps, position: 20 USD
         // Profit guarantee: should pass
         // Risk/reward: should pass
-        let (should, reason) = should_place_trade(10.0, 20.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(10.0, 20.0, 5.0, -0.01, 2.0, &pg);
         // May or may not pass depending on exact calculations
         assert!(reason == "ok" || reason != "ok"); // Just check it returns
     }
 
     #[test]
     fn test_should_place_trade_spread_below_minimum() {
-        let (should, reason) = should_place_trade(3.0, 20.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(3.0, 20.0, 5.0, -0.01, 2.0, &pg);
         assert!(!should);
         assert_eq!(reason, "spread_below_minimum");
     }
@@ -360,7 +362,8 @@ mod tests {
     #[test]
     fn test_should_place_trade_not_profitable_after_fees() {
         // Very small position, spread barely covers fees
-        let (should, reason) = should_place_trade(10.0, 1.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(10.0, 1.0, 5.0, -0.01, 2.0, &pg);
         // May fail profit guarantee check
         if !should {
             assert!(reason == "not_profitable_after_fees" || reason == "risk_reward_too_low");
@@ -369,28 +372,32 @@ mod tests {
 
     #[test]
     fn test_should_place_trade_zero_spread() {
-        let (should, reason) = should_place_trade(0.0, 20.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(0.0, 20.0, 5.0, -0.01, 2.0, &pg);
         assert!(!should);
         assert_eq!(reason, "spread_below_minimum");
     }
 
     #[test]
     fn test_should_place_trade_negative_spread() {
-        let (should, reason) = should_place_trade(-10.0, 20.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(-10.0, 20.0, 5.0, -0.01, 2.0, &pg);
         assert!(!should);
         assert_eq!(reason, "spread_below_minimum");
     }
 
     #[test]
     fn test_should_place_trade_zero_position() {
-        let (should, reason) = should_place_trade(10.0, 0.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(10.0, 0.0, 5.0, -0.01, 2.0, &pg);
         assert!(!should);
         assert!(reason == "not_profitable_after_fees" || reason == "risk_reward_too_low");
     }
 
     #[test]
     fn test_should_place_trade_negative_position() {
-        let (should, reason) = should_place_trade(10.0, -100.0, 5.0, -0.01, 2.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(10.0, -100.0, 5.0, -0.01, 2.0, &pg);
         assert!(!should);
         assert!(reason == "not_profitable_after_fees" || reason == "risk_reward_too_low");
     }
@@ -398,7 +405,8 @@ mod tests {
     #[test]
     fn test_should_place_trade_very_high_risk_reward_requirement() {
         // Require 100:1 risk/reward (impossible)
-        let (should, reason) = should_place_trade(10.0, 20.0, 5.0, -0.01, 100.0);
+        let pg = ProfitGuarantee::default();
+        let (should, reason) = should_place_trade(10.0, 20.0, 5.0, -0.01, 100.0, &pg);
         assert!(!should);
         assert_eq!(reason, "risk_reward_too_low");
     }

@@ -18,7 +18,7 @@ use rust_decimal::Decimal;
 use strategy::{Context, DynMm, DynMmCfg, Strategy};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
@@ -675,6 +675,13 @@ async fn main() -> Result<()> {
 
     let tick_ms = max(cfg.internal.min_tick_interval_ms, cfg.exec.cancel_replace_interval_ms);
     let min_usd_per_order = cfg.min_usd_per_order.unwrap_or(0.0);
+    
+    // KRİTİK DÜZELTME: ProfitGuarantee'yi config'den oluştur (ana akışa entegre)
+    let min_profit_usd = cfg.strategy.min_profit_usd.unwrap_or(0.50); // Default: $0.50
+    let maker_fee_rate = cfg.strategy.maker_fee_rate.unwrap_or(0.0002); // Default: 2 bps
+    let taker_fee_rate = cfg.strategy.taker_fee_rate.unwrap_or(0.0004); // Default: 4 bps
+    let profit_guarantee = utils::ProfitGuarantee::new(min_profit_usd, maker_fee_rate, taker_fee_rate);
+    
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now(),
         Duration::from_millis(tick_ms),
@@ -688,6 +695,9 @@ async fn main() -> Result<()> {
         symbol_count = states.len(),
         tick_interval_ms = tick_ms,
         min_usd_per_order,
+        min_profit_usd,
+        maker_fee_rate,
+        taker_fee_rate,
         "main trading loop starting"
     );
     
@@ -1135,9 +1145,10 @@ async fn main() -> Result<()> {
             }
             
             // PERFORMANS: Clone'ları sadece gerektiğinde yap
-            let symbol = &state.meta.symbol;
+            // KRİTİK: symbol'i clone et çünkü state'i mutable borrow edeceğiz
+            let symbol = state.meta.symbol.clone();
             let base_asset = &state.meta.base_asset;
-            let quote_asset = &state.meta.quote_asset;
+            let quote_asset = state.meta.quote_asset.clone();
 
             // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
             // KRİTİK DÜZELTME: Cache'den oku (race condition önlendi)
@@ -1145,7 +1156,7 @@ async fn main() -> Result<()> {
             let is_debug_symbol = symbol_index <= cfg.internal.debug_symbol_count;
             
             // Cache'den bakiye oku (loop başında çekildi)
-            let q_free = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+            let q_free = quote_balances.get(&quote_asset).copied().unwrap_or(0.0);
             
                     // Futures için: leverage ile toplam kullanılabilir miktar
             let has_balance = {
@@ -1212,7 +1223,7 @@ async fn main() -> Result<()> {
                 // KRİTİK İYİLEŞTİRME: Missed events recovery - önce pozisyonu al (inventory sync için)
                 // Fill olmuş emirler için inventory güncellemesi yapılabilmesi için pozisyon gerekli
                 let current_pos = match venue.get_position(&symbol).await {
-                    Ok(pos) => pos,
+                    Ok(pos) => Some(pos),
                     Err(err) => {
                         warn!(%symbol, ?err, "failed to get position for order sync, skipping inventory check");
                         // Position alınamazsa devam et ama inventory check yapma
@@ -1674,13 +1685,14 @@ async fn main() -> Result<()> {
             state.daily_pnl = current_pnl; // Şimdilik current PnL, ileride günlük reset eklenebilir
             
             // 2. Funding cost takibi (futures için)
-            // KRİTİK DÜZELTME: Funding cost hesaplama düzeltildi
-            // Funding rate zaten per 8h rate, direkt çarpılabilir
+            // KRİTİK DÜZELTME: Funding cost normalizasyonu - her tick için doğru maliyet
+            // Funding rate 8 saatlik (28800 saniye) bir orandır
+            // Tick başına maliyet = funding_rate_8h * (tick_secs / 28800) * position_size_notional
             if let Some(funding_rate) = funding_rate {
-                // Funding cost = funding_rate * position_size_notional (her 8 saatte bir)
-                // Not: Bu sadece bir tick'teki maliyet, gerçek maliyet 8 saatte bir uygulanır
-                let funding_cost = funding_rate * position_size_notional;
-                state.total_funding_cost += Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
+                let tick_secs = (tick_ms as f64) / 1000.0; // Tick süresi saniye cinsinden
+                const FUNDING_INTERVAL_SEC: f64 = 8.0 * 3600.0; // 8 saat = 28800 saniye
+                let funding_cost_per_tick = funding_rate * (tick_secs / FUNDING_INTERVAL_SEC) * position_size_notional;
+                state.total_funding_cost += Decimal::from_f64_retain(funding_cost_per_tick).unwrap_or(Decimal::ZERO);
             }
             
             // 3. Pozisyon boyutu geçmişi (risk analizi için)
@@ -1900,7 +1912,7 @@ async fn main() -> Result<()> {
                     if let Ok(logger) = json_logger.lock() {
                         let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
                         logger.log_position_opened(
-                            symbol,
+                            &symbol,
                             side,
                             pos.entry,
                             pos.qty,
@@ -2043,7 +2055,7 @@ async fn main() -> Result<()> {
                                 let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
                                 let leverage = pos.leverage;
                                 logger.log_position_closed(
-                                    symbol,
+                                    &symbol,
                                     side,
                                     pos.entry,
                                     mark_px,
@@ -2055,7 +2067,7 @@ async fn main() -> Result<()> {
                                 // Also log as completed trade
                                 let fees = 0.0; // Fees calculated separately if needed
                                 logger.log_trade_completed(
-                                    symbol,
+                                    &symbol,
                                     side,
                                     pos.entry,
                                     mark_px,
@@ -2108,7 +2120,7 @@ async fn main() -> Result<()> {
                 if let Ok(logger) = json_logger.lock() {
                     let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
                     logger.log_position_updated(
-                        symbol,
+                        &symbol,
                         side,
                         pos.entry,
                         pos.qty,
@@ -2478,7 +2490,13 @@ async fn main() -> Result<()> {
                     bid_notional.max(ask_notional) // Use larger of the two
                 };
                 
-                let min_spread_bps = cfg.strategy.min_spread_bps.unwrap_or(60.0);
+                // KRİTİK DÜZELTME: Dinamik min_spread_bps hesapla (ProfitGuarantee ile)
+                // Sabit 60 bps yerine, pozisyon boyutuna göre dinamik hesapla
+                let min_spread_bps_dynamic = profit_guarantee.calculate_min_spread_bps(position_size_usd);
+                // Config'deki min_spread_bps minimum eşik olarak kullan (fallback)
+                let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(60.0);
+                let min_spread_bps = min_spread_bps_dynamic.max(min_spread_bps_config);
+                
                 let stop_loss_threshold = cfg.internal.stop_loss_threshold;
                 let min_risk_reward_ratio = cfg.internal.min_risk_reward_ratio;
                 
@@ -2488,13 +2506,14 @@ async fn main() -> Result<()> {
                     min_spread_bps,
                     stop_loss_threshold,
                     min_risk_reward_ratio,
+                    &profit_guarantee, // KRİTİK: ProfitGuarantee'yi parametre olarak geç
                 );
                 
                 if !should_place {
                     // JSON log: Trade rejected
                     if let Ok(logger) = json_logger.lock() {
                         logger.log_trade_rejected(
-                            symbol,
+                            &symbol,
                             reason,
                             spread_bps,
                             position_size_usd,
@@ -2682,7 +2701,7 @@ async fn main() -> Result<()> {
                 // JSON log: Order created
                 if let Ok(logger) = json_logger.lock() {
                     logger.log_order_created(
-                symbol,
+                &symbol,
                 &order_id,
                 Side::Buy,
                 px,
@@ -2941,7 +2960,7 @@ async fn main() -> Result<()> {
                             // JSON log: Order created
                             if let Ok(logger) = json_logger.lock() {
                             logger.log_order_created(
-                            symbol,
+                            &symbol,
                             &order_id,
                             Side::Sell,
                             px,

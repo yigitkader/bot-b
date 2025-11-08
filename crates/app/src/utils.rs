@@ -414,8 +414,9 @@ impl ProfitGuarantee {
     }
 
     /// Default constructor with Binance Futures fees
+    /// KRİTİK DÜZELTME: 0.005 USD (0.5 cent) → 0.50 USD (50 cent) hedef
     pub fn default() -> Self {
-        Self::new(0.005, 0.0002, 0.0004) // 0.50 cents, 2 bps maker, 4 bps taker
+        Self::new(0.50, 0.0002, 0.0004) // 0.50 USD, 2 bps maker, 4 bps taker
     }
 
     /// Calculate minimum spread required for profitable trade
@@ -676,6 +677,7 @@ pub fn should_place_trade(
     min_spread_bps: f64,
     stop_loss_threshold: f64,
     min_risk_reward_ratio: f64,
+    profit_guarantee: &ProfitGuarantee,
 ) -> (bool, &'static str) {
     // 1. Minimum spread kontrolü
     if spread_bps < min_spread_bps {
@@ -683,7 +685,7 @@ pub fn should_place_trade(
     }
     
     // 2. Profit guarantee kontrolü
-    let profit_guarantee = ProfitGuarantee::default();
+    // KRİTİK DÜZELTME: ProfitGuarantee artık parametre olarak geçiliyor (default kaldırıldı)
     if !profit_guarantee.is_trade_profitable(spread_bps, position_size_usd) {
         return (false, "not_profitable_after_fees");
     }
