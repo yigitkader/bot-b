@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
 use reqwest::{Client, RequestBuilder, Response};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -889,55 +890,174 @@ impl BinanceFutures {
         Ok(mark)
     }
 
+    /// Close position with reduceOnly guarantee and verification
+    /// 
+    /// KRİTİK: Futures için pozisyon kapatma garantisi:
+    /// 1. reduceOnly=true ile market order gönder
+    /// 2. Pozisyon tam olarak kapatıldığını doğrula
+    /// 3. Kısmi kapatma durumunda retry yap
+    /// 4. Leverage ile uyumlu olduğundan emin ol
     pub async fn flatten_position(&self, sym: &str) -> Result<()> {
-        let pos = self.fetch_position(sym).await?;
-        let qty_dec = pos.qty.0;
-        if qty_dec.is_zero() {
+        // İlk pozisyon kontrolü
+        let initial_pos = self.fetch_position(sym).await?;
+        let initial_qty = initial_pos.qty.0;
+        
+        if initial_qty.is_zero() {
+            // Pozisyon zaten kapalı
             return Ok(());
         }
-        let side = if qty_dec > Decimal::ZERO {
-            Side::Sell
+        
+        let initial_side = if initial_qty.is_sign_positive() {
+            Side::Sell  // Long pozisyon → Sell ile kapat
         } else {
-            Side::Buy
+            Side::Buy   // Short pozisyon → Buy ile kapat
         };
+        
         let rules = self.rules_for(sym).await?;
-        let qty = quantize_decimal(qty_dec.abs(), rules.step_size);
-        if qty <= Decimal::ZERO {
+        let initial_qty_abs = quantize_decimal(initial_qty.abs(), rules.step_size);
+        
+        if initial_qty_abs <= Decimal::ZERO {
             warn!(
                 symbol = %sym,
-                original_qty = %qty_dec,
+                original_qty = %initial_qty,
                 "quantized position size is zero, skipping close"
             );
             return Ok(());
         }
-        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
-        let params = vec![
-            format!("symbol={}", sym),
-            format!(
-                "side={}",
-                if matches!(side, Side::Buy) {
-                    "BUY"
-                } else {
-                    "SELL"
+        
+        // KRİTİK: Pozisyon kapatma retry mekanizması (kısmi kapatma durumunda)
+        let max_attempts = 3;
+        
+        for attempt in 0..max_attempts {
+            // Mevcut pozisyonu kontrol et (retry durumunda pozisyon değişmiş olabilir)
+            let current_pos = self.fetch_position(sym).await?;
+            let current_qty = current_pos.qty.0;
+            
+            if current_qty.is_zero() {
+                // Pozisyon tamamen kapatıldı
+                if attempt > 0 {
+                    info!(
+                        symbol = %sym,
+                        attempts = attempt + 1,
+                        "position fully closed after retry"
+                    );
                 }
-            ),
-            "type=MARKET".to_string(),
-            format!("quantity={}", qty_str),
-            "reduceOnly=true".to_string(),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-        ];
-        let qs = params.join("&");
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-        send_void(
-            self.common
-                .client
-                .post(url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
-            .await?;
-        Ok(())
+                return Ok(());
+            }
+            
+            // Kalan pozisyon miktarını hesapla
+            let remaining_qty = quantize_decimal(current_qty.abs(), rules.step_size);
+            
+            if remaining_qty <= Decimal::ZERO {
+                return Ok(());
+            }
+            
+            // Side belirleme (pozisyon yönüne göre)
+            let side = if current_qty.is_sign_positive() {
+                Side::Sell  // Long → Sell
+            } else {
+                Side::Buy   // Short → Buy
+            };
+            
+            let qty_str = format_decimal_fixed(remaining_qty, rules.qty_precision);
+            
+            // KRİTİK: reduceOnly=true ve type=MARKET garantisi
+            let params = vec![
+                format!("symbol={}", sym),
+                format!(
+                    "side={}",
+                    if matches!(side, Side::Buy) {
+                        "BUY"
+                    } else {
+                        "SELL"
+                    }
+                ),
+                "type=MARKET".to_string(),  // Post-only değil, market order
+                format!("quantity={}", qty_str),
+                "reduceOnly=true".to_string(),  // KRİTİK: Yeni pozisyon açmayı önle
+                format!("timestamp={}", BinanceCommon::ts()),
+                format!("recvWindow={}", self.common.recv_window_ms),
+            ];
+            
+            let qs = params.join("&");
+            let sig = self.common.sign(&qs);
+            let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
+            
+            // Emir gönder
+            match send_void(
+                self.common
+                    .client
+                    .post(&url)
+                    .header("X-MBX-APIKEY", &self.common.api_key),
+            )
+            .await {
+                Ok(_) => {
+                    // Emir başarılı, pozisyon durumunu kontrol et
+                    // Exchange'in işlemesi için kısa bir bekleme
+                    // Not: exec crate'inde tokio yok, bu yüzden hemen kontrol ediyoruz
+                    // Retry mekanizması zaten var, bu yeterli
+                    
+                    let verify_pos = self.fetch_position(sym).await?;
+                    let verify_qty = verify_pos.qty.0;
+                    
+                    if verify_qty.is_zero() {
+                        // Pozisyon tamamen kapatıldı
+                        info!(
+                            symbol = %sym,
+                            attempt = attempt + 1,
+                            initial_qty = %initial_qty,
+                            "position fully closed and verified"
+                        );
+                        return Ok(());
+                    } else {
+                        // Kısmi kapatma - retry yap
+                        let remaining_pct = (verify_qty.abs() / initial_qty.abs() * Decimal::from(100))
+                            .to_f64()
+                            .unwrap_or(0.0);
+                        
+                        warn!(
+                            symbol = %sym,
+                            attempt = attempt + 1,
+                            initial_qty = %initial_qty,
+                            remaining_qty = %verify_qty,
+                            remaining_pct = remaining_pct,
+                            "position partially closed, retrying..."
+                        );
+                        
+                        if attempt < max_attempts - 1 {
+                            // Son deneme değilse devam et
+                            continue;
+                        } else {
+                            // Son denemede hala pozisyon varsa hata döndür
+                            return Err(anyhow::anyhow!(
+                                "Failed to fully close position after {} attempts. Initial: {}, Remaining: {}",
+                                max_attempts,
+                                initial_qty,
+                                verify_qty
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt < max_attempts - 1 {
+                        warn!(
+                            symbol = %sym,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "failed to close position, retrying..."
+                        );
+                        // Retry öncesi bekleme - exec crate'inde tokio yok
+                        // Caller tarafında retry yapılacak
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Buraya gelmemeli (yukarıdaki return'ler ile çıkılmalı)
+        Err(anyhow::anyhow!("Unexpected error in flatten_position"))
     }
 }
 

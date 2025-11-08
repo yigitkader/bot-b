@@ -1814,68 +1814,105 @@ async fn main() -> Result<()> {
                         warn!(%symbol, ?err, "failed to cancel orders before position close");
                     }
                     
-                    // Pozisyonu kapat (reduceOnly market order) - KRİTİK DÜZELTME: Retry mekanizması
-                    let mut position_closed = false;
-                    for attempt in 0..3 {
-                        // API Rate Limit koruması
-                        // close_position uses place_limit internally: Weight 1
-                        rate_limit_guard(1).await;
-                        let close_result = match &venue {
-                            V::Spot(v) => v.close_position(&symbol).await,
-                            V::Fut(v) => v.close_position(&symbol).await,
-                        };
-                        match close_result {
-                            Ok(_) => {
-                                position_closed = true;
+                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile)
+                    // close_position fonksiyonu içinde:
+                    // 1. reduceOnly=true garantisi (futures için)
+                    // 2. Market order (post-only değil)
+                    // 3. Pozisyon kapatma sonrası doğrulama
+                    // 4. Kısmi kapatma durumunda otomatik retry (3 deneme)
+                    rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                    let close_result = match &venue {
+                        V::Spot(v) => v.close_position(&symbol).await,
+                        V::Fut(v) => {
+                            // Futures için özel kontrol: Pozisyon kapatma sonrası doğrulama
+                            let result = v.close_position(&symbol).await;
+                            
+                            // KRİTİK: Pozisyon kapatma sonrası doğrulama
+                            if result.is_ok() {
+                                // Kısa bir bekleme (exchange'in işlemesi için)
+                                tokio::time::sleep(Duration::from_millis(500)).await;
                                 
-                                // JSON log: Position closed
-                                if let Ok(logger) = json_logger.lock() {
-                                    let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
-                                    let leverage = pos.leverage;
-                                    logger.log_position_closed(
-                                        symbol,
-                                        side,
-                                        pos.entry,
-                                        mark_px,
-                                        pos.qty,
-                                        leverage,
-                                        &reason,
-                                    );
-                                    
-                                    // Also log as completed trade
-                                    let fees = 0.0; // Fees calculated separately if needed
-                                    logger.log_trade_completed(
-                                        symbol,
-                                        side,
-                                        pos.entry,
-                                        mark_px,
-                                        pos.qty,
-                                        fees,
-                                        leverage,
-                                    );
+                                // Pozisyon durumunu kontrol et
+                                rate_limit_guard(5).await; // GET /fapi/v2/positionRisk: Weight 5
+                                match v.get_position(&symbol).await {
+                                    Ok(verify_pos) => {
+                                        if !verify_pos.qty.0.is_zero() {
+                                            warn!(
+                                                %symbol,
+                                                remaining_qty = %verify_pos.qty.0,
+                                                "position not fully closed after close_position call, this should not happen (retry mechanism should handle this)"
+                                            );
+                                            // close_position içinde retry mekanizması var, burada sadece log
+                                        } else {
+                                            info!(
+                                                %symbol,
+                                                "position fully closed and verified"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            %symbol,
+                                            error = %e,
+                                            "failed to verify position closure"
+                                        );
+                                    }
                                 }
-                                
-                                info!(
-                                    %symbol,
-                                    reason,
-                                    final_pnl = pnl_f64,
-                                    attempt = attempt + 1,
-                                    "position closed successfully"
-                                );
-                                break;
                             }
-                            Err(err) if attempt < 2 => {
-                                warn!(%symbol, ?err, attempt = attempt + 1, "failed to close position, retrying...");
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
-                            Err(err) => {
-                                warn!(%symbol, ?err, "failed to close position after 3 attempts");
-                            }
+                            
+                            result
                         }
-                    }
+                    };
                     
-                    if !position_closed {
-                        warn!(%symbol, reason, "position close failed after retries, state will be reset anyway");
+                    match close_result {
+                        Ok(_) => {
+                            // JSON log: Position closed
+                            if let Ok(logger) = json_logger.lock() {
+                                let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+                                let leverage = pos.leverage;
+                                logger.log_position_closed(
+                                    symbol,
+                                    side,
+                                    pos.entry,
+                                    mark_px,
+                                    pos.qty,
+                                    leverage,
+                                    &reason,
+                                );
+                                
+                                // Also log as completed trade
+                                let fees = 0.0; // Fees calculated separately if needed
+                                logger.log_trade_completed(
+                                    symbol,
+                                    side,
+                                    pos.entry,
+                                    mark_px,
+                                    pos.qty,
+                                    fees,
+                                    leverage,
+                                );
+                            }
+                            
+                            info!(
+                                %symbol,
+                                reason,
+                                final_pnl = pnl_f64,
+                                entry_price = %pos.entry.0,
+                                exit_price = %mark_px.0,
+                                quantity = %pos.qty.0,
+                                leverage = pos.leverage,
+                                "position closed successfully with reduceOnly guarantee"
+                            );
+                        }
+                        Err(err) => {
+                            error!(
+                                %symbol,
+                                error = %err,
+                                reason,
+                                "CRITICAL: failed to close position, manual intervention may be required"
+                            );
+                            // Hata durumunda state'i sıfırlamaya devam et (pozisyon hala açık olabilir)
+                        }
                     }
                     
                     // State'i sıfırla

@@ -419,6 +419,7 @@ mod tests {
 
     fn create_test_config() -> AppCfg {
         AppCfg {
+            symbol: None,
             symbols: vec![],
             auto_discover_quote: true,
             quote_asset: "USDC".to_string(),
@@ -426,7 +427,7 @@ mod tests {
             mode: "futures".to_string(),
             metrics_port: Some(9000),
             max_usd_per_order: 100.0,
-            min_usd_per_order: 20.0,
+            min_usd_per_order: Some(20.0),
             min_quote_balance_usd: 1.0,
             leverage: Some(3),
             price_tick: 0.001,
@@ -479,7 +480,7 @@ mod tests {
                 cancel_replace_interval_ms: 1500,
                 max_order_age_ms: 10000,
             },
-            websocket: WsCfg {
+            websocket: WebsocketCfg {
                 enabled: true,
                 reconnect_delay_ms: 5000,
                 ping_interval_ms: 30000,

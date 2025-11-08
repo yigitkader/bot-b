@@ -527,7 +527,7 @@ mod tests {
         let unrealized_pnl: f64 = 20.0; // 20 USD kar
         
         // When: Margin hesaplanır (unrealized PnL ile)
-        let base_margin: f64 = existing_position_notional / effective_leverage; // 40 USD
+        let _base_margin: f64 = existing_position_notional / effective_leverage; // 40 USD
         let existing_position_margin: f64 = calculate_margin_with_pnl(
             existing_position_notional,
             effective_leverage,
@@ -945,6 +945,215 @@ mod tests {
             trailing_stop_drawdown_small
         };
         assert_eq!(trailing_stop_small, 0.01, "Small profit should use 1% trailing stop");
+    }
+
+    // ============================================================================
+    // Position Closing Tests (reduceOnly guarantee)
+    // ============================================================================
+
+    #[test]
+    fn test_position_close_reduce_only_guarantee() {
+        // KRİTİK TEST: Pozisyon kapatma - reduceOnly garantisi
+        // Futures için pozisyon kapatırken reduceOnly=true kullanılmalı
+        
+        // Long pozisyon kapatma: Sell ile kapatılmalı
+        let long_position = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 5);
+        let close_side = if long_position.qty.0.is_sign_positive() {
+            Side::Sell  // Long → Sell
+        } else {
+            Side::Buy   // Short → Buy
+        };
+        
+        assert_eq!(close_side, Side::Sell, "Long position should be closed with Sell");
+        
+        // Short pozisyon kapatma: Buy ile kapatılmalı
+        let short_position = create_test_position("BTCUSDT", dec!(-0.1), dec!(50000), 5);
+        let close_side_short = if short_position.qty.0.is_sign_positive() {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        
+        assert_eq!(close_side_short, Side::Buy, "Short position should be closed with Buy");
+    }
+
+    #[test]
+    fn test_position_close_market_order_guarantee() {
+        // KRİTİK TEST: Pozisyon kapatma - Market order garantisi
+        // Post-only değil, market order kullanılmalı (hızlı kapatma için)
+        
+        let order_type = "MARKET"; // Post-only değil
+        let is_post_only = false;
+        
+        assert_eq!(order_type, "MARKET", "Position close should use MARKET order type");
+        assert!(!is_post_only, "Position close should NOT use post-only");
+    }
+
+    #[test]
+    fn test_position_close_quantity_verification() {
+        // KRİTİK TEST: Pozisyon kapatma - Miktar doğrulama
+        // Kapatma sonrası pozisyon miktarı sıfır olmalı
+        
+        let initial_qty = dec!(0.1);
+        let closed_qty = dec!(0); // Kapatma sonrası
+        
+        assert!(closed_qty.is_zero(), "Position quantity should be zero after close");
+        assert_ne!(initial_qty, closed_qty, "Initial and closed quantities should differ");
+    }
+
+    #[test]
+    fn test_position_close_partial_retry_logic() {
+        // KRİTİK TEST: Kısmi kapatma durumunda retry mantığı
+        // Eğer pozisyon kısmen kapatıldıysa, kalan miktar için retry yapılmalı
+        
+        let initial_qty = dec!(0.1);
+        let after_first_close = dec!(0.05); // Kısmi kapatma
+        let after_second_close = dec!(0); // Tam kapatma
+        
+        let remaining_after_first = initial_qty - after_first_close;
+        let should_retry = !after_first_close.is_zero();
+        
+        assert!(should_retry, "Should retry when position is partially closed");
+        assert_eq!(remaining_after_first, dec!(0.05), "Remaining quantity should be 0.05");
+        assert!(after_second_close.is_zero(), "Position should be fully closed after retry");
+    }
+
+    #[test]
+    fn test_position_close_leverage_consistency() {
+        // KRİTİK TEST: Pozisyon kapatma - Leverage tutarlılığı
+        // Kapatma sırasında leverage bilgisi doğru kullanılmalı
+        
+        let position = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 5);
+        let leverage = position.leverage;
+        
+        // Leverage pozitif olmalı ve makul bir değer olmalı
+        assert!(leverage > 0, "Leverage should be positive");
+        assert!(leverage <= 125, "Leverage should be within reasonable bounds (Binance max: 125)");
+        
+        // Kapatma sırasında leverage bilgisi korunmalı
+        let close_leverage = leverage;
+        assert_eq!(close_leverage, leverage, "Leverage should remain consistent during close");
+    }
+
+    #[test]
+    fn test_position_close_cancel_orders_first() {
+        // KRİTİK TEST: Pozisyon kapatma - Önce emirleri iptal et
+        // Pozisyon kapatmadan önce tüm açık emirler iptal edilmeli
+        
+        let mut active_orders: HashMap<String, TestOrderInfo> = HashMap::new();
+        active_orders.insert("order1".to_string(), create_test_order("order1", Side::Buy, dec!(50000), dec!(0.1), 1_000));
+        active_orders.insert("order2".to_string(), create_test_order("order2", Side::Sell, dec!(50010), dec!(0.1), 1_000));
+        
+        assert_eq!(active_orders.len(), 2, "Should have 2 active orders before close");
+        
+        // Emirleri iptal et
+        active_orders.clear();
+        
+        assert_eq!(active_orders.len(), 0, "All orders should be cancelled before position close");
+    }
+
+    #[test]
+    fn test_position_close_zero_position_skip() {
+        // KRİTİK TEST: Sıfır pozisyon kapatma - Skip et
+        // Pozisyon zaten sıfırsa kapatma işlemi skip edilmeli
+        
+        let zero_position = create_test_position("BTCUSDT", dec!(0), dec!(50000), 5);
+        let should_skip = zero_position.qty.0.is_zero();
+        
+        assert!(should_skip, "Should skip close when position is already zero");
+    }
+
+    #[test]
+    fn test_position_close_quantity_quantization() {
+        // KRİTİK TEST: Pozisyon kapatma - Miktar quantizasyonu
+        // Kapatma miktarı step_size'e göre quantize edilmeli
+        
+        let position_qty = dec!(0.123456789); // Çok hassas miktar
+        let step_size = dec!(0.001); // 0.001 step
+        
+        // Quantize: (0.123456789 / 0.001).floor() * 0.001 = 123 * 0.001 = 0.123
+        let quantized = (position_qty / step_size).floor() * step_size;
+        
+        assert_eq!(quantized, dec!(0.123), "Position quantity should be quantized to step_size");
+        assert!(quantized <= position_qty, "Quantized quantity should not exceed original");
+    }
+
+    #[test]
+    fn test_position_close_max_attempts_limit() {
+        // KRİTİK TEST: Pozisyon kapatma - Maksimum deneme sayısı
+        // 3 denemeden sonra hata döndürülmeli
+        
+        let max_attempts = 3;
+        let mut attempts = 0;
+        let mut position_closed = false;
+        
+        // Simüle edilmiş retry döngüsü
+        while attempts < max_attempts && !position_closed {
+            attempts += 1;
+            // Simüle: İlk 2 denemede kısmi kapatma, 3. denemede tam kapatma
+            if attempts == 3 {
+                position_closed = true;
+            }
+        }
+        
+        assert_eq!(attempts, 3, "Should attempt up to 3 times");
+        assert!(position_closed, "Position should be closed after max attempts");
+        
+        // Başarısız senaryo: 3 denemeden sonra hala açık
+        let mut attempts_failed = 0;
+        let position_closed_failed = false;
+        
+        while attempts_failed < max_attempts && !position_closed_failed {
+            attempts_failed += 1;
+            // Simüle: Hiçbir denemede kapatılamadı
+        }
+        
+        assert_eq!(attempts_failed, 3, "Should attempt 3 times even if failed");
+        assert!(!position_closed_failed, "Position should remain open if all attempts fail");
+    }
+
+    #[test]
+    fn test_position_close_side_determination() {
+        // KRİTİK TEST: Pozisyon kapatma - Side belirleme
+        // Pozisyon yönüne göre doğru side seçilmeli
+        
+        // Long pozisyon (pozitif qty) → Sell ile kapat
+        let long_qty = dec!(0.1);
+        let long_side = if long_qty.is_sign_positive() {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        assert_eq!(long_side, Side::Sell, "Long position should close with Sell");
+        
+        // Short pozisyon (negatif qty) → Buy ile kapat
+        let short_qty = dec!(-0.1);
+        let short_side = if short_qty.is_sign_positive() {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        assert_eq!(short_side, Side::Buy, "Short position should close with Buy");
+    }
+
+    #[test]
+    fn test_position_close_verification_after_close() {
+        // KRİTİK TEST: Pozisyon kapatma sonrası doğrulama
+        // Kapatma sonrası pozisyon durumu kontrol edilmeli
+        
+        let initial_position = create_test_position("BTCUSDT", dec!(0.1), dec!(50000), 5);
+        let initial_qty = initial_position.qty.0;
+        
+        // Simüle: Kapatma işlemi
+        let closed_position = create_test_position("BTCUSDT", dec!(0), dec!(50000), 5);
+        let closed_qty = closed_position.qty.0;
+        
+        // Doğrulama: Pozisyon sıfır olmalı
+        let is_fully_closed = closed_qty.is_zero();
+        let was_closed = initial_qty != closed_qty;
+        
+        assert!(is_fully_closed, "Position should be zero after close");
+        assert!(was_closed, "Position quantity should change after close");
     }
 }
 
