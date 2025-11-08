@@ -17,7 +17,8 @@ min_usd_per_order: 20.0  # Gerçekçi: 15.0 → 20.0 (daha fazla kazanç/işlem,
 min_quote_balance_usd: 1.0
 
 # Kaldıraç (sadece futures)
-leverage: 5
+# KRİTİK DÜZELTME: 5 → 3 (daha güvenli)
+leverage: 3
 
 # Fiyat/lot adımı (quantize için). İstersen exchangeInfo'dan otomatik de çekebiliriz,
 # ama basit ve deterministik olsun diye konfigde tutuyoruz.
@@ -66,12 +67,12 @@ strategy:
   opportunity_threshold_off: 0.2   # Fırsat modu kapanma eşiği
   
   # --- Manipülasyon Tespit Eşikleri ---
-  price_jump_threshold_bps: 150.0  # Flash crash/pump eşiği (bps)
+  price_jump_threshold_bps: 250.0  # Flash crash/pump eşiği (bps) (150 → 250: daha sıkı, false positive azalt)
   fake_breakout_threshold_bps: 100.0 # Fake breakout eşiği (bps)
   liquidity_drop_threshold: 0.5    # Likidite düşüş eşiği (ratio)
   
   # --- Envanter Yönetimi ---
-  inventory_threshold_ratio: 0.05  # Envanter threshold oranı (%)
+  inventory_threshold_ratio: 0.15  # Envanter threshold oranı (%) (0.05 → 0.15: daha toleranslı, market making için)
   
   # --- Adaptif Spread Katsayıları ---
   volatility_coefficient: 0.5     # Volatilite katsayısı (c1)
@@ -79,8 +80,8 @@ strategy:
   
   # --- Diğer ---
   min_liquidity_required: 0.01     # Minimum likidite gereksinimi
-  opportunity_size_multiplier: 2.0 # Fırsat modu pozisyon çarpanı (5.0 → 2.0: daha güvenli)
-  strong_trend_multiplier: 1.5     # Güçlü trend pozisyon çarpanı (3.0 → 1.5: daha güvenli)
+  opportunity_size_multiplier: 1.5 # Fırsat modu pozisyon çarpanı (2.0 → 1.5: daha güvenli)
+  strong_trend_multiplier: 1.2     # Güçlü trend pozisyon çarpanı (1.5 → 1.2: daha güvenli)
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"

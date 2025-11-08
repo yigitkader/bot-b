@@ -1254,7 +1254,19 @@ async fn main() -> Result<()> {
         let total_symbols = states.len();
         let mut symbol_index = 0;
         
+        // KRİTİK DÜZELTME: Rate limit koruması - Her tick'te maksimum sembol sayısı
+        // 16 req/sec limit ile: Her tick'te max 8 sembol işle (güvenli margin)
+        // 500ms tick interval: 8 sembol/tick = 16 sembol/saniye = güvenli
+        const MAX_SYMBOLS_PER_TICK: usize = 8;
+        let mut symbols_processed_this_tick = 0;
+        
         for state in states.iter_mut() {
+            // Rate limit koruması: Her tick'te maksimum sembol sayısı
+            if symbols_processed_this_tick >= MAX_SYMBOLS_PER_TICK {
+                // Bu tick'te yeterli sembol işlendi, kalan semboller bir sonraki tick'te işlenecek
+                skipped_count += 1;
+                continue;
+            }
             symbol_index += 1;
             
             // Progress log: Her 50 sembolde bir veya ilk 10 sembolde
@@ -1380,6 +1392,7 @@ async fn main() -> Result<()> {
             }
             
             processed_count += 1;
+            symbols_processed_this_tick += 1;
 
             // --- AKILLI EMİR SENKRONİZASYONU: API'den gerçek durumu kontrol et ---
             // ÖNEMLİ: Saniyelik değişimler olduğu için her tick'te kontrol etmeliyiz
@@ -1950,8 +1963,6 @@ async fn main() -> Result<()> {
                 // Küçük kazançlar için erken kar alma, büyük kazançlar için daha uzun tut
                 let take_profit_threshold_small = 0.01; // %1 kar (küçük pozisyonlar için)
                 let take_profit_threshold_large = 0.05; // %5 kar (büyük pozisyonlar/fırsat modu için)
-                // Dinamik trailing stop: Kar büyüdükçe genişlet
-                let base_trailing_stop_threshold = 0.02; // %2 base trailing stop
                 
                 // Pozisyon boyutuna göre eşik seç
                 let is_large_position = position_size_notional > 200.0; // 200 USD'den büyük = büyük pozisyon
@@ -1981,17 +1992,18 @@ async fn main() -> Result<()> {
                 };
                 
                 // Dinamik trailing stop: Peak'ten düşerse kapat, kar büyüdükçe genişlet
+                // KRİTİK DÜZELTME: Daha sıkı trailing stop (fill rate artır)
                 let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
                 let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
                 let should_trailing_stop = if peak_pnl_f64 > 0.0 && current_pnl_f64 < peak_pnl_f64 {
                     let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
-                    // Dinamik trailing stop: Kar büyüdükçe genişlet
-                    let trailing_stop = if peak_pnl_f64 > 50.0 {
-                        0.05 // %5 (büyük karlar için)
+                    // Dinamik trailing stop: Kar büyüdükçe genişlet (daha sıkı eşikler)
+                    let trailing_stop = if peak_pnl_f64 > 100.0 {
+                        0.03 // %3 (büyük karlar için, 0.05 → 0.03)
                     } else if peak_pnl_f64 > 20.0 {
-                        0.03 // %3 (orta karlar için)
+                        0.015 // %1.5 (orta karlar için, 0.03 → 0.015)
                     } else {
-                        base_trailing_stop_threshold // %2 (küçük karlar için)
+                        0.01 // %1 (küçük karlar için, 0.02 → 0.01)
                     };
                     drawdown_from_peak >= trailing_stop
                 } else {
@@ -2003,12 +2015,14 @@ async fn main() -> Result<()> {
                     state.peak_pnl = current_pnl;
                 }
                 
-                // Zarar durdur: %1'den fazla zarar varsa ve trend kötüleşiyorsa kapat
-                let stop_loss_threshold = -0.01; // %1 zarar
+                // Zarar durdur: %0.5'den fazla zarar varsa ve trend kötüleşiyorsa kapat
+                // KRİTİK DÜZELTME: Daha sıkı zarar durdurma (-0.01 → -0.005)
+                let stop_loss_threshold = -0.005; // %0.5 zarar (daha erken kes)
                 let should_stop_loss = if price_change_pct <= stop_loss_threshold {
                     // Zarar var, trend analizi yap
-                    if pnl_trend < -0.2 || state.position_hold_duration_ms > 600_000 {
-                        // Trend kötüleşiyor veya 10 dakikadan fazla zararda, kapat
+                    // KRİTİK DÜZELTME: 10 dakika → 2 dakika (600_000 → 120_000)
+                    if pnl_trend < -0.2 || state.position_hold_duration_ms > 120_000 {
+                        // Trend kötüleşiyor veya 2 dakikadan fazla zararda, kapat
                         true
                     } else {
                         false
@@ -2201,6 +2215,7 @@ async fn main() -> Result<()> {
                 tick_size: tick_size_decimal, // Per-symbol tick_size (crossing guard için)
             };
             let mut quotes = state.strategy.on_tick(&ctx);
+            
             // Debug: Strateji neden quote üretmedi?
             if quotes.bid.is_none() && quotes.ask.is_none() {
                 use tracing::debug;
@@ -2337,13 +2352,21 @@ async fn main() -> Result<()> {
                     // MEVCUT POZİSYON DİKKATE ALINARAK: Mevcut pozisyonun margin'i çıkarıldıktan sonra kalan bakiye kullanılır
                     let max_usable_from_account = available_after_position.min(cfg.max_usd_per_order);
                     
+                    // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
+                    let is_opportunity_mode = state.strategy.is_opportunity_mode();
+                    let effective_leverage_for_caps = if is_opportunity_mode {
+                        effective_leverage / 2.0 // Fırsat modunda yarıya düşür
+                    } else {
+                        effective_leverage
+                    };
+                    
                     // Leverage ile açılan pozisyon boyutu (sadece bilgi amaçlı)
-                    let position_size_with_leverage = max_usable_from_account * effective_leverage;
+                    let position_size_with_leverage = max_usable_from_account * effective_leverage_for_caps;
                     
                     // per_order_cap = margin (hesaptan giden para) = 100 USD
                     // per_order_notional = pozisyon boyutu = margin * leverage = 100 * 20 = 2000 USD
                     let per_order_cap_margin = cfg.max_usd_per_order;
-                    let per_order_notional = per_order_cap_margin * effective_leverage;
+                    let per_order_notional = per_order_cap_margin * effective_leverage_for_caps;
                     info!(
                         %symbol,
                         quote_asset = %quote_asset,
@@ -2351,11 +2374,13 @@ async fn main() -> Result<()> {
                         existing_position_margin,
                         available_after_position,
                         effective_leverage,
+                        effective_leverage_for_caps,
+                        is_opportunity_mode,
                         max_usable_from_account,
                         position_size_with_leverage,
                         per_order_limit_margin_usd = per_order_cap_margin,
                         per_order_limit_notional_usd = per_order_notional,
-                        "calculated futures caps: max_usable_from_account is max USD that will leave your account, leverage only affects position size (existing position margin deducted)"
+                        "calculated futures caps: max_usable_from_account is max USD that will leave your account, leverage only affects position size (existing position margin deducted, opportunity mode reduces leverage by 50%)"
                     );
                     Caps {
                         buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
@@ -2695,7 +2720,13 @@ async fn main() -> Result<()> {
                                             // ÖNEMLİ: Kullanıcının isteği: "20 USD varsa 20 USD kullanılabilir"
                                             // Yani minimum notional'ı karşılamaya çalışma, mevcut bakiyeyle işlem yap
                                             // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
-                                            let max_qty_by_margin = ((available_margin * effective_leverage) / price_quantized / step).floor() * step;
+                                            // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
+                                            let effective_leverage_for_qty_bid = if state.strategy.is_opportunity_mode() {
+                                                effective_leverage / 2.0
+                                            } else {
+                                                effective_leverage
+                                            };
+                                            let max_qty_by_margin = ((available_margin * effective_leverage_for_qty_bid) / price_quantized / step).floor() * step;
                                             
                                             // Eğer mevcut bakiyeyle minimum notional'ı karşılayabiliyorsak, onu hedefle
                                             // Ama karşılayamıyorsak, mevcut bakiyeyle ne kadar yapılabilirse o kadar yap
@@ -2887,7 +2918,13 @@ async fn main() -> Result<()> {
                                             // ÖNEMLİ: Kullanıcının isteği: "20 USD varsa 20 USD kullanılabilir"
                                             // Yani minimum notional'ı karşılamaya çalışma, mevcut bakiyeyle işlem yap
                                             // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
-                                            let max_qty_by_margin = ((available_margin * effective_leverage_ask) / price_quantized / step).floor() * step;
+                                            // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
+                                            let effective_leverage_for_qty_ask = if state.strategy.is_opportunity_mode() {
+                                                effective_leverage_ask / 2.0
+                                            } else {
+                                                effective_leverage_ask
+                                            };
+                                            let max_qty_by_margin = ((available_margin * effective_leverage_for_qty_ask) / price_quantized / step).floor() * step;
                                             
                                             // Eğer mevcut bakiyeyle minimum notional'ı karşılayabiliyorsak, onu hedefle
                                             // Ama karşılayamıyorsak, mevcut bakiyeyle ne kadar yapılabilirse o kadar yap

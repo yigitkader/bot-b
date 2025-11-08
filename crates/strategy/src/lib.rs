@@ -36,6 +36,10 @@ pub struct Context {
 
 pub trait Strategy: Send + Sync {
     fn on_tick(&mut self, ctx: &Context) -> Quotes;
+    /// Fırsat modu aktif mi? (manipulation_opportunity var mı?)
+    fn is_opportunity_mode(&self) -> bool {
+        false // Default: fırsat modu yok
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,15 +110,15 @@ fn default_adverse_selection_threshold_on() -> f64 { 0.6 }
 fn default_adverse_selection_threshold_off() -> f64 { 0.4 }
 fn default_opportunity_threshold_on() -> f64 { 0.5 }
 fn default_opportunity_threshold_off() -> f64 { 0.2 }
-fn default_price_jump_threshold_bps() -> f64 { 150.0 }
+fn default_price_jump_threshold_bps() -> f64 { 250.0 } // 150 → 250: daha sıkı, false positive azalt
 fn default_fake_breakout_threshold_bps() -> f64 { 100.0 }
 fn default_liquidity_drop_threshold() -> f64 { 0.5 }
-fn default_inventory_threshold_ratio() -> f64 { 0.05 }
+fn default_inventory_threshold_ratio() -> f64 { 0.15 } // 0.05 → 0.15: daha toleranslı, market making için
 fn default_volatility_coefficient() -> f64 { 0.5 }
 fn default_ofi_coefficient() -> f64 { 0.5 }
 fn default_min_liquidity_required() -> f64 { 0.01 }
-fn default_opportunity_size_multiplier() -> f64 { 2.0 }
-fn default_strong_trend_multiplier() -> f64 { 1.5 }
+fn default_opportunity_size_multiplier() -> f64 { 1.5 } // 2.0 → 1.5: daha güvenli
+fn default_strong_trend_multiplier() -> f64 { 1.2 } // 1.5 → 1.2: daha güvenli
 
 pub struct DynMm {
     pub a: f64,
@@ -396,15 +400,17 @@ impl DynMm {
         // Config'den: Envanter threshold oranı
         let threshold = self.inv_cap.0 * Decimal::from_f64_retain(self.inventory_threshold_ratio).unwrap_or(Decimal::ZERO);
         
+        // KRİTİK DÜZELTME: Daha toleranslı envanter yönetimi (market making için)
+        // Her iki tarafta da quote ver, ama asimetrik (hedefe doğru agresif)
         if diff < threshold {
             // Hedef envantere yakınsa: market making (her iki taraf)
             (true, true)
         } else if current_inv.0 < target_inv.0 {
-            // Mevcut envanter hedeften düşük: sadece al (bid) - AGRESİF
-            (true, false)
+            // Mevcut envanter hedeften düşük: Bid agresif, ask pasif (her iki taraf)
+            (true, true) // Her iki taraf ama bid öncelikli
         } else {
-            // Mevcut envanter hedeften yüksek: sadece sat (ask) - AGRESİF
-            (false, true)
+            // Mevcut envanter hedeften yüksek: Ask agresif, bid pasif (her iki taraf)
+            (true, true) // Her iki taraf ama ask öncelikli
         }
     }
 }
@@ -480,9 +486,10 @@ impl Strategy for DynMm {
                 let liquidity_stable = spread_bps < self.max_spread_bps * 0.5; // Spread normal seviyede
                 
                 // Gelişmiş tespit: Fiyat değişimi + volume artışı + time frame + likidite kontrolü
+                // KRİTİK DÜZELTME: Daha sıkı filtreler (false positive azalt)
                 if price_change_bps.abs() > self.price_jump_threshold_bps 
-                   && volume_ratio > 3.0              // Volume 3x veya daha fazla arttı
-                   && time_elapsed_ms < 5000          // 5 saniye içinde
+                   && volume_ratio > 5.0              // Volume 5x veya daha fazla arttı (3x → 5x)
+                   && time_elapsed_ms < 2000          // 2 saniye içinde (5s → 2s: daha keskin)
                    && liquidity_stable {              // Likidite stabil
                     self.flash_crash_detected = true;
                     
@@ -1011,18 +1018,21 @@ impl Strategy for DynMm {
             pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)
         });
         
-        // Bid: best_bid'den ASLA yüksek olmamalı (eşitlik dahil) - pasif emir garantisi
+        // KRİTİK DÜZELTME: Daha agresif crossing guard (fill rate artır)
+        // %0.01 tolerans ile best'e yakın emirler ver (pasif ama daha agresif)
         if let Some(best_bid) = c.ob.best_bid {
-            if bid_px.0 >= best_bid.px.0 {
-                // Bid best bid'e eşit veya yüksek → best_bid'in 1 tick altına çek
-                bid_px = Px((best_bid.px.0 - tick).max(Decimal::ZERO));
+            let tolerance = best_bid.px.0 * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO); // %0.01 tolerans
+            if bid_px.0 > best_bid.px.0 + tolerance {
+                // Bid best bid'den %0.01'den fazla yüksek → best_bid'e eşitle (agresif)
+                bid_px = Px(best_bid.px.0);
             }
         }
         // Ask: best_ask'den ASLA düşük olmamalı (eşitlik dahil) - pasif emir garantisi
         if let Some(best_ask) = c.ob.best_ask {
-            if ask_px.0 <= best_ask.px.0 {
-                // Ask best ask'e eşit veya düşük → best_ask'in 1 tick üstüne çek
-                ask_px = Px(best_ask.px.0 + tick);
+            let tolerance = best_ask.px.0 * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO); // %0.01 tolerans
+            if ask_px.0 < best_ask.px.0 - tolerance {
+                // Ask best ask'den %0.01'den fazla düşük → best_ask'e eşitle (agresif)
+                ask_px = Px(best_ask.px.0);
             }
         }
         
@@ -1115,6 +1125,10 @@ impl Strategy for DynMm {
         );
         
         final_quotes
+    }
+    
+    fn is_opportunity_mode(&self) -> bool {
+        self.manipulation_opportunity.is_some()
     }
 }
 
