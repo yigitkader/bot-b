@@ -291,6 +291,8 @@ pub struct DynMm {
     last_adverse_bid: bool,      // Son adverse bid durumu (histerezis için)
     last_adverse_ask: bool,      // Son adverse ask durumu (histerezis için)
     last_opportunity_mode: bool, // Son fırsat modu durumu (histerezis için)
+    // --- WARM-UP TRACKING: İlk tick'lerde recovery check'i skip et ---
+    warm_up_ticks_remaining: usize, // Warm-up fazında kalan tick sayısı
 }
 
 impl From<DynMmCfg> for DynMm {
@@ -335,7 +337,8 @@ impl From<DynMmCfg> for DynMm {
             manipulation_volume_ratio_threshold: c
                 .manipulation_volume_ratio_threshold
                 .unwrap_or(5.0),
-            manipulation_time_threshold_ms: c.manipulation_time_threshold_ms.unwrap_or(2000),
+            // KRİTİK İYİLEŞTİRME: 2000ms → 5000ms (flash crash'ler 5-30 saniye sürebilir)
+            manipulation_time_threshold_ms: c.manipulation_time_threshold_ms.unwrap_or(5000),
             manipulation_price_history_min_len: c.manipulation_price_history_min_len.unwrap_or(3),
             manipulation_price_history_max_len: c.manipulation_price_history_max_len.unwrap_or(200),
             flash_crash_recovery_window_ms: c.flash_crash_recovery_window_ms.unwrap_or(30000),
@@ -379,6 +382,8 @@ impl From<DynMmCfg> for DynMm {
             last_adverse_bid: false,
             last_adverse_ask: false,
             last_opportunity_mode: false,
+            // Warm-up tracking başlangıç değeri
+            warm_up_ticks_remaining: 0, // Başlangıçta warm-up yok
         }
     }
 }
@@ -408,7 +413,8 @@ impl DynMm {
     }
 
     /// Order Book Imbalance (top-k): (BidVol - AskVol) / (BidVol + AskVol)
-    /// k=1 için best bid/ask volumes kullanılır
+    /// KRİTİK İYİLEŞTİRME: Top-K levels kullanılıyor (on_tick'te hesaplanıyor)
+    /// k=1 için best bid/ask volumes, k>1 için top-K levels'ın toplam volume'u kullanılır
     fn calculate_imbalance(&self, bid_vol: Decimal, ask_vol: Decimal) -> f64 {
         let total_vol = bid_vol + ask_vol;
         if total_vol.is_zero() {
@@ -465,14 +471,15 @@ impl DynMm {
             let ofi_increment = delta_bid_f64 - delta_ask_f64;
 
             // KRİTİK DÜZELTME: OFI kümülatif olmalı (her tick'te increment eklenir)
-            // Window dışındaki eski değerler için decay uygula
+            // Eski değerler için exponential decay uygula
             if let Some(last_ts) = self.last_timestamp_ms {
                 let time_diff_ms = timestamp_ms.saturating_sub(last_ts);
-                if time_diff_ms > self.ofi_window_ms {
-                    // Window dışındayız: OFI'yı decay et (eski değerlerin etkisini azalt)
+                if time_diff_ms > 0 {
                     // Exponential decay: ofi_signal *= exp(-time_diff / window)
-                    // Basitleştirilmiş: Linear decay (daha hızlı)
-                    let decay_factor = (self.ofi_window_ms as f64 / time_diff_ms as f64).min(1.0);
+                    // Window = decay time constant: time_diff = window → signal decays to ~37% (1/e)
+                    // time_diff << window → minimal decay
+                    // time_diff >> window → heavy decay
+                    let decay_factor = (-(time_diff_ms as f64) / self.ofi_window_ms as f64).exp();
                     self.ofi_signal *= decay_factor;
                 }
             }
@@ -493,7 +500,12 @@ impl DynMm {
         // Volatiliteyi bps'e çevir: sqrt(ewma_volatility) * 10000.0
         // Örnek: ewma_volatility = 0.0001 → sqrt(0.0001) = 0.01 → 0.01 * 10000 = 100 bps
         // Ama bu çok yüksek, bu yüzden daha küçük bir katsayı kullanıyoruz
-        let vol_component = (self.ewma_volatility.sqrt() * 10000.0).max(0.0); // bps'e çevir
+        // KRİTİK İYİLEŞTİRME: Minimum volatility floor - çok düşük volatilitede spread çok dar oluyor
+        // Minimum volatility = 0.0001 (1 bps) → sqrt(0.0001) * 10000 = 100 bps → c1 * 100 bps
+        // Bu, düşük volatilite durumunda bile makul bir spread sağlar
+        const MIN_VOLATILITY: f64 = 0.0001; // Minimum volatility floor (1 bps)
+        let effective_volatility = self.ewma_volatility.max(MIN_VOLATILITY);
+        let vol_component = (effective_volatility.sqrt() * 10000.0).max(0.0); // bps'e çevir
         let c1 = self.volatility_coefficient; // Config'den: volatilite katsayısı
 
         // OFI bileşeni: c₂·|OFI|
@@ -594,9 +606,19 @@ impl Strategy for DynMm {
             _ => return Quotes::default(),
         };
 
-        // Volume'ları al (best bid/ask için)
-        let bid_vol = c.ob.best_bid.map(|b| b.qty.0).unwrap_or(Decimal::ONE);
-        let ask_vol = c.ob.best_ask.map(|a| a.qty.0).unwrap_or(Decimal::ONE);
+        // KRİTİK İYİLEŞTİRME: Top-K levels kullan (daha güvenilir imbalance için)
+        // Top-K levels varsa toplam volume'u kullan, yoksa best bid/ask volume'u kullan
+        let (bid_vol, ask_vol) = if let (Some(top_bids), Some(top_asks)) = (&c.ob.top_bids, &c.ob.top_asks) {
+            // Top-K levels mevcut: tüm level'ların volume'larını topla
+            let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
+            let ask_vol_sum: Decimal = top_asks.iter().map(|a| a.qty.0).sum();
+            (bid_vol_sum.max(Decimal::ONE), ask_vol_sum.max(Decimal::ONE))
+        } else {
+            // Fallback: best bid/ask volumes (backward compatibility)
+            let bid_vol = c.ob.best_bid.map(|b| b.qty.0).unwrap_or(Decimal::ONE);
+            let ask_vol = c.ob.best_ask.map(|a| a.qty.0).unwrap_or(Decimal::ONE);
+            (bid_vol, ask_vol)
+        };
 
         // 3. Klasik mid price (fallback)
         let mid = (bid + ask) / Decimal::from(2u32);
@@ -670,7 +692,12 @@ impl Strategy for DynMm {
                 // 1. Son N saniye içindeki fiyatları filtrele
                 // 2. Minimum/maksimum noktayı bul
                 // 3. Recovery var mı kontrol et (en az X% geri yükselme/düşme)
-                let recovery_check = {
+                // NOT: Warm-up fazında recovery check'i skip et (dummy price'lar yanıltıcı olabilir)
+                let recovery_check = if self.warm_up_ticks_remaining > 0 {
+                    // Warm-up fazında: Recovery check'i skip et (dummy price'lar tüm fiyatlar aynı olduğu için yanıltıcı)
+                    false // Flash crash detection'ı engelle (güvenli tarafta kal)
+                } else {
+                    let recovery_check_result = {
                     let window_start_ms = now_ms.saturating_sub(self.flash_crash_recovery_window_ms);
                     
                     // Zaman penceresi içindeki fiyatları filtrele
@@ -763,6 +790,8 @@ impl Strategy for DynMm {
                         // Yeterli veri yok, ama gevşetilmiş kontrol: eğer çok büyük bir değişim varsa geç
                         price_change_bps.abs() > self.price_jump_threshold_bps * 2.0
                     }
+                    };
+                    recovery_check_result
                 };
 
                 if price_change_bps.abs() > self.price_jump_threshold_bps 
@@ -1067,6 +1096,8 @@ impl Strategy for DynMm {
 
         // KRİTİK DÜZELTME: Price history warm-up - İlk 20 tick'te dummy price'lar ekle
         // Recovery check için yeterli veri sağlamak için warm-up yap
+        // NOT: Dummy price'lar tüm fiyatlar aynı olduğu için recovery check'i yanıltabilir
+        // Bu yüzden warm-up sırasında recovery check'i skip ediyoruz
         if self.price_history.is_empty() {
             // İlk tick: Warm-up için 20 dummy price ekle (mevcut mid price ile)
             let warm_up_count = 20;
@@ -1074,6 +1105,13 @@ impl Strategy for DynMm {
                 let dummy_timestamp = now_ms.saturating_sub((warm_up_count - i) * 100); // 100ms aralıklarla
                 self.price_history.push((dummy_timestamp, c.mark_price.0));
             }
+            // Warm-up başlat: İlk 20 tick'te recovery check'i skip et
+            self.warm_up_ticks_remaining = warm_up_count;
+        }
+        
+        // Warm-up tick sayacını azalt
+        if self.warm_up_ticks_remaining > 0 {
+            self.warm_up_ticks_remaining -= 1;
         }
 
         // Fiyat geçmişini güncelle (basit timestamp simülasyonu)
@@ -1142,10 +1180,22 @@ impl Strategy for DynMm {
                 _ => 0.7,
             };
 
-            // KRİTİK İYİLEŞTİRME: Confidence threshold optimize edildi (0.85 → 0.70)
-            // Çok yüksek threshold (0.85) gerçek fırsatları kaçırıyordu
-            // 0.70 threshold: False positive'leri azaltırken gerçek fırsatları da yakalar
-            let min_confidence_threshold = self.confidence_min_threshold;
+            // KRİTİK İYİLEŞTİRME: Adaptive confidence threshold - opportunity type'a göre
+            // Volume-based fırsatlar (VolumeAnomalyTrend) için daha düşük threshold (0.55)
+            // Price-based fırsatlar (FlashCrashLong, FlashPumpShort) için yüksek threshold (0.70)
+            // Volume-based fırsatlar daha gürültülü olabilir, bu yüzden daha düşük threshold
+            // false negative'leri önlemek için gerekli (0.50-0.60 aralığı önerilir)
+            let min_confidence_threshold = match opp {
+                ManipulationOpportunity::VolumeAnomalyTrend { .. } => {
+                    // Volume-based: 0.55 threshold (daha düşük, false negative önleme)
+                    // Config'deki threshold'dan bağımsız olarak 0.55 kullan
+                    0.55
+                }
+                _ => {
+                    // Price-based ve diğerleri: Normal threshold (0.70, config'den)
+                    self.confidence_min_threshold
+                }
+            };
 
             if confidence < min_confidence_threshold {
                 use tracing::debug; // warn → debug: Çok fazla log spam önleme
@@ -1370,10 +1420,10 @@ impl Strategy for DynMm {
             self.calculate_adaptive_spread(base_spread_bps, min_spread_bps);
 
         // KRİTİK DÜZELTME: Imbalance adjustment kaldırıldı (çift sayma önleme)
-        // Imbalance zaten pricing'de imbalance_skew ile kullanılıyor
+        // Imbalance zaten microprice'da dahil (volume-weighted)
         // Spread'e eklemek çift sayma yaratıyordu
         // Not: Imbalance'a göre spread genişletme risk yönetimi için gerekli değil,
-        // çünkü imbalance_skew zaten fiyatları asimetrik yapıyor (risk yönetimi)
+        // çünkü microprice zaten imbalance'ı yansıtıyor (risk yönetimi)
 
         // Likidasyon riski: yakınsa spread'i genişlet
         if c.liq_gap_bps < 300.0 {
@@ -1381,7 +1431,7 @@ impl Strategy for DynMm {
         }
 
         // Order book spread'i kullan (fiyatlama için), adaptive spread'i risk kontrolü için kullan
-        // NOT: Imbalance adjustment kaldırıldı, sadece imbalance_skew pricing'de kullanılıyor
+        // NOT: Imbalance adjustment kaldırıldı, microprice zaten imbalance'ı içeriyor
         let spread_bps_for_pricing = adaptive_spread_bps;
 
         // Funding rate skew: pozitif funding'de ask'i yukarı çek (long pozisyon için daha iyi)
@@ -1390,35 +1440,32 @@ impl Strategy for DynMm {
         // Envanter yönüne göre asimetrik spread: envanter varsa o tarafı daha agresif yap
         let inv_skew_bps = inv_direction * inv_bias * 20.0; // Envanter bias'ına göre ekstra skew
 
-        // KRİTİK DÜZELTME: Imbalance skew mantığı
-        // Microprice zaten imbalance'ı yansıtıyor:
+        // KRİTİK DÜZELTME: Imbalance skew çift sayma sorunu
+        // Microprice zaten imbalance'ı içeriyor (volume-weighted):
         //   - Bid heavy (pozitif imbalance) → microprice ask'e yakın
         //   - Ask heavy (negatif imbalance) → microprice bid'e yakın
-        // Imbalance skew, microprice'ın zaten yaptığı etkiyi TERSİNE çevirmeli:
-        //   - Bid heavy → bid'i yukarı, ask'i aşağı çek (microprice'ı düzelt)
-        //   - Ask heavy → ask'i yukarı, bid'i aşağı çek (microprice'ı düzelt)
-        // Bu yüzden imbalance_skew işareti TERS olmalı: -imbalance
-        let imbalance_skew_bps = -imbalance * 10.0; // Ters işaret: bid heavy → bid yukarı, ask aşağı
+        // Bu yüzden imbalance_skew eklemek çift sayma yapıyor.
+        // Çözüm: Microprice kullan (imbalance zaten dahil), imbalance_skew'i kaldır
+        // Alternatif: Mid price kullan + imbalance_skew (ama microprice daha iyi tahmin)
 
         let half = Decimal::try_from(spread_bps_for_pricing / 2.0 / 1e4).unwrap_or(Decimal::ZERO);
         let skew = Decimal::try_from(funding_skew / 1e4).unwrap_or(Decimal::ZERO);
         let inv_skew = Decimal::try_from(inv_skew_bps / 1e4).unwrap_or(Decimal::ZERO);
-        let imb_skew = Decimal::try_from(imbalance_skew_bps / 1e4).unwrap_or(Decimal::ZERO);
 
-        // Fiyatlama: Microprice kullan (daha iyi tahmin)
+        // Fiyatlama: Microprice kullan (daha iyi tahmin, imbalance zaten dahil)
         let pricing_base = microprice;
 
-        // Bid: microprice'den aşağı (half + funding_skew + inv_skew + imbalance_skew)
+        // Bid: microprice'den aşağı (half + funding_skew + inv_skew)
         // Pozitif envanter varsa inv_skew pozitif, bid daha aşağı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, bid daha yukarı (almaya zorla)
-        // Pozitif imbalance (bid heavy) → imbalance_skew negatif (ters işaret), bid yukarı (doğru)
-        let mut bid_px = Px(pricing_base * (Decimal::ONE - half - skew - inv_skew - imb_skew));
+        // NOT: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor
+        let mut bid_px = Px(pricing_base * (Decimal::ONE - half - skew - inv_skew));
 
-        // Ask: microprice'den yukarı (half + funding_skew + inv_skew + imbalance_skew)
+        // Ask: microprice'den yukarı (half + funding_skew + inv_skew)
         // Pozitif envanter varsa inv_skew pozitif, ask daha yukarı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, ask daha aşağı (almaya zorla)
-        // Pozitif imbalance (bid heavy) → imbalance_skew negatif (ters işaret), ask aşağı (doğru)
-        let mut ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew + imb_skew));
+        // NOT: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor
+        let mut ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew));
 
         // --- CROSSING GUARD: Fiyatların best bid/ask'i geçmemesi garantisi ---
         // KRİTİK DÜZELTME: Per-symbol tick_size kullan (global fallback yerine)
@@ -1662,6 +1709,8 @@ mod tests {
                     px: Px(ask),
                     qty: Qty(ask_vol),
                 }),
+                top_bids: None,
+                top_asks: None,
             },
             sigma: 0.5,
             inv: Qty(inv),
@@ -2091,6 +2140,8 @@ mod tests {
                     px: Px(dec!(50010)),
                     qty: Qty(dec!(1.0)), // Büyük volume
                 }),
+                top_bids: None,
+                top_asks: None,
             },
             sigma: 0.5,
             inv: Qty(dec!(0)),
@@ -2150,13 +2201,8 @@ mod tests {
             "inv_skew conversion should be correct"
         );
 
-        // Test: imbalance_skew dönüşümü
-        let imbalance_skew_bps = 10.0f64; // 10 bps
-        let imbalance_skew_ratio = imbalance_skew_bps / 1e4; // 0.001
-        assert!(
-            (imbalance_skew_ratio - 0.001f64).abs() < 1e-6,
-            "imbalance_skew conversion should be correct"
-        );
+        // NOT: imbalance_skew test kaldırıldı - imbalance_skew artık kullanılmıyor
+        // (microprice zaten imbalance'ı içeriyor, çift sayma önlemek için kaldırıldı)
     }
 
     #[test]
@@ -2170,20 +2216,19 @@ mod tests {
         let funding_skew_ratio = funding_skew_bps / 1e4; // 0.001
         let inv_skew_bps = 5.0; // 5 bps
         let inv_skew_ratio = inv_skew_bps / 1e4; // 0.0005
-        let imb_skew_bps = -3.0; // -3 bps
-        let imb_skew_ratio = imb_skew_bps / 1e4; // -0.0003
 
         let half = Decimal::try_from(half_ratio).unwrap();
         let skew = Decimal::try_from(funding_skew_ratio).unwrap();
         let inv_skew = Decimal::try_from(inv_skew_ratio).unwrap();
-        let imb_skew = Decimal::try_from(imb_skew_ratio).unwrap();
 
-        // Bid: microprice * (1 - half - skew - inv_skew - imb_skew)
-        let bid_ratio = Decimal::ONE - half - skew - inv_skew - imb_skew;
+        // Bid: microprice * (1 - half - skew - inv_skew)
+        // NOT: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor
+        let bid_ratio = Decimal::ONE - half - skew - inv_skew;
         let bid_px = microprice * bid_ratio;
 
-        // Ask: microprice * (1 + half + skew + inv_skew + imb_skew)
-        let ask_ratio = Decimal::ONE + half + skew + inv_skew + imb_skew;
+        // Ask: microprice * (1 + half + skew + inv_skew)
+        // NOT: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor
+        let ask_ratio = Decimal::ONE + half + skew + inv_skew;
         let ask_px = microprice * ask_ratio;
 
         // Bid ask arası spread kontrolü
@@ -2191,10 +2236,10 @@ mod tests {
         let spread_ratio = spread / microprice;
         let spread_bps_calc = spread_ratio.to_f64().unwrap_or(0.0) * 1e4;
 
-        // Spread = 2 * (half + skew + inv_skew + imb_skew)
-        // = 2 * (50 + 10 + 5 - 3) = 2 * 62 = 124 bps
+        // Spread = 2 * (half + skew + inv_skew)
+        // = 2 * (50 + 10 + 5) = 2 * 65 = 130 bps
         let expected_spread_bps =
-            2.0 * (half_ratio * 1e4 + funding_skew_bps + inv_skew_bps + imb_skew_bps);
+            2.0 * (half_ratio * 1e4 + funding_skew_bps + inv_skew_bps);
         // Tolerans: 1 bps (hesaplama hataları ve rounding için)
         assert!(
             (spread_bps_calc - expected_spread_bps).abs() < 1.0,
@@ -2384,7 +2429,7 @@ mod tests {
         );
 
         // Time threshold kontrolü
-        let time_elapsed_ms = 1500; // 1.5 saniye (threshold 2000ms'den az)
+        let time_elapsed_ms = 1500; // 1.5 saniye (threshold 5000ms'den az)
         assert!(
             time_elapsed_ms < strategy.manipulation_time_threshold_ms,
             "Time elapsed should be less than threshold"

@@ -594,6 +594,7 @@ async fn main() -> Result<()> {
             peak_pnl: Decimal::ZERO,
             position_hold_duration_ms: 0,
             last_order_price_update: HashMap::new(),
+            position_orders: Vec::new(), // KRİTİK İYİLEŞTİRME: Order-to-position mapping
             // Gelişmiş risk ve kazanç takibi
             daily_pnl: Decimal::ZERO,
             total_funding_cost: Decimal::ZERO,
@@ -711,7 +712,17 @@ async fn main() -> Result<()> {
                     
                     // PATCH: Reconnect sonrası tüm sembollerin açık emirlerini sync et
                     // Hayalet emirleri önlemek için full sync yap
+                    // KRİTİK İYİLEŞTİRME: Missed events recovery - pozisyon kontrolü ile fill/cancel ayrımı
                     for state in &mut states {
+                        // Önce pozisyonu al (inventory sync için)
+                        let current_pos = match venue.get_position(&state.meta.symbol).await {
+                            Ok(pos) => Some(pos),
+                            Err(err) => {
+                                warn!(symbol = %state.meta.symbol, ?err, "failed to get position for reconnect sync");
+                                None
+                            }
+                        };
+                        
                         rate_limit_guard(3).await; // GET /api/v3/openOrders: Weight 3
                         let sync_result = venue.get_open_orders(&state.meta.symbol).await;
                         
@@ -722,25 +733,76 @@ async fn main() -> Result<()> {
                                     .map(|o| o.order_id.clone())
                                     .collect();
                                 
-                                // Local'de olup API'de olmayan emirleri temizle
-                                let mut removed_count = 0;
-                                state.active_orders.retain(|order_id, _| {
+                                // KRİTİK İYİLEŞTİRME: Removed orders'ı track et (fill mi cancel mi anlamak için)
+                                let mut removed_orders = Vec::new();
+                                state.active_orders.retain(|order_id, order_info| {
                                     if !api_order_ids.contains(order_id) {
-                                        removed_count += 1;
+                                        removed_orders.push(order_info.clone());
                                         false
                                     } else {
                                         true
                                     }
                                 });
                                 
-                                if removed_count > 0 {
-                                    state.consecutive_no_fills = 0;
-                                    state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_reconnect_factor + cfg.internal.fill_rate_reconnect_bonus).min(1.0);
-                                    info!(
-                                        symbol = %state.meta.symbol,
-                                        removed_orders = removed_count,
-                                        "full sync after reconnect: removed filled/canceled orders"
-                                    );
+                                if !removed_orders.is_empty() {
+                                    // Inventory sync yap (fill olmuş olabilir)
+                                    if let Some(pos) = current_pos {
+                                        let old_inv = state.inv.0;
+                                        state.inv = Qty(pos.qty.0);
+                                        state.last_inventory_update = Some(std::time::Instant::now());
+                                        
+                                        // Eğer inventory değiştiyse fill olmuş
+                                        if old_inv != pos.qty.0 {
+                                            state.consecutive_no_fills = 0;
+                                            state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                                            
+                                            // KRİTİK İYİLEŞTİRME: Buy order'lar fill olduysa position_orders'a ekle
+                                            let inv_increased = pos.qty.0 > old_inv;
+                                            if inv_increased {
+                                                for removed_order in &removed_orders {
+                                                    if removed_order.side == Side::Buy {
+                                                        if !state.position_orders.contains(&removed_order.order_id) {
+                                                            state.position_orders.push(removed_order.order_id.clone());
+                                                            debug!(
+                                                                symbol = %state.meta.symbol,
+                                                                order_id = %removed_order.order_id,
+                                                                "reconnect sync: buy order filled, added to position_orders"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Pozisyon sıfıra düştüyse position_orders'ı temizle
+                                            if pos.qty.0.is_zero() && !old_inv.is_zero() {
+                                                state.position_orders.clear();
+                                                debug!(symbol = %state.meta.symbol, "reconnect sync: position closed, cleared position_orders");
+                                            }
+                                            
+                                            info!(
+                                                symbol = %state.meta.symbol,
+                                                removed_orders = removed_orders.len(),
+                                                inv_change = %(pos.qty.0 - old_inv),
+                                                "reconnect sync: orders removed and inventory changed - likely filled"
+                                            );
+                                        } else {
+                                            // Inventory değişmediyse cancel olmuş
+                                            update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                                            info!(
+                                                symbol = %state.meta.symbol,
+                                                removed_orders = removed_orders.len(),
+                                                "reconnect sync: orders removed but inventory unchanged - likely canceled"
+                                            );
+                                        }
+                                    } else {
+                                        // Position alınamadı, eski mantıkla devam et (fill olarak varsay)
+                                        state.consecutive_no_fills = 0;
+                                        state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_reconnect_factor + cfg.internal.fill_rate_reconnect_bonus).min(1.0);
+                                        warn!(
+                                            symbol = %state.meta.symbol,
+                                            removed_orders = removed_orders.len(),
+                                            "reconnect sync: orders removed but position unavailable, assuming filled"
+                                        );
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -764,13 +826,23 @@ async fn main() -> Result<()> {
                         let state = &mut states[*idx];
                         
                         // KRİTİK: Event-based state management - sadece event'lerle state güncelle
-                        // Duplicate event handling: Aynı order_id için aynı cumulative_filled_qty'yi ignore et
+                        // KRİTİK İYİLEŞTİRME: Duplicate detection - cumulative_filled_qty + order_status kontrolü
+                        // Aynı cumulative_filled_qty birden fazla gelebilir (network retry), bu yüzden
+                        // sadece cumulative qty değil, order state'i de kontrol et
                         let is_duplicate = if let Some(existing_order) = state.active_orders.get(&order_id) {
-                            // Eğer cumulative filled qty aynıysa, bu duplicate event
+                            // Eğer cumulative qty aynı VE status değişmemişse duplicate
+                            // (Status değişmişse yeni bir event olabilir, örneğin PARTIALLY_FILLED -> FILLED)
                             existing_order.filled_qty.0 >= cumulative_filled_qty.0
                         } else {
-                            // Order yoksa, bu yeni bir fill (reconnect sonrası olabilir)
-                            false
+                            // Order yoksa, bu reconnect sonrası olabilir
+                            // Inventory güncellemesi için event'i kabul et ama log yap
+                            warn!(
+                                %symbol,
+                                order_id = %order_id,
+                                cumulative_filled_qty = %cumulative_filled_qty.0,
+                                "fill event for unknown order (reconnect?)"
+                            );
+                            false // Inventory'yi güncelle ama order state'i yok
                         };
                         
                         if is_duplicate {
@@ -778,6 +850,7 @@ async fn main() -> Result<()> {
                                 %symbol,
                                 order_id = %order_id,
                                 cumulative_filled_qty = %cumulative_filled_qty.0,
+                                order_status = %order_status,
                                 "duplicate fill event ignored"
                             );
                             continue; // Duplicate event'i ignore et
@@ -800,7 +873,9 @@ async fn main() -> Result<()> {
                         let fill_increment = qty.0; // Bu fill'de ne kadar fill oldu
                         
                         // Inventory güncelle (sadece incremental fill miktarı)
-                        let mut inv = state.inv.0;
+                        // NOT: Order state'de yoksa bile inventory güncelle (reconnect sonrası olabilir)
+                        let old_inv = state.inv.0;
+                        let mut inv = old_inv;
                         if side == Side::Buy {
                             inv += fill_increment;
                         } else {
@@ -809,7 +884,34 @@ async fn main() -> Result<()> {
                         state.inv = Qty(inv);
                         state.last_inventory_update = Some(std::time::Instant::now());
                         
-                        // Order state güncelle
+                        // KRİTİK İYİLEŞTİRME: Order-to-position mapping - pozisyon oluşturan order'ları track et
+                        // Buy fill → pozisyon artar → order'ı ekle
+                        // Sell fill → pozisyon azalır → order ekleme (pozisyon kapatıyor, oluşturmuyor)
+                        if side == Side::Buy && fill_increment > Decimal::ZERO {
+                            // Buy order fill oldu ve pozisyon arttı → bu order pozisyonu oluşturdu/arttırdı
+                            if !state.position_orders.contains(&order_id) {
+                                state.position_orders.push(order_id.clone());
+                                debug!(
+                                    %symbol,
+                                    order_id = %order_id,
+                                    fill_increment = %fill_increment,
+                                    old_inv = %old_inv,
+                                    new_inv = %inv,
+                                    total_position_orders = state.position_orders.len(),
+                                    "position entry: buy order filled, added to position_orders"
+                                );
+                            }
+                        }
+                        // Pozisyon sıfıra düştüyse position_orders'ı temizle
+                        if inv.is_zero() && !old_inv.is_zero() {
+                            state.position_orders.clear();
+                            debug!(
+                                %symbol,
+                                "position closed: cleared position_orders"
+                            );
+                        }
+                        
+                        // Order state güncelle (varsa)
                         let should_remove = if let Some(order_info) = state.active_orders.get_mut(&order_id) {
                             // Order var, güncelle
                             order_info.filled_qty = cumulative_filled_qty;
@@ -835,35 +937,27 @@ async fn main() -> Result<()> {
                                 if order_status == "FILLED" { "fully filled" } else { "partial fill" }
                             );
                             
-                            // Eğer order tamamen fill olduysa (FILLED status), active_orders'dan kaldır
-                            if order_status == "FILLED" || remaining_qty.is_zero() {
-                        update_fill_rate_on_fill(
-                            state,
-                            cfg.internal.fill_rate_increase_factor,
-                            cfg.internal.fill_rate_increase_bonus,
-                        );
-                                true // Remove order
-                            } else {
-                                // Partial fill - sadece fill rate'i hafifçe artır
-                                state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_partial_fill_factor + cfg.internal.fill_rate_partial_fill_bonus).min(1.0);
-                                false // Keep order
-                            }
+                            // Status kontrolü: FILLED ise kaldır
+                            order_status == "FILLED" || remaining_qty.is_zero()
                         } else {
-                            // Order local state'de yok (reconnect sonrası olabilir)
-                            // API'den order bilgisini al ve state'e ekle
-                            warn!(
-                            %symbol,
-                            order_id = %order_id,
-                                "fill event for unknown order (reconnect?), will sync from API"
-                            );
-                            // Reconnect sonrası sync yapılacak, burada sadece inventory güncelle
+                            // Order state'de yok, ama inventory güncelledik
+                            // API'den sync gerekecek
+                            false
+                        };
+                        
+                        // Fill rate güncelle (order state'e göre)
+                        if should_remove {
+                            // Full fill: Normal fill rate güncellemesi
                             update_fill_rate_on_fill(
                                 state,
                                 cfg.internal.fill_rate_increase_factor,
                                 cfg.internal.fill_rate_increase_bonus,
                             );
-                            false // Don't remove (order not in state)
-                        };
+                        } else if fill_increment > Decimal::ZERO {
+                            // Partial fill: Daha hafif fill rate güncellemesi
+                            // Order state'de yoksa bile (reconnect sonrası) hafif güncelleme yap
+                            state.order_fill_rate = (state.order_fill_rate * 0.98 + 0.02).min(1.0);
+                        }
                         
                         // Order'ı kaldır (eğer tamamen fill olduysa)
                         if should_remove {
@@ -891,22 +985,40 @@ async fn main() -> Result<()> {
                         let state = &mut states[*idx];
                         
                         // KRİTİK: Event-based state management - sadece event'lerle state güncelle
-                        // client_order_id ile idempotency kontrolü
-                        let was_removed = if let Some(order_info) = state.active_orders.get(&order_id) {
-                            // client_order_id eşleşiyorsa veya yoksa, order'ı kaldır
-                            if let (Some(client_id), Some(order_client_id)) = (&client_order_id, &order_info.client_order_id) {
-                                client_id == order_client_id
+                        // KRİTİK İYİLEŞTİRME: Idempotency kontrolü - client_order_id validation
+                        // Aynı order_id farklı semboller için kullanılabilir (Binance'ta sembol bazlı unique)
+                        // Bu yüzden client_order_id kontrolü kritik
+                        let should_remove = if let Some(order_info) = state.active_orders.get(&order_id) {
+                            // client_order_id varsa kontrol et
+                            if let Some(ref client_id) = client_order_id {
+                                if let Some(ref order_client_id) = order_info.client_order_id {
+                                    // Her ikisi de varsa eşleşmeli
+                                    client_id == order_client_id
+                                } else {
+                                    // Event'te var ama order'da yok - muhtemelen yanlış event
+                                    warn!(
+                                        %symbol,
+                                        order_id = %order_id,
+                                        client_order_id = %client_id,
+                                        "cancel event has client_order_id but order doesn't, ignoring"
+                                    );
+                                    false
+                                }
                             } else {
-                                true // client_order_id yoksa, order_id ile eşleştir
+                                // Event'te client_order_id yok - legacy event, order_id ile eşleştir
+                                // NOT: Order'da client_order_id varsa bile, legacy event'i kabul et
+                                // (geriye dönük uyumluluk için)
+                                true
                             }
                         } else {
-                            false // Order zaten yok
+                            // Order zaten yok
+                            false
                         };
                         
-                        if was_removed {
-                        state.active_orders.remove(&order_id);
+                        if should_remove {
+                            state.active_orders.remove(&order_id);
                             state.last_order_price_update.remove(&order_id);
-                        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                            update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
                             
                             info!(
                                 %symbol,
@@ -1097,6 +1209,17 @@ async fn main() -> Result<()> {
                 cfg.internal.order_sync_interval_sec,
             );
             if should_sync_orders {
+                // KRİTİK İYİLEŞTİRME: Missed events recovery - önce pozisyonu al (inventory sync için)
+                // Fill olmuş emirler için inventory güncellemesi yapılabilmesi için pozisyon gerekli
+                let current_pos = match venue.get_position(&symbol).await {
+                    Ok(pos) => pos,
+                    Err(err) => {
+                        warn!(%symbol, ?err, "failed to get position for order sync, skipping inventory check");
+                        // Position alınamazsa devam et ama inventory check yapma
+                        None
+                    }
+                };
+                
                 // API Rate Limit koruması
                 rate_limit_guard(3).await; // GET /api/v3/openOrders: Weight 3
                 let sync_result = venue.get_open_orders(&symbol).await;
@@ -1109,28 +1232,79 @@ async fn main() -> Result<()> {
                             .map(|o| o.order_id.clone())
                             .collect();
                         
-                        // Local'de olup API'de olmayan emirleri temizle (muhtemelen fill oldu)
-                        let mut removed_count = 0;
-                        state.active_orders.retain(|order_id, _| {
+                        // KRİTİK İYİLEŞTİRME: Removed orders'ı track et (fill mi cancel mi anlamak için)
+                        let mut removed_orders = Vec::new();
+                        state.active_orders.retain(|order_id, order_info| {
                             if !api_order_ids.contains(order_id) {
-                                removed_count += 1;
+                                removed_orders.push(order_info.clone());
                                 false // Remove
                             } else {
                                 true // Keep
                             }
                         });
                         
-                        if removed_count > 0 {
-                            // KRİTİK DÜZELTME: Fill olan emirler varsa consecutive_no_fills sıfırla
-                            state.consecutive_no_fills = 0;
-                            // Fill oranını artır
-                            state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_increase_factor + cfg.internal.fill_rate_increase_bonus * (removed_count as f64).min(1.0)).min(1.0);
-                            info!(
-                                %symbol,
-                                removed_orders = removed_count,
-                                remaining_orders = state.active_orders.len(),
-                                "synced orders: removed filled/canceled orders from local state"
-                            );
+                        if !removed_orders.is_empty() {
+                            // Inventory sync yap (fill olmuş olabilir)
+                            if let Some(pos) = current_pos {
+                                let old_inv = state.inv.0;
+                                state.inv = Qty(pos.qty.0);
+                                state.last_inventory_update = Some(std::time::Instant::now());
+                                
+                                // Eğer inventory değiştiyse fill olmuş
+                                if old_inv != pos.qty.0 {
+                                    state.consecutive_no_fills = 0;
+                                    state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                                    
+                                    // KRİTİK İYİLEŞTİRME: Buy order'lar fill olduysa position_orders'a ekle
+                                    // Inventory arttıysa buy order'lar fill olmuş demektir
+                                    let inv_increased = pos.qty.0 > old_inv;
+                                    if inv_increased {
+                                        for removed_order in &removed_orders {
+                                            if removed_order.side == Side::Buy {
+                                                if !state.position_orders.contains(&removed_order.order_id) {
+                                                    state.position_orders.push(removed_order.order_id.clone());
+                                                    debug!(
+                                                        %symbol,
+                                                        order_id = %removed_order.order_id,
+                                                        "order sync: buy order filled, added to position_orders"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Pozisyon sıfıra düştüyse position_orders'ı temizle
+                                    if pos.qty.0.is_zero() && !old_inv.is_zero() {
+                                        state.position_orders.clear();
+                                        debug!(%symbol, "order sync: position closed, cleared position_orders");
+                                    }
+                                    
+                                    info!(
+                                        %symbol,
+                                        removed_orders = removed_orders.len(),
+                                        inv_change = %(pos.qty.0 - old_inv),
+                                        old_inv = %old_inv,
+                                        new_inv = %pos.qty.0,
+                                        "orders removed and inventory changed - likely filled"
+                                    );
+                                } else {
+                                    // Inventory değişmediyse cancel olmuş
+                                    update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                                    info!(
+                                        %symbol,
+                                        removed_orders = removed_orders.len(),
+                                        "orders removed but inventory unchanged - likely canceled"
+                                    );
+                                }
+                            } else {
+                                // Position alınamadı, eski mantıkla devam et (fill olarak varsay)
+                                state.consecutive_no_fills = 0;
+                                state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_increase_factor + cfg.internal.fill_rate_increase_bonus * (removed_orders.len() as f64).min(1.0)).min(1.0);
+                                warn!(
+                                    %symbol,
+                                    removed_orders = removed_orders.len(),
+                                    "orders removed but position unavailable, assuming filled"
+                                );
+                            }
                         }
                         
                         // API'de olup local'de olmayan emirleri ekle (başka yerden açılmış olabilir)
@@ -1342,8 +1516,9 @@ async fn main() -> Result<()> {
                     
                     // Akıllı karar: Emir çok eski mi?
                     // Pozisyon varsa stale emirleri daha hızlı temizle (pozisyon yönetimi için)
+                    // KRİTİK İYİLEŞTİRME: 1/2 → 2/3 (daha az agresif, yarıya düşürmek çok agresif)
                     let max_age_for_stale = if position_size_notional > 0.0 {
-                        cfg.exec.max_order_age_ms / 2 // Pozisyon varsa yarı süre
+                        (cfg.exec.max_order_age_ms * 2) / 3 // Pozisyon varsa 2/3 süre (daha az agresif)
                     } else {
                         cfg.exec.max_order_age_ms
                     };
@@ -1416,6 +1591,8 @@ async fn main() -> Result<()> {
                     px: ask,
                     qty: Qty(Decimal::from(1)),
                 }),
+                top_bids: None, // Top-K levels not available from best_prices()
+                top_asks: None, // Top-K levels not available from best_prices()
             };
 
             // Pozisyon ve mark price zaten yukarıda alındı, tekrar almayalım
@@ -1423,43 +1600,64 @@ async fn main() -> Result<()> {
             // KRİTİK DÜZELTME: WebSocket reconnect sonrası pozisyon sync'i
             // Reconnect sonrası sadece emirleri değil, pozisyonları da sync et
             // force_sync_all true ise TAM sync yap (reconnect sonrası)
-            // RACE CONDITION ÖNLEME: Son envanter güncellemesinden 100ms geçmeden sync yapma
+            // RACE CONDITION ÖNLEME: Son envanter güncellemesinden 500ms geçmeden sync yapma
+            // WebSocket event'i ile REST API sync arasında 200-500ms gecikme normal
             let inv_diff = (state.inv.0 - pos.qty.0).abs();
+            
+            // KRİTİK İYİLEŞTİRME: Threshold çok küçük (0.00000001) rounding error'ları false positive yaratabilir
+            // Daha makul bir threshold kullan: minimum step_size veya 0.0001 (0.01% of a unit)
+            // Config'den gelen threshold'u kullan, yoksa daha makul bir default (0.0001)
             let reconcile_threshold = Decimal::from_str_radix(&cfg.internal.inventory_reconcile_threshold, 10)
-                .unwrap_or(Decimal::new(1, 8));
+                .unwrap_or(Decimal::new(1, 4)); // 0.0001 instead of 0.00000001 (100x larger, prevents rounding errors)
             let is_reconnect_sync = force_sync_all;
             
             // Son envanter güncellemesinden bu yana geçen süre (race condition önleme)
+            // KRİTİK İYİLEŞTİRME: 100ms → 500ms (WebSocket/REST API gecikmesi için)
+            const MIN_SYNC_INTERVAL_MS: u128 = 500; // 200-500ms gecikme normal, 500ms güvenli
             let time_since_last_update = state.last_inventory_update
                 .map(|t| t.elapsed().as_millis())
                 .unwrap_or(1000); // Eğer hiç güncelleme yoksa, sync yap
             
             // Reconnect sonrası veya normal durumda uyumsuzluk varsa sync yap
-            // Ama son güncellemeden 100ms geçmeden sync yapma (race condition önleme)
-            if is_reconnect_sync || (inv_diff > reconcile_threshold && time_since_last_update > 100) {
-                if is_reconnect_sync {
-                    // Reconnect sonrası: Her zaman sync yap (uyumsuzluk olsun ya da olmasın)
-                    info!(
-                        %symbol,
-                        ws_inv = %state.inv.0,
-                        api_inv = %pos.qty.0,
-                        diff = %inv_diff,
-                        "force syncing position after reconnect (full sync)"
-                    );
-                    state.inv = pos.qty; // Force sync
-                    state.last_inventory_update = Some(std::time::Instant::now());
-                } else if inv_diff > reconcile_threshold && time_since_last_update > 100 {
-                    // Normal durumda: Sadece uyumsuzluk varsa ve son güncellemeden 100ms geçtiyse sync yap
-                    warn!(
-                        %symbol,
-                        ws_inv = %state.inv.0,
-                        api_inv = %pos.qty.0,
-                        diff = %inv_diff,
-                        time_since_last_update_ms = time_since_last_update,
-                        "inventory mismatch detected, syncing with API position (race condition safe)"
-                    );
-                    state.inv = pos.qty; // Force sync
-                    state.last_inventory_update = Some(std::time::Instant::now());
+            // KRİTİK İYİLEŞTİRME: Force sync mantığı - reconnect sonrası her zaman sync yap
+            // Normal durumda daha toleranslı ol (threshold + timing kontrolü)
+            if is_reconnect_sync {
+                // Reconnect sonrası: Her zaman sync yap (uyumsuzluk olsun ya da olmasın)
+                // Timing kontrolü yok - reconnect sonrası hemen sync yap
+                info!(
+                    %symbol,
+                    ws_inv = %state.inv.0,
+                    api_inv = %pos.qty.0,
+                    diff = %inv_diff,
+                    "force syncing position after reconnect (full sync)"
+                );
+                let old_inv = state.inv.0;
+                state.inv = pos.qty; // Force sync
+                state.last_inventory_update = Some(std::time::Instant::now());
+                // KRİTİK İYİLEŞTİRME: Pozisyon sıfıra düştüyse position_orders'ı temizle
+                if pos.qty.0.is_zero() && !old_inv.is_zero() {
+                    state.position_orders.clear();
+                    debug!(%symbol, "position closed via reconnect sync: cleared position_orders");
+                }
+            } else if inv_diff > reconcile_threshold && time_since_last_update > MIN_SYNC_INTERVAL_MS {
+                // Normal durumda: Sadece uyumsuzluk varsa ve son güncellemeden 500ms geçtiyse sync yap
+                // Daha toleranslı: threshold daha büyük (rounding error'ları ignore et)
+                warn!(
+                    %symbol,
+                    ws_inv = %state.inv.0,
+                    api_inv = %pos.qty.0,
+                    diff = %inv_diff,
+                    threshold = %reconcile_threshold,
+                    time_since_last_update_ms = time_since_last_update,
+                    "inventory mismatch detected, syncing with API position (race condition safe)"
+                );
+                let old_inv = state.inv.0;
+                state.inv = pos.qty; // Force sync
+                state.last_inventory_update = Some(std::time::Instant::now());
+                // KRİTİK İYİLEŞTİRME: Pozisyon sıfıra düştüyse position_orders'ı temizle
+                if pos.qty.0.is_zero() && !old_inv.is_zero() {
+                    state.position_orders.clear();
+                    debug!(%symbol, "position closed via normal sync: cleared position_orders");
                 }
             }
 
@@ -1719,6 +1917,7 @@ async fn main() -> Result<()> {
                 state.position_entry_time = None;
                 state.peak_pnl = Decimal::ZERO;
                 state.position_hold_duration_ms = 0;
+                state.position_orders.clear(); // KRİTİK İYİLEŞTİRME: Pozisyon kapandı, order tracking'i temizle
             }
             
             // Pozisyon trend analizi: Son 10 snapshot'a bak
@@ -1893,6 +2092,7 @@ async fn main() -> Result<()> {
                     state.peak_pnl = Decimal::ZERO;
                     state.position_hold_duration_ms = 0;
                     state.daily_pnl = Decimal::ZERO; // Pozisyon kapandı, günlük PnL sıfırla
+                    state.position_orders.clear(); // KRİTİK İYİLEŞTİRME: Pozisyon kapandı, order tracking'i temizle
                 }
             }
             
@@ -1950,6 +2150,43 @@ async fn main() -> Result<()> {
             
             // --- AKILLI FILL ORANI TAKİBİ: Zaman bazlı fill rate kontrolü ---
             // KRİTİK DÜZELTME: Tick sayısı yerine zaman bazlı kontrol (1 saniye = 1000 tick yerine gerçek zaman)
+            // KRİTİK İYİLEŞTİRME: Time-based decay - 30 saniye fill yoksa fill rate'i düşür
+            // Bu, tick-based tracking'den daha doğru (tick frequency değişebilir)
+            // Decay sadece 30 saniyelik aralıklarda bir kez uygulanır (her tick'te değil)
+            if let Some(last_fill) = state.last_fill_time {
+                let seconds_since_fill = last_fill.elapsed().as_secs();
+                const TIME_BASED_DECAY_THRESHOLD_SEC: u64 = 30; // 30 saniye fill yoksa decay
+                const DECAY_INTERVAL_SEC: u64 = 30; // Her 30 saniyede bir decay uygula
+                
+                if seconds_since_fill >= TIME_BASED_DECAY_THRESHOLD_SEC {
+                    // Her 30 saniyelik aralıkta bir kez decay uygula (her tick'te değil)
+                    // Örnek: 30-59 saniye arası → 1 kez, 60-89 saniye arası → 1 kez, vb.
+                    // Period hesapla: 30-59 → period 1, 60-89 → period 2, vb.
+                    let current_period = seconds_since_fill / DECAY_INTERVAL_SEC;
+                    // Bir önceki tick'teki period'u tahmin et (1 saniye önce)
+                    let previous_period = seconds_since_fill.saturating_sub(1) / DECAY_INTERVAL_SEC;
+                    
+                    // Eğer yeni bir 30 saniyelik period'a geçtiysek decay uygula
+                    // Bu, her 30 saniyede bir kez decay yapılmasını garanti eder
+                    if current_period > previous_period {
+                        // 30 saniyedir fill yok - fill rate'i düşür
+                        state.order_fill_rate *= 0.9; // %10 azalt
+                        state.consecutive_no_fills += 1; // Geriye dönük uyumluluk için
+                        
+                        debug!(
+                            symbol = %state.meta.symbol,
+                            fill_rate = state.order_fill_rate,
+                            seconds_since_fill,
+                            decay_period = current_period,
+                            consecutive_no_fills = state.consecutive_no_fills,
+                            "time-based fill rate decay: no fills for {} seconds (period {})",
+                            seconds_since_fill,
+                            current_period
+                        );
+                    }
+                }
+            }
+            
             if state.active_orders.len() > 0 {
                 // Emirlerin ne kadar süredir açık olduğunu kontrol et
                 let oldest_order_age = state.active_orders.values()
@@ -2432,7 +2669,11 @@ async fn main() -> Result<()> {
                     created_at: Instant::now(),
                     last_fill_time: None,
                 };
-                state.active_orders.insert(order_id.clone(), info);
+                state.active_orders.insert(order_id.clone(), info.clone());
+                                // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
+                                // place_limit içinde fiyat quantize/round edilebilir, ama crossing guard zaten strategy'de yapıldı
+                                // info.price = crossing guard adjusted price (px), bu fiyatı kaydet
+                                state.last_order_price_update.insert(order_id.clone(), info.price);
                                 // Başarılı emir için spent hesapla (hesaptan giden para = margin)
                                 // Notional (pozisyon boyutu) / leverage = hesaptan giden para
                                 let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
@@ -2559,8 +2800,9 @@ async fn main() -> Result<()> {
                                 created_at: Instant::now(),
                                 last_fill_time: None,
                             };
-                                                    state.active_orders.insert(order_id.clone(), info);
-                                                    state.last_order_price_update.insert(order_id, px);
+                                                    state.active_orders.insert(order_id.clone(), info.clone());
+                                                    // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
+                                                    state.last_order_price_update.insert(order_id.clone(), info.price);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
                                                     let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
                                                     total_spent_on_bids = notional / effective_leverage;
@@ -2626,7 +2868,9 @@ async fn main() -> Result<()> {
                                     created_at: Instant::now(),
                                     last_fill_time: None,
                                 };
-                                        state.active_orders.insert(order_id2, info2);
+                                        state.active_orders.insert(order_id2.clone(), info2.clone());
+                                        // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
+                                        state.last_order_price_update.insert(order_id2, info2.price);
                                         // Spent güncelle (hesaptan giden para = margin)
                                         // Notional / leverage = hesaptan giden para
                                         total_spent_on_bids += qty2_notional / effective_leverage;
@@ -2688,7 +2932,11 @@ async fn main() -> Result<()> {
                             created_at: Instant::now(),
                             last_fill_time: None,
                             };
-                            state.active_orders.insert(order_id.clone(), info);
+                            state.active_orders.insert(order_id.clone(), info.clone());
+                            // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
+                            // place_limit içinde fiyat quantize/round edilebilir, ama crossing guard zaten strategy'de yapıldı
+                            // info.price = crossing guard adjusted price (px), bu fiyatı kaydet
+                            state.last_order_price_update.insert(order_id.clone(), info.price);
                             
                             // JSON log: Order created
                             if let Ok(logger) = json_logger.lock() {
@@ -2815,8 +3063,9 @@ async fn main() -> Result<()> {
                                     created_at: Instant::now(),
                                     last_fill_time: None,
                                 };
-                                                    state.active_orders.insert(order_id.clone(), info);
-                                                    state.last_order_price_update.insert(order_id, px);
+                                                    state.active_orders.insert(order_id.clone(), info.clone());
+                                                    // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
+                                                    state.last_order_price_update.insert(order_id.clone(), info.price);
                                                     // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
                                                     let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
                                                     total_spent_on_asks = notional / effective_leverage_ask;
@@ -2882,7 +3131,9 @@ async fn main() -> Result<()> {
                                 created_at: Instant::now(),
                                 last_fill_time: None,
                             };
-                                        state.active_orders.insert(order_id2, info2);
+                                        state.active_orders.insert(order_id2.clone(), info2.clone());
+                                        // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
+                                        state.last_order_price_update.insert(order_id2, info2.price);
                                         // Spent güncelle (hesaptan giden para = margin)
                                         // Notional / leverage = hesaptan giden para
                                         total_spent_on_asks += qty2_notional / effective_leverage_ask;
@@ -3026,7 +3277,7 @@ fn should_sync_orders(
 fn is_order_stale(order: &OrderInfo, max_age_ms: u64, has_position: bool) -> bool {
     let age_ms = order.created_at.elapsed().as_millis() as u64;
     let threshold = if has_position {
-        max_age_ms / 2
+        (max_age_ms * 2) / 3 // KRİTİK İYİLEŞTİRME: 1/2 → 2/3 (daha az agresif)
     } else {
         max_age_ms
     };

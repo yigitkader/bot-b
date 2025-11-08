@@ -40,6 +40,8 @@ pub struct SymbolState {
     pub peak_pnl: Decimal,
     pub position_hold_duration_ms: u64,
     pub last_order_price_update: HashMap<String, Px>,
+    // KRİTİK İYİLEŞTİRME: Order-to-position mapping - hangi order'lar bu pozisyonu oluşturdu?
+    pub position_orders: Vec<String>, // Bu pozisyonu oluşturan order ID'ler (fill olan order'lar)
     
     // Advanced tracking
     pub daily_pnl: Decimal,

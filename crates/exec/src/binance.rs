@@ -442,7 +442,8 @@ impl BinanceFutures {
         let max_attempts = 3;
 
         for attempt in 0..max_attempts {
-            // Mevcut pozisyonu kontrol et (retry durumunda pozisyon değişmiş olabilir)
+            // KRİTİK İYİLEŞTİRME: Her attempt'te mevcut pozisyonu kontrol et
+            // Retry durumunda pozisyon değişmiş olabilir (kısmi kapatma)
             let current_pos = self.fetch_position(sym).await?;
             let current_qty = current_pos.qty.0;
 
@@ -452,16 +453,18 @@ impl BinanceFutures {
                     info!(
                         symbol = %sym,
                         attempts = attempt + 1,
+                        initial_qty = %initial_qty,
                         "position fully closed after retry"
                     );
                 }
                 return Ok(());
             }
 
-            // Kalan pozisyon miktarını hesapla
+            // Kalan pozisyon miktarını hesapla (quantize et)
             let remaining_qty = quantize_decimal(current_qty.abs(), rules.step_size);
 
             if remaining_qty <= Decimal::ZERO {
+                // Quantize sonrası sıfır oldu, pozisyon zaten kapalı sayılabilir
                 return Ok(());
             }
 
@@ -509,7 +512,9 @@ impl BinanceFutures {
                     // KRİTİK DÜZELTME: Exchange'in işlemesi için bekleme eklendi
                     // Market order gönderildikten sonra exchange'in işlemesi için zaman gerekir
                     // Hemen kontrol etmek yanlış sonuçlara yol açabilir (pozisyon henüz kapanmamış olabilir)
-                    tokio::time::sleep(Duration::from_millis(500)).await; // Exchange işlemesi için 500ms bekle
+                    // KRİTİK İYİLEŞTİRME: Binance için 1000ms daha güvenli (500ms yeterli olmayabilir)
+                    // Exchange'in order'ı işlemesi ve position update'i için yeterli süre
+                    tokio::time::sleep(Duration::from_millis(1000)).await; // Exchange işlemesi için 1000ms bekle (Binance)
 
                     let verify_pos = self.fetch_position(sym).await?;
                     let verify_qty = verify_pos.qty.0;
@@ -524,19 +529,34 @@ impl BinanceFutures {
                         );
                         return Ok(());
                     } else {
-                        // Kısmi kapatma - retry yap
-                        let remaining_pct = (verify_qty.abs() / initial_qty.abs()
-                            * Decimal::from(100))
-                        .to_f64()
-                        .unwrap_or(0.0);
+                        // KRİTİK İYİLEŞTİRME: Kısmi kapatma tespiti - kapatılan miktarı hesapla
+                        // Bu attempt'te ne kadar kapatıldı?
+                        let closed_amount = current_qty.abs() - verify_qty.abs();
+                        let close_ratio = if current_qty.abs() > Decimal::ZERO {
+                            closed_amount / current_qty.abs()
+                        } else {
+                            Decimal::ZERO
+                        };
+                        
+                        // Kalan pozisyon yüzdesi (initial'a göre)
+                        let remaining_pct = if initial_qty.abs() > Decimal::ZERO {
+                            (verify_qty.abs() / initial_qty.abs() * Decimal::from(100))
+                                .to_f64()
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
 
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
                             initial_qty = %initial_qty,
+                            current_qty_at_attempt = %current_qty,
                             remaining_qty = %verify_qty,
+                            closed_amount = %closed_amount,
+                            close_ratio = %close_ratio,
                             remaining_pct = remaining_pct,
-                            "position partially closed, retrying..."
+                            "partial close detected, retrying..."
                         );
 
                         if attempt < max_attempts - 1 {
@@ -545,10 +565,11 @@ impl BinanceFutures {
                         } else {
                             // Son denemede hala pozisyon varsa hata döndür
                             return Err(anyhow::anyhow!(
-                                "Failed to fully close position after {} attempts. Initial: {}, Remaining: {}",
+                                "Failed to fully close position after {} attempts. Initial: {}, Remaining: {}, Closed in last attempt: {}",
                                 max_attempts,
                                 initial_qty,
-                                verify_qty
+                                verify_qty,
+                                closed_amount
                             ));
                         }
                     }
@@ -613,14 +634,12 @@ impl Venue for BinanceFutures {
         let rules = self.rules_for(sym).await?;
 
         // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
-        // Precision'ı tick_size ve step_size ile uyumlu hale getir
-        // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
-        let price_prec_from_tick = scale_from_step(rules.tick_size);
-        let qty_prec_from_step = scale_from_step(rules.step_size);
-        // tick_size'dan hesaplanan precision'ı kullan (exchange'in verdiği precision yanlış olabilir)
-        // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
-        let price_precision = price_prec_from_tick.min(rules.price_precision);
-        let qty_precision = qty_prec_from_step.min(rules.qty_precision);
+        // KRİTİK İYİLEŞTİRME: Exchange'in precision'ını önceliklendir
+        // Exchange'in verdiği precision'ı kullan (SymbolRules'da zaten exchange precision varsa kullanılıyor,
+        // yoksa tick_size'dan hesaplanmış oluyor - bu mantık SymbolRules oluşturulurken yapılıyor)
+        // Exchange'in precision'ını override etmeye gerek yok, çünkü exchange kurallarına uyum önemli
+        let price_precision = rules.price_precision;
+        let qty_precision = rules.qty_precision;
 
         // Quantize: step_size'a göre floor
         let price_quantized = quantize_decimal(px.0, rules.tick_size);

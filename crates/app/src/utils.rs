@@ -197,9 +197,6 @@ impl RateLimiter {
     /// Sleep sırasında lock yokken başka thread'ler weight ekleyebilir.
     /// Bu yüzden sleep'i küçük parçalara bölüp her parçada kontrol yapıyoruz.
     pub async fn wait_if_needed(&self, weight: u32) {
-        // Sleep polling interval: 100ms (race condition önleme için)
-        const POLL_INTERVAL_MS: u64 = 100;
-        
         loop {
             let now = Instant::now();
             let mut requests = self.requests.lock().unwrap();
@@ -221,8 +218,9 @@ impl RateLimiter {
                         let sleep_duration = wait_time.duration_since(now);
                         drop(requests);
                         drop(weights);
-                        // KRİTİK DÜZELTME: Sleep'i küçük parçalara böl, her parçada kontrol yap
-                        self.sleep_with_polling(sleep_duration, POLL_INTERVAL_MS).await;
+                        // Kısa bekleme (< 1 saniye): 100ms polling (fine-grained)
+                        let poll_interval_ms = 100;
+                        self.sleep_with_polling(sleep_duration, poll_interval_ms).await;
                         continue;
                     }
                 }
@@ -237,8 +235,9 @@ impl RateLimiter {
                     if wait.as_millis() > 0 {
                         drop(requests);
                         drop(weights);
-                        // KRİTİK DÜZELTME: Sleep'i küçük parçalara böl, her parçada kontrol yap
-                        self.sleep_with_polling(wait, POLL_INTERVAL_MS).await;
+                        // Kısa bekleme (< 1 saniye): 100ms polling (fine-grained)
+                        let poll_interval_ms = 100;
+                        self.sleep_with_polling(wait, poll_interval_ms).await;
                         continue;
                     }
                 }
@@ -263,8 +262,18 @@ impl RateLimiter {
                         let sleep_duration = wait_time.duration_since(now);
                         drop(requests);
                         drop(weights);
-                        // KRİTİK DÜZELTME: Sleep'i küçük parçalara böl, her parçada kontrol yap
-                        self.sleep_with_polling(sleep_duration, POLL_INTERVAL_MS).await;
+                        // KRİTİK İYİLEŞTİRME: Adaptive polling interval - Binance 1 dakikalık pencere kullanıyor
+                        // Uzun bekleme (> 10 saniye): 2-5 saniye polling (overhead azaltma)
+                        // Orta bekleme (1-10 saniye): 1 saniye polling
+                        // Kısa bekleme (< 1 saniye): 100ms polling
+                        let poll_interval_ms = if sleep_duration.as_secs() > 10 {
+                            3000 // 3 saniye - uzun bekleme için (1 dakikalık limit)
+                        } else if sleep_duration.as_secs() >= 1 {
+                            1000 // 1 saniye - orta bekleme için
+                        } else {
+                            100 // 100ms - kısa bekleme için (per-second limit)
+                        };
+                        self.sleep_with_polling(sleep_duration, poll_interval_ms).await;
                         continue;
                     }
                 }
@@ -280,9 +289,14 @@ impl RateLimiter {
     /// Sleep with polling: Sleep'i küçük parçalara böl ve her parçada kontrol yap
     /// Bu, sleep sırasında başka thread'lerin weight eklemesini önler (race condition fix)
     /// 
+    /// KRİTİK İYİLEŞTİRME: Adaptive polling interval
+    /// - Binance 1 dakikalık pencere kullanıyor, bu yüzden uzun bekleme için 1-5 saniye polling yeterli
+    /// - Kısa bekleme için 100ms polling (per-second limit için)
+    /// - Bu overhead'i önemli ölçüde azaltır
+    /// 
     /// # Arguments
     /// * `total_duration` - Toplam bekleme süresi
-    /// * `poll_interval_ms` - Her kontrol arasındaki süre (ms)
+    /// * `poll_interval_ms` - Her kontrol arasındaki süre (ms) - adaptive olarak seçilir
     async fn sleep_with_polling(&self, total_duration: Duration, poll_interval_ms: u64) {
         let poll_interval = Duration::from_millis(poll_interval_ms);
         let mut remaining = total_duration;

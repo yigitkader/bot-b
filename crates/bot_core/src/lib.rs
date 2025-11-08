@@ -14,10 +14,14 @@ pub mod types {
         pub qty: Qty,
     }
 
-    #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
     pub struct OrderBook {
         pub best_bid: Option<BookLevel>,
         pub best_ask: Option<BookLevel>,
+        // KRİTİK İYİLEŞTİRME: Top-K levels for more reliable imbalance calculation
+        // When available, imbalance uses sum of top-K levels instead of just best bid/ask
+        pub top_bids: Option<Vec<BookLevel>>, // Top-K bid levels (sorted by price descending)
+        pub top_asks: Option<Vec<BookLevel>>, // Top-K ask levels (sorted by price ascending)
     }
 
     #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +87,8 @@ mod tests {
                 px: Px(dec!(50010)),
                 qty: Qty(dec!(0.1)),
             }),
+            top_bids: None,
+            top_asks: None,
         };
 
         assert!(ob.best_bid.is_some());
