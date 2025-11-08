@@ -77,6 +77,150 @@ pub fn is_usd_stable(asset: &str) -> bool {
 }
 
 // ============================================================================
+// Margin Chunking and Position Sizing
+// ============================================================================
+
+/// Split available margin into chunks of 10-100 USD
+/// 
+/// # Arguments
+/// * `available_margin` - Available margin in USD
+/// * `min_margin_per_trade` - Minimum margin per trade (default: 10 USD)
+/// * `max_margin_per_trade` - Maximum margin per trade (default: 100 USD)
+/// 
+/// # Returns
+/// Vector of margin chunks, each between min and max
+/// 
+/// # Examples
+/// - 0-9 USD: empty vector (ignored)
+/// - 10-100 USD: single chunk
+/// - 101-200 USD: 1×100 + 1×(remainder)
+/// - 201-300 USD: 2×100 + 1×(remainder)
+pub fn split_margin_into_chunks(
+    available_margin: f64,
+    min_margin_per_trade: f64,
+    max_margin_per_trade: f64,
+) -> Vec<f64> {
+    let mut chunks = Vec::new();
+    let mut remaining = available_margin;
+    
+    // While we have enough for a full chunk (max_margin_per_trade)
+    while remaining >= max_margin_per_trade {
+        chunks.push(max_margin_per_trade);
+        remaining -= max_margin_per_trade;
+    }
+    
+    // If remainder is >= min_margin_per_trade, add it as a separate chunk
+    if remaining >= min_margin_per_trade {
+        chunks.push(remaining);
+    }
+    
+    chunks
+}
+
+/// Calculate quantity and price from margin, leverage, and exchange rules
+/// 
+/// # Arguments
+/// * `margin_chunk` - Margin chunk in USD (10-100)
+/// * `leverage` - Leverage (20-50x)
+/// * `price` - Current price
+/// * `rules` - Exchange rules (stepSize, tickSize, minQty, minNotional, precisions)
+/// 
+/// # Returns
+/// Option<(qty_string, price_string)> if valid, None if cannot satisfy rules
+pub fn calc_qty_from_margin(
+    margin_chunk: f64,
+    leverage: f64,
+    price: Decimal,
+    rules: &SymbolRules,
+) -> Option<(String, String)> {
+    // Calculate notional = margin * leverage
+    let notional = margin_chunk * leverage;
+    
+    // Calculate raw quantity = notional / price
+    let price_f64 = price.to_f64().unwrap_or(0.0);
+    if price_f64 <= 0.0 {
+        return None;
+    }
+    
+    let qty_raw = notional / price_f64;
+    
+    // Floor to step size
+    let step_size_f64 = rules.step_size.to_f64().unwrap_or(0.001);
+    let qty_floor = qty_raw.floor_div_step(step_size_f64);
+    
+    // Floor price to tick size
+    let tick_size_f64 = rules.tick_size.to_f64().unwrap_or(0.001);
+    let price_floor = price_f64.floor_div_step(tick_size_f64);
+    
+    // Check minQty
+    let min_qty_f64 = rules.step_size.to_f64().unwrap_or(0.0); // minQty usually = stepSize
+    if qty_floor < min_qty_f64 {
+        // Try to increase to minQty
+        let qty_ceil = (min_qty_f64 / step_size_f64).ceil() * step_size_f64;
+        let notional_check = qty_ceil * price_floor;
+        let min_notional_f64 = rules.min_notional.to_f64().unwrap_or(0.0);
+        
+        if notional_check >= min_notional_f64 {
+            // Format with precision
+            let qty_str = format_qty_with_precision(qty_ceil, rules.qty_precision);
+            let price_str = format_price_with_precision(price_floor, rules.price_precision);
+            return Some((qty_str, price_str));
+        } else {
+            return None; // Cannot satisfy minNotional even with minQty
+        }
+    }
+    
+    // Check minNotional
+    let notional_check = qty_floor * price_floor;
+    let min_notional_f64 = rules.min_notional.to_f64().unwrap_or(0.0);
+    
+    if notional_check < min_notional_f64 {
+        // Try to increase qty to satisfy minNotional
+        let qty_needed = (min_notional_f64 / price_floor).ceil_div_step(step_size_f64);
+        if qty_needed >= min_qty_f64 {
+            let qty_str = format_qty_with_precision(qty_needed, rules.qty_precision);
+            let price_str = format_price_with_precision(price_floor, rules.price_precision);
+            return Some((qty_str, price_str));
+        } else {
+            return None; // Cannot satisfy both minQty and minNotional
+        }
+    }
+    
+    // Format with precision
+    let qty_str = format_qty_with_precision(qty_floor, rules.qty_precision);
+    let price_str = format_price_with_precision(price_floor, rules.price_precision);
+    Some((qty_str, price_str))
+}
+
+/// Helper trait for ceiling division by step
+trait CeilStep {
+    fn ceil_div_step(self, step: f64) -> f64;
+}
+
+impl CeilStep for f64 {
+    fn ceil_div_step(self, step: f64) -> f64 {
+        if step <= 0.0 {
+            return self;
+        }
+        (self / step).ceil() * step
+    }
+}
+
+/// Format quantity with precision (truncate, don't round)
+fn format_qty_with_precision(qty: f64, precision: usize) -> String {
+    let multiplier = 10_f64.powi(precision as i32);
+    let truncated = (qty * multiplier).floor() / multiplier;
+    format!("{:.prec$}", truncated, prec = precision)
+}
+
+/// Format price with precision (truncate, don't round)
+fn format_price_with_precision(price: f64, precision: usize) -> String {
+    let multiplier = 10_f64.powi(precision as i32);
+    let truncated = (price * multiplier).floor() / multiplier;
+    format!("{:.prec$}", truncated, prec = precision)
+}
+
+// ============================================================================
 // PnL Calculation Helpers
 // ============================================================================
 
@@ -422,27 +566,30 @@ impl ProfitGuarantee {
     /// Calculate minimum spread required for profitable trade
     /// 
     /// # Arguments
-    /// * `position_size_usd` - Position size in USD
+    /// * `position_size_usd` - Position size in USD (notional)
     /// 
     /// # Returns
     /// Minimum spread in bps (basis points) required for profit
+    /// 
+    /// # Formula
+    /// Maker → maker (giriş+çıkış) için ücret toplamı: fees_bps_total = 2 * maker_fee_bps
+    /// İstenen net kâr: $0.50
+    /// Gerekli brüt bps: target_bps = 10000 * 0.50 / notional
+    /// min_spread_bps_needed = fees_bps_total + target_bps
     pub fn calculate_min_spread_bps(&self, position_size_usd: f64) -> f64 {
         if position_size_usd <= 0.0 {
             return 0.0;
         }
 
-        // Net profit = Gross profit - Fees
-        // Gross profit = position_size * spread_rate
-        // Fees = position_size * (maker_fee + taker_fee)
-        // 
-        // min_profit = position_size * spread_rate - position_size * (maker_fee + taker_fee)
-        // min_profit = position_size * (spread_rate - total_fee_rate)
-        // spread_rate = (min_profit / position_size) + total_fee_rate
-        // spread_bps = spread_rate * 10000
-
-        let total_fee_rate = self.maker_fee_rate + self.taker_fee_rate;
-        let min_spread_rate = (self.min_profit_usd / position_size_usd) + total_fee_rate;
-        min_spread_rate * 10000.0 // Convert to bps
+        // Maker → maker (giriş+çıkış) için ücret toplamı: 2 * maker_fee_bps
+        let maker_fee_bps = self.maker_fee_rate * 10000.0;
+        let fees_bps_total = 2.0 * maker_fee_bps;
+        
+        // İstenen net kâr için gerekli brüt bps
+        let target_bps = 10000.0 * self.min_profit_usd / position_size_usd;
+        
+        // Minimum spread = fees + target profit
+        fees_bps_total + target_bps
     }
 
     /// Check if a trade is profitable given spread and position size
@@ -721,4 +868,8 @@ pub fn should_place_trade(
 #[cfg(test)]
 #[path = "rate_limiter_tests.rs"]
 mod rate_limiter_tests;
+
+#[cfg(test)]
+#[path = "utils_tests.rs"]
+mod utils_tests;
 

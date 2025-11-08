@@ -289,6 +289,44 @@ impl BinanceFutures {
         }
     }
     
+    /// Margin type ayarla (isolated veya cross)
+    /// KRİTİK: Başlangıçta her sembol için margin type'ı açıkça ayarla
+    /// /fapi/v1/marginType endpoint'i ile isolated/cross margin set edilir
+    /// 
+    /// # Arguments
+    /// * `sym` - Symbol (örn: "BTCUSDT")
+    /// * `isolated` - true = isolated margin, false = cross margin
+    pub async fn set_margin_type(&self, sym: &str, isolated: bool) -> Result<()> {
+        let margin_type = if isolated { "ISOLATED" } else { "CROSSED" };
+        let params = vec![
+            format!("symbol={}", sym),
+            format!("marginType={}", margin_type),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/marginType?{}&signature={}", self.base, qs, sig);
+        
+        match send_void(
+            self.common
+                .client
+                .post(&url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(%sym, margin_type = %margin_type, "margin type set successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(%sym, margin_type = %margin_type, error = %e, "failed to set margin type");
+                Err(e)
+            }
+        }
+    }
+    
     /// Per-symbol metadata (tick_size, step_size) alır, fallback olarak global değerleri kullanır
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
         if let Some(r) = FUT_RULES.get(sym) {

@@ -7,9 +7,10 @@ allow_usdt_quote: true  # USDC yanında USDT'yi de dahil et (daha fazla likidite
 mode: "futures"       # "spot" | "futures"
 metrics_port: 9000
 
-# Emir boyutu sınırı (notional = price * qty); hem spot hem futures için uygulanır.
-max_usd_per_order: 100.0
-min_usd_per_order: 20.0  # Gerçekçi: 15.0 → 20.0 (daha fazla kazanç/işlem, 20 USD * 3 bps = 0.006 USD minimum)
+# Emir boyutu sınırı (margin = hesaptan çıkan para); hem spot hem futures için uygulanır.
+# KRİTİK: Her işlem için min 10 - max 100 USDC/USDT kuralı zorunlu
+max_usd_per_order: 100.0  # Maximum margin per trade (USD)
+min_usd_per_order: 10.0   # Minimum margin per trade (USD) - 10-100 arası chunk'lar
 
 # Quote asset minimum bakiye eşiği (USD)
 # Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
@@ -18,8 +19,8 @@ min_usd_per_order: 20.0  # Gerçekçi: 15.0 → 20.0 (daha fazla kazanç/işlem,
 min_quote_balance_usd: 1.0
 
 # Kaldıraç (sadece futures)
-# KRİTİK DÜZELTME: 5 → 3 (daha güvenli)
-leverage: 5
+# KRİTİK: 20x-50x desteklenecek (isolated margin ile)
+leverage: 20
 
 # Fiyat/lot adımı (quantize için). İstersen exchangeInfo'dan otomatik de çekebiliriz,
 # ama basit ve deterministik olsun diye konfigde tutuyoruz.
@@ -41,8 +42,10 @@ risk:
   inv_cap: "0.50"
   min_liq_gap_bps: 300
   dd_limit_bps: 2000
-  max_leverage: 20
+  max_leverage: 50  # 20x-50x desteklenecek
   slippage_bps_reserve: 2.0  # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
+  use_isolated_margin: true  # Isolated margin kullan (20x-50x için kritik)
+  max_open_chunks_per_symbol_per_side: 2  # Sembol başına yönde maksimum açık chunk sayısı
 
 strategy:
   type: "dyn_mm"
@@ -51,16 +54,17 @@ strategy:
   base_size: "20.0"  # 20 → 50 (daha fazla kazanç/işlem)
   
   # --- Spread ve Fiyatlama Eşikleri ---
-  min_spread_bps: 30.0              # Minimum spread (bps) (60.0 → 30.0: fill oranını artır, dinamik spread ile fee+kar garantisi korunur)
+  min_spread_bps: 2.0               # Minimum spread floor (bps) - dinamik spread ile birleştirilir (maker fee + $0.50 net hedefi)
   max_spread_bps: 200.0            # Maksimum spread (bps) (150 → 200: daha toleranslı)
   spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
   spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)
   
   # --- Profit Guarantee ve Fee Ayarları (KRİTİK) ---
-  min_profit_usd: 0.50              # Minimum kar hedefi (USD) - default: 0.50 (50 cent)
-  maker_fee_rate: 0.0002            # Maker fee oranı (0.0002 = 2 bps = 0.02%) - Binance Futures default
+  min_profit_usd: 0.50              # Minimum kar hedefi (USD) - işlem başına net +$0.50
+  maker_fee_rate: 0.0001            # Maker fee oranı (0.0001 = 1 bp = 0.01%) - Binance Futures maker
   taker_fee_rate: 0.0004            # Taker fee oranı (0.0004 = 4 bps = 0.04%) - Binance Futures default
   # Not: slippage_bps_reserve artık risk.slippage_bps_reserve altında
+  # Dynamic spread: min_spread_bps = max(min_spread_bps_floor, 2*maker_fee_bps + 10000*0.5/notional)
   
   # --- Trend Takibi Eşikleri ---
   strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
@@ -99,7 +103,7 @@ exec:
   venue: "binance"     # sabit
   cancel_replace_interval_ms: 1500  # Rate limit koruması: 500 → 1500 (daha az churn, rate limit riski azalır)
   max_order_age_ms: 10000  # 5000 → 10000 (daha uzun emir ömrü, daha az cancel/replace)
-  default_leverage: 5  # Default leverage (futures için) - her sembol için set edilir (cfg.leverage fallback olarak kullanılır)
+  default_leverage: 20  # Default leverage (futures için) - 20x-50x desteklenecek (cfg.leverage fallback olarak kullanılır)
 
 websocket:
   enabled: true

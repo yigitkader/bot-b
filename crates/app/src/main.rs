@@ -15,6 +15,7 @@ use exec::{decimal_places, Venue};
 use risk::{RiskAction, RiskLimits};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::str::FromStr;
 use strategy::{Context, DynMm, DynMmCfg, Strategy};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -22,11 +23,11 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
-use utils::{clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot};
+use utils::{calc_qty_from_margin, clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, split_margin_into_chunks};
 
 use std::cmp::max;
 use std::collections::HashMap;
-// Removed unused Ordering import
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
@@ -633,6 +634,22 @@ async fn main() -> Result<()> {
         .unwrap_or(1); // Default: 1x (en güvenli)
     
     if cfg.mode == "futures" {
+        // KRİTİK: Isolated margin ayarla (her sembol için)
+        let use_isolated = cfg.risk.use_isolated_margin;
+        if use_isolated {
+            info!("setting isolated margin for all symbols");
+            for state in &states {
+                let symbol = &state.meta.symbol;
+                // API Rate Limit koruması
+                rate_limit_guard(1).await; // POST /fapi/v1/marginType: Weight 1
+                if let Err(err) = venue.set_margin_type(symbol, true).await {
+                    warn!(%symbol, error = %err, "failed to set isolated margin, continuing anyway");
+                    // Hata olsa bile devam et (margin type zaten doğru olabilir)
+                }
+            }
+            info!("isolated margin set for all symbols");
+        }
+        
         info!(leverage = leverage_to_set, "setting leverage for all symbols");
         for state in &states {
             let symbol = &state.meta.symbol;
@@ -1345,10 +1362,9 @@ async fn main() -> Result<()> {
             symbols_processed_this_tick += 1;
 
             let should_sync_orders = should_sync_orders(
-                force_sync_all,
-                state.last_order_sync,
-                cfg.internal.order_sync_interval_sec,
-            );
+                state,
+                cfg.internal.order_sync_interval_sec * 1000, // Convert to ms
+            ) || force_sync_all;
             if should_sync_orders {
                 // KRİTİK İYİLEŞTİRME: Missed events recovery - önce pozisyonu al (inventory sync için)
                 // Fill olmuş emirler için inventory güncellemesi yapılabilmesi için pozisyon gerekli
@@ -2855,680 +2871,535 @@ async fn main() -> Result<()> {
             }
 
                     // ---- FUTURES BID ----
-                    // Her bid emri bağımsız, max 100 USD, toplam varlık paylaşılır
+                    // KRİTİK: Margin chunking sistemi - 10-100 USD arası chunk'lar
+                    // Her chunk için ayrı emir oluştur, max_open_chunks_per_symbol_per_side kontrolü yap
                     // ÖNEMLİ: total_spent_on_bids = hesaptan giden para (margin), pozisyon boyutu değil
                     // Örnek: 100 USD notional pozisyon, 20x leverage → hesaptan giden: 100/20 = 5 USD
                     // NOT: effective_leverage config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     let mut total_spent_on_bids = 0.0f64; // Hesaptan giden para (margin) toplamı
+                    
+                    // Açık bid emir sayısını kontrol et (max chunks kontrolü)
+                    let open_bid_orders = state.active_orders.values()
+                        .filter(|o| o.side == Side::Buy)
+                        .count();
+                    let max_chunks = cfg.risk.max_open_chunks_per_symbol_per_side;
+                    
                     if let Some((px, qty)) = quotes.bid {
+                        // KRİTİK: Margin chunking - available margin'ı 10-100 USD chunk'larına böl
+                        let available_margin_for_bids = (caps.buy_total - total_spent_on_bids).max(0.0);
+                        let min_margin = cfg.min_usd_per_order.unwrap_or(10.0);
+                        let max_margin = cfg.max_usd_per_order;
                         
-                        // İlk bid emri (max 100 USD)
-                        info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures bid order");
-                        
-                        // KRİTİK: Test order - İlk emir öncesi doğrulama
-                        // Eğer test_order_passed false ise, test order yap
-                        if !state.test_order_passed {
-                            rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
-                            match venue.test_order(&symbol, Side::Buy, px, qty, tif).await {
-                                Ok(_) => {
-                                    state.test_order_passed = true;
-                                    info!(%symbol, "test order passed, proceeding with real order");
-                                }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    let error_lower = error_str.to_lowercase();
-                                    
-                                    // -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek
-                                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
-                                        error!(%symbol, error = %e, "test order failed with -1111, disabling symbol and refreshing rules");
-                                        
-                                        // Rules'ı yeniden çek
-                                        match venue.rules_for(&symbol).await {
-                                            Ok(new_rules) => {
-                                                state.symbol_rules = Some(new_rules);
-                                                state.rules_fetch_failed = false;
-                                                state.disabled = false;
-                                                info!(%symbol, "rules refreshed after test order -1111, symbol re-enabled");
-                                                // Test order'ı tekrar dene (bir kez daha)
-                                                rate_limit_guard(1).await;
-                                                match venue.test_order(&symbol, Side::Buy, px, qty, tif).await {
-                                                    Ok(_) => {
-                                                        state.test_order_passed = true;
-                                                        info!(%symbol, "test order passed after rules refresh");
-                                                    }
-                                                    Err(e2) => {
-                                                        error!(%symbol, error = %e2, "test order still failed after rules refresh, disabling symbol");
-                                                        state.disabled = true;
-                                                        state.rules_fetch_failed = true;
-                                                        continue; // Bu sembolü skip et
-                                                    }
-                                                }
-                                            }
-                                            Err(e2) => {
-                                                error!(%symbol, error = %e2, "failed to refresh rules after test order -1111, disabling symbol");
-                                                state.disabled = true;
-                                                state.rules_fetch_failed = true;
-                                                continue; // Bu sembolü skip et
-                                            }
-                                        }
-                                    } else {
-                                        // Diğer hatalar için sembolü disable et ama rules'ı yeniden çekme
-                                        warn!(%symbol, error = %e, "test order failed (non-precision error), disabling symbol");
-                                        state.disabled = true;
-                                        continue; // Bu sembolü skip et
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // API Rate Limit koruması
-                        rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        
-                        // ClientOrderId oluştur (idempotency için)
-                        // Format: {symbol}_{side}_{timestamp_ms}_{random}
-                        // Binance: max 36 karakter, alphanumeric, '-' ve '_' kullanılabilir
-                        let timestamp_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis();
-                        let random_suffix = (timestamp_ms % 10000) as u64; // Son 4 haneli random
-                        let client_order_id = format!("{}_{}_{}_{}", 
-                            symbol.replace("-", "_").replace("/", "_"), // Symbol'deki özel karakterleri değiştir
-                            "B", // Buy
-                            timestamp_ms,
-                            random_suffix
+                        let margin_chunks = split_margin_into_chunks(
+                            available_margin_for_bids,
+                            min_margin,
+                            max_margin,
                         );
-                        // 36 karakter limit kontrolü
-                        let client_order_id = if client_order_id.len() > 36 {
-                            // Kısalt: symbol'ü kısalt
-                            let symbol_short = symbol.chars().take(8).collect::<String>();
-                            format!("{}_{}_{}_{}", symbol_short, "B", timestamp_ms, random_suffix)
-                                .chars().take(36).collect::<String>()
-                        } else {
-                            client_order_id
-                        };
                         
-                match venue.place_limit_with_client_id(&symbol, Side::Buy, px, qty, tif, &client_order_id).await {
-                            Ok((order_id, returned_client_id)) => {
-                let info = OrderInfo { 
-                    order_id: order_id.clone(), 
-                    client_order_id: returned_client_id.or(Some(client_order_id)),
-                    side: Side::Buy, 
-                    price: px, 
-                    qty, 
-                    filled_qty: Qty(Decimal::ZERO),
-                    remaining_qty: qty,
-                    created_at: Instant::now(),
-                    last_fill_time: None,
-                };
-                state.active_orders.insert(order_id.clone(), info.clone());
-                                // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
-                                // place_limit içinde fiyat quantize/round edilebilir, ama crossing guard zaten strategy'de yapıldı
-                                // info.price = crossing guard adjusted price (px), bu fiyatı kaydet
-                                state.last_order_price_update.insert(order_id.clone(), info.price);
-                                // Başarılı emir için spent hesapla (hesaptan giden para = margin)
-                                // Notional (pozisyon boyutu) / leverage = hesaptan giden para
-                                let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
-                                total_spent_on_bids = notional / effective_leverage;
-                
-                // JSON log: Order created
-                if let Ok(logger) = json_logger.lock() {
-                    logger.log_order_created(
-                &symbol,
-                &order_id,
-                Side::Buy,
-                px,
-                qty,
-                "spread_opportunity",
-                &cfg.exec.tif,
-                    );
-                }
+                        info!(
+                            %symbol,
+                            available_margin = available_margin_for_bids,
+                            chunks_count = margin_chunks.len(),
+                            open_bid_orders,
+                            max_chunks,
+                            "margin chunking for bids"
+                        );
+                        
+                        // Her chunk için emir oluştur (max chunks kontrolü ile)
+                        for (chunk_idx, margin_chunk) in margin_chunks.iter().enumerate() {
+                            // Max chunks kontrolü
+                            if open_bid_orders + chunk_idx >= max_chunks {
+                                info!(
+                                    %symbol,
+                                    open_bid_orders,
+                                    chunk_idx,
+                                    max_chunks,
+                                    "skipping chunk: max open chunks per symbol per side reached"
+                                );
+                                break;
                             }
-                            Err(err) => {
-                                let msg = err.to_string();
-                                if msg.contains("below min notional after clamps") {
-                                    let required_min = msg
-                                        .split('<')
-                                        .nth(1)
-                                        .and_then(|s| s.split(')').next())
-                                        .and_then(|s| s.trim().parse::<f64>().ok());
-                                    if let Some(min_notional) = required_min {
-                                        // --- öğren & gerekirse kalıcı disable ---
-                                        state.min_notional_req = Some(min_notional);
-                                        // >= kontrolü: min_notional (pozisyon boyutu) >= max_notional (margin * leverage) ise bu tick'i skip et
-                                        // KRİTİK DÜZELTME: Disable etme, sadece bu tick'i skip et (bakiye artarsa veya fiyat değişirse tekrar deneyebilir)
-                                        let max_notional = cfg.max_usd_per_order * effective_leverage;
-                                        if min_notional >= max_notional {
-                                            warn!(%symbol, min_notional, max_notional, max_usd_per_order = cfg.max_usd_per_order, effective_leverage,
-                                                  "skipping tick: exchange min_notional >= max position size (margin * leverage), will retry on next tick if conditions change");
-                                            // Disable etme, sadece bu emri skip et ve continue ile bir sonraki emre geç
-                                            continue;
-                                        }
-                                        // retry: min_notional'a göre miktarı büyüt (cap'e kadar)
-                                        // order_cap = pozisyon boyutu (notional), margin değil
-                                        // ÖNEMLİ: Fiyat ve miktar quantize edilecek, bu yüzden quantize edilmiş değerleri kullan
-                                        let price_raw = px.0.to_f64().unwrap_or(0.0);
-                                        let price_tick = cfg.price_tick;
-                                        let step = cfg.qty_step;
-                                        
-                                        // Fiyatı quantize et (place_limit içinde yapılan işlem)
-                                        let price_quantized = if price_tick > 0.0 {
-                                            (price_raw / price_tick).floor() * price_tick
-                                        } else {
-                                            price_raw
-                                        };
-                                        
-                                        let order_cap = caps.buy_notional; // Zaten notional (pozisyon boyutu)
-                                        // MARGIN KONTROLÜ: Retry'da hesaplanan miktar için yeterli margin var mı?
-                                        let available_margin = caps.buy_total - total_spent_on_bids; // Kalan margin
-                                        let mut new_qty = 0.0f64;
-                                        if price_quantized > 0.0 && step > 0.0 && available_margin > 0.0 {
-                                            // ÖNEMLİ: Kullanıcının isteği: "20 USD varsa 20 USD kullanılabilir"
-                                            // Yani minimum notional'ı karşılamaya çalışma, mevcut bakiyeyle işlem yap
-                                            // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
-                                            // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
-                                            let effective_leverage_for_qty_bid = if state.strategy.is_opportunity_mode() {
-                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
-                                            } else {
-                                                effective_leverage
-                                            };
-                                            let max_qty_by_margin = ((available_margin * effective_leverage_for_qty_bid) / price_quantized / step).floor() * step;
-                                            
-                                            // KRİTİK DÜZELTME: Min notional retry mantığını düzelt
-                                            // Önce bakiye yeterliliğini kontrol et
-                                            if max_qty_by_margin * price_quantized < min_notional {
-                                                // Bakiye yetersiz, min notional'ı karşılayamıyoruz → Skip et, retry yapma
-                                                warn!(%symbol, ?px, required_min = ?min_notional, available_notional = max_qty_by_margin * price_quantized, "skip bid: insufficient balance for min_notional, skipping order");
-                                                new_qty = 0.0; // Skip et
-                                            } else {
-                                                // Bakiye yeterli, min notional'a göre qty hesapla
-                                                // Min notional için gerekli qty'yi hesapla (%10 güvenli margin ile)
-                                                // PATCH: Güvenlik marjını 10% → 5%'e düşür
-                                                let min_qty_for_notional = (min_notional * 1.05 / price_quantized / step).ceil() * step;
-                                                
-                                                // Cap kontrolü: max qty by cap (notional)
-                                                let max_qty_by_cap = (order_cap / price_quantized / step).floor() * step;
-                                                let max_qty = max_qty_by_cap.min(max_qty_by_margin);
-                                                
-                                                // Final qty: min_notional gereksinimi, cap ve margin constraint'i karşılamalı
-                                                new_qty = min_qty_for_notional.min(max_qty);
-                                                
-                                                // Final kontrol: Min notional ve margin kontrolü
-                                                let final_notional = new_qty * price_quantized;
-                                                let required_margin = final_notional / effective_leverage_for_qty_bid;
-                                                
-                                                if final_notional < min_notional || required_margin > available_margin {
-                                                    // Hala yetersiz, skip et
-                                                    warn!(%symbol, ?px, required_min = ?min_notional, final_notional, required_margin, available_margin, "skip bid: cannot satisfy both min_notional and margin constraint");
-                                                    new_qty = 0.0; // Skip et
-                                                }
-                                            }
-                                        }
-                                        if new_qty > 0.0 {
-                                            let retry_qty = Qty(rust_decimal::Decimal::from_f64_retain(new_qty).unwrap_or(rust_decimal::Decimal::ZERO));
-                                            info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures bid with exchange min notional");
-                                            // API Rate Limit koruması
-                                            rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                                            // KRİTİK DÜZELTME: Retry için deterministik clientOrderId (idempotency)
-                                            // Retry'de qty değiştiği için yeni ID oluştur, ama deterministik olmalı
-                                            let retry_price_str = format!("{:.8}", px.0.to_f64().unwrap_or(0.0));
-                                            let retry_qty_str = format!("{:.8}", retry_qty.0.to_f64().unwrap_or(0.0));
-                                            let retry_price_hash = retry_price_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
-                                            let retry_qty_hash = retry_qty_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
-                                            let retry_timestamp_ms = SystemTime::now()
-                                                .duration_since(UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_millis();
-                                            let symbol_clean = symbol.replace("-", "_").replace("/", "_");
-                                            let retry_client_order_id = format!("{}_{}_{}_{}_{}", 
-                                                symbol_clean,
-                                                "B",
-                                                retry_price_hash,
-                                                retry_qty_hash,
-                                                retry_timestamp_ms
-                                            );
-                                            // 36 karakter limit kontrolü
-                                            let retry_client_order_id = if retry_client_order_id.len() > 36 {
-                                                let symbol_short = symbol_clean.chars().take(8).collect::<String>();
-                                                format!("{}_{}_{}_{}_{}", symbol_short, "B", retry_price_hash, retry_qty_hash, retry_timestamp_ms)
-                                                    .chars().take(36).collect::<String>()
-                                            } else {
-                                                retry_client_order_id
-                                            };
-                    match venue.place_limit_with_client_id(&symbol, Side::Buy, px, retry_qty, tif, &retry_client_order_id).await {
-                                                Ok((order_id, returned_client_id)) => {
-                            let info = OrderInfo { 
-                                order_id: order_id.clone(), 
-                                client_order_id: returned_client_id.or(Some(retry_client_order_id)),
-                                side: Side::Buy, 
-                                price: px, 
-                                qty: retry_qty, 
-                                filled_qty: Qty(Decimal::ZERO),
-                                remaining_qty: retry_qty,
-                                created_at: Instant::now(),
-                                last_fill_time: None,
+                            
+                            // Exchange rules kontrolü
+                            let rules = match state.symbol_rules.as_ref() {
+                                Some(r) => r,
+                                None => {
+                                    warn!(%symbol, "no exchange rules available, skipping chunk");
+                                    continue;
+                                }
                             };
-                                                    state.active_orders.insert(order_id.clone(), info.clone());
-                                                    // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
-                                                    state.last_order_price_update.insert(order_id.clone(), info.price);
-                                                    // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
-                                                    let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
-                                                    total_spent_on_bids = notional / effective_leverage;
+                            
+                            // calc_qty_from_margin kullanarak qty hesapla
+                            let effective_leverage_for_chunk = if state.strategy.is_opportunity_mode() {
+                                effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
+                            } else {
+                                effective_leverage
+                            };
+                            
+                            let qty_price_result = calc_qty_from_margin(
+                                *margin_chunk,
+                                effective_leverage_for_chunk,
+                                px.0,
+                                rules,
+                            );
+                            
+                            let (qty_str, price_str) = match qty_price_result {
+                                Some((q, p)) => (q, p),
+                                None => {
+                                    warn!(
+                                        %symbol,
+                                        margin_chunk,
+                                        "calc_qty_from_margin returned None, skipping chunk"
+                                    );
+                                    continue;
+                                }
+                            };
+                            
+                            // String'leri Decimal'e çevir
+                            let chunk_qty = match Decimal::from_str(&qty_str) {
+                                Ok(d) => Qty(d),
+                                Err(e) => {
+                                    warn!(%symbol, qty_str, error = %e, "failed to parse qty string, skipping chunk");
+                                    continue;
+                                }
+                            };
+                            
+                            let chunk_price = match Decimal::from_str(&price_str) {
+                                Ok(d) => Px(d),
+                                Err(e) => {
+                                    warn!(%symbol, price_str, error = %e, "failed to parse price string, skipping chunk");
+                                    continue;
+                                }
+                            };
+                            
+                            // Min notional kontrolü
+                            let chunk_notional = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
+                            let min_req = state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk);
+                            if chunk_notional < min_req {
+                                warn!(
+                                    %symbol,
+                                    chunk_notional,
+                                    min_req,
+                                    "chunk notional below min_notional, skipping"
+                                );
+                                continue;
+                            }
+                            
+                            // İlk chunk için test order (sadece bir kez)
+                            if chunk_idx == 0 && !state.test_order_passed {
+                            rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                                match venue.test_order(&symbol, Side::Buy, chunk_price, chunk_qty, tif).await {
+                                    Ok(_) => {
+                                        state.test_order_passed = true;
+                                        info!(%symbol, "test order passed, proceeding with real orders");
+                                    }
+                                    Err(e) => {
+                                        let error_str = e.to_string();
+                                        let error_lower = error_str.to_lowercase();
+                                        
+                                        if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                                            error!(%symbol, error = %e, "test order failed with -1111, disabling symbol and refreshing rules");
+                                            
+                                            match venue.rules_for(&symbol).await {
+                                                Ok(new_rules) => {
+                                                    state.symbol_rules = Some(new_rules);
+                                                    state.rules_fetch_failed = false;
+                                                    state.disabled = false;
+                                                    info!(%symbol, "rules refreshed after test order -1111, symbol re-enabled");
+                                                    // Test order'ı tekrar dene
+                                                    rate_limit_guard(1).await;
+                                                    match venue.test_order(&symbol, Side::Buy, chunk_price, chunk_qty, tif).await {
+                                                        Ok(_) => {
+                                                            state.test_order_passed = true;
+                                                            info!(%symbol, "test order passed after rules refresh");
+                                                        }
+                                                        Err(e2) => {
+                                                            error!(%symbol, error = %e2, "test order still failed after rules refresh, disabling symbol");
+                                                            state.disabled = true;
+                                                            state.rules_fetch_failed = true;
+                                                            break; // Chunk loop'undan çık
+                                                        }
+                                                    }
                                                 }
-                                                Err(err2) => {
-                                                    warn!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, ?err2, "retry bid still failed");
+                                                Err(e2) => {
+                                                    error!(%symbol, error = %e2, "failed to refresh rules after test order -1111, disabling symbol");
+                                                    state.disabled = true;
+                                                    state.rules_fetch_failed = true;
+                                                    break; // Chunk loop'undan çık
                                                 }
                                             }
                                         } else {
-                                            warn!(%symbol, ?px, required_min = ?min_notional, cap = ?order_cap, "skip bid: insufficient balance for exchange min notional");
+                                            warn!(%symbol, error = %e, "test order failed (non-precision error), disabling symbol");
+                                            state.disabled = true;
+                                            break; // Chunk loop'undan çık
                                         }
-                                    } else {
-                                        warn!(%symbol, ?px, ?qty, ?err, "failed bid (min notional parse failed)");
-                                    }
-                                } else {
-                                    warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures bid order");
-                                }
-                            }
-                        }
-
-                        // Kalan notional ile ikinci/üçüncü bid emirleri (her biri max 100 USD)
-                        // Toplam varlık paylaşılır: 300 USD varsa → bid 100, ask 100, kalan 100 ile ikinci bid
-                        let min_req_for_second = state.min_notional_req.unwrap_or(min_usd_per_order);
-                        // Kalan bakiye varsa ve min_notional'a yetiyorsa, max 100 USD'lik ek emirler yap
-                        loop {
-                            let remaining = (caps.buy_total - total_spent_on_bids).max(0.0);
-                            if remaining < min_req_for_second.max(min_usd_per_order) || px.0 <= Decimal::ZERO {
-                                break; // Yetersiz bakiye veya geçersiz fiyat
-                            }
-                            
-                            // Her ek emir max 100 USD (hesaptan giden para = margin)
-                            // order_size = margin, notional = margin * leverage
-                            let order_size_margin = remaining.min(cfg.max_usd_per_order);
-                            let order_size_notional = order_size_margin * effective_leverage; // Pozisyon boyutu
-                            let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
-                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, qty_step_local);
-                            let qty2_notional = (px.0.to_f64().unwrap_or(0.0)) * (qty2.0.to_f64().unwrap_or(0.0));
-                            
-                            if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
-                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures bid with leftover notional");
-                                // API Rate Limit koruması
-                                rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        // Extra bid için clientOrderId
-                        let extra_timestamp_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis();
-                        let extra_client_order_id = format!("{}_{}_E_{}", 
-                            symbol.replace("-", "_").replace("/", "_"),
-                            "B",
-                            extra_timestamp_ms
-                        ).chars().take(36).collect::<String>();
-                        match venue.place_limit_with_client_id(&symbol, Side::Buy, px, qty2, tif, &extra_client_order_id).await {
-                            Ok((order_id2, returned_client_id2)) => {
-                                let info2 = OrderInfo { 
-                                    order_id: order_id2.clone(), 
-                                    client_order_id: returned_client_id2.or(Some(extra_client_order_id)),
-                                    side: Side::Buy, 
-                                    price: px, 
-                                    qty: qty2, 
-                                    filled_qty: Qty(Decimal::ZERO),
-                                    remaining_qty: qty2,
-                                    created_at: Instant::now(),
-                                    last_fill_time: None,
-                                };
-                                        state.active_orders.insert(order_id2.clone(), info2.clone());
-                                        // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
-                                        state.last_order_price_update.insert(order_id2, info2.price);
-                                        // Spent güncelle (hesaptan giden para = margin)
-                                        // Notional / leverage = hesaptan giden para
-                                        total_spent_on_bids += qty2_notional / effective_leverage;
-                                    }
-                                    Err(err) => {
-                                        warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra futures bid order");
-                                        break; // Hata varsa döngüden çık
                                     }
                                 }
+                            }
+                            
+                            // API Rate Limit koruması
+                            rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                            
+                            // ClientOrderId oluştur
+                            let timestamp_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis();
+                            let random_suffix = (timestamp_ms % 10000) as u64;
+                            let client_order_id = format!("{}_{}_C{}_{}_{}", 
+                                symbol.replace("-", "_").replace("/", "_"),
+                                "B",
+                                chunk_idx,
+                                timestamp_ms,
+                                random_suffix
+                            );
+                            let client_order_id = if client_order_id.len() > 36 {
+                                let symbol_short = symbol.chars().take(8).collect::<String>();
+                                format!("{}_{}_C{}_{}", symbol_short, "B", chunk_idx, timestamp_ms)
+                                    .chars().take(36).collect::<String>()
                             } else {
-                                break; // Yetersiz notional, döngüden çık
+                                client_order_id
+                            };
+                            
+                            info!(
+                                %symbol,
+                                chunk_idx,
+                                margin_chunk,
+                                ?chunk_price,
+                                ?chunk_qty,
+                                chunk_notional,
+                                "placing futures bid order (chunk)"
+                            );
+                            
+                            match venue.place_limit_with_client_id(&symbol, Side::Buy, chunk_price, chunk_qty, tif, &client_order_id).await {
+                                Ok((order_id, returned_client_id)) => {
+                                    let info = OrderInfo { 
+                                        order_id: order_id.clone(), 
+                                        client_order_id: returned_client_id.or(Some(client_order_id)),
+                                        side: Side::Buy, 
+                                        price: chunk_price, 
+                                        qty: chunk_qty, 
+                                        filled_qty: Qty(Decimal::ZERO),
+                                        remaining_qty: chunk_qty,
+                                        created_at: Instant::now(),
+                                        last_fill_time: None,
+                                    };
+                                    state.active_orders.insert(order_id.clone(), info.clone());
+                                    state.last_order_price_update.insert(order_id.clone(), info.price);
+                                    
+                                    // Spent güncelle (hesaptan giden para = margin)
+                                    total_spent_on_bids += *margin_chunk;
+                                    
+                                    // JSON log
+                                    if let Ok(logger) = json_logger.lock() {
+                                        logger.log_order_created(
+                                            &symbol,
+                                            &order_id,
+                                            Side::Buy,
+                                            chunk_price,
+                                            chunk_qty,
+                                            "spread_opportunity",
+                                            &cfg.exec.tif,
+                                        );
+                                    }
+                                    
+                                    // Logging metrics: margin_chunk, lev, notional, qty_str, px_str, min_spread_bps_used
+                                    let chunk_notional_log = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
+                                    let min_spread_bps_used = dyn_cfg.min_spread_bps;
+                                    info!(
+                                        %symbol,
+                                        chunk_idx,
+                                        order_id,
+                                        margin_chunk = *margin_chunk,
+                                        lev = effective_leverage_for_chunk,
+                                        notional = chunk_notional_log,
+                                        qty_str = %qty_str,
+                                        px_str = %price_str,
+                                        min_spread_bps_used,
+                                        "bid order created successfully (chunk)"
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        %symbol,
+                                        chunk_idx,
+                                        margin_chunk,
+                                        error = %err,
+                                        "failed to place futures bid order (chunk)"
+                                    );
+                                    // Chunk başarısız olsa bile diğer chunk'ları dene
+                                }
                             }
                         }
+                        
+                        // Eski kod kaldırıldı - chunking sistemi kullanılıyor
                     }
 
                     // ---- FUTURES ASK ----
-                    // Her ask emri bağımsız, max 100 USD, toplam varlık paylaşılır (bid'lerden sonra kalan)
+                    // KRİTİK: Margin chunking sistemi - 10-100 USD arası chunk'lar (ask için de aynı mantık)
+                    // Her chunk için ayrı emir oluştur, max_open_chunks_per_symbol_per_side kontrolü yap
                     // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
                     // NOT: effective_leverage_ask config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     if let Some((px, qty)) = quotes.ask {
                         let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı
                         
-                        // İlk ask emri (max 100 USD)
-                        info!(%symbol, ?px, ?qty, tif = ?tif, "placing futures ask order");
+                        // Açık ask emir sayısını kontrol et (max chunks kontrolü)
+                        let open_ask_orders = state.active_orders.values()
+                            .filter(|o| o.side == Side::Sell)
+                            .count();
+                        let max_chunks = cfg.risk.max_open_chunks_per_symbol_per_side;
                         
-                        // KRİTİK: Test order - İlk emir öncesi doğrulama (ask için de)
-                        // Eğer test_order_passed false ise, test order yap
-                        if !state.test_order_passed {
-                            rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
-                            match venue.test_order(&symbol, Side::Sell, px, qty, tif).await {
-                                Ok(_) => {
-                                    state.test_order_passed = true;
-                                    info!(%symbol, "test order passed (ask), proceeding with real order");
+                        // KRİTİK: Margin chunking - available margin'ı 10-100 USD chunk'larına böl
+                        // Ask'ler bid'lerden sonra kalan bakiyeyi kullanır
+                        let available_margin_for_asks = (caps.buy_total - total_spent_on_bids - total_spent_on_asks).max(0.0);
+                        let min_margin = cfg.min_usd_per_order.unwrap_or(10.0);
+                        let max_margin = cfg.max_usd_per_order;
+                        
+                        let margin_chunks = split_margin_into_chunks(
+                            available_margin_for_asks,
+                            min_margin,
+                            max_margin,
+                        );
+                        
+                        info!(
+                            %symbol,
+                            available_margin = available_margin_for_asks,
+                            chunks_count = margin_chunks.len(),
+                            open_ask_orders,
+                            max_chunks,
+                            "margin chunking for asks"
+                        );
+                        
+                        // Her chunk için emir oluştur (max chunks kontrolü ile)
+                        for (chunk_idx, margin_chunk) in margin_chunks.iter().enumerate() {
+                            // Max chunks kontrolü
+                            if open_ask_orders + chunk_idx >= max_chunks {
+                                info!(
+                                    %symbol,
+                                    open_ask_orders,
+                                    chunk_idx,
+                                    max_chunks,
+                                    "skipping chunk: max open chunks per symbol per side reached"
+                                );
+                                break;
+                            }
+                            
+                            // Exchange rules kontrolü
+                            let rules = match state.symbol_rules.as_ref() {
+                                Some(r) => r,
+                                None => {
+                                    warn!(%symbol, "no exchange rules available, skipping chunk");
+                                    continue;
                                 }
+                            };
+                            
+                            // calc_qty_from_margin kullanarak qty hesapla
+                            let effective_leverage_for_chunk = if state.strategy.is_opportunity_mode() {
+                                effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
+                            } else {
+                                effective_leverage_ask
+                            };
+                            
+                            let qty_price_result = calc_qty_from_margin(
+                                *margin_chunk,
+                                effective_leverage_for_chunk,
+                                px.0,
+                                rules,
+                            );
+                            
+                            let (qty_str, price_str) = match qty_price_result {
+                                Some((q, p)) => (q, p),
+                                None => {
+                                    warn!(
+                                        %symbol,
+                                        margin_chunk,
+                                        "calc_qty_from_margin returned None, skipping chunk"
+                                    );
+                                    continue;
+                                }
+                            };
+                            
+                            // String'leri Decimal'e çevir
+                            let chunk_qty = match Decimal::from_str(&qty_str) {
+                                Ok(d) => Qty(d),
                                 Err(e) => {
-                                    let error_str = e.to_string();
-                                    let error_lower = error_str.to_lowercase();
-                                    
-                                    // -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek
-                                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
-                                        error!(%symbol, error = %e, "test order failed with -1111 (ask), disabling symbol and refreshing rules");
+                                    warn!(%symbol, qty_str, error = %e, "failed to parse qty string, skipping chunk");
+                                    continue;
+                                }
+                            };
+                            
+                            let chunk_price = match Decimal::from_str(&price_str) {
+                                Ok(d) => Px(d),
+                                Err(e) => {
+                                    warn!(%symbol, price_str, error = %e, "failed to parse price string, skipping chunk");
+                                    continue;
+                                }
+                            };
+                            
+                            // Min notional kontrolü
+                            let chunk_notional = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
+                            let min_req = state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk);
+                            if chunk_notional < min_req {
+                                warn!(
+                                    %symbol,
+                                    chunk_notional,
+                                    min_req,
+                                    "chunk notional below min_notional, skipping"
+                                );
+                                continue;
+                            }
+                            
+                            // İlk chunk için test order (sadece bir kez, ask için)
+                            if chunk_idx == 0 && !state.test_order_passed {
+                                rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                                match venue.test_order(&symbol, Side::Sell, chunk_price, chunk_qty, tif).await {
+                                    Ok(_) => {
+                                        state.test_order_passed = true;
+                                        info!(%symbol, "test order passed (ask), proceeding with real orders");
+                                    }
+                                    Err(e) => {
+                                        let error_str = e.to_string();
+                                        let error_lower = error_str.to_lowercase();
                                         
-                                        // Rules'ı yeniden çek
-                                        match venue.rules_for(&symbol).await {
-                                            Ok(new_rules) => {
-                                                state.symbol_rules = Some(new_rules);
-                                                state.rules_fetch_failed = false;
-                                                state.disabled = false;
-                                                info!(%symbol, "rules refreshed after test order -1111 (ask), symbol re-enabled");
-                                                // Test order'ı tekrar dene (bir kez daha)
-                                                rate_limit_guard(1).await;
-                                                match venue.test_order(&symbol, Side::Sell, px, qty, tif).await {
-                                                    Ok(_) => {
-                                                        state.test_order_passed = true;
-                                                        info!(%symbol, "test order passed after rules refresh (ask)");
-                                                    }
-                                                    Err(e2) => {
-                                                        error!(%symbol, error = %e2, "test order still failed after rules refresh (ask), disabling symbol");
-                                                        state.disabled = true;
-                                                        state.rules_fetch_failed = true;
-                                                        continue; // Bu sembolü skip et
+                                        if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                                            error!(%symbol, error = %e, "test order failed with -1111 (ask), disabling symbol and refreshing rules");
+                                            
+                                            match venue.rules_for(&symbol).await {
+                                                Ok(new_rules) => {
+                                                    state.symbol_rules = Some(new_rules);
+                                                    state.rules_fetch_failed = false;
+                                                    state.disabled = false;
+                                                    info!(%symbol, "rules refreshed after test order -1111 (ask), symbol re-enabled");
+                                                    // Test order'ı tekrar dene
+                                                    rate_limit_guard(1).await;
+                                                    match venue.test_order(&symbol, Side::Sell, chunk_price, chunk_qty, tif).await {
+                                                        Ok(_) => {
+                                                            state.test_order_passed = true;
+                                                            info!(%symbol, "test order passed after rules refresh (ask)");
+                                                        }
+                                                        Err(e2) => {
+                                                            error!(%symbol, error = %e2, "test order still failed after rules refresh (ask), disabling symbol");
+                                                            state.disabled = true;
+                                                            state.rules_fetch_failed = true;
+                                                            break; // Chunk loop'undan çık
+                                                        }
                                                     }
                                                 }
+                                                Err(e2) => {
+                                                    error!(%symbol, error = %e2, "failed to refresh rules after test order -1111 (ask), disabling symbol");
+                                                    state.disabled = true;
+                                                    state.rules_fetch_failed = true;
+                                                    break; // Chunk loop'undan çık
+                                                }
                                             }
-                                            Err(e2) => {
-                                                error!(%symbol, error = %e2, "failed to refresh rules after test order -1111 (ask), disabling symbol");
-                                                state.disabled = true;
-                                                state.rules_fetch_failed = true;
-                                                continue; // Bu sembolü skip et
-                                            }
+                                        } else {
+                                            warn!(%symbol, error = %e, "test order failed (ask, non-precision error), disabling symbol");
+                                            state.disabled = true;
+                                            break; // Chunk loop'undan çık
                                         }
-                                    } else {
-                                        // Diğer hatalar için sembolü disable et ama rules'ı yeniden çekme
-                                        warn!(%symbol, error = %e, "test order failed (ask, non-precision error), disabling symbol");
-                                        state.disabled = true;
-                                        continue; // Bu sembolü skip et
                                     }
                                 }
                             }
-                        }
-                        
-                        // API Rate Limit koruması
-                        rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                        
-                        // ClientOrderId oluştur (idempotency için)
-                        let timestamp_ms = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis();
-                        let random_suffix = (timestamp_ms % 10000) as u64;
-                        let client_order_id = format!("{}_{}_{}_{}", 
-                            symbol.replace("-", "_").replace("/", "_"),
-                            "S", // Sell
-                            timestamp_ms,
-                            random_suffix
-                        );
-                        // 36 karakter limit kontrolü
-                        let client_order_id = if client_order_id.len() > 36 {
-                            let symbol_short = symbol.chars().take(8).collect::<String>();
-                            format!("{}_{}_{}_{}", symbol_short, "S", timestamp_ms, random_suffix)
-                                .chars().take(36).collect::<String>()
-                        } else {
-                            client_order_id
-                        };
-                        
-                match venue.place_limit_with_client_id(&symbol, Side::Sell, px, qty, tif, &client_order_id).await {
-                            Ok((order_id, returned_client_id)) => {
-                        let info = OrderInfo { 
-                            order_id: order_id.clone(), 
-                            client_order_id: returned_client_id.or(Some(client_order_id)),
-                            side: Side::Sell, 
-                            price: px, 
-                            qty, 
-                            filled_qty: Qty(Decimal::ZERO),
-                            remaining_qty: qty,
-                            created_at: Instant::now(),
-                            last_fill_time: None,
-                            };
-                            state.active_orders.insert(order_id.clone(), info.clone());
-                            // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
-                            // place_limit içinde fiyat quantize/round edilebilir, ama crossing guard zaten strategy'de yapıldı
-                            // info.price = crossing guard adjusted price (px), bu fiyatı kaydet
-                            state.last_order_price_update.insert(order_id.clone(), info.price);
                             
-                            // JSON log: Order created
-                            if let Ok(logger) = json_logger.lock() {
-                            logger.log_order_created(
-                            &symbol,
-                            &order_id,
-                            Side::Sell,
-                            px,
-                            qty,
-                            "spread_opportunity",
-                            &cfg.exec.tif,
-                            );
-                            }
-                                // Başarılı emir için spent hesapla (hesaptan giden para = margin)
-                                // Notional (pozisyon boyutu) / leverage = hesaptan giden para
-                                let notional = (px.0.to_f64().unwrap_or(0.0)) * (qty.0.to_f64().unwrap_or(0.0));
-                                total_spent_on_asks = notional / effective_leverage_ask;
-                            }
-                            Err(err) => {
-                                let msg = err.to_string();
-                                if msg.contains("below min notional after clamps") {
-                                    let required_min = msg
-                                        .split('<')
-                                        .nth(1)
-                                        .and_then(|s| s.split(')').next())
-                                        .and_then(|s| s.trim().parse::<f64>().ok());
-                                    if let Some(min_notional) = required_min {
-                                        // --- öğren & gerekirse kalıcı disable ---
-                                        state.min_notional_req = Some(min_notional);
-                                        // >= kontrolü: min_notional (pozisyon boyutu) >= max_notional (margin * leverage) ise bu tick'i skip et
-                                        // KRİTİK DÜZELTME: Disable etme, sadece bu tick'i skip et (bakiye artarsa veya fiyat değişirse tekrar deneyebilir)
-                                        let max_notional = cfg.max_usd_per_order * effective_leverage_ask;
-                                        if min_notional >= max_notional {
-                                            warn!(%symbol, min_notional, max_notional, max_usd_per_order = cfg.max_usd_per_order, effective_leverage = effective_leverage_ask,
-                                                  "skipping tick: exchange min_notional >= max position size (margin * leverage), will retry on next tick if conditions change");
-                                            // Disable etme, sadece bu emri skip et ve continue ile bir sonraki emre geç
-                                            continue;
-                                        }
-                                        // order_cap = pozisyon boyutu (notional), margin değil
-                                        // ÖNEMLİ: Fiyat ve miktar quantize edilecek, bu yüzden quantize edilmiş değerleri kullan
-                                        // Per-symbol metadata kullan (fallback: global cfg)
-                                        let price_raw = px.0.to_f64().unwrap_or(0.0);
-                                        let price_tick = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
-                                        let step = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
-                                        
-                                        // Fiyatı quantize et (place_limit içinde yapılan işlem)
-                                        let price_quantized = if price_tick > 0.0 {
-                                            (price_raw / price_tick).floor() * price_tick
-                                        } else {
-                                            price_raw
-                                        };
-                                        
-                                        let order_cap = caps.sell_notional; // Zaten notional (pozisyon boyutu)
-                                        // MARGIN KONTROLÜ: Retry'da hesaplanan miktar için yeterli margin var mı?
-                                        let available_margin = caps.buy_total - total_spent_on_bids - total_spent_on_asks; // Kalan margin
-                                        let mut new_qty = 0.0f64;
-                                        if price_quantized > 0.0 && step > 0.0 && available_margin > 0.0 {
-                                            // ÖNEMLİ: Kullanıcının isteği: "20 USD varsa 20 USD kullanılabilir"
-                                            // Yani minimum notional'ı karşılamaya çalışma, mevcut bakiyeyle işlem yap
-                                            // Önce mevcut bakiyeyle maksimum ne kadar işlem yapılabilir hesapla
-                                            // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
-                                            let effective_leverage_for_qty_ask = if state.strategy.is_opportunity_mode() {
-                            effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
-                                            } else {
-                                                effective_leverage_ask
-                                            };
-                                            let max_qty_by_margin = ((available_margin * effective_leverage_for_qty_ask) / price_quantized / step).floor() * step;
-                                            
-                                            // KRİTİK DÜZELTME: Min notional retry mantığını düzelt
-                                            // Önce bakiye yeterliliğini kontrol et
-                                            if max_qty_by_margin * price_quantized < min_notional {
-                                                // Bakiye yetersiz, min notional'ı karşılayamıyoruz → Skip et, retry yapma
-                                                warn!(%symbol, ?px, required_min = ?min_notional, available_notional = max_qty_by_margin * price_quantized, "skip ask: insufficient balance for min_notional, skipping order");
-                                                new_qty = 0.0; // Skip et
-                                            } else {
-                                                // Bakiye yeterli, min notional'a göre qty hesapla
-                                                // Min notional için gerekli qty'yi hesapla (%10 güvenli margin ile)
-                                                // PATCH: Güvenlik marjını 10% → 5%'e düşür
-                                                let min_qty_for_notional = (min_notional * 1.05 / price_quantized / step).ceil() * step;
-                                                
-                                                // Cap kontrolü: max qty by cap (notional)
-                                                let max_qty_by_cap = (order_cap / price_quantized / step).floor() * step;
-                                                let max_qty = max_qty_by_cap.min(max_qty_by_margin);
-                                                
-                                                // Final qty: min_notional gereksinimi, cap ve margin constraint'i karşılamalı
-                                                new_qty = min_qty_for_notional.min(max_qty);
-                                                
-                                                // Final kontrol: Min notional ve margin kontrolü
-                                                let final_notional = new_qty * price_quantized;
-                                                let required_margin = final_notional / effective_leverage_for_qty_ask;
-                                                
-                                                if final_notional < min_notional || required_margin > available_margin {
-                                                    // Hala yetersiz, skip et
-                                                    warn!(%symbol, ?px, required_min = ?min_notional, final_notional, required_margin, available_margin, "skip ask: cannot satisfy both min_notional and margin constraint");
-                                                    new_qty = 0.0; // Skip et
-                                                }
-                                            }
-                                        }
-                                        if new_qty > 0.0 {
-                                            let retry_qty = Qty(rust_decimal::Decimal::from_f64_retain(new_qty).unwrap_or(rust_decimal::Decimal::ZERO));
-                                            info!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, min_notional, "retrying futures ask with exchange min notional");
-                                            // API Rate Limit koruması
-                                            rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                            // KRİTİK DÜZELTME: Retry için deterministik clientOrderId (idempotency)
-                            // Retry'de qty değiştiği için yeni ID oluştur, ama deterministik olmalı
-                            let retry_price_str = format!("{:.8}", px.0.to_f64().unwrap_or(0.0));
-                            let retry_qty_str = format!("{:.8}", retry_qty.0.to_f64().unwrap_or(0.0));
-                            let retry_price_hash = retry_price_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
-                            let retry_qty_hash = retry_qty_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
-                            let retry_timestamp_ms = SystemTime::now()
+                            // API Rate Limit koruması
+                            rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                            
+                            // ClientOrderId oluştur
+                            let timestamp_ms = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis();
-                            let symbol_clean = symbol.replace("-", "_").replace("/", "_");
-                            let retry_client_order_id = format!("{}_{}_{}_{}_{}", 
-                                symbol_clean,
+                            let random_suffix = (timestamp_ms % 10000) as u64;
+                            let client_order_id = format!("{}_{}_C{}_{}_{}", 
+                                symbol.replace("-", "_").replace("/", "_"),
                                 "S",
-                                retry_price_hash,
-                                retry_qty_hash,
-                                retry_timestamp_ms
+                                chunk_idx,
+                                timestamp_ms,
+                                random_suffix
                             );
-                            // 36 karakter limit kontrolü
-                            let retry_client_order_id = if retry_client_order_id.len() > 36 {
-                                let symbol_short = symbol_clean.chars().take(8).collect::<String>();
-                                format!("{}_{}_{}_{}_{}", symbol_short, "S", retry_price_hash, retry_qty_hash, retry_timestamp_ms)
+                            let client_order_id = if client_order_id.len() > 36 {
+                                let symbol_short = symbol.chars().take(8).collect::<String>();
+                                format!("{}_{}_C{}_{}", symbol_short, "S", chunk_idx, timestamp_ms)
                                     .chars().take(36).collect::<String>()
                             } else {
-                                retry_client_order_id
+                                client_order_id
                             };
-                            match venue.place_limit_with_client_id(&symbol, Side::Sell, px, retry_qty, tif, &retry_client_order_id).await {
-                                                Ok((order_id, returned_client_id)) => {
-                                let info = OrderInfo { 
-                                    order_id: order_id.clone(), 
-                                    client_order_id: returned_client_id.or(Some(retry_client_order_id)),
-                                    side: Side::Sell, 
-                                    price: px, 
-                                    qty: retry_qty, 
-                                    filled_qty: Qty(Decimal::ZERO),
-                                    remaining_qty: retry_qty,
-                                    created_at: Instant::now(),
-                                    last_fill_time: None,
-                                };
-                                                    state.active_orders.insert(order_id.clone(), info.clone());
-                                                    // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
-                                                    state.last_order_price_update.insert(order_id.clone(), info.price);
-                                                    // Retry başarılı oldu, spent güncelle (hesaptan giden para = margin)
-                                                    let notional = (px.0.to_f64().unwrap_or(0.0)) * (retry_qty.0.to_f64().unwrap_or(0.0));
-                                                    total_spent_on_asks = notional / effective_leverage_ask;
-                                                }
-                                                Err(err2) => {
-                                                    warn!(%symbol, ?px, qty = ?retry_qty, tif = ?tif, ?err2, "retry ask still failed");
-                                                }
-                                            }
-                                        } else {
-                                            warn!(%symbol, ?px, required_min = ?min_notional, cap = ?order_cap, "skip ask: insufficient balance for exchange min notional");
-                                        }
-                                    } else {
-                                        warn!(%symbol, ?px, ?qty, ?err, "failed ask (min notional parse failed)");
+                            
+                            info!(
+                                %symbol,
+                                chunk_idx,
+                                margin_chunk,
+                                ?chunk_price,
+                                ?chunk_qty,
+                                chunk_notional,
+                                "placing futures ask order (chunk)"
+                            );
+                            
+                            match venue.place_limit_with_client_id(&symbol, Side::Sell, chunk_price, chunk_qty, tif, &client_order_id).await {
+                                Ok((order_id, returned_client_id)) => {
+                                    let info = OrderInfo { 
+                                        order_id: order_id.clone(), 
+                                        client_order_id: returned_client_id.or(Some(client_order_id)),
+                                        side: Side::Sell, 
+                                        price: chunk_price, 
+                                        qty: chunk_qty, 
+                                        filled_qty: Qty(Decimal::ZERO),
+                                        remaining_qty: chunk_qty,
+                                        created_at: Instant::now(),
+                                        last_fill_time: None,
+                                    };
+                                    state.active_orders.insert(order_id.clone(), info.clone());
+                                    state.last_order_price_update.insert(order_id.clone(), info.price);
+                                    
+                                    // Spent güncelle (hesaptan giden para = margin)
+                                    total_spent_on_asks += *margin_chunk;
+                                    
+                                    // JSON log
+                                    if let Ok(logger) = json_logger.lock() {
+                                        logger.log_order_created(
+                                            &symbol,
+                                            &order_id,
+                                            Side::Sell,
+                                            chunk_price,
+                                            chunk_qty,
+                                            "spread_opportunity",
+                                            &cfg.exec.tif,
+                                        );
                                     }
-                                } else {
-                                    warn!(%symbol, ?px, ?qty, tif = ?tif, ?err, "failed to place futures ask order");
+                                    
+                                    // Logging metrics: margin_chunk, lev, notional, qty_str, px_str, min_spread_bps_used
+                                    let chunk_notional_log = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
+                                    let min_spread_bps_used = dyn_cfg.min_spread_bps;
+                                    info!(
+                                        %symbol,
+                                        chunk_idx,
+                                        order_id,
+                                        margin_chunk = *margin_chunk,
+                                        lev = effective_leverage_for_chunk,
+                                        notional = chunk_notional_log,
+                                        qty_str = %qty_str,
+                                        px_str = %price_str,
+                                        min_spread_bps_used,
+                                        "ask order created successfully (chunk)"
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        %symbol,
+                                        chunk_idx,
+                                        margin_chunk,
+                                        error = %err,
+                                        "failed to place futures ask order (chunk)"
+                                    );
+                                    // Chunk başarısız olsa bile diğer chunk'ları dene
                                 }
                             }
                         }
                         
-                        // Kalan notional ile ikinci/üçüncü ask emirleri (her biri max 100 USD)
-                        // Ask'ler bid'lerden sonra kalan bakiyeyi kullanır
-                        let min_req_for_second = state.min_notional_req.unwrap_or(min_usd_per_order);
-                        loop {
-                            // Bid'lerden sonra kalan bakiye
-                            let remaining = (caps.buy_total - total_spent_on_bids - total_spent_on_asks).max(0.0);
-                            if remaining < min_req_for_second.max(min_usd_per_order) || px.0 <= Decimal::ZERO {
-                                break; // Yetersiz bakiye veya geçersiz fiyat
-                            }
-                            
-                            // Her ek emir max 100 USD (hesaptan giden para = margin)
-                            // order_size = margin, notional = margin * leverage
-                            let order_size_margin = remaining.min(cfg.max_usd_per_order);
-                            let order_size_notional = order_size_margin * effective_leverage_ask; // Pozisyon boyutu
-                            let qty_step_local = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
-                            let qty2 = clamp_qty_by_usd(qty, px, order_size_notional, qty_step_local);
-                            let qty2_notional = (px.0.to_f64().unwrap_or(0.0)) * (qty2.0.to_f64().unwrap_or(0.0));
-                            
-                            if qty2.0 > Decimal::ZERO && qty2_notional >= min_req_for_second {
-                                info!(%symbol, ?px, qty = ?qty2, tif = ?tif, remaining, order_size_margin, order_size_notional, min_notional = min_req_for_second, "placing extra futures ask with leftover notional");
-                                // API Rate Limit koruması
-                                rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                    // Extra ask için clientOrderId
-                    let extra_timestamp_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis();
-                    let extra_client_order_id = format!("{}_{}_E_{}", 
-                        symbol.replace("-", "_").replace("/", "_"),
-                        "S",
-                        extra_timestamp_ms
-                    ).chars().take(36).collect::<String>();
-                    match venue.place_limit_with_client_id(&symbol, Side::Sell, px, qty2, tif, &extra_client_order_id).await {
-                        Ok((order_id2, returned_client_id2)) => {
-                            let info2 = OrderInfo { 
-                                order_id: order_id2.clone(), 
-                                client_order_id: returned_client_id2.or(Some(extra_client_order_id)),
-                                side: Side::Sell, 
-                                price: px, 
-                                qty: qty2, 
-                                filled_qty: Qty(Decimal::ZERO),
-                                remaining_qty: qty2,
-                                created_at: Instant::now(),
-                                last_fill_time: None,
-                            };
-                                        state.active_orders.insert(order_id2.clone(), info2.clone());
-                                        // KRİTİK İYİLEŞTİRME: Gerçek fiyatı kaydet (crossing guard'dan sonra)
-                                        state.last_order_price_update.insert(order_id2, info2.price);
-                                        // Spent güncelle (hesaptan giden para = margin)
-                                        // Notional / leverage = hesaptan giden para
-                                        total_spent_on_asks += qty2_notional / effective_leverage_ask;
-                                    }
-                                    Err(err) => {
-                                        warn!(%symbol, ?px, qty = ?qty2, tif = ?tif, ?err, "failed to place extra futures ask order");
-                                        break; // Hata varsa döngüden çık
-                                    }
-                                }
-                            } else {
-                                break; // Yetersiz notional, döngüden çık
-                            }
-                        }
+                        // Eski kod kaldırıldı - chunking sistemi kullanılıyor
                     }
+
+                    // Eski bid ve ask kodları kaldırıldı - chunking sistemi kullanılıyor
+                    // Chunking sistemi yukarıda implement edildi (bid ve ask için)
         } // Close for loop: for state_idx in prioritized_indices
         
         // Loop sonu: İstatistikleri logla (her 10 tick'te bir veya ilk 5 tick)
@@ -3559,23 +3430,19 @@ async fn fetch_quote_balance(
     venue: &BinanceFutures,
     quote_asset: &str,
 ) -> f64 {
-    rate_limit_guard(5).await; // GET /fapi/v2/balance: Weight 5
-    let result = timeout(Duration::from_secs(5), venue.available_balance(quote_asset)).await;
-    
-    match result {
-        Ok(Ok(balance)) => balance.to_f64().unwrap_or(0.0),
-        _ => 0.0,
+    match venue.available_balance(quote_asset).await {
+        Ok(balance) => balance.to_f64().unwrap_or(0.0),
+        Err(_) => 0.0,
     }
 }
 
-/// Collect unique quote assets from states
-#[allow(dead_code)]
+/// Collect unique quote assets from all symbol states
 fn collect_unique_quote_assets(states: &[SymbolState]) -> Vec<String> {
-    let mut unique: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut quote_assets = std::collections::HashSet::new();
     for state in states {
-        unique.insert(state.meta.quote_asset.clone());
+        quote_assets.insert(state.meta.quote_asset.clone());
     }
-    unique.into_iter().collect()
+    quote_assets.into_iter().collect()
 }
 
 /// Fetch balances for all unique quote assets
@@ -3634,35 +3501,23 @@ fn update_fill_rate_on_fill(
         .min(1.0);
 }
 
-/// Update fill rate after order cancel
+/// Update fill rate on order cancel
 fn update_fill_rate_on_cancel(state: &mut SymbolState, decrease_factor: f64) {
+    state.consecutive_no_fills += 1;
     state.order_fill_rate = (state.order_fill_rate * decrease_factor).max(0.0);
 }
 
-/// Check if order should be synced
+/// Check if orders should be synced
 fn should_sync_orders(
-    force_sync: bool,
-    last_sync: Option<Instant>,
-    sync_interval_sec: u64,
+    state: &SymbolState,
+    sync_interval_ms: u64,
 ) -> bool {
-    if force_sync {
-        return true;
-    }
-    last_sync
-        .map(|last| last.elapsed().as_secs() >= sync_interval_sec)
-        .unwrap_or(true)
-}
-
-/// Check if order is stale
-#[allow(dead_code)]
-fn is_order_stale(order: &OrderInfo, max_age_ms: u64, has_position: bool) -> bool {
-    let age_ms = order.created_at.elapsed().as_millis() as u64;
-    let threshold = if has_position {
-        (max_age_ms * 2) / 3 // KRİTİK İYİLEŞTİRME: 1/2 → 2/3 (daha az agresif)
+    if let Some(last_sync) = state.last_order_sync {
+        let elapsed = last_sync.elapsed().as_millis() as u64;
+        elapsed >= sync_interval_ms
     } else {
-        max_age_ms
-    };
-    age_ms > threshold
+        true
+    }
 }
 
 /// Check if position should be closed based on profit/loss

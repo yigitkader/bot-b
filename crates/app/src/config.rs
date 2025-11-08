@@ -17,6 +17,10 @@ pub struct RiskCfg {
     pub max_leverage: u32,
     #[serde(default = "default_slippage_bps_reserve")]
     pub slippage_bps_reserve: f64, // Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
+    #[serde(default = "default_use_isolated_margin")]
+    pub use_isolated_margin: bool, // Isolated margin kullan (default: true)
+    #[serde(default = "default_max_open_chunks_per_symbol_per_side")]
+    pub max_open_chunks_per_symbol_per_side: usize, // Sembol başına yönde maksimum açık chunk sayısı
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +334,8 @@ fn default_max_order_age() -> u64 { 10_000 }
 fn default_ws_reconnect_delay() -> u64 { 5_000 }
 fn default_ws_ping_interval() -> u64 { 30_000 }
 fn default_slippage_bps_reserve() -> f64 { 2.0 } // Default: 2 bps slippage reserve
+fn default_use_isolated_margin() -> bool { true } // Default: isolated margin kullan
+fn default_max_open_chunks_per_symbol_per_side() -> usize { 2 } // Default: sembol başına yönde max 2 chunk
 fn default_pnl_history_max_len() -> usize { 1024 }
 fn default_position_size_history_max_len() -> usize { 100 }
 fn default_max_symbols_per_tick() -> usize { 8 }
