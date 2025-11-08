@@ -262,6 +262,15 @@ async fn main() -> Result<()> {
 
     let mut selected: Vec<SymbolMeta> = Vec::new();
     for sym in &normalized {
+        // Özel karakterli sembolleri filtrele (API signature hatalarına neden olur)
+        if !sym.is_ascii() {
+            warn!(
+                symbol = %sym,
+                "skipping symbol with non-ASCII characters (causes API signature errors)"
+            );
+            continue;
+        }
+        
         if let Some(meta) = metadata.iter().find(|m| &m.symbol == sym) {
             // --- quote eşleşmesi ya birebir ya da USD-stable grubu uyumu ---
             let exact_quote = meta.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset);
@@ -429,6 +438,12 @@ async fn main() -> Result<()> {
             symbols_after_filtering = auto.len(),
             "filtered symbols by quote asset balance"
         );
+        
+        // Özel karakterli sembolleri filtrele (API signature hatalarına neden olur)
+        auto.retain(|m| {
+            // Sadece ASCII karakterler içeren sembolleri kabul et
+            m.symbol.is_ascii()
+        });
         
         // USDC ve USDT eşit muamele görmeli - alfabetik sırala
         auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));

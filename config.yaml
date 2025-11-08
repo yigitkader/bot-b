@@ -79,7 +79,7 @@ strategy:
   ofi_coefficient: 0.5            # OFI katsayısı (c2)
   
   # --- Diğer ---
-  min_liquidity_required: 0.01     # Minimum likidite gereksinimi
+  min_liquidity_required: 0.001    # Minimum likidite gereksinimi (0.01 → 0.001: daha fazla sembol için trade yapılabilir)
   opportunity_size_multiplier: 1.05 # Fırsat modu pozisyon çarpanı (1.1 → 1.05: konservatif)
   strong_trend_multiplier: 1.0     # Güçlü trend pozisyon çarpanı (1.5 → 1.0: normal boyut)
 
