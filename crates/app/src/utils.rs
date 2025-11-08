@@ -340,3 +340,319 @@ pub async fn rate_limit_guard_default() {
     rate_limit_guard(1).await;
 }
 
+// ============================================================================
+// Profit Guarantee and Tracking
+// ============================================================================
+
+use std::sync::Mutex;
+
+/// Profit guarantee calculator - ensures each trade is profitable after fees
+pub struct ProfitGuarantee {
+    /// Minimum profit per trade in USD (e.g., 0.50 cents = 0.005 USD)
+    min_profit_usd: f64,
+    /// Maker fee rate (e.g., 0.0002 = 0.02% = 2 bps)
+    maker_fee_rate: f64,
+    /// Taker fee rate (e.g., 0.0004 = 0.04% = 4 bps)
+    taker_fee_rate: f64,
+}
+
+impl ProfitGuarantee {
+    /// Create a new profit guarantee calculator
+    /// 
+    /// # Arguments
+    /// * `min_profit_usd` - Minimum profit per trade in USD (e.g., 0.005 for 0.50 cents)
+    /// * `maker_fee_rate` - Maker fee rate (default: 0.0002 = 2 bps for Binance Futures)
+    /// * `taker_fee_rate` - Taker fee rate (default: 0.0004 = 4 bps for Binance Futures)
+    pub fn new(min_profit_usd: f64, maker_fee_rate: f64, taker_fee_rate: f64) -> Self {
+        Self {
+            min_profit_usd,
+            maker_fee_rate,
+            taker_fee_rate,
+        }
+    }
+
+    /// Default constructor with Binance Futures fees
+    pub fn default() -> Self {
+        Self::new(0.005, 0.0002, 0.0004) // 0.50 cents, 2 bps maker, 4 bps taker
+    }
+
+    /// Calculate minimum spread required for profitable trade
+    /// 
+    /// # Arguments
+    /// * `position_size_usd` - Position size in USD
+    /// 
+    /// # Returns
+    /// Minimum spread in bps (basis points) required for profit
+    pub fn calculate_min_spread_bps(&self, position_size_usd: f64) -> f64 {
+        if position_size_usd <= 0.0 {
+            return 0.0;
+        }
+
+        // Net profit = Gross profit - Fees
+        // Gross profit = position_size * spread_rate
+        // Fees = position_size * (maker_fee + taker_fee)
+        // 
+        // min_profit = position_size * spread_rate - position_size * (maker_fee + taker_fee)
+        // min_profit = position_size * (spread_rate - total_fee_rate)
+        // spread_rate = (min_profit / position_size) + total_fee_rate
+        // spread_bps = spread_rate * 10000
+
+        let total_fee_rate = self.maker_fee_rate + self.taker_fee_rate;
+        let min_spread_rate = (self.min_profit_usd / position_size_usd) + total_fee_rate;
+        min_spread_rate * 10000.0 // Convert to bps
+    }
+
+    /// Check if a trade is profitable given spread and position size
+    /// 
+    /// # Arguments
+    /// * `spread_bps` - Current spread in basis points
+    /// * `position_size_usd` - Position size in USD
+    /// 
+    /// # Returns
+    /// true if trade is profitable, false otherwise
+    pub fn is_trade_profitable(&self, spread_bps: f64, position_size_usd: f64) -> bool {
+        if position_size_usd <= 0.0 {
+            return false;
+        }
+
+        let min_spread_bps = self.calculate_min_spread_bps(position_size_usd);
+        spread_bps >= min_spread_bps
+    }
+
+    /// Calculate expected profit for a trade
+    /// 
+    /// # Arguments
+    /// * `spread_bps` - Current spread in basis points
+    /// * `position_size_usd` - Position size in USD
+    /// 
+    /// # Returns
+    /// Expected profit in USD (can be negative if unprofitable)
+    pub fn calculate_expected_profit(&self, spread_bps: f64, position_size_usd: f64) -> f64 {
+        if position_size_usd <= 0.0 {
+            return 0.0;
+        }
+
+        let spread_rate = spread_bps / 10000.0;
+        let gross_profit = position_size_usd * spread_rate;
+        let total_fees = position_size_usd * (self.maker_fee_rate + self.taker_fee_rate);
+        gross_profit - total_fees
+    }
+
+    /// Calculate optimal position size for a given spread
+    /// 
+    /// # Arguments
+    /// * `spread_bps` - Current spread in basis points
+    /// * `min_position_usd` - Minimum position size in USD
+    /// * `max_position_usd` - Maximum position size in USD
+    /// 
+    /// # Returns
+    /// Optimal position size in USD that guarantees minimum profit
+    pub fn calculate_optimal_position_size(
+        &self,
+        spread_bps: f64,
+        min_position_usd: f64,
+        max_position_usd: f64,
+    ) -> f64 {
+        if spread_bps <= 0.0 {
+            return min_position_usd;
+        }
+
+        let spread_rate = spread_bps / 10000.0;
+        let total_fee_rate = self.maker_fee_rate + self.taker_fee_rate;
+        let net_spread_rate = spread_rate - total_fee_rate;
+
+        if net_spread_rate <= 0.0 {
+            // Spread doesn't cover fees, use minimum
+            return min_position_usd;
+        }
+
+        // Calculate position size needed for minimum profit
+        let optimal_size = self.min_profit_usd / net_spread_rate;
+        
+        // Clamp to min/max bounds
+        optimal_size.max(min_position_usd).min(max_position_usd)
+    }
+
+    /// Calculate risk/reward ratio for a trade
+    /// 
+    /// # Arguments
+    /// * `spread_bps` - Current spread in basis points
+    /// * `position_size_usd` - Position size in USD
+    /// * `max_loss_pct` - Maximum loss percentage (e.g., 0.01 = 1%)
+    /// 
+    /// # Returns
+    /// Risk/reward ratio (e.g., 2.0 = 2:1 reward:risk)
+    pub fn calculate_risk_reward_ratio(
+        &self,
+        spread_bps: f64,
+        position_size_usd: f64,
+        max_loss_pct: f64,
+    ) -> f64 {
+        if position_size_usd <= 0.0 || max_loss_pct <= 0.0 {
+            return 0.0;
+        }
+
+        let expected_profit = self.calculate_expected_profit(spread_bps, position_size_usd);
+        let max_loss = position_size_usd * max_loss_pct.abs();
+
+        if max_loss <= 0.0 {
+            return 0.0;
+        }
+
+        expected_profit / max_loss
+    }
+}
+
+/// Profit tracker for monitoring trading performance
+pub struct ProfitTracker {
+    total_trades: u32,
+    winning_trades: u32,
+    total_profit: f64,
+    total_fees: f64,
+    total_loss: f64,
+}
+
+impl ProfitTracker {
+    pub fn new() -> Self {
+        Self {
+            total_trades: 0,
+            winning_trades: 0,
+            total_profit: 0.0,
+            total_fees: 0.0,
+            total_loss: 0.0,
+        }
+    }
+
+    /// Record a completed trade
+    /// 
+    /// # Arguments
+    /// * `profit` - Net profit in USD (can be negative)
+    /// * `fees` - Total fees paid in USD
+    pub fn record_trade(&mut self, profit: f64, fees: f64) {
+        self.total_trades += 1;
+        self.total_fees += fees;
+
+        if profit > 0.0 {
+            self.winning_trades += 1;
+            self.total_profit += profit;
+        } else {
+            self.total_loss += profit.abs();
+        }
+    }
+
+    /// Get win rate as percentage
+    pub fn win_rate(&self) -> f64 {
+        if self.total_trades == 0 {
+            return 0.0;
+        }
+        (self.winning_trades as f64 / self.total_trades as f64) * 100.0
+    }
+
+    /// Get net profit (profit - fees - losses)
+    pub fn net_profit(&self) -> f64 {
+        self.total_profit - self.total_fees - self.total_loss
+    }
+
+    /// Get statistics as formatted string
+    pub fn get_stats(&self) -> String {
+        let win_rate = self.win_rate();
+        let net_profit = self.net_profit();
+        let avg_profit_per_trade = if self.total_trades > 0 {
+            net_profit / self.total_trades as f64
+        } else {
+            0.0
+        };
+
+        format!(
+            "Trades: {}, Win Rate: {:.1}%, Net Profit: ${:.2}, Fees: ${:.2}, Avg Profit/Trade: ${:.4}",
+            self.total_trades, win_rate, net_profit, self.total_fees, avg_profit_per_trade
+        )
+    }
+
+    /// Reset all statistics
+    pub fn reset(&mut self) {
+        self.total_trades = 0;
+        self.winning_trades = 0;
+        self.total_profit = 0.0;
+        self.total_fees = 0.0;
+        self.total_loss = 0.0;
+    }
+}
+
+impl Default for ProfitTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Thread-safe profit tracker wrapper
+pub type SharedProfitTracker = Mutex<ProfitTracker>;
+
+/// Calculate spread in basis points from bid and ask prices
+/// 
+/// # Arguments
+/// * `bid` - Bid price
+/// * `ask` - Ask price
+/// 
+/// # Returns
+/// Spread in basis points (bps), or 0.0 if invalid
+pub fn calculate_spread_bps(bid: Decimal, ask: Decimal) -> f64 {
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
+        return 0.0;
+    }
+    
+    let bid_f = bid.to_f64().unwrap_or(0.0);
+    let ask_f = ask.to_f64().unwrap_or(0.0);
+    
+    if bid_f <= 0.0 || ask_f <= 0.0 || ask_f <= bid_f {
+        return 0.0;
+    }
+    
+    let spread_rate = (ask_f - bid_f) / bid_f;
+    spread_rate * 10000.0 // Convert to bps
+}
+
+/// Check if a trade should be placed based on profit guarantee and risk/reward
+/// 
+/// # Arguments
+/// * `spread_bps` - Current spread in basis points
+/// * `position_size_usd` - Position size in USD
+/// * `min_spread_bps` - Minimum spread threshold from config
+/// * `stop_loss_threshold` - Stop loss threshold (negative, e.g., -0.01 for 1%)
+/// * `min_risk_reward_ratio` - Minimum risk/reward ratio (e.g., 2.0 for 2:1)
+/// 
+/// # Returns
+/// (should_place, reason) - true if trade should be placed, false otherwise with reason
+pub fn should_place_trade(
+    spread_bps: f64,
+    position_size_usd: f64,
+    min_spread_bps: f64,
+    stop_loss_threshold: f64,
+    min_risk_reward_ratio: f64,
+) -> (bool, &'static str) {
+    // 1. Minimum spread kontrolü
+    if spread_bps < min_spread_bps {
+        return (false, "spread_below_minimum");
+    }
+    
+    // 2. Profit guarantee kontrolü
+    let profit_guarantee = ProfitGuarantee::default();
+    if !profit_guarantee.is_trade_profitable(spread_bps, position_size_usd) {
+        return (false, "not_profitable_after_fees");
+    }
+    
+    // 3. Risk/Reward oranı kontrolü
+    let max_loss_pct = stop_loss_threshold.abs();
+    let risk_reward_ratio = profit_guarantee.calculate_risk_reward_ratio(
+        spread_bps,
+        position_size_usd,
+        max_loss_pct,
+    );
+    
+    if risk_reward_ratio < min_risk_reward_ratio {
+        return (false, "risk_reward_too_low");
+    }
+    
+    (true, "ok")
+}
+

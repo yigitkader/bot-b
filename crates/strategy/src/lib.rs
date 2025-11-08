@@ -120,6 +120,8 @@ pub struct DynMmCfg {
     #[serde(default)]
     pub confidence_max_multiplier: Option<f64>,
     #[serde(default)]
+    pub confidence_min_threshold: Option<f64>,
+    #[serde(default)]
     pub trend_analysis_min_history: Option<usize>,
     #[serde(default)]
     pub trend_analysis_threshold_negative: Option<f64>,
@@ -187,6 +189,7 @@ pub struct DynMm {
     confidence_spread_max: f64,
     confidence_bonus_multiplier: f64,
     confidence_max_multiplier: f64,
+    confidence_min_threshold: f64,
     #[allow(dead_code)]
     trend_analysis_min_history: usize,
     #[allow(dead_code)]
@@ -268,6 +271,7 @@ impl From<DynMmCfg> for DynMm {
             confidence_spread_max: c.confidence_spread_max.unwrap_or(150.0),
             confidence_bonus_multiplier: c.confidence_bonus_multiplier.unwrap_or(0.3),
             confidence_max_multiplier: c.confidence_max_multiplier.unwrap_or(1.5),
+            confidence_min_threshold: c.confidence_min_threshold.unwrap_or(0.75),
             trend_analysis_min_history: c.trend_analysis_min_history.unwrap_or(10),
             trend_analysis_threshold_negative: c.trend_analysis_threshold_negative.unwrap_or(-0.15),
             trend_analysis_threshold_strong_negative: c.trend_analysis_threshold_strong_negative.unwrap_or(-0.20),
@@ -889,14 +893,14 @@ impl Strategy for DynMm {
                 _ => 0.7,
             };
             
-            // PATCH: Sadece yüksek güven varsa işlem yap (%75+ güven gerekli)
-            const MIN_CONFIDENCE_THRESHOLD: f64 = 0.75; // %75+ güven gerekli
+            // PATCH: Sadece yüksek güven varsa işlem yap (config'den threshold)
+            let min_confidence_threshold = self.confidence_min_threshold;
             
-            if confidence < MIN_CONFIDENCE_THRESHOLD {
+            if confidence < min_confidence_threshold {
                 use tracing::warn;
                 warn!(
                     confidence,
-                    threshold = MIN_CONFIDENCE_THRESHOLD,
+                    threshold = min_confidence_threshold,
                     "SKIPPING OPPORTUNITY: confidence too low (false positive risk)"
                 );
                 self.manipulation_opportunity = None; // Fırsatı iptal et

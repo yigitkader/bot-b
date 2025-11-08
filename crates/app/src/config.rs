@@ -236,6 +236,8 @@ pub struct StrategyInternalCfg {
     pub confidence_bonus_multiplier: f64,
     #[serde(default = "default_confidence_max_multiplier")]
     pub confidence_max_multiplier: f64,
+    #[serde(default = "default_confidence_min_threshold")]
+    pub confidence_min_threshold: f64,
     #[serde(default = "default_trend_analysis_min_history")]
     pub trend_analysis_min_history: usize,
     #[serde(default = "default_trend_analysis_threshold_negative")]
@@ -300,6 +302,7 @@ fn default_confidence_spread_min() -> f64 { 50.0 }
 fn default_confidence_spread_max() -> f64 { 150.0 }
 fn default_confidence_bonus_multiplier() -> f64 { 0.3 }
 fn default_confidence_max_multiplier() -> f64 { 1.5 }
+fn default_confidence_min_threshold() -> f64 { 0.75 }
 fn default_trend_analysis_min_history() -> usize { 10 }
 fn default_trend_analysis_threshold_negative() -> f64 { -0.15 }
 fn default_trend_analysis_threshold_strong_negative() -> f64 { -0.20 }

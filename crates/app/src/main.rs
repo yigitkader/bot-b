@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
         confidence_spread_max: Some(cfg.strategy_internal.confidence_spread_max),
         confidence_bonus_multiplier: Some(cfg.strategy_internal.confidence_bonus_multiplier),
         confidence_max_multiplier: Some(cfg.strategy_internal.confidence_max_multiplier),
+        confidence_min_threshold: Some(cfg.strategy_internal.confidence_min_threshold),
         trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
         trend_analysis_threshold_negative: Some(cfg.strategy_internal.trend_analysis_threshold_negative),
         trend_analysis_threshold_strong_negative: Some(cfg.strategy_internal.trend_analysis_threshold_strong_negative),
@@ -2120,6 +2121,42 @@ async fn main() -> Result<()> {
             }
             if !sell_cap_ok {
                 quotes.ask = None;
+            }
+
+            // --- PROFIT GUARANTEE FILTER: Trade yapılmadan önce karlılık kontrolü ---
+            if let (Some((bid_px, bid_qty)), Some((ask_px, ask_qty))) = (quotes.bid, quotes.ask) {
+                let spread_bps = utils::calculate_spread_bps(bid_px.0, ask_px.0);
+                let position_size_usd = {
+                    let bid_notional = bid_px.0.to_f64().unwrap_or(0.0) * bid_qty.0.to_f64().unwrap_or(0.0);
+                    let ask_notional = ask_px.0.to_f64().unwrap_or(0.0) * ask_qty.0.to_f64().unwrap_or(0.0);
+                    bid_notional.max(ask_notional) // Use larger of the two
+                };
+                
+                let min_spread_bps = cfg.strategy.min_spread_bps.unwrap_or(60.0);
+                let stop_loss_threshold = cfg.internal.stop_loss_threshold;
+                let min_risk_reward_ratio = 2.0; // 2:1 minimum risk/reward
+                
+                let (should_place, reason) = utils::should_place_trade(
+                    spread_bps,
+                    position_size_usd,
+                    min_spread_bps,
+                    stop_loss_threshold,
+                    min_risk_reward_ratio,
+                );
+                
+                if !should_place {
+                    use tracing::debug;
+                    debug!(
+                        %symbol,
+                        spread_bps,
+                        position_size_usd,
+                        reason,
+                        "TRADE FILTERED: not profitable or risk/reward too low"
+                    );
+                    // Filter out quotes that don't meet profit guarantee
+                    quotes.bid = None;
+                    quotes.ask = None;
+                }
             }
 
             // Per-symbol metadata kullan (fallback: global cfg)
