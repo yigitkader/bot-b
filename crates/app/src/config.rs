@@ -2,7 +2,7 @@
 // Configuration structures and loading logic
 
 use anyhow::{anyhow, Result};
-use rust_decimal::Decimal;
+// Removed unused import
 use serde::Deserialize;
 
 // ============================================================================
@@ -104,8 +104,10 @@ pub struct InternalCfg {
     #[serde(default = "default_max_symbols_per_tick")]
     pub max_symbols_per_tick: usize,
     #[serde(default = "default_rate_limiter_safety_factor")]
+    #[allow(dead_code)]
     pub rate_limiter_safety_factor: f64,
     #[serde(default = "default_rate_limiter_min_interval_ms")]
+    #[allow(dead_code)]
     pub rate_limiter_min_interval_ms: u64,
     #[serde(default = "default_order_sync_interval_sec")]
     pub order_sync_interval_sec: u64,

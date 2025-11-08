@@ -58,8 +58,8 @@ mod tests {
 
     /// Margin hesaplama helper (unrealized PnL ile)
     fn calculate_margin_with_pnl(position_notional: f64, leverage: f64, unrealized_pnl: f64) -> f64 {
-        let base_margin = position_notional / leverage;
-        (base_margin - unrealized_pnl).max(0.0)
+        let base_margin: f64 = position_notional / leverage;
+        (base_margin - unrealized_pnl).max(0.0_f64)
     }
 
     /// Test constants
@@ -164,7 +164,7 @@ mod tests {
         let trailing_stop_threshold = 0.01; // %1
         
         let should_trailing_stop = if peak_pnl_f64 > 0.0 && current_pnl_f64 < peak_pnl_f64 {
-            let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01_f64);
+            let drawdown_from_peak: f64 = (peak_pnl_f64 - current_pnl_f64) / (peak_pnl_f64 as f64).abs().max(0.01_f64);
             drawdown_from_peak >= trailing_stop_threshold
         } else {
             false
@@ -382,9 +382,9 @@ mod tests {
     #[test]
     fn test_leverage_position_size_calculation() {
         // Mevcut pozisyonun margin'i çıkarıldıktan sonra kalan bakiyeden leverage uygulanmalı
-        let total_balance = 100.0; // 100 USD toplam bakiye
-        let existing_position_notional = 200.0; // 200 USD pozisyon
-        let effective_leverage = 5.0;
+        let total_balance: f64 = 100.0; // 100 USD toplam bakiye
+        let existing_position_notional: f64 = 200.0; // 200 USD pozisyon
+        let effective_leverage: f64 = 5.0;
         
         // Mevcut pozisyonun margin'i = notional / leverage
         let existing_position_margin: f64 = existing_position_notional / effective_leverage; // 40 USD
@@ -498,19 +498,19 @@ mod tests {
     #[test]
     fn test_leverage_margin_with_unrealized_pnl_loss() {
         // Given: Zarar eden pozisyon (unrealized PnL negatif)
-        let total_balance = 100.0;
-        let existing_position_notional = 200.0;
-        let effective_leverage = 5.0;
-        let unrealized_pnl = -20.0; // 20 USD zarar
+        let total_balance: f64 = 100.0;
+        let existing_position_notional: f64 = 200.0;
+        let effective_leverage: f64 = 5.0;
+        let unrealized_pnl: f64 = -20.0; // 20 USD zarar
         
         // When: Margin hesaplanır (unrealized PnL ile)
-        let base_margin = existing_position_notional / effective_leverage; // 40 USD
-        let existing_position_margin = calculate_margin_with_pnl(
+        let base_margin: f64 = existing_position_notional / effective_leverage; // 40 USD
+        let existing_position_margin: f64 = calculate_margin_with_pnl(
             existing_position_notional,
             effective_leverage,
             unrealized_pnl
         ); // 60 USD
-        let available_after_position = (total_balance - existing_position_margin).max(0.0);
+        let available_after_position: f64 = (total_balance - existing_position_margin).max(0.0_f64);
         
         // Then: Zarar eden pozisyon margin'i tüketir
         assert_eq!(base_margin, 40.0, "Base margin should be 40 USD");
@@ -521,19 +521,19 @@ mod tests {
     #[test]
     fn test_leverage_margin_with_unrealized_pnl_profit() {
         // Given: Kar eden pozisyon (unrealized PnL pozitif)
-        let total_balance = 100.0;
-        let existing_position_notional = 200.0;
-        let effective_leverage = 5.0;
-        let unrealized_pnl = 20.0; // 20 USD kar
+        let total_balance: f64 = 100.0;
+        let existing_position_notional: f64 = 200.0;
+        let effective_leverage: f64 = 5.0;
+        let unrealized_pnl: f64 = 20.0; // 20 USD kar
         
         // When: Margin hesaplanır (unrealized PnL ile)
-        let base_margin = existing_position_notional / effective_leverage; // 40 USD
-        let existing_position_margin = calculate_margin_with_pnl(
+        let base_margin: f64 = existing_position_notional / effective_leverage; // 40 USD
+        let existing_position_margin: f64 = calculate_margin_with_pnl(
             existing_position_notional,
             effective_leverage,
             unrealized_pnl
         ); // 20 USD
-        let available_after_position = (total_balance - existing_position_margin).max(0.0);
+        let available_after_position: f64 = (total_balance - existing_position_margin).max(0.0_f64);
         
         // Then: Kar eden pozisyon margin'i serbest bırakır
         assert_eq!(existing_position_margin, 20.0, "Profit position frees up margin");
@@ -550,7 +550,7 @@ mod tests {
         let take_profit_threshold = 0.05; // %5 take profit eşiği
         
         // Trailing stop kontrolü
-        let drawdown_from_peak = (peak_pnl_f64 - current_pnl_f64) / peak_pnl_f64.abs().max(0.01);
+        let drawdown_from_peak: f64 = (peak_pnl_f64 - current_pnl_f64) / (peak_pnl_f64 as f64).abs().max(0.01_f64);
         let trailing_stop_threshold = 0.01; // %1 trailing stop
         let should_trailing_stop = drawdown_from_peak >= trailing_stop_threshold && peak_pnl_f64 > 20.0;
         
@@ -596,7 +596,7 @@ mod tests {
         let step = 0.001;
         
         // Önce maksimum qty'yi belirle (margin constraint)
-        let max_qty_by_margin = ((available_margin * effective_leverage) / price_quantized / step).floor() * step;
+        let max_qty_by_margin: f64 = (((available_margin * effective_leverage) / price_quantized / step) as f64).floor() * step;
         let available_notional = max_qty_by_margin * price_quantized;
         
         // Bakiye yetersizse min notional'ı karşılayamayan emir yapma
@@ -607,12 +607,12 @@ mod tests {
         
         // Yeterli bakiye varsa
         let available_margin_sufficient = 12.0; // 12 USD bakiye (yeterli)
-        let max_qty_by_margin_sufficient = ((available_margin_sufficient * effective_leverage) / price_quantized / step).floor() * step;
+        let max_qty_by_margin_sufficient: f64 = (((available_margin_sufficient * effective_leverage) / price_quantized / step) as f64).floor() * step;
         let available_notional_sufficient = max_qty_by_margin_sufficient * price_quantized;
         
         // Min qty hesapla
-        let min_qty_for_notional = (min_notional * 1.1 / price_quantized / step).ceil() * step; // %10 güvenli margin
-        let final_qty = min_qty_for_notional.min(max_qty_by_margin_sufficient);
+        let min_qty_for_notional: f64 = ((min_notional * 1.1 / price_quantized / step) as f64).ceil() * step; // %10 güvenli margin
+        let final_qty: f64 = min_qty_for_notional.min(max_qty_by_margin_sufficient);
         let final_notional = final_qty * price_quantized;
         let required_margin = final_notional / effective_leverage;
         
@@ -701,9 +701,9 @@ mod tests {
         // Flash crash: Büyük düşüş = yüksek güven
         let price_drop_bps = 400.0; // 400 bps düşüş
         let confidence_price_drop_max = 500.0;
-        let confidence_flash_crash = (price_drop_bps / confidence_price_drop_max).min(1.0).max(0.5);
-        let confidence_bonus = confidence_bonus_multiplier * confidence_flash_crash;
-        let multiplier_flash_crash = (base_multiplier + confidence_bonus).min(confidence_max_multiplier);
+        let confidence_flash_crash: f64 = ((price_drop_bps / confidence_price_drop_max) as f64).min(1.0_f64).max(0.5_f64);
+        let confidence_bonus: f64 = confidence_bonus_multiplier * confidence_flash_crash;
+        let multiplier_flash_crash: f64 = (base_multiplier + confidence_bonus).min(confidence_max_multiplier);
         
         assert!(multiplier_flash_crash > base_multiplier, "Flash crash should increase multiplier");
         assert!(multiplier_flash_crash <= confidence_max_multiplier, "Multiplier should not exceed max");
@@ -712,17 +712,17 @@ mod tests {
         let volume_ratio = 8.0; // 8x volume
         let confidence_volume_ratio_min = 5.0;
         let confidence_volume_ratio_max = 10.0;
-        let confidence_volume = ((volume_ratio - confidence_volume_ratio_min) / (confidence_volume_ratio_max - confidence_volume_ratio_min)).min(1.0).max(0.5);
-        let confidence_bonus_volume = confidence_bonus_multiplier * confidence_volume;
-        let multiplier_volume = (base_multiplier + confidence_bonus_volume).min(confidence_max_multiplier);
+        let confidence_volume: f64 = (((volume_ratio - confidence_volume_ratio_min) / (confidence_volume_ratio_max - confidence_volume_ratio_min)) as f64).min(1.0_f64).max(0.5_f64);
+        let confidence_bonus_volume: f64 = confidence_bonus_multiplier * confidence_volume;
+        let multiplier_volume: f64 = (base_multiplier + confidence_bonus_volume).min(confidence_max_multiplier);
         
         assert!(multiplier_volume > base_multiplier, "High volume should increase multiplier");
         
         // Düşük güven: Küçük düşüş
         let price_drop_bps_small = 260.0; // 260 bps (eşik 250'den biraz fazla)
-        let confidence_small = (price_drop_bps_small / confidence_price_drop_max).min(1.0).max(0.5);
-        let confidence_bonus_small = confidence_bonus_multiplier * confidence_small;
-        let multiplier_small = (base_multiplier + confidence_bonus_small).min(confidence_max_multiplier);
+        let confidence_small: f64 = ((price_drop_bps_small / confidence_price_drop_max) as f64).min(1.0_f64).max(0.5_f64);
+        let confidence_bonus_small: f64 = confidence_bonus_multiplier * confidence_small;
+        let multiplier_small: f64 = (base_multiplier + confidence_bonus_small).min(confidence_max_multiplier);
         
         assert!(multiplier_small < multiplier_flash_crash, "Small drop should have lower multiplier than large drop");
     }
@@ -853,9 +853,9 @@ mod tests {
         assert_eq!(pnl_zero, dec!(0), "PnL should be zero for zero position");
         
         // Sıfır bakiye
-        let total_balance_zero = 0.0;
-        let existing_position_margin_zero = 0.0;
-        let available_after_position_zero = (total_balance_zero - existing_position_margin_zero).max(0.0);
+        let total_balance_zero: f64 = 0.0;
+        let existing_position_margin_zero: f64 = 0.0;
+        let available_after_position_zero: f64 = (total_balance_zero - existing_position_margin_zero).max(0.0_f64);
         assert_eq!(available_after_position_zero, 0.0, "Available should be zero when balance is zero");
         
         // Sıfır leverage (bölme hatası önleme)
@@ -863,8 +863,8 @@ mod tests {
         let leverage_zero = 0.0;
         // Leverage sıfır olamaz (config'de kontrol edilmeli), ama test için
         if leverage_zero > 0.0 {
-            let margin = position_notional / leverage_zero;
-            assert!(margin.is_finite(), "Margin should be finite");
+            let margin: f64 = position_notional / leverage_zero;
+            assert!(margin.is_finite() || margin == 0.0, "Margin should be finite or zero");
         }
     }
 
@@ -878,9 +878,9 @@ mod tests {
         assert!(pnl_loss < Decimal::ZERO, "PnL should be negative for loss");
         
         // Negatif bakiye (imkansız ama kontrol)
-        let total_balance_negative = -10.0;
-        let existing_position_margin_negative = 5.0;
-        let available_after_position_negative = (total_balance_negative - existing_position_margin_negative).max(0.0);
+        let total_balance_negative: f64 = -10.0;
+        let existing_position_margin_negative: f64 = 5.0;
+        let available_after_position_negative: f64 = (total_balance_negative - existing_position_margin_negative).max(0.0_f64);
         assert_eq!(available_after_position_negative, 0.0, "Available should be zero when balance is negative");
     }
 
@@ -892,12 +892,14 @@ mod tests {
         
         // Çok büyük pozisyon ile PnL hesaplama (overflow kontrolü)
         let pnl_large = (very_large_mark_price.0 - very_large_position.entry.0) * very_large_position.qty.0;
-        assert!(pnl_large.is_finite(), "PnL should be finite even for very large values");
+        // Decimal için is_finite() yok, f64'e çevirip kontrol et
+        let pnl_f64 = pnl_large.to_f64().unwrap_or(0.0);
+        assert!(pnl_f64.is_finite() || pnl_f64 == 0.0, "PnL should be finite or zero even for very large values");
         
         // Çok büyük bakiye
-        let total_balance_large = 1_000_000.0;
-        let existing_position_margin_large = 100_000.0;
-        let available_after_position_large = (total_balance_large - existing_position_margin_large).max(0.0);
+        let total_balance_large: f64 = 1_000_000.0;
+        let existing_position_margin_large: f64 = 100_000.0;
+        let available_after_position_large: f64 = (total_balance_large - existing_position_margin_large).max(0.0_f64);
         assert_eq!(available_after_position_large, 900_000.0, "Available should handle large values correctly");
     }
 

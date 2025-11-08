@@ -50,8 +50,8 @@ strategy:
   # --- Spread ve Fiyatlama Eşikleri ---
   min_spread_bps: 3.0              # Minimum spread (bps)
   max_spread_bps: 100.0            # Maksimum spread (bps)
-  spread_arbitrage_min_bps: 50.0   # Spread arbitraj minimum eşiği (bps) (30 → 50: daha gerçekçi)
-  spread_arbitrage_max_bps: 150.0  # Spread arbitraj maksimum eşiği (bps) (200 → 150: çok geniş spread riskli)
+  spread_arbitrage_min_bps: 10.0   # Spread arbitraj minimum eşiği (bps) (50 → 10: gerçekçi Binance spread)
+  spread_arbitrage_max_bps: 30.0   # Spread arbitraj maksimum eşiği (bps) (150 → 30: gerçekçi Binance spread)
   
   # --- Trend Takibi Eşikleri ---
   strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
@@ -67,7 +67,7 @@ strategy:
   opportunity_threshold_off: 0.2   # Fırsat modu kapanma eşiği
   
   # --- Manipülasyon Tespit Eşikleri ---
-  price_jump_threshold_bps: 250.0  # Flash crash/pump eşiği (bps) (150 → 250: daha sıkı, false positive azalt)
+  price_jump_threshold_bps: 100.0  # Flash crash/pump eşiği (bps) (250 → 100: gerçekçi, daha fazla fırsat)
   fake_breakout_threshold_bps: 100.0 # Fake breakout eşiği (bps)
   liquidity_drop_threshold: 0.5    # Likidite düşüş eşiği (ratio)
   
@@ -80,8 +80,8 @@ strategy:
   
   # --- Diğer ---
   min_liquidity_required: 0.01     # Minimum likidite gereksinimi
-  opportunity_size_multiplier: 1.2 # Fırsat modu pozisyon çarpanı (1.5 → 1.2: daha güvenli, false positive riski azalt)
-  strong_trend_multiplier: 1.2     # Güçlü trend pozisyon çarpanı (1.5 → 1.2: daha güvenli)
+  opportunity_size_multiplier: 2.0 # Fırsat modu pozisyon çarpanı (1.2 → 2.0: daha agresif, kazanç için)
+  strong_trend_multiplier: 1.5     # Güçlü trend pozisyon çarpanı (1.2 → 1.5: daha agresif)
 
 exec:
   tif: "post_only"     # "gtc" | "ioc" | "post_only"
@@ -129,8 +129,8 @@ internal:
   pnl_alert_threshold_negative: -0.03 # %3 zarar
   
   # Take profit eşikleri
-  take_profit_threshold_small: 0.01   # %1 (küçük pozisyonlar)
-  take_profit_threshold_large: 0.05   # %5 (büyük pozisyonlar)
+  take_profit_threshold_small: 0.005   # %0.5 (küçük pozisyonlar) (0.01 → 0.005: daha gerçekçi)
+  take_profit_threshold_large: 0.02   # %2 (büyük pozisyonlar) (0.05 → 0.02: daha gerçekçi)
   take_profit_time_threshold_ms: 600000  # 10 dakika
   take_profit_min_profit_threshold: 0.10  # %10
   
@@ -139,7 +139,7 @@ internal:
   trailing_stop_peak_threshold_medium: 20.0   # USD (orta karlar)
   trailing_stop_drawdown_large: 0.03    # %3 (büyük karlar için)
   trailing_stop_drawdown_medium: 0.015  # %1.5 (orta karlar için)
-  trailing_stop_drawdown_small: 0.01     # %1 (küçük karlar için)
+  trailing_stop_drawdown_small: 0.001   # %0.1 (küçük karlar için) (0.01 → 0.001: daha toleranslı)
   trailing_stop_min_peak: 0.01           # Minimum peak (USD)
   
   # Stop loss eşikleri
@@ -153,8 +153,8 @@ internal:
 # --- Strateji İç Mantık Parametreleri ---
 strategy_internal:
   # Manipülasyon tespiti
-  manipulation_volume_ratio_threshold: 5.0    # 5x volume artışı
-  manipulation_time_threshold_ms: 2000        # 2 saniye içinde
+  manipulation_volume_ratio_threshold: 2.5    # 2.5x volume artışı (5.0 → 2.5: gerçekçi)
+  manipulation_time_threshold_ms: 5000        # 5 saniye içinde (2000 → 5000: daha toleranslı)
   manipulation_price_history_min_len: 3        # Minimum fiyat geçmişi uzunluğu
   manipulation_price_history_max_len: 200     # Maximum fiyat geçmişi uzunluğu
   
@@ -165,7 +165,7 @@ strategy_internal:
   confidence_spread_min: 50.0                 # Min spread for confidence (bps)
   confidence_spread_max: 150.0                # Max spread for confidence (bps)
   confidence_bonus_multiplier: 0.3            # Confidence bonus multiplier
-  confidence_max_multiplier: 1.5              # Max multiplier cap
+  confidence_max_multiplier: 2.0              # Max multiplier cap (1.5 → 2.0: daha agresif)
   
   # Trend analizi
   trend_analysis_min_history: 10              # Minimum geçmiş uzunluğu

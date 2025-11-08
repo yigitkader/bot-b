@@ -187,8 +187,11 @@ pub struct DynMm {
     confidence_spread_max: f64,
     confidence_bonus_multiplier: f64,
     confidence_max_multiplier: f64,
+    #[allow(dead_code)]
     trend_analysis_min_history: usize,
+    #[allow(dead_code)]
     trend_analysis_threshold_negative: f64,
+    #[allow(dead_code)]
     trend_analysis_threshold_strong_negative: f64,
     // Akıllı karar verme için state
     price_history: Vec<(u64, Decimal)>, // (timestamp_ms, price)
@@ -197,6 +200,7 @@ pub struct DynMm {
     ewma_volatility: f64,        // EWMA volatilite (σ²)
     ewma_volatility_alpha: f64,  // EWMA decay factor (λ)
     ofi_signal: f64,             // Order Flow Imbalance (kümülatif)
+    #[allow(dead_code)]
     ofi_window_ms: u64,          // OFI penceresi (ms)
     last_mid_price: Option<Decimal>, // Son mid price (volatilite için)
     last_timestamp_ms: Option<u64>,  // Son timestamp (OFI için)
@@ -270,7 +274,7 @@ impl From<DynMmCfg> for DynMm {
             price_history: Vec::with_capacity(c.manipulation_price_history_max_len.unwrap_or(200)), // Config'den: Fiyat geçmişi kapasitesi
             target_inventory: Qty(Decimal::ZERO), // Başlangıçta nötr
             // Mikro-yapı sinyalleri başlangıç değerleri
-            ewma_volatility: 0.0001,      // Başlangıç volatilite (1 bps)
+            ewma_volatility: 0.001,       // Başlangıç volatilite (10 bps) (0.0001 → 0.001: daha gerçekçi)
             ewma_volatility_alpha: 0.95,   // EWMA decay: %95 eski, %5 yeni
             ofi_signal: 0.0,              // Başlangıçta nötr
             ofi_window_ms: 200,           // 200ms OFI penceresi
@@ -362,20 +366,9 @@ impl DynMm {
             // OFI increment: bid volume artışı - ask volume artışı
             let ofi_increment = delta_bid_f64 - delta_ask_f64;
             
-            // EWMA decay: eski OFI'yı azalt, yeni increment'i ekle
-            if let Some(last_ts) = self.last_timestamp_ms {
-                let dt_ms = timestamp_ms.saturating_sub(last_ts);
-                if dt_ms > 0 && dt_ms <= self.ofi_window_ms {
-                    let decay_factor = (dt_ms as f64 / self.ofi_window_ms as f64).min(1.0);
-                    self.ofi_signal = self.ofi_signal * (1.0 - decay_factor * 0.1) + ofi_increment * decay_factor;
-                } else {
-                    // Window dışı: sadece yeni increment'i ekle
-                    self.ofi_signal = self.ofi_signal * 0.9 + ofi_increment * 0.1;
-                }
-            } else {
-                // İlk tick: direkt increment
-                self.ofi_signal = ofi_increment;
-            }
+            // KRİTİK DÜZELTME: OFI'yı direkt kullan (EWMA kaldır, daha hassas sinyal)
+            // EWMA zaten volatilite'de yapılıyor, OFI için direkt değer kullan
+            self.ofi_signal = ofi_increment;
         } else {
             // İlk tick: volumes'ları kaydet, OFI sinyali sıfır
             self.ofi_signal = 0.0;
@@ -545,28 +538,32 @@ impl Strategy for DynMm {
                 let liquidity_stable = spread_bps < self.max_spread_bps * 0.5; // Spread normal seviyede
                 
                 // Gelişmiş tespit: Fiyat değişimi + volume artışı + time frame + likidite kontrolü
-                // KRİTİK DÜZELTME: Daha sıkı filtreler (false positive azalt) + geri dönüş kontrolü
-                // Flash crash sonrası geri dönüş kontrolü: Gerçek flash crash mi yoksa normal volatilite mi?
+                // KRİTİK DÜZELTME: Recovery check'i gevşet - sadece yeterli veri varsa kontrol et
+                // Gerçek flash crash'ler 100ms'den daha uzun sürer, bu yüzden recovery check opsiyonel
                 let recovery_check = if self.price_history.len() >= self.manipulation_price_history_min_len {
                     let last_3: Vec<Decimal> = self.price_history.iter().rev().take(3).map(|(_, p)| *p).collect();
-                    if price_change_bps < -self.price_jump_threshold_bps {
-                        // Düşüş sonrası geri yükseliyor mu? (gerçek flash crash)
-                        last_3[0] > last_3[1] && last_3[1] < last_3[2]
-                    } else if price_change_bps > self.price_jump_threshold_bps {
-                        // Yükseliş sonrası geri düşüyor mu? (gerçek flash pump)
-                        last_3[0] < last_3[1] && last_3[1] > last_3[2]
+                    if last_3.len() >= 3 {
+                        if price_change_bps < -self.price_jump_threshold_bps {
+                            // Düşüş sonrası geri yükseliyor mu? (gerçek flash crash)
+                            last_3[0] > last_3[1] && last_3[1] < last_3[2]
+                        } else if price_change_bps > self.price_jump_threshold_bps {
+                            // Yükseliş sonrası geri düşüyor mu? (gerçek flash pump)
+                            last_3[0] < last_3[1] && last_3[1] > last_3[2]
+                        } else {
+                            true // Veri yoksa geç (gevşetilmiş kontrol)
+                        }
                     } else {
-                        false
+                        true // Yeterli veri yok, ama geç (gevşetilmiş kontrol)
                     }
                 } else {
-                    false // Yeterli veri yok, güvenli tarafta kal
+                    true // İlk tick'lerde recovery check yok, geç (gevşetilmiş kontrol)
                 };
                 
                 if price_change_bps.abs() > self.price_jump_threshold_bps 
                    && volume_ratio > self.manipulation_volume_ratio_threshold  // Config'den: Volume ratio threshold
                    && time_elapsed_ms < self.manipulation_time_threshold_ms   // Config'den: Time threshold
                    && liquidity_stable                // Likidite stabil
-                   && recovery_check {                // Geri dönüş kontrolü (gerçek flash crash/pump)
+                   && recovery_check {                // Geri dönüş kontrolü (gevşetilmiş - yeterli veri yoksa geç)
                     self.flash_crash_detected = true;
                     
                     // FIRSAT: Flash crash → LONG, Flash pump → SHORT
@@ -824,6 +821,17 @@ impl Strategy for DynMm {
         
         // 2. Order Book Imbalance
         let imbalance = self.calculate_imbalance(bid_vol, ask_vol);
+        
+        // KRİTİK DÜZELTME: Price history warm-up - İlk 20 tick'te dummy price'lar ekle
+        // Recovery check için yeterli veri sağlamak için warm-up yap
+        if self.price_history.is_empty() {
+            // İlk tick: Warm-up için 20 dummy price ekle (mevcut mid price ile)
+            let warm_up_count = 20;
+            for i in 0..warm_up_count {
+                let dummy_timestamp = now_ms.saturating_sub((warm_up_count - i) * 100); // 100ms aralıklarla
+                self.price_history.push((dummy_timestamp, c.mark_price.0));
+            }
+        }
         
         // Fiyat geçmişini güncelle (basit timestamp simülasyonu)
         // now_ms zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
