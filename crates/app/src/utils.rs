@@ -344,8 +344,6 @@ pub async fn rate_limit_guard_default() {
 // Profit Guarantee and Tracking
 // ============================================================================
 
-use std::sync::Mutex;
-
 /// Profit guarantee calculator - ensures each trade is profitable after fees
 pub struct ProfitGuarantee {
     /// Minimum profit per trade in USD (e.g., 0.50 cents = 0.005 USD)

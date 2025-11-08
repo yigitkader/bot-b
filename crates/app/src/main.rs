@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
         )
         .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap: {}", e))?,
         // Config'den gelen değerler (yoksa default kullanılır)
-        min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(3.0),
+        min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(60.0), // Config'den: 60.0 (fee + kar garantisi)
         max_spread_bps: cfg.strategy.max_spread_bps.unwrap_or(100.0),
         spread_arbitrage_min_bps: cfg.strategy.spread_arbitrage_min_bps.unwrap_or(30.0),
         spread_arbitrage_max_bps: cfg.strategy.spread_arbitrage_max_bps.unwrap_or(200.0),
@@ -119,8 +119,8 @@ async fn main() -> Result<()> {
         volatility_coefficient: cfg.strategy.volatility_coefficient.unwrap_or(0.5),
         ofi_coefficient: cfg.strategy.ofi_coefficient.unwrap_or(0.5),
         min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
-        opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(2.0), // 5.0 → 2.0: daha güvenli
-        strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.5), // 3.0 → 1.5: daha güvenli
+        opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(1.05), // Config'den: 1.05 (konservatif)
+        strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.0), // Config'den: 1.0 (normal boyut)
         // Strategy internal config (config.yaml'den strategy_internal bölümünden)
         manipulation_volume_ratio_threshold: Some(cfg.strategy_internal.manipulation_volume_ratio_threshold),
         manipulation_time_threshold_ms: Some(cfg.strategy_internal.manipulation_time_threshold_ms),
@@ -178,6 +178,7 @@ async fn main() -> Result<()> {
             confidence_spread_max: dyn_cfg.confidence_spread_max,
             confidence_bonus_multiplier: dyn_cfg.confidence_bonus_multiplier,
             confidence_max_multiplier: dyn_cfg.confidence_max_multiplier,
+            confidence_min_threshold: dyn_cfg.confidence_min_threshold,
             trend_analysis_min_history: dyn_cfg.trend_analysis_min_history,
             trend_analysis_threshold_negative: dyn_cfg.trend_analysis_threshold_negative,
             trend_analysis_threshold_strong_negative: dyn_cfg.trend_analysis_threshold_strong_negative,
