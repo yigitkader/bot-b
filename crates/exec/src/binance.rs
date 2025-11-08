@@ -473,7 +473,18 @@ impl BinanceSpot {
             Side::Buy
         };
         let rules = self.rules_for(symbol).await?;
-        let qty = quantize_decimal(qty_dec.abs(), rules.step_size);
+        
+        // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
+        let qty_prec_from_step = scale_from_step(rules.step_size);
+        let qty_precision = qty_prec_from_step.min(rules.qty_precision);
+        
+        // Quantize: step_size'a göre floor
+        let qty_quantized = quantize_decimal(qty_dec.abs(), rules.step_size);
+        
+        // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
+        // Bu, "Precision is over the maximum" hatasını önler
+        let qty = qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+        
         if qty <= Decimal::ZERO {
             warn!(
                 %symbol,
@@ -482,7 +493,7 @@ impl BinanceSpot {
             );
             return Ok(());
         }
-        let qty_str = format_decimal_fixed(qty, rules.qty_precision);
+        let qty_str = format_decimal_fixed(qty, qty_precision);
 
         let params = vec![
             format!("symbol={}", symbol),
@@ -534,16 +545,8 @@ impl Venue for BinanceSpot {
         };
 
         let rules = self.rules_for(sym).await?;
-        let price = quantize_decimal(px.0, rules.tick_size);
-        let qty = quantize_decimal(qty.0.abs(), rules.step_size);
-        let notional = price * qty;
-        if !rules.min_notional.is_zero() && notional < rules.min_notional {
-            return Err(anyhow!(
-                "below min notional after clamps ({} < {})",
-                notional,
-                rules.min_notional
-            ));
-        }
+        
+        // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
         // Precision'ı tick_size ve step_size ile uyumlu hale getir
         // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
         let price_prec_from_tick = scale_from_step(rules.tick_size);
@@ -552,6 +555,26 @@ impl Venue for BinanceSpot {
         // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
         let price_precision = price_prec_from_tick.min(rules.price_precision);
         let qty_precision = qty_prec_from_step.min(rules.qty_precision);
+        
+        // Quantize: step_size'a göre floor
+        let price_quantized = quantize_decimal(px.0, rules.tick_size);
+        let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
+        
+        // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
+        // Bu, "Precision is over the maximum" hatasını önler
+        let price = price_quantized.round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
+        let qty = qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+        
+        let notional = price * qty;
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            return Err(anyhow!(
+                "below min notional after clamps ({} < {})",
+                notional,
+                rules.min_notional
+            ));
+        }
+        
+        // Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty, qty_precision);
 
@@ -1082,16 +1105,8 @@ impl Venue for BinanceFutures {
         };
 
         let rules = self.rules_for(sym).await?;
-        let price = quantize_decimal(px.0, rules.tick_size);
-        let qty = quantize_decimal(qty.0.abs(), rules.step_size);
-        let notional = price * qty;
-        if !rules.min_notional.is_zero() && notional < rules.min_notional {
-            return Err(anyhow!(
-                "below min notional after clamps ({} < {})",
-                notional,
-                rules.min_notional
-            ));
-        }
+        
+        // KRİTİK DÜZELTME: Precision'ı önce hesapla, sonra quantize et
         // Precision'ı tick_size ve step_size ile uyumlu hale getir
         // Exchange'in verdiği precision yanlış olabilir, bu yüzden tick_size'dan hesaplanan precision'ı öncelikli kullan
         let price_prec_from_tick = scale_from_step(rules.tick_size);
@@ -1100,6 +1115,26 @@ impl Venue for BinanceFutures {
         // Ama eğer exchange'in verdiği precision daha küçükse, onu kullan (daha güvenli)
         let price_precision = price_prec_from_tick.min(rules.price_precision);
         let qty_precision = qty_prec_from_step.min(rules.qty_precision);
+        
+        // Quantize: step_size'a göre floor
+        let price_quantized = quantize_decimal(px.0, rules.tick_size);
+        let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
+        
+        // KRİTİK: Quantize sonrası precision'a göre normalize et (internal precision'ı temizle)
+        // Bu, "Precision is over the maximum" hatasını önler
+        let price = price_quantized.round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
+        let qty = qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+        
+        let notional = price * qty;
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            return Err(anyhow!(
+                "below min notional after clamps ({} < {})",
+                notional,
+                rules.min_notional
+            ));
+        }
+        
+        // Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty, qty_precision);
 
