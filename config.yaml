@@ -80,7 +80,7 @@ strategy:
   
   # --- Diğer ---
   min_liquidity_required: 0.01     # Minimum likidite gereksinimi
-  opportunity_size_multiplier: 1.5 # Fırsat modu pozisyon çarpanı (2.0 → 1.5: daha güvenli)
+  opportunity_size_multiplier: 1.2 # Fırsat modu pozisyon çarpanı (1.5 → 1.2: daha güvenli, false positive riski azalt)
   strong_trend_multiplier: 1.2     # Güçlü trend pozisyon çarpanı (1.5 → 1.2: daha güvenli)
 
 exec:

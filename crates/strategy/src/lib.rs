@@ -117,7 +117,7 @@ fn default_inventory_threshold_ratio() -> f64 { 0.15 } // 0.05 → 0.15: daha to
 fn default_volatility_coefficient() -> f64 { 0.5 }
 fn default_ofi_coefficient() -> f64 { 0.5 }
 fn default_min_liquidity_required() -> f64 { 0.01 }
-fn default_opportunity_size_multiplier() -> f64 { 1.5 } // 2.0 → 1.5: daha güvenli
+fn default_opportunity_size_multiplier() -> f64 { 1.2 } // 1.5 → 1.2: daha güvenli, false positive riski azalt
 fn default_strong_trend_multiplier() -> f64 { 1.2 } // 1.5 → 1.2: daha güvenli
 
 pub struct DynMm {
@@ -486,11 +486,28 @@ impl Strategy for DynMm {
                 let liquidity_stable = spread_bps < self.max_spread_bps * 0.5; // Spread normal seviyede
                 
                 // Gelişmiş tespit: Fiyat değişimi + volume artışı + time frame + likidite kontrolü
-                // KRİTİK DÜZELTME: Daha sıkı filtreler (false positive azalt)
+                // KRİTİK DÜZELTME: Daha sıkı filtreler (false positive azalt) + geri dönüş kontrolü
+                // Flash crash sonrası geri dönüş kontrolü: Gerçek flash crash mi yoksa normal volatilite mi?
+                let recovery_check = if self.price_history.len() >= 3 {
+                    let last_3: Vec<Decimal> = self.price_history.iter().rev().take(3).map(|(_, p)| *p).collect();
+                    if price_change_bps < -self.price_jump_threshold_bps {
+                        // Düşüş sonrası geri yükseliyor mu? (gerçek flash crash)
+                        last_3[0] > last_3[1] && last_3[1] < last_3[2]
+                    } else if price_change_bps > self.price_jump_threshold_bps {
+                        // Yükseliş sonrası geri düşüyor mu? (gerçek flash pump)
+                        last_3[0] < last_3[1] && last_3[1] > last_3[2]
+                    } else {
+                        false
+                    }
+                } else {
+                    false // Yeterli veri yok, güvenli tarafta kal
+                };
+                
                 if price_change_bps.abs() > self.price_jump_threshold_bps 
                    && volume_ratio > 5.0              // Volume 5x veya daha fazla arttı (3x → 5x)
                    && time_elapsed_ms < 2000          // 2 saniye içinde (5s → 2s: daha keskin)
-                   && liquidity_stable {              // Likidite stabil
+                   && liquidity_stable                // Likidite stabil
+                   && recovery_check {                // Geri dönüş kontrolü (gerçek flash crash/pump)
                     self.flash_crash_detected = true;
                     
                     // FIRSAT: Flash crash → LONG, Flash pump → SHORT
@@ -1018,21 +1035,20 @@ impl Strategy for DynMm {
             pricing_base * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO)
         });
         
-        // KRİTİK DÜZELTME: Daha agresif crossing guard (fill rate artır)
-        // %0.01 tolerans ile best'e yakın emirler ver (pasif ama daha agresif)
+        // KRİTİK DÜZELTME: Crossing guard - 1 tick altına çek (maker olarak kal, fee düşük)
+        // Best bid'e eşitlemek = market order gibi → Agresif taker, fee daha yüksek
+        // 1 tick altına çek = maker order → Pasif, fee düşük
         if let Some(best_bid) = c.ob.best_bid {
-            let tolerance = best_bid.px.0 * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO); // %0.01 tolerans
-            if bid_px.0 > best_bid.px.0 + tolerance {
-                // Bid best bid'den %0.01'den fazla yüksek → best_bid'e eşitle (agresif)
-                bid_px = Px(best_bid.px.0);
+            if bid_px.0 >= best_bid.px.0 {
+                // Bid best bid'e eşit veya yüksek → best_bid'in 1 tick altına çek (maker olarak kal)
+                bid_px = Px((best_bid.px.0 - tick).max(Decimal::ZERO));
             }
         }
         // Ask: best_ask'den ASLA düşük olmamalı (eşitlik dahil) - pasif emir garantisi
         if let Some(best_ask) = c.ob.best_ask {
-            let tolerance = best_ask.px.0 * Decimal::try_from(0.0001).unwrap_or(Decimal::ZERO); // %0.01 tolerans
-            if ask_px.0 < best_ask.px.0 - tolerance {
-                // Ask best ask'den %0.01'den fazla düşük → best_ask'e eşitle (agresif)
-                ask_px = Px(best_ask.px.0);
+            if ask_px.0 <= best_ask.px.0 {
+                // Ask best ask'e eşit veya düşük → best_ask'in 1 tick üstüne çek (maker olarak kal)
+                ask_px = Px(best_ask.px.0 + tick);
             }
         }
         

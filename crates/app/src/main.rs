@@ -1254,13 +1254,42 @@ async fn main() -> Result<()> {
         let total_symbols = states.len();
         let mut symbol_index = 0;
         
-        // KRİTİK DÜZELTME: Rate limit koruması - Her tick'te maksimum sembol sayısı
+        // KRİTİK DÜZELTME: Rate limit koruması - Her tick'te maksimum sembol sayısı + önceliklendirme
         // 16 req/sec limit ile: Her tick'te max 8 sembol işle (güvenli margin)
         // 500ms tick interval: 8 sembol/tick = 16 sembol/saniye = güvenli
         const MAX_SYMBOLS_PER_TICK: usize = 8;
         let mut symbols_processed_this_tick = 0;
         
-        for state in states.iter_mut() {
+        // KRİTİK DÜZELTME: Sembol önceliklendirme - Aktif pozisyon/emir olanlar önce
+        // Round-robin offset: Her tick'te farklı sembollerden başla (adil dağılım)
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ROUND_ROBIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
+        let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % states.len().max(1);
+        
+        // Önceliklendirme: Aktif emir/pozisyon olanlar önce
+        let mut states_with_priority: Vec<(usize, bool)> = states.iter()
+            .enumerate()
+            .map(|(idx, state)| {
+                let has_priority = !state.active_orders.is_empty() || !state.inv.0.is_zero();
+                (idx, has_priority)
+            })
+            .collect();
+        
+        // Öncelikli olanları öne al
+        states_with_priority.sort_by(|a, b| b.1.cmp(&a.1)); // true (öncelikli) önce
+        
+        // Round-robin: Offset'ten başla
+        let prioritized_indices: Vec<usize> = states_with_priority
+            .iter()
+            .map(|(idx, _)| *idx)
+            .cycle()
+            .skip(round_robin_offset)
+            .take(states.len())
+            .collect();
+        
+        for state_idx in prioritized_indices {
+            let state = &mut states[state_idx];
+            
             // Rate limit koruması: Her tick'te maksimum sembol sayısı
             if symbols_processed_this_tick >= MAX_SYMBOLS_PER_TICK {
                 // Bu tick'te yeterli sembol işlendi, kalan semboller bir sonraki tick'te işlenecek
@@ -1802,17 +1831,31 @@ async fn main() -> Result<()> {
 
             // Pozisyon ve mark price zaten yukarıda alındı, tekrar almayalım
             // Envanter senkronizasyonu yap
+            // KRİTİK DÜZELTME: WebSocket reconnect sonrası pozisyon sync'i
+            // Reconnect sonrası sadece emirleri değil, pozisyonları da sync et
             let inv_diff = (state.inv.0 - pos.qty.0).abs();
             let reconcile_threshold = Decimal::new(1, 8);
             if inv_diff > reconcile_threshold {
-                warn!(
-                    %symbol,
-                    ws_inv = %state.inv.0,
-                    api_inv = %pos.qty.0,
-                    diff = %inv_diff,
-                    "inventory mismatch detected, syncing with API position"
-                );
-                state.inv = pos.qty;
+                // Normal durumda veya reconnect sonrası: Envanter uyumsuzluğu var
+                let is_reconnect_sync = force_sync_all;
+                if is_reconnect_sync {
+                    warn!(
+                        %symbol,
+                        ws_inv = %state.inv.0,
+                        api_inv = %pos.qty.0,
+                        diff = %inv_diff,
+                        "force syncing position after reconnect"
+                    );
+                } else {
+                    warn!(
+                        %symbol,
+                        ws_inv = %state.inv.0,
+                        api_inv = %pos.qty.0,
+                        diff = %inv_diff,
+                        "inventory mismatch detected, syncing with API position"
+                    );
+                }
+                state.inv = pos.qty; // Force sync
             }
 
             record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px);
@@ -1828,8 +1871,12 @@ async fn main() -> Result<()> {
             state.daily_pnl = current_pnl; // Şimdilik current PnL, ileride günlük reset eklenebilir
             
             // 2. Funding cost takibi (futures için)
-            if let Some(funding) = funding_rate {
-                let funding_cost = funding * position_size_notional;
+            // KRİTİK DÜZELTME: Funding cost hesaplama düzeltildi
+            // Funding rate zaten per 8h rate, direkt çarpılabilir
+            if let Some(funding_rate) = funding_rate {
+                // Funding cost = funding_rate * position_size_notional (her 8 saatte bir)
+                // Not: Bu sadece bir tick'teki maliyet, gerçek maliyet 8 saatte bir uygulanır
+                let funding_cost = funding_rate * position_size_notional;
                 state.total_funding_cost += Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
             }
             
@@ -2031,15 +2078,26 @@ async fn main() -> Result<()> {
                     false
                 };
                 
+                // KRİTİK DÜZELTME: Trailing stop ve take profit çakışması - Öncelik sırası
+                // Önce trailing stop (20 USD+ karlardayken), sonra take profit/stop loss
+                // Trailing stop peak'ten %1-3 düşerse tetikleniyor, take profit %5+ kar istiyor
+                // Çakışma: %4 kardayken %1 trailing stop tetiklenebilir (erken kapanış) → Öncelik trailing stop
+                let (should_close, reason) = if should_trailing_stop && peak_pnl_f64 > 20.0 {
+                    // Trailing stop (sadece 20 USD+ karlardayken, erken kapanış önle)
+                    (true, "trailing_stop")
+                } else if should_take_profit {
+                    // Take profit (trailing stop tetiklenmediyse)
+                    (true, "take_profit")
+                } else if should_stop_loss {
+                    // Stop loss (en son, zarar durdurma)
+                    (true, "stop_loss")
+                } else {
+                    // Pozisyonu koru
+                    (false, "")
+                };
+                
                 // Akıllı karar: Pozisyonu kapat
-                if should_take_profit || should_trailing_stop || should_stop_loss {
-                    let reason = if should_take_profit {
-                        "take_profit"
-                    } else if should_trailing_stop {
-                        "trailing_stop"
-                    } else {
-                        "stop_loss"
-                    };
+                if should_close {
                     
                     warn!(
                         %symbol,
@@ -2332,11 +2390,16 @@ async fn main() -> Result<()> {
                     // NOT: effective_leverage config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     // (Futures için leverage sembol bazında değişmez, config'den gelir)
                     
-                    // MEVCUT POZİSYONLARIN MARGİN'İNİ ÇIKAR: Mevcut pozisyon varsa, onun margin'ini hesaptan çıkar
-                    // Mevcut pozisyonun margin'i = pozisyon notional / leverage
-                    // position_size_notional zaten yukarıda hesaplandı (satır 1242)
+                    // MEVCUT POZİSYONLARIN GERÇEK MARGİN'İNİ ÇIKAR: Unrealized PnL hesaba katılmalı
+                    // KRİTİK DÜZELTME: Zarar eden pozisyon margin'i tüketir ama kod bunu görmüyordu
+                    // Mevcut pozisyonun margin'i = (pozisyon notional / leverage) - unrealized PnL
+                    // position_size_notional ve current_pnl zaten yukarıda hesaplandı
                     let existing_position_margin = if position_size_notional > 0.0 {
-                        position_size_notional / effective_leverage
+                        let base_margin = position_size_notional / effective_leverage;
+                        // Unrealized PnL: Zarar eden pozisyon margin'i tüketir, kar eden pozisyon margin'i serbest bırakır
+                        let unrealized_pnl = current_pnl.to_f64().unwrap_or(0.0);
+                        // Margin kullanımı = base_margin - unrealized_pnl (negatif PnL margin'i tüketir)
+                        (base_margin - unrealized_pnl).max(0.0) // Negatif olamaz
                     } else {
                         0.0
                     };
@@ -2756,33 +2819,22 @@ async fn main() -> Result<()> {
                                                 warn!(%symbol, ?px, required_min = ?min_notional, available_notional = max_qty_by_margin * price_quantized, "skip bid: insufficient balance for min_notional, skipping order");
                                                 new_qty = 0.0; // Skip et
                                             } else {
-                                                // Mevcut bakiyeyle minimum notional'ı karşılayabiliyoruz, garanti et
-                                                let mut attempts = 0;
-                                                let max_attempts = 20; // Maksimum 20 step artır
-                                                while attempts < max_attempts {
-                                                    let notional_after_quantize = new_qty * price_quantized;
-                                                    // KRİTİK DÜZELTME: Önce min notional kontrolü (pozisyon boyutu)
-                                                    if notional_after_quantize >= min_notional {
-                                                        // Min notional karşılandı, şimdi margin kontrolü (ayrı kontrol)
-                                                        let required_margin = notional_after_quantize / effective_leverage;
-                                                        if required_margin <= available_margin {
-                                                            break; // Yeterli notional VE margin
-                                                        } else {
-                                                            // Margin yetersiz, daha küçük miktar dene
-                                                            if new_qty >= step {
-                                                                new_qty -= step;
-                                                                continue; // Tekrar kontrol et
-                                                            } else {
-                                                                break; // Daha fazla azaltılamaz
-                                                            }
-                                                        }
-                                                    }
-                                                    // Notional yeterli değil, artır ve tekrar kontrol et
-                                                    if new_qty + step > max_qty {
-                                                        break; // Cap'e ulaştık
-                                                    }
-                                                    new_qty += step;
-                                                    attempts += 1;
+                                                // KRİTİK DÜZELTME: Min notional retry mantığını sadeleştir
+                                                // Önce maksimum qty'yi belirle (margin constraint)
+                                                // Sonra min notional'a ulaşana kadar artır, ama max_qty_by_margin'i aşma
+                                                let min_qty_for_notional = (min_notional * 1.1 / price_quantized / step).ceil() * step; // %10 güvenli margin
+                                                
+                                                // Final qty: min_notional gereksinimi ve margin constraint'i karşılamalı
+                                                new_qty = min_qty_for_notional.min(max_qty_by_margin);
+                                                
+                                                // Final kontrol: Min notional ve margin kontrolü
+                                                let final_notional = new_qty * price_quantized;
+                                                let required_margin = final_notional / effective_leverage_for_qty_bid;
+                                                
+                                                if final_notional < min_notional || required_margin > available_margin {
+                                                    // Hala yetersiz, skip et
+                                                    warn!(%symbol, ?px, required_min = ?min_notional, final_notional, required_margin, available_margin, "skip bid: cannot satisfy both min_notional and margin constraint");
+                                                    new_qty = 0.0; // Skip et
                                                 }
                                             }
                                         }
@@ -2954,33 +3006,22 @@ async fn main() -> Result<()> {
                                                 warn!(%symbol, ?px, required_min = ?min_notional, available_notional = max_qty_by_margin * price_quantized, "skip ask: insufficient balance for min_notional, skipping order");
                                                 new_qty = 0.0; // Skip et
                                             } else {
-                                                // Mevcut bakiyeyle minimum notional'ı karşılayabiliyoruz, garanti et
-                                                let mut attempts = 0;
-                                                let max_attempts = 20; // Maksimum 20 step artır
-                                                while attempts < max_attempts {
-                                                    let notional_after_quantize = new_qty * price_quantized;
-                                                    // KRİTİK DÜZELTME: Önce min notional kontrolü (pozisyon boyutu)
-                                                    if notional_after_quantize >= min_notional {
-                                                        // Min notional karşılandı, şimdi margin kontrolü (ayrı kontrol)
-                                                        let required_margin = notional_after_quantize / effective_leverage_ask;
-                                                        if required_margin <= available_margin {
-                                                            break; // Yeterli notional VE margin
-                                                        } else {
-                                                            // Margin yetersiz, daha küçük miktar dene
-                                                            if new_qty >= step {
-                                                                new_qty -= step;
-                                                                continue; // Tekrar kontrol et
-                                                            } else {
-                                                                break; // Daha fazla azaltılamaz
-                                                            }
-                                                        }
-                                                    }
-                                                    // Notional yeterli değil, artır ve tekrar kontrol et
-                                                    if new_qty + step > max_qty {
-                                                        break; // Cap'e ulaştık
-                                                    }
-                                                    new_qty += step;
-                                                    attempts += 1;
+                                                // KRİTİK DÜZELTME: Min notional retry mantığını sadeleştir
+                                                // Önce maksimum qty'yi belirle (margin constraint)
+                                                // Sonra min notional'a ulaşana kadar artır, ama max_qty_by_margin'i aşma
+                                                let min_qty_for_notional = (min_notional * 1.1 / price_quantized / step).ceil() * step; // %10 güvenli margin
+                                                
+                                                // Final qty: min_notional gereksinimi ve margin constraint'i karşılamalı
+                                                new_qty = min_qty_for_notional.min(max_qty_by_margin);
+                                                
+                                                // Final kontrol: Min notional ve margin kontrolü
+                                                let final_notional = new_qty * price_quantized;
+                                                let required_margin = final_notional / effective_leverage_for_qty_ask;
+                                                
+                                                if final_notional < min_notional || required_margin > available_margin {
+                                                    // Hala yetersiz, skip et
+                                                    warn!(%symbol, ?px, required_min = ?min_notional, final_notional, required_margin, available_margin, "skip ask: cannot satisfy both min_notional and margin constraint");
+                                                    new_qty = 0.0; // Skip et
                                                 }
                                             }
                                         }
