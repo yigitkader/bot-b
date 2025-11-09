@@ -3520,12 +3520,14 @@ async fn main() -> Result<()> {
                                         %symbol,
                                         chunk_idx,
                                         order_id,
-                                        margin_chunk = *margin_chunk,
+                                        margin_chunk = *margin_chunk,  // Hesaptan çıkan para (margin)
                                         lev = effective_leverage_for_chunk,
-                                        notional = chunk_notional_log,
+                                        notional = chunk_notional_log,  // Oluşan pozisyon (margin * leverage)
                                         qty_str = %qty_str,
                                         px_str = %price_str,
                                         min_spread_bps_used,
+                                        total_spent_so_far = total_spent_on_bids,  // Şu ana kadar kullanılan toplam margin
+                                        remaining_balance = caps.buy_total - total_spent_on_bids,  // Kalan bakiye
                                         "bid order created successfully (chunk)"
                                     );
                             }
@@ -3850,12 +3852,14 @@ async fn main() -> Result<()> {
                                         %symbol,
                                         chunk_idx,
                                         order_id,
-                                        margin_chunk = *margin_chunk,
+                                        margin_chunk = *margin_chunk,  // Hesaptan çıkan para (margin)
                                         lev = effective_leverage_for_chunk,
-                                        notional = chunk_notional_log,
+                                        notional = chunk_notional_log,  // Oluşan pozisyon (margin * leverage)
                                         qty_str = %qty_str,
                                         px_str = %price_str,
                                         min_spread_bps_used,
+                                        total_spent_so_far = total_spent_on_bids + total_spent_on_asks,  // Şu ana kadar kullanılan toplam margin (bid + ask)
+                                        remaining_balance = caps.buy_total - total_spent_on_bids - total_spent_on_asks,  // Kalan bakiye
                                         "ask order created successfully (chunk)"
                                     );
                                 }

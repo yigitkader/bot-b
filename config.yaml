@@ -42,10 +42,10 @@ risk:
   inv_cap: "0.50"
   min_liq_gap_bps: 300
   dd_limit_bps: 2000
-  max_leverage: 50  # 20x-50x desteklenecek
+  max_leverage: 100  # 20x-50x desteklenecek
   slippage_bps_reserve: 2.0  # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
   use_isolated_margin: true  # Isolated margin kullan (20x-50x için kritik)
-  max_open_chunks_per_symbol_per_side: 2  # Sembol başına yönde maksimum açık chunk sayısı
+  max_open_chunks_per_symbol_per_side: 5  # Sembol başına yönde maksimum açık chunk sayısı
 
 strategy:
   type: "dyn_mm"
@@ -177,11 +177,11 @@ internal:
   stop_loss_trend_threshold: -0.2       # %20 trend düşüşü
   
   # Pozisyon boyutu risk kontrolü
-  max_position_size_buffer: 5.0  # 5x buffer
+  max_position_size_buffer: 10.0  # 10x buffer (5.0 → 10.0: daha fazla pozisyon boyutuna izin ver)
   opportunity_mode_position_multiplier: 2.0  # Fırsat modunda pozisyon çarpanı (normal 1x)
   opportunity_mode_leverage_reduction: 0.5  # Fırsat modunda leverage azaltma faktörü (0.5 = yarıya düşür)
-  opportunity_mode_soft_limit_ratio: 0.8  # Soft limit: Yeni emirleri durdur (%80)
-  opportunity_mode_medium_limit_ratio: 0.9  # Medium limit: Mevcut emirleri azalt (%90)
+  opportunity_mode_soft_limit_ratio: 0.95  # Soft limit: Yeni emirleri durdur (%95) (0.8 → 0.95: daha yüksek threshold)
+  opportunity_mode_medium_limit_ratio: 1.0  # Medium limit: Mevcut emirleri azalt (%100) (0.9 → 1.0: hard limit)
   opportunity_mode_hard_limit_ratio: 1.0  # Hard limit: Force-close (%100)
   
   # Risk/Reward ve Profit Guarantee

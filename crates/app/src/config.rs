@@ -353,7 +353,7 @@ fn default_ws_reconnect_delay() -> u64 { 5_000 }
 fn default_ws_ping_interval() -> u64 { 30_000 }
 fn default_slippage_bps_reserve() -> f64 { 2.0 } // Default: 2 bps slippage reserve
 fn default_use_isolated_margin() -> bool { true } // Default: isolated margin kullan
-fn default_max_open_chunks_per_symbol_per_side() -> usize { 2 } // Default: sembol başına yönde max 2 chunk
+fn default_max_open_chunks_per_symbol_per_side() -> usize { 5 } // Default: sembol başına yönde max 5 chunk
 fn default_pnl_history_max_len() -> usize { 1024 }
 fn default_position_size_history_max_len() -> usize { 100 }
 fn default_max_symbols_per_tick() -> usize { 8 }
@@ -388,11 +388,11 @@ fn default_trailing_stop_min_peak() -> f64 { 0.01 }
 fn default_stop_loss_threshold() -> f64 { -0.005 }
 fn default_stop_loss_time_threshold_ms() -> u64 { 120_000 }
 fn default_stop_loss_trend_threshold() -> f64 { -0.2 }
-fn default_max_position_size_buffer() -> f64 { 5.0 }
+fn default_max_position_size_buffer() -> f64 { 10.0 }
 fn default_opportunity_mode_position_multiplier() -> f64 { 2.0 }
 fn default_opportunity_mode_leverage_reduction() -> f64 { 0.5 }
-fn default_opportunity_mode_soft_limit_ratio() -> f64 { 0.8 } // %80'de yeni emirleri durdur
-fn default_opportunity_mode_medium_limit_ratio() -> f64 { 0.9 } // %90'da mevcut emirleri azalt
+fn default_opportunity_mode_soft_limit_ratio() -> f64 { 0.95 } // %95'te yeni emirleri durdur
+fn default_opportunity_mode_medium_limit_ratio() -> f64 { 1.0 } // %100'de mevcut emirleri azalt (hard limit)
 fn default_opportunity_mode_hard_limit_ratio() -> f64 { 1.0 } // %100'de force-close
 fn default_min_risk_reward_ratio() -> f64 { 2.0 }
 fn default_take_profit_position_size_threshold() -> f64 { 100.0 }
