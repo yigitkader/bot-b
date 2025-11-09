@@ -43,6 +43,16 @@ pub trait Strategy: Send + Sync {
     fn is_opportunity_mode(&self) -> bool {
         false // Default: fırsat modu yok
     }
+    /// Trend bilgisini döndür (basis points cinsinden)
+    /// Pozitif = uptrend, Negatif = downtrend
+    fn get_trend_bps(&self) -> f64 {
+        0.0 // Default: trend bilgisi yok
+    }
+    /// Volatilite bilgisini döndür (EWMA volatilite)
+    /// Yüksek volatilite = daha riskli = küçük chunk boyutu
+    fn get_volatility(&self) -> f64 {
+        0.0 // Default: volatilite bilgisi yok
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1625,6 +1635,16 @@ impl Strategy for DynMm {
 
     fn is_opportunity_mode(&self) -> bool {
         self.manipulation_opportunity.is_some()
+    }
+    
+    fn get_trend_bps(&self) -> f64 {
+        // Mevcut detect_trend() metodunu kullan
+        self.detect_trend()
+    }
+    
+    fn get_volatility(&self) -> f64 {
+        // EWMA volatilite'yi döndür
+        self.ewma_volatility
     }
 }
 

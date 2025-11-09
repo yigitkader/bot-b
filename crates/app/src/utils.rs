@@ -427,6 +427,56 @@ pub fn clamp_price_to_market_distance(
     price.max(min_price).min(max_price)
 }
 
+/// Analyze order book depth to find optimal price level
+/// 
+/// # Arguments
+/// * `order_book` - Order book with top bids/asks
+/// * `side` - Order side (Buy or Sell)
+/// * `min_required_volume_usd` - Minimum required volume in USD for a level to be considered
+/// * `best_bid` - Best bid price (fallback)
+/// * `best_ask` - Best ask price (fallback)
+/// 
+/// # Returns
+/// Optimal price based on depth analysis, or best_bid/best_ask if no suitable level found
+pub fn find_optimal_price_from_depth(
+    order_book: &bot_core::types::OrderBook,
+    side: bot_core::types::Side,
+    min_required_volume_usd: f64,
+    best_bid: Decimal,
+    best_ask: Decimal,
+) -> Decimal {
+    match side {
+        bot_core::types::Side::Buy => {
+            // BID: En yüksek volume'lu level'ı bul (best_bid'e yakın)
+            if let Some(top_bids) = &order_book.top_bids {
+                for level in top_bids.iter() {
+                    let level_volume_usd = (level.px.0 * level.qty.0).to_f64().unwrap_or(0.0);
+                    // Yeterli volume varsa ve best_bid'e yakınsa kullan
+                    if level_volume_usd >= min_required_volume_usd && level.px.0 <= best_bid {
+                        return level.px.0;
+                    }
+                }
+            }
+            // Fallback: best_bid
+            best_bid
+        }
+        bot_core::types::Side::Sell => {
+            // ASK: En yüksek volume'lu level'ı bul (best_ask'e yakın)
+            if let Some(top_asks) = &order_book.top_asks {
+                for level in top_asks.iter() {
+                    let level_volume_usd = (level.px.0 * level.qty.0).to_f64().unwrap_or(0.0);
+                    // Yeterli volume varsa ve best_ask'e yakınsa kullan
+                    if level_volume_usd >= min_required_volume_usd && level.px.0 >= best_ask {
+                        return level.px.0;
+                    }
+                }
+            }
+            // Fallback: best_ask
+            best_ask
+        }
+    }
+}
+
 /// Adjust price for aggressiveness based on trend and manipulation
 /// 
 /// # Arguments

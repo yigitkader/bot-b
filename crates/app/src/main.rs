@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
-use utils::{adjust_price_for_aggressiveness, calc_net_pnl_usd, calc_qty_from_margin, clamp_price_to_market_distance, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
+use utils::{adjust_price_for_aggressiveness, calc_net_pnl_usd, calc_qty_from_margin, clamp_price_to_market_distance, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, find_optimal_price_from_depth, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
 
 use std::cmp::max;
 use std::collections::HashMap;
@@ -2368,33 +2368,112 @@ async fn main() -> Result<()> {
                 // Kural 1: Sabit TP ($0.50) - Her zaman çalışır (yaş sınırı yok)
                 let should_close_tp = net_pnl >= tp_usd;
                 
-                // Kural 2: Time-box ve direkt kazanç alma
-                // - İlk 20 saniye: Net kâr >= $0.50 ise kapat (hedef kar)
-                // - 20 saniyeden sonra: Direkt kazancı al (net_pnl > 0 ise kapat)
-                // Tek amaç: artacak mı azalacak mı - küçük kazançları hızlı al
-                let should_close_timebox = if let Some(entry_time) = state.position_entry_time {
+                // Kural 2: AKILLI POZİSYON YÖNETİMİ - Çoklu faktör analizi
+                // Faktörler:
+                // 1. Time-weighted profit: İlk saniyelerde daha agresif, sonra daha toleranslı
+                // 2. Trend takibi: Pozisyon yönü ile trend aynı yöndeyse daha uzun tut
+                // 3. Momentum: Hızlı hareket varsa daha agresif kapat
+                // 4. Volatilite: Yüksek volatilitede daha hızlı kapat
+                // 5. Peak PnL trailing: En yüksek kardan belirli bir düşüş varsa kapat
+                // 6. Drawdown: Belirli bir zarara ulaşırsa kapat
+                // 7. Recovery: Zarardan kâra dönüşünce hemen kapat (küçük kâr bile olsa)
+                let should_close_smart = if let Some(entry_time) = state.position_entry_time {
                     let age_secs = entry_time.elapsed().as_secs();
-                    if age_secs <= timebox_secs {
-                        // İlk 20 saniye: Net kâr >= $0.50 ise kapat (hedef kar)
-                        net_pnl >= tp_usd
+                    let age_secs_f64 = age_secs as f64;
+                    
+                    // 1. TIME-WEIGHTED PROFIT: İlk saniyelerde daha agresif
+                    // İlk 10 saniye: $0.30+ kâr varsa kapat (çok agresif)
+                    // 10-20 saniye: $0.50+ kâr varsa kapat (hedef kar)
+                    // 20-60 saniye: $0.20+ kâr varsa kapat (toleranslı)
+                    // 60+ saniye: $0.10+ kâr varsa kapat (çok toleranslı)
+                    let time_weighted_threshold = if age_secs_f64 <= 10.0 {
+                        tp_usd * 0.6  // İlk 10 saniye: $0.30
+                    } else if age_secs_f64 <= 20.0 {
+                        tp_usd       // 10-20 saniye: $0.50
+                    } else if age_secs_f64 <= 60.0 {
+                        tp_usd * 0.4 // 20-60 saniye: $0.20
                     } else {
-                        // 20 saniyeden sonra: Direkt kazancı al (net_pnl > 0 ise kapat)
-                        // Küçük kazançlar peşindeyiz, beklemeden al
-                        net_pnl > 0.0
-                    }
+                        tp_usd * 0.2 // 60+ saniye: $0.10
+                    };
+                    
+                    // 2. TREND TAKİBİ: Pozisyon yönü ile trend aynı yöndeyse daha uzun tut
+                    let trend_bps = state.strategy.get_trend_bps();
+                    let position_side = if pos.qty.0.is_sign_positive() { 1.0 } else { -1.0 };
+                    let trend_aligned = (trend_bps > 0.0 && position_side > 0.0) || (trend_bps < 0.0 && position_side < 0.0);
+                    let trend_factor = if trend_aligned {
+                        1.3  // Trend ile aynı yönde: %30 daha toleranslı (daha uzun tut)
+                    } else {
+                        0.8  // Trend ile ters yönde: %20 daha agresif (daha hızlı kapat)
+                    };
+                    
+                    // 3. MOMENTUM: PnL trend'ine bak (son 10 snapshot)
+                    let momentum_factor = if pnl_trend > 0.1 {
+                        1.2  // Pozitif momentum: %20 daha toleranslı (daha uzun tut)
+                    } else if pnl_trend < -0.1 {
+                        0.7  // Negatif momentum: %30 daha agresif (daha hızlı kapat)
+                    } else {
+                        1.0  // Nötr momentum: Normal
+                    };
+                    
+                    // 4. VOLATİLİTE: Yüksek volatilitede daha hızlı kapat
+                    let volatility = state.strategy.get_volatility();
+                    let volatility_factor = if volatility > 0.05 {
+                        0.7  // Yüksek volatilite: %30 daha agresif
+                    } else if volatility < 0.01 {
+                        1.2  // Düşük volatilite: %20 daha toleranslı
+                    } else {
+                        1.0  // Normal volatilite: Normal
+                    };
+                    
+                    // 5. PEAK PNL TRAILING: En yüksek kardan belirli bir düşüş varsa kapat
+                    let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
+                    let drawdown_from_peak = peak_pnl_f64 - net_pnl;
+                    let trailing_stop_threshold = tp_usd * 0.5; // $0.25 trailing stop
+                    let should_close_trailing = peak_pnl_f64 > tp_usd && drawdown_from_peak > trailing_stop_threshold;
+                    
+                    // 6. DRAWDOWN: Belirli bir zarara ulaşırsa kapat (risk yönetimi)
+                    let max_loss_threshold = -tp_usd * 2.0; // -$1.00 max loss
+                    let should_close_drawdown = net_pnl < max_loss_threshold;
+                    
+                    // 7. RECOVERY (ZARARDAN KURTULMA): Zarardan kâra dönüşünce hemen kapat
+                    // Senaryo: 20 saniye geçti, zarardasın, 30 saniye sonra kar ettin
+                    // Çözüm: Zarardan kurtulunca (net_pnl > 0) hemen kapat (küçük kâr bile olsa)
+                    let was_in_loss = state.pnl_history.len() >= 2 && {
+                        // Son 2 snapshot'a bak: Zararda mıydık?
+                        let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);
+                        prev_pnl < 0.0
+                    };
+                    let should_close_recovery = was_in_loss && net_pnl > 0.0;
+                    
+                    // Kombine threshold: Tüm faktörleri birleştir
+                    let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
+                    
+                    // Kapatma kararı: Threshold'u geçtiyse veya trailing/drawdown/recovery tetiklendiyse
+                    let should_close_by_threshold = net_pnl >= combined_threshold;
+                    
+                    should_close_by_threshold || should_close_trailing || should_close_drawdown || should_close_recovery
                 } else {
                     false
                 };
                 
                 // Kapatma kararı
-                if (should_close_tp || should_close_timebox) && !state.position_closing && can_attempt_close {
+                if (should_close_tp || should_close_smart) && !state.position_closing && can_attempt_close {
                     state.position_closing = true;
                     state.last_close_attempt = Some(Instant::now());
                     
+                    // Recovery durumunu kontrol et (zarardan kâra dönüş)
+                    let was_in_loss = state.pnl_history.len() >= 2 && {
+                        let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);
+                        prev_pnl < 0.0
+                    };
+                    let is_recovery = was_in_loss && net_pnl > 0.0;
+                    
                     let reason = if should_close_tp {
                         format!("fixed_tp_{:.2}_usd", net_pnl)
+                    } else if is_recovery {
+                        format!("recovery_exit_{:.2}_usd", net_pnl)
                     } else {
-                        format!("timebox_20s_net_{:.2}_usd", net_pnl)
+                        format!("smart_exit_{:.2}_usd", net_pnl)
                     };
                     
                     info!(
@@ -2406,8 +2485,8 @@ async fn main() -> Result<()> {
                         qty = %qty_abs,
                         position_side = ?position_side,
                         should_close_tp,
-                        should_close_timebox,
-                        "KRİTİK: Closing position (fixed TP or time-box rule triggered)"
+                        should_close_smart,
+                        "KRİTİK: Closing position (fixed TP or smart exit rule triggered)"
                     );
                     
                     // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
@@ -2772,6 +2851,9 @@ async fn main() -> Result<()> {
             // Per-symbol tick_size'ı Context'e geç (crossing guard için)
             let tick_size_f64 = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
             let tick_size_decimal = Decimal::from_f64_retain(tick_size_f64);
+            
+            // OrderBook'u clone et (chunk loop içinde market depth analizi için)
+            let ob_clone = ob.clone();
             
             let ctx = Context {
                 ob,
@@ -3295,17 +3377,29 @@ async fn main() -> Result<()> {
                         let is_opportunity_mode = state.strategy.is_opportunity_mode();
                         
                         // Pozisyon varsa daha toleranslı, yoksa daha sıkı
-                        let max_distance_pct = if position_size_notional > 0.0 {
+                        let base_distance_pct = if position_size_notional > 0.0 {
                             cfg.internal.order_price_distance_with_position // %0.5
                         } else {
                             cfg.internal.order_price_distance_no_position // %0.3
                         };
                         
-                        // Trend bilgisi: Strategy'den al (şimdilik 0, ileride entegre edilebilir)
-                        // TODO: Strategy trait'ine get_trend_bps() metodu eklenebilir
-                        let trend_bps = 0.0;
+                        // ADAPTİF FİYATLANDIRMA: Fill rate'e göre dinamik distance ayarla
+                        // Düşük fill rate = emirler doldurulmuyor = daha yakın fiyat
+                        let fill_rate_factor = if state.order_fill_rate < 0.3 {
+                            0.5  // Fill rate çok düşük: %50 daha yakın (çok agresif)
+                        } else if state.order_fill_rate < 0.6 {
+                            0.7  // Fill rate düşük: %30 daha yakın (agresif)
+                        } else {
+                            1.0  // Fill rate iyi: Normal mesafe
+                        };
+                        
+                        let max_distance_pct = base_distance_pct * fill_rate_factor;
+                        
+                        // Trend bilgisi: Strategy'den al
+                        let trend_bps = state.strategy.get_trend_bps();
                         
                         // Agresif fiyatlandırma: best_bid'e çok yakın (hızlı fill için)
+                        // Adaptif distance ile fill rate'e göre otomatik ayarlanıyor
                         let px_clamped = adjust_price_for_aggressiveness(
                             px.0,
                             bid.0,
@@ -3317,10 +3411,35 @@ async fn main() -> Result<()> {
                         );
                         let px = Px(px_clamped);
                         
+                        // Debug log: Adaptif fiyatlandırma bilgisi
+                        if state.order_fill_rate < 0.6 {
+                            debug!(
+                                %symbol,
+                                fill_rate = state.order_fill_rate,
+                                base_distance_pct,
+                                fill_rate_factor,
+                                adaptive_distance_pct = max_distance_pct,
+                                "adaptif fiyatlandırma: düşük fill rate nedeniyle daha yakın fiyat (bid)"
+                            );
+                        }
+                        
                         // KRİTİK: Margin chunking - available margin'ı 10-100 USD chunk'larına böl
                         let available_margin_for_bids = (caps.buy_total - total_spent_on_bids).max(0.0);
-                        let min_margin = cfg.min_usd_per_order.unwrap_or(10.0);
-                        let max_margin = cfg.max_usd_per_order;
+                        
+                        // VOLATİLİTE BAZLI POSITION SIZING: Yüksek volatilite = küçük chunk
+                        let volatility = state.strategy.get_volatility();
+                        let base_chunk_size: f64 = 50.0; // Ortalama chunk boyutu
+                        let volatility_factor: f64 = if volatility > 0.05 {
+                            0.6  // Yüksek volatilite (>%5): %40 daha küçük chunk
+                        } else if volatility < 0.01 {
+                            1.2  // Düşük volatilite (<%1): %20 daha büyük chunk
+                        } else {
+                            1.0  // Normal volatilite: Normal chunk
+                        };
+                        
+                        let adaptive_chunk_size: f64 = base_chunk_size * volatility_factor;
+                        let min_margin: f64 = (adaptive_chunk_size * 0.2).max(cfg.min_usd_per_order.unwrap_or(10.0)).min(100.0);
+                        let max_margin: f64 = (adaptive_chunk_size * 2.0).min(cfg.max_usd_per_order).max(10.0);
                         
                         let margin_chunks = split_margin_into_chunks(
                             available_margin_for_bids,
@@ -3367,10 +3486,27 @@ async fn main() -> Result<()> {
                                 effective_leverage
                             };
                             
+                            // MARKET DEPTH ANALİZİ: Order book depth'e göre optimal fiyat seç
+                            // Minimum required volume: Chunk notional'in %50'si (güvenli fill için)
+                            let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
+                            let min_required_volume_usd = chunk_notional_estimate * 0.5;
+                            
+                            // Depth analizi ile optimal fiyat bul
+                            let optimal_price_from_depth = find_optimal_price_from_depth(
+                                &ob_clone,
+                                Side::Buy,
+                                min_required_volume_usd,
+                                bid.0,
+                                ask.0,
+                            );
+                            
+                            // Strategy price ile depth price arasında en iyisini seç (market'e daha yakın olan)
+                            let px_with_depth = px.0.max(optimal_price_from_depth).min(bid.0);
+                            
                             let qty_price_result = calc_qty_from_margin(
                                 *margin_chunk,
                                 effective_leverage_for_chunk,
-                                px.0,
+                                px_with_depth,
                                 rules,
                                 Side::Buy, // BID için
                             );
@@ -3669,17 +3805,29 @@ async fn main() -> Result<()> {
                         let is_opportunity_mode = state.strategy.is_opportunity_mode();
                         
                         // Pozisyon varsa daha toleranslı, yoksa daha sıkı
-                        let max_distance_pct = if position_size_notional > 0.0 {
+                        let base_distance_pct = if position_size_notional > 0.0 {
                             cfg.internal.order_price_distance_with_position // %0.5
                         } else {
                             cfg.internal.order_price_distance_no_position // %0.3
                         };
                         
-                        // Trend bilgisi: Strategy'den al (şimdilik 0, ileride entegre edilebilir)
-                        // TODO: Strategy trait'ine get_trend_bps() metodu eklenebilir
-                        let trend_bps = 0.0;
+                        // ADAPTİF FİYATLANDIRMA: Fill rate'e göre dinamik distance ayarla
+                        // Düşük fill rate = emirler doldurulmuyor = daha yakın fiyat
+                        let fill_rate_factor = if state.order_fill_rate < 0.3 {
+                            0.5  // Fill rate çok düşük: %50 daha yakın (çok agresif)
+                        } else if state.order_fill_rate < 0.6 {
+                            0.7  // Fill rate düşük: %30 daha yakın (agresif)
+                        } else {
+                            1.0  // Fill rate iyi: Normal mesafe
+                        };
+                        
+                        let max_distance_pct = base_distance_pct * fill_rate_factor;
+                        
+                        // Trend bilgisi: Strategy'den al
+                        let trend_bps = state.strategy.get_trend_bps();
                         
                         // Agresif fiyatlandırma: best_ask'e çok yakın (hızlı fill için)
+                        // Adaptif distance ile fill rate'e göre otomatik ayarlanıyor
                         let px_clamped = adjust_price_for_aggressiveness(
                             px.0,
                             bid.0,
@@ -3690,6 +3838,18 @@ async fn main() -> Result<()> {
                             max_distance_pct,
                         );
                         let px = Px(px_clamped);
+                        
+                        // Debug log: Adaptif fiyatlandırma bilgisi
+                        if state.order_fill_rate < 0.6 {
+                            debug!(
+                                %symbol,
+                                fill_rate = state.order_fill_rate,
+                                base_distance_pct,
+                                fill_rate_factor,
+                                adaptive_distance_pct = max_distance_pct,
+                                "adaptif fiyatlandırma: düşük fill rate nedeniyle daha yakın fiyat (ask)"
+                            );
+                        }
                         
                         let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı
                         
@@ -3702,8 +3862,21 @@ async fn main() -> Result<()> {
                         // KRİTİK: Margin chunking - available margin'ı 10-100 USD chunk'larına böl
                         // Ask'ler bid'lerden sonra kalan bakiyeyi kullanır
                         let available_margin_for_asks = (caps.buy_total - total_spent_on_bids - total_spent_on_asks).max(0.0);
-                        let min_margin = cfg.min_usd_per_order.unwrap_or(10.0);
-                        let max_margin = cfg.max_usd_per_order;
+                        
+                        // VOLATİLİTE BAZLI POSITION SIZING: Yüksek volatilite = küçük chunk
+                        let volatility = state.strategy.get_volatility();
+                        let base_chunk_size = 50.0; // Ortalama chunk boyutu
+                        let volatility_factor = if volatility > 0.05 {
+                            0.6  // Yüksek volatilite (>%5): %40 daha küçük chunk
+                        } else if volatility < 0.01 {
+                            1.2  // Düşük volatilite (<%1): %20 daha büyük chunk
+                        } else {
+                            1.0  // Normal volatilite: Normal chunk
+                        };
+                        
+                        let adaptive_chunk_size: f64 = base_chunk_size * volatility_factor;
+                        let min_margin: f64 = (adaptive_chunk_size * 0.2).max(cfg.min_usd_per_order.unwrap_or(10.0)).min(100.0);
+                        let max_margin: f64 = (adaptive_chunk_size * 2.0).min(cfg.max_usd_per_order).max(10.0);
                         
                         let margin_chunks = split_margin_into_chunks(
                             available_margin_for_asks,
@@ -3746,14 +3919,31 @@ async fn main() -> Result<()> {
                             // calc_qty_from_margin kullanarak qty hesapla
                             let effective_leverage_for_chunk = if state.strategy.is_opportunity_mode() {
                                 effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
-                                            } else {
+                            } else {
                                 effective_leverage_ask
                             };
+                            
+                            // MARKET DEPTH ANALİZİ: Order book depth'e göre optimal fiyat seç
+                            // Minimum required volume: Chunk notional'in %50'si (güvenli fill için)
+                            let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
+                            let min_required_volume_usd = chunk_notional_estimate * 0.5;
+                            
+                            // Depth analizi ile optimal fiyat bul
+                            let optimal_price_from_depth = find_optimal_price_from_depth(
+                                &ob_clone,
+                                Side::Sell,
+                                min_required_volume_usd,
+                                bid.0,
+                                ask.0,
+                            );
+                            
+                            // Strategy price ile depth price arasında en iyisini seç (market'e daha yakın olan)
+                            let px_with_depth = px.0.min(optimal_price_from_depth).max(ask.0);
                             
                             let qty_price_result = calc_qty_from_margin(
                                 *margin_chunk,
                                 effective_leverage_for_chunk,
-                                px.0,
+                                px_with_depth,
                                 rules,
                                 Side::Sell, // ASK için
                             );
