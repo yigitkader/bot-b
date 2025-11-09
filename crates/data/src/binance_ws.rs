@@ -72,7 +72,7 @@ impl UserDataStream {
         client: &Client,
         base: &str,
         api_key: &str,
-        kind: UserStreamKind,
+        _kind: UserStreamKind,
     ) -> Result<String> {
         let base = base.trim_end_matches('/');
         let endpoint = format!("{}/fapi/v1/listenKey", base);

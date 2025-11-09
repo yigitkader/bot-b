@@ -53,6 +53,15 @@ pub trait Strategy: Send + Sync {
     fn get_volatility(&self) -> f64 {
         0.0 // Default: volatilite bilgisi yok
     }
+    /// Volatilite bilgisini bps cinsinden döndür
+    fn get_volatility_bps(&self) -> f64 {
+        let vol = self.get_volatility();
+        (vol.sqrt() * 10000.0).max(0.0) // sqrt(σ²) * 10000 = bps
+    }
+    /// OFI (Order Flow Imbalance) sinyalini döndür
+    fn get_ofi_signal(&self) -> f64 {
+        0.0 // Default: OFI bilgisi yok
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1645,6 +1654,15 @@ impl Strategy for DynMm {
     fn get_volatility(&self) -> f64 {
         // EWMA volatilite'yi döndür
         self.ewma_volatility
+    }
+    
+    fn get_volatility_bps(&self) -> f64 {
+        let vol = self.ewma_volatility;
+        (vol.sqrt() * 10000.0).max(0.0) // sqrt(σ²) * 10000 = bps
+    }
+    
+    fn get_ofi_signal(&self) -> f64 {
+        self.ofi_signal
     }
 }
 

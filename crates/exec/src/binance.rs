@@ -269,6 +269,7 @@ struct FutPosition {
     #[serde(rename = "liquidationPrice")]
     liquidation_price: String,
     #[serde(rename = "positionSide", default)]
+    #[allow(dead_code)]
     position_side: Option<String>, // "LONG" | "SHORT" | "BOTH" (hedge mode) veya None (one-way mode)
     #[serde(rename = "marginType", default)]
     margin_type: String, // "isolated" or "cross"
@@ -792,19 +793,130 @@ impl BinanceFutures {
                     }
                 }
                 Err(e) => {
-                    if attempt < max_attempts - 1 {
+                    let error_str = e.to_string();
+                    let error_lower = error_str.to_lowercase();
+                    
+                    // KRİTİK DÜZELTME: MIN_NOTIONAL hatası yakalama (-1013 veya "min notional")
+                    // Küçük "artık" miktarlarda reduce-only market close borsa min_notional eşiğini sağlamayabilir
+                    if error_lower.contains("-1013") || error_lower.contains("min notional") || error_lower.contains("min_notional") {
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
                             error = %e,
-                            "failed to close position, retrying..."
+                            remaining_qty = %remaining_qty,
+                            min_notional = %rules.min_notional,
+                            "MIN_NOTIONAL error in reduce-only market close, trying limit reduce-only fallback"
                         );
-                        // KRİTİK DÜZELTME: Retry öncesi bekleme eklendi
-                        // Hızlı retry'ler exchange'i overload edebilir
-                        tokio::time::sleep(Duration::from_millis(500)).await; // Retry öncesi 500ms bekle
-                        continue;
+                        
+                        // Fallback: Limit reduce-only ile karşı tarafta 1-2 tick avantajlı pasif bırak
+                        let (best_bid, best_ask) = match self.best_prices(sym).await {
+                            Ok(prices) => prices,
+                            Err(e2) => {
+                                warn!(symbol = %sym, error = %e2, "failed to fetch best prices for limit fallback");
+                                if attempt < max_attempts - 1 {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    continue;
+                                } else {
+                                    return Err(anyhow!("MIN_NOTIONAL error and limit fallback failed: {}", e));
+                                }
+                            }
+                        };
+                        
+                        // Limit reduce-only emri: karşı tarafta 1-2 tick avantajlı
+                        let tick_size = rules.tick_size;
+                        let limit_price = if matches!(side, Side::Buy) {
+                            // Short kapatma: Buy limit, bid'den 1 tick yukarı (maker olabilir)
+                            best_bid.0 + tick_size
+                        } else {
+                            // Long kapatma: Sell limit, ask'ten 1 tick aşağı (maker olabilir)
+                            best_ask.0 - tick_size
+                        };
+                        
+                        let limit_price_quantized = quantize_decimal(limit_price, tick_size);
+                        let limit_price_str = format_decimal_fixed(limit_price_quantized, rules.price_precision);
+                        
+                        // Limit reduce-only emri gönder
+                        let mut limit_params = vec![
+                            format!("symbol={}", sym),
+                            format!("side={}", if matches!(side, Side::Buy) { "BUY" } else { "SELL" }),
+                            "type=LIMIT".to_string(),
+                            "timeInForce=GTC".to_string(),
+                            format!("price={}", limit_price_str),
+                            format!("quantity={}", qty_str),
+                            "reduceOnly=true".to_string(),
+                            format!("timestamp={}", BinanceCommon::ts()),
+                            format!("recvWindow={}", self.common.recv_window_ms),
+                        ];
+                        
+                        if let Some(pos_side) = position_side {
+                            limit_params.push(format!("positionSide={}", pos_side));
+                        }
+                        
+                        let limit_qs = limit_params.join("&");
+                        let limit_sig = self.common.sign(&limit_qs);
+                        let limit_url = format!("{}/fapi/v1/order?{}&signature={}", self.base, limit_qs, limit_sig);
+                        
+                        match send_void(
+                            self.common
+                                .client
+                                .post(&limit_url)
+                                .header("X-MBX-APIKEY", &self.common.api_key),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                info!(
+                                    symbol = %sym,
+                                    limit_price = %limit_price_quantized,
+                                    qty = %remaining_qty,
+                                    "MIN_NOTIONAL fallback: limit reduce-only order placed successfully"
+                                );
+                                // Limit emri başarılı, pozisyon kapatılacak (emir fill olunca)
+                                return Ok(());
+                            }
+                            Err(e2) => {
+                                warn!(
+                                    symbol = %sym,
+                                    error = %e2,
+                                    "MIN_NOTIONAL fallback: limit reduce-only order also failed"
+                                );
+                                // Limit emri de başarısız, dust için komple sıfırlamaya zorla
+                                if remaining_qty < rules.min_notional / Decimal::from(1000) {
+                                    // Çok küçük miktar, quantize et ve sıfırla
+                                    let dust_qty = quantize_decimal(remaining_qty, rules.step_size);
+                                    if dust_qty <= Decimal::ZERO {
+                                        info!(
+                                            symbol = %sym,
+                                            "MIN_NOTIONAL: remaining qty is dust, considering position closed"
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                                // Son deneme değilse devam et
+                                if attempt < max_attempts - 1 {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    continue;
+                                } else {
+                                    return Err(anyhow!("MIN_NOTIONAL error: market and limit reduce-only both failed: {}", e));
+                                }
+                            }
+                        }
                     } else {
-                        return Err(e);
+                        // MIN_NOTIONAL hatası değil, normal retry
+                        if attempt < max_attempts - 1 {
+                            warn!(
+                                symbol = %sym,
+                                attempt = attempt + 1,
+                                error = %e,
+                                "failed to close position, retrying..."
+                            );
+                            // KRİTİK DÜZELTME: Retry öncesi bekleme eklendi
+                            // Hızlı retry'ler exchange'i overload edebilir
+                            tokio::time::sleep(Duration::from_millis(500)).await; // Retry öncesi 500ms bekle
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -906,6 +1018,9 @@ impl Venue for BinanceFutures {
             format!("recvWindow={}", self.common.recv_window_ms),
             "newOrderRespType=RESULT".to_string(),
         ];
+        
+        // ✅ YENİ: reduceOnly desteği (TP emirleri için) - şimdilik false (normal emirler için)
+        // TP emirleri için ayrı bir public method kullanılacak
         
         // ClientOrderId ekle (idempotency için) - sadece boş değilse
         if !client_order_id.is_empty() {
@@ -1123,6 +1238,154 @@ impl Venue for BinanceFutures {
 }
 
 impl BinanceFutures {
+    /// Place limit order with client order ID and optional reduceOnly flag (public method for TP orders)
+    pub async fn place_limit_with_reduce_only(
+        &self,
+        sym: &str,
+        side: Side,
+        px: Px,
+        qty: Qty,
+        tif: Tif,
+        client_order_id: &str,
+        reduce_only: bool,
+    ) -> Result<(String, Option<String>)> {
+        let s_side = match side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        };
+        let tif_str = match tif {
+            Tif::PostOnly => "GTX",
+            Tif::Gtc => "GTC",
+            Tif::Ioc => "IOC",
+        };
+
+        let rules = self.rules_for(sym).await?;
+        let (price_str, qty_str, price_quantized, qty_quantized) = 
+            Self::validate_and_format_order_params(px, qty, &rules, sym)?;
+
+        info!(
+            %sym,
+            side = ?side,
+            price_original = %px.0,
+            price_quantized = %price_quantized,
+            price_str,
+            qty_original = %qty.0,
+            qty_quantized = %qty_quantized,
+            qty_str,
+            price_precision = rules.price_precision,
+            qty_precision = rules.qty_precision,
+            endpoint = "/fapi/v1/order",
+            reduce_only,
+            "order validation guard passed, submitting TP order"
+        );
+
+        let mut params = vec![
+            format!("symbol={}", sym),
+            format!("side={}", s_side),
+            "type=LIMIT".to_string(),
+            format!("timeInForce={}", tif_str),
+            format!("price={}", price_str),
+            format!("quantity={}", qty_str),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+            "newOrderRespType=RESULT".to_string(),
+        ];
+        
+        // ✅ YENİ: reduceOnly desteği (TP emirleri için)
+        if reduce_only {
+            params.push("reduceOnly=true".to_string());
+        }
+        
+        if !client_order_id.is_empty() {
+            if client_order_id.len() <= 36 && client_order_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                params.push(format!("newClientOrderId={}", client_order_id));
+            }
+        }
+        
+        const MAX_RETRIES: u32 = 3;
+        const INITIAL_BACKOFF_MS: u64 = 100;
+        let mut last_error = None;
+        let mut order_result: Option<FutPlacedOrder> = None;
+        
+        for attempt in 0..=MAX_RETRIES {
+            let retry_qs = params.join("&");
+            let retry_sig = self.common.sign(&retry_qs);
+            let retry_url = format!("{}/fapi/v1/order?{}&signature={}", self.base, retry_qs, retry_sig);
+            
+            match self.common
+                .client
+                .post(&retry_url)
+                .header("X-MBX-APIKEY", &self.common.api_key)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        match resp.json::<FutPlacedOrder>().await {
+                            Ok(order) => {
+                                order_result = Some(order);
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt < MAX_RETRIES {
+                                    let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                    last_error = Some(anyhow!("json parse error: {}", e));
+                                    continue;
+                                } else {
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    } else {
+                        let body = resp.text().await.unwrap_or_default();
+                        if is_permanent_error(status.as_u16(), &body) {
+                            return Err(anyhow!("binance api error: {} - {} (permanent)", status, body));
+                        }
+                        if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
+                            let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            last_error = Some(anyhow!("binance api error: {} - {}", status, body));
+                            continue;
+                        } else {
+                            return Err(anyhow!("binance api error: {} - {}", status, body));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        last_error = Some(e.into());
+                        continue;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        
+        let order = order_result.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("unknown error after retries"))
+        })?;
+
+        info!(
+            %sym,
+            ?side,
+            price_quantized = %price_quantized,
+            qty_quantized = %qty_quantized,
+            price_str,
+            qty_str,
+            tif = ?tif,
+            order_id = order.order_id,
+            client_order_id = ?order.client_order_id,
+            reduce_only,
+            "futures place_limit_with_reduce_only ok"
+        );
+        Ok((order.order_id.to_string(), order.client_order_id))
+    }
+    
     /// Test order endpoint - İlk emir öncesi doğrulama
     /// /fapi/v1/order/test endpoint'i ile emir parametrelerini test et
     /// -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek

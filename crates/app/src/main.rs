@@ -27,7 +27,7 @@ use utils::{adjust_price_for_aggressiveness, calc_net_pnl_usd, calc_qty_from_mar
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
@@ -614,39 +614,41 @@ async fn main() -> Result<()> {
             pnl_history: Vec::new(),
             min_notional_req: None,
             disabled: rules_fetch_failed, // KRİTİK: ExchangeInfo başarısızsa disable et
+            disabled_until: None, // Disabled semboller için cooldown
             symbol_rules, // Per-symbol metadata (fallback: None, global cfg kullanılır)
             rules_fetch_failed, // ExchangeInfo fetch durumu
             last_rules_retry: None, // Periyodik retry için
             test_order_passed: false, // İlk emir öncesi test order henüz yapılmadı
+            test_order_passed_buy: false, // Buy tarafı için test order henüz yapılmadı
+            test_order_passed_sell: false, // Sell tarafı için test order henüz yapılmadı
             last_position_check: None,
             last_order_sync: None,
             order_fill_rate: cfg.internal.initial_fill_rate,
             consecutive_no_fills: 0,
-            last_fill_time: None, // Zaman bazlı fill rate için
-            last_inventory_update: None, // Envanter güncelleme race condition önleme için
-            last_decay_period: None, // Fill rate decay period tracking (optimizasyon için)
+            last_fill_time: None,
+            last_inventory_update: None,
+            last_decay_period: None,
             position_entry_time: None,
             peak_pnl: Decimal::ZERO,
+            last_peak_update: None,
             position_hold_duration_ms: 0,
             last_order_price_update: HashMap::new(),
-            position_orders: Vec::new(), // KRİTİK İYİLEŞTİRME: Order-to-position mapping
-            // Gelişmiş risk ve kazanç takibi
+            position_orders: Vec::new(),
+            last_cancel_all_time: None,
+            cancel_all_attempt_count: 0,
             daily_pnl: Decimal::ZERO,
             total_funding_cost: Decimal::ZERO,
             position_size_notional_history: Vec::with_capacity(cfg.internal.position_size_history_max_len),
             last_pnl_alert: None,
             cumulative_pnl: Decimal::ZERO,
-            // Funding cost tracking
             last_applied_funding_time: None,
-            // PnL tracking
             last_daily_reset: None,
+            last_daily_reset_date: None,
             avg_entry_price: None,
-            // Long/Short seçimi için histerezis ve cooldown
             last_direction_change: None,
             current_direction: None,
             direction_signal_strength: 0.0,
             regime: None,
-            // Position closing control
             position_closing: false,
             last_close_attempt: None,
         });
@@ -860,7 +862,6 @@ async fn main() -> Result<()> {
     );
     
     // Tick counter: Loop başında ve sonunda kullanılacak
-    use std::sync::atomic::AtomicU64;
     static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
     
     info!(
@@ -876,8 +877,27 @@ async fn main() -> Result<()> {
     // WebSocket reconnect sonrası missed events sync flag'i (loop dışında)
     let mut force_sync_all = false;
     
+    // BEST PRACTICE: Bot sürekli çalışır, ancak Ctrl+C ile graceful shutdown yapılabilir
+    // Shutdown mekanizması sadece manuel durdurma için - bot normalde sürekli çalışır
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {
+                // Normal trading tick - bot sürekli çalışır
+            }
+            result = tokio::signal::ctrl_c() => {
+                match result {
+                    Ok(_) => {
+                        info!("shutdown signal received (Ctrl+C), initiating graceful shutdown");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to wait for ctrl_c signal, continuing");
+                        // Signal handler kurulamadı ama bot çalışmaya devam eder
+                        continue;
+                    }
+                }
+            }
+        }
         
         // DEBUG: Her tick'te log (ilk birkaç tick için)
         let tick_num = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4364,6 +4384,22 @@ async fn main() -> Result<()> {
                 );
         }
     }
+    
+    // BEST PRACTICE: Graceful shutdown - tüm kaynakları temizle
+    info!("main loop ended, performing graceful shutdown");
+    
+    // Async logger'ın channel'ını kapat (writer task'ın son event'leri yazması için)
+    // Logger Arc ile shared olduğu için drop edildiğinde sender drop olur ve receiver None alır
+    drop(json_logger);
+    
+    // Event channel'ı kapat (WebSocket task'ı bunu algılayacak ve duracak)
+    drop(event_tx);
+    
+    // Kısa bir süre bekle ki pending işlemler (logger flush, WebSocket cleanup) tamamlansın
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    
+    info!("graceful shutdown completed");
+    Ok(())
 }
 
 // ============================================================================

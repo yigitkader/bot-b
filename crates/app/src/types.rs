@@ -23,13 +23,16 @@ pub struct SymbolState {
     // Min notional tracking
     pub min_notional_req: Option<f64>,
     pub disabled: bool,
+    pub disabled_until: Option<std::time::Instant>, // Disabled semboller için cooldown (5 dk)
     
     // Per-symbol metadata
     pub symbol_rules: Option<std::sync::Arc<exec::binance::SymbolRules>>,
     // KRİTİK: ExchangeInfo fetch durumu - başarısızsa trade etme
     pub rules_fetch_failed: bool, // ExchangeInfo çekilemediyse true (trade etme)
     pub last_rules_retry: Option<Instant>, // Son retry zamanı (periyodik retry için)
-    pub test_order_passed: bool, // İlk emir öncesi test order başarılı mı?
+    pub test_order_passed: bool, // İlk emir öncesi test order başarılı mı? (deprecated, use test_order_passed_buy/sell)
+    pub test_order_passed_buy: bool, // Buy tarafı için test order başarılı mı?
+    pub test_order_passed_sell: bool, // Sell tarafı için test order başarılı mı?
     
     // Position and order tracking
     pub last_position_check: Option<Instant>,
@@ -43,10 +46,14 @@ pub struct SymbolState {
     // Position management
     pub position_entry_time: Option<Instant>,
     pub peak_pnl: Decimal,
+    pub last_peak_update: Option<Instant>, // Peak PnL güncelleme cooldown için
     pub position_hold_duration_ms: u64,
     pub last_order_price_update: HashMap<String, Px>,
     // KRİTİK İYİLEŞTİRME: Order-to-position mapping - hangi order'lar bu pozisyonu oluşturdu?
     pub position_orders: Vec<String>, // Bu pozisyonu oluşturan order ID'ler (fill olan order'lar)
+    // Cancel-replace debounce ve backoff
+    pub last_cancel_all_time: Option<Instant>, // Son cancel_all zamanı (debounce için)
+    pub cancel_all_attempt_count: u32, // Cancel_all deneme sayısı (backoff için)
     
     // Advanced tracking
     pub daily_pnl: Decimal,
@@ -60,7 +67,8 @@ pub struct SymbolState {
     pub last_applied_funding_time: Option<u64>, // Unix timestamp (ms) - son uygulanan funding time
     
     // PnL tracking
-    pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı
+    pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı (deprecated, use last_daily_reset_date)
+    pub last_daily_reset_date: Option<chrono::NaiveDate>, // UTC tarih - son günlük reset tarihi (drift önleme için)
     pub avg_entry_price: Option<Decimal>, // Ortalama entry price (pozisyon açılırken güncellenir)
     
     // Long/Short seçimi için histerezis ve cooldown

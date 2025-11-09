@@ -3,6 +3,7 @@
 
 use bot_core::types::*;
 use exec::binance::SymbolRules;
+use exec;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -30,6 +31,35 @@ pub fn get_price_tick(
         .map(|r| r.tick_size.to_f64().unwrap_or(fallback))
         .unwrap_or(fallback)
 }
+
+/// KRİTİK DÜZELTME: Tick/step kuantizasyon standardizasyonu - tek util fonksiyon
+/// Fiyatı tick'e, miktarı step'e çevirir ve string format üretir
+/// 
+/// # Arguments
+/// * `price` - Raw price (Decimal)
+/// * `qty` - Raw quantity (Decimal)
+/// * `rules` - Symbol rules (tick_size, step_size, precisions)
+/// 
+/// # Returns
+/// (price_str, qty_str, price_quantized, qty_quantized)
+pub fn quantize_order(
+    price: Decimal,
+    qty: Decimal,
+    rules: &SymbolRules,
+) -> (String, String, Decimal, Decimal) {
+    // 1. Quantize: price to tick, qty to step
+    let price_quantized = exec::quant_utils_floor_to_step(price, rules.tick_size);
+    let qty_quantized = exec::quant_utils_floor_to_step(qty.abs(), rules.step_size);
+    
+    // 2. Format: precision'a göre string'e çevir (exec::binance modülünden kullan)
+    use exec::binance::format_decimal_fixed;
+    let price_str = format_decimal_fixed(price_quantized, rules.price_precision);
+    let qty_str = format_decimal_fixed(qty_quantized, rules.qty_precision);
+    
+    (price_str, qty_str, price_quantized, qty_quantized)
+}
+
+// format_decimal_fixed exec::binance'da mevcut, oradan kullan
 
 /// Helper trait for floor division by step
 pub trait FloorStep {
@@ -265,6 +295,86 @@ pub fn calc_qty_from_margin(
     let qty_str = format_qty_with_precision(qty_floor, rules.qty_precision);
     let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
     Some((qty_str, price_str))
+}
+
+/// KRİTİK DÜZELTME: ProfitGuarantee wrapper - maker→taker fallback zinciri standardize
+/// Tek wrapper fonksiyon: required_take_profit_price_with_fallback
+/// 
+/// # Arguments
+/// * `side` - Position side (Buy=Long, Sell=Short)
+/// * `entry_price` - Entry price
+/// * `qty` - Quantity
+/// * `maker_fee_rate` - Maker fee rate (e.g., 0.0001)
+/// * `taker_fee_rate` - Taker fee rate (e.g., 0.0004)
+/// * `min_profit_usd` - Minimum profit in USD
+/// * `tick_size` - Tick size for quantization
+/// * `best_bid` - Best bid price (for maker check)
+/// * `best_ask` - Best ask price (for maker check)
+/// 
+/// # Returns
+/// (tp_price_quantized, is_taker_fallback, reason_code)
+pub fn required_take_profit_price_with_fallback(
+    side: bot_core::types::Side,
+    entry_price: Decimal,
+    qty: Decimal,
+    maker_fee_rate: f64,
+    taker_fee_rate: f64,
+    min_profit_usd: f64,
+    tick_size: Decimal,
+    best_bid: Decimal,
+    best_ask: Decimal,
+) -> Option<(Decimal, bool, &'static str)> {
+    let maker_fee_bps = maker_fee_rate * 10000.0;
+    let taker_fee_bps = taker_fee_rate * 10000.0;
+    
+    // Önce maker→maker senaryosu
+    let tp_maker = required_take_profit_price(
+        side,
+        entry_price,
+        qty,
+        maker_fee_bps,
+        maker_fee_bps,
+        min_profit_usd,
+    )?;
+    
+    // Quantize et
+    let tp_quantized = match side {
+        bot_core::types::Side::Buy => exec::quant_utils_ceil_to_step(tp_maker, tick_size),
+        bot_core::types::Side::Sell => exec::quant_utils_floor_to_step(tp_maker, tick_size),
+    };
+    
+    // Maker kontrolü
+    let is_maker = match side {
+        bot_core::types::Side::Buy => {
+            // Long: TP = sell exit, best_ask'ten en az 1 tick yüksek olmalı
+            tp_quantized >= best_ask + tick_size
+        }
+        bot_core::types::Side::Sell => {
+            // Short: TP = buy exit, best_bid'ten en az 1 tick düşük olmalı
+            tp_quantized <= best_bid - tick_size
+        }
+    };
+    
+    if is_maker {
+        return Some((tp_quantized, false, "TP_MAKER"));
+    }
+    
+    // Maker olamıyorsa taker fallback
+    let tp_taker = required_take_profit_price(
+        side,
+        entry_price,
+        qty,
+        taker_fee_bps,
+        taker_fee_bps,
+        min_profit_usd,
+    )?;
+    
+    let tp_taker_quantized = match side {
+        bot_core::types::Side::Buy => exec::quant_utils_ceil_to_step(tp_taker, tick_size),
+        bot_core::types::Side::Sell => exec::quant_utils_floor_to_step(tp_taker, tick_size),
+    };
+    
+    Some((tp_taker_quantized, true, "TP_TAKER_FALLBACK"))
 }
 
 /// Calculate required take profit price to guarantee net profit ≥ min_profit_usd
@@ -1163,6 +1273,7 @@ impl Default for ProfitTracker {
 pub type SharedProfitTracker = Mutex<ProfitTracker>;
 
 /// Calculate spread in basis points from bid and ask prices
+/// KRİTİK DÜZELTME: Mid price bazlı tutarlı hesaplama (volatilite anında sapma önleme)
 /// 
 /// # Arguments
 /// * `bid` - Bid price
@@ -1170,6 +1281,10 @@ pub type SharedProfitTracker = Mutex<ProfitTracker>;
 /// 
 /// # Returns
 /// Spread in basis points (bps), or 0.0 if invalid
+/// 
+/// # Formula
+/// spread_bps = (ask - bid) / ((ask + bid) / 2) * 10000
+/// Mid price kullanarak volatilite anında sapmayı önler
 pub fn calculate_spread_bps(bid: Decimal, ask: Decimal) -> f64 {
     if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
         return 0.0;
@@ -1182,7 +1297,13 @@ pub fn calculate_spread_bps(bid: Decimal, ask: Decimal) -> f64 {
         return 0.0;
     }
     
-    let spread_rate = (ask_f - bid_f) / bid_f;
+    // KRİTİK DÜZELTME: Mid price bazlı hesaplama (tutarlı, volatilite anında sapma önleme)
+    let mid_price = (bid_f + ask_f) / 2.0;
+    if mid_price <= 0.0 {
+        return 0.0;
+    }
+    
+    let spread_rate = (ask_f - bid_f) / mid_price;
     spread_rate * 10000.0 // Convert to bps
 }
 

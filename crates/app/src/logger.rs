@@ -454,9 +454,283 @@ impl JsonLogger {
 // Thread-safe logger wrapper
 pub type SharedLogger = Arc<Mutex<JsonLogger>>;
 
-/// Create a shared logger instance
+/// KRİTİK DÜZELTME: Async logger with bounded channel (blocking risk önleme)
+/// Bounded channel ile writer task asenkron flush eder
+pub struct AsyncJsonLogger {
+    sender: tokio::sync::mpsc::Sender<LogEvent>,
+}
+
+impl AsyncJsonLogger {
+    /// Create a new async logger with bounded channel
+    pub fn new(log_file: &str) -> Result<Self, std::io::Error> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEvent>(1000); // Bounded channel: 1000 event
+        
+        // Writer task: asenkron flush
+        let logger = JsonLogger::new(log_file)?;
+        let logger_arc = Arc::new(Mutex::new(logger));
+        let logger_clone = logger_arc.clone();
+        
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Ok(logger) = logger_clone.lock() {
+                    if let Err(e) = logger.write_event(&event) {
+                        eprintln!("Async logger write failed: {}", e);
+                    }
+                }
+            }
+        });
+        
+        Ok(Self { sender: tx })
+    }
+    
+    /// Send event to async channel (non-blocking)
+    pub fn log_event(&self, event: LogEvent) {
+        // Non-blocking send: channel doluysa drop et (lossy logging)
+        let _ = self.sender.try_send(event);
+    }
+    
+    // Convenience methods that match JsonLogger interface
+    pub fn log_order_created(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        side: Side,
+        price: Px,
+        qty: Qty,
+        reason: &str,
+        tif: &str,
+    ) {
+        let notional = price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0);
+        let event = LogEvent::OrderCreated {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            order_id: order_id.to_string(),
+            side: format!("{:?}", side),
+            price: price.0.to_f64().unwrap_or(0.0),
+            quantity: qty.0.to_f64().unwrap_or(0.0),
+            notional_usd: notional,
+            reason: reason.to_string(),
+            tif: tif.to_string(),
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_order_filled(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        side: Side,
+        price: Px,
+        qty: Qty,
+        is_maker: bool,
+        new_inventory: Qty,
+        fill_rate: f64,
+    ) {
+        let notional = price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0);
+        let event = LogEvent::OrderFilled {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            order_id: order_id.to_string(),
+            side: format!("{:?}", side),
+            price: price.0.to_f64().unwrap_or(0.0),
+            quantity: qty.0.to_f64().unwrap_or(0.0),
+            notional_usd: notional,
+            is_maker,
+            new_inventory: new_inventory.0.to_f64().unwrap_or(0.0),
+            fill_rate,
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_order_canceled(
+        &self,
+        symbol: &str,
+        order_id: &str,
+        reason: &str,
+        fill_rate: f64,
+    ) {
+        let event = LogEvent::OrderCanceled {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            order_id: order_id.to_string(),
+            reason: reason.to_string(),
+            fill_rate,
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_position_opened(
+        &self,
+        symbol: &str,
+        side: &str,
+        entry_price: Px,
+        qty: Qty,
+        leverage: u32,
+        reason: &str,
+    ) {
+        let notional = entry_price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0).abs();
+        let event = LogEvent::PositionOpened {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            entry_price: entry_price.0.to_f64().unwrap_or(0.0),
+            quantity: qty.0.to_f64().unwrap_or(0.0),
+            notional_usd: notional,
+            leverage,
+            reason: reason.to_string(),
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_position_updated(
+        &self,
+        symbol: &str,
+        side: &str,
+        entry_price: Px,
+        qty: Qty,
+        mark_price: Px,
+        leverage: u32,
+    ) {
+        let notional = entry_price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0).abs();
+        let qty_f = qty.0.to_f64().unwrap_or(0.0);
+        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
+        let mark_f = mark_price.0.to_f64().unwrap_or(0.0);
+        
+        let unrealized_pnl = (mark_f - entry_f) * qty_f;
+        let unrealized_pnl_pct = if entry_f > 0.0 {
+            ((mark_f - entry_f) / entry_f) * 100.0
+        } else {
+            0.0
+        };
+        
+        let event = LogEvent::PositionUpdated {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            entry_price: entry_f,
+            quantity: qty_f,
+            mark_price: mark_f,
+            notional_usd: notional,
+            unrealized_pnl,
+            unrealized_pnl_pct,
+            leverage,
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_position_closed(
+        &self,
+        symbol: &str,
+        side: &str,
+        entry_price: Px,
+        exit_price: Px,
+        qty: Qty,
+        leverage: u32,
+        reason: &str,
+    ) {
+        let qty_f = qty.0.to_f64().unwrap_or(0.0);
+        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
+        let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
+        
+        let realized_pnl = (exit_f - entry_f) * qty_f;
+        let realized_pnl_pct = if entry_f > 0.0 {
+            ((exit_f - entry_f) / entry_f) * 100.0
+        } else {
+            0.0
+        };
+        
+        let event = LogEvent::PositionClosed {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            entry_price: entry_f,
+            exit_price: exit_f,
+            quantity: qty_f,
+            realized_pnl,
+            realized_pnl_pct,
+            leverage,
+            reason: reason.to_string(),
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_trade_completed(
+        &self,
+        symbol: &str,
+        side: &str,
+        entry_price: Px,
+        exit_price: Px,
+        qty: Qty,
+        fees: f64,
+        leverage: u32,
+    ) {
+        let qty_f = qty.0.to_f64().unwrap_or(0.0);
+        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
+        let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
+        
+        let notional = entry_f * qty_f.abs();
+        let realized_pnl = (exit_f - entry_f) * qty_f;
+        let realized_pnl_pct = if entry_f > 0.0 {
+            ((exit_f - entry_f) / entry_f) * 100.0
+        } else {
+            0.0
+        };
+        
+        let net_profit = realized_pnl - fees;
+        let is_profitable = net_profit > 0.0;
+        
+        let event = LogEvent::TradeCompleted {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            entry_price: entry_f,
+            exit_price: exit_f,
+            quantity: qty_f,
+            notional_usd: notional,
+            realized_pnl,
+            realized_pnl_pct,
+            fees,
+            net_profit,
+            is_profitable,
+            leverage,
+        };
+        self.log_event(event);
+    }
+    
+    pub fn log_trade_rejected(
+        &self,
+        symbol: &str,
+        reason: &str,
+        spread_bps: f64,
+        position_size_usd: f64,
+        min_spread_bps: f64,
+    ) {
+        let event = LogEvent::TradeRejected {
+            timestamp: JsonLogger::timestamp_ms(),
+            symbol: symbol.to_string(),
+            reason: reason.to_string(),
+            spread_bps,
+            position_size_usd,
+            min_spread_bps,
+        };
+        self.log_event(event);
+    }
+}
+
+// Thread-safe async logger wrapper
+pub type SharedAsyncLogger = Arc<AsyncJsonLogger>;
+
+/// Create a shared async logger instance (bounded channel ile)
 pub fn create_logger(log_file: &str) -> Result<SharedLogger, std::io::Error> {
+    // Backward compatibility: eski sync logger döndür
+    // Async logger için ayrı bir fonksiyon kullanılabilir
     let logger = JsonLogger::new(log_file)?;
     Ok(Arc::new(Mutex::new(logger)))
+}
+
+/// Create an async logger instance (bounded channel ile, non-blocking)
+pub fn create_async_logger(log_file: &str) -> Result<SharedAsyncLogger, std::io::Error> {
+    let logger = AsyncJsonLogger::new(log_file)?;
+    Ok(Arc::new(logger))
 }
 
