@@ -49,12 +49,14 @@ risk:
 
 strategy:
   type: "dyn_mm"
-  a: 100.0   # Gerçekçi: 80.0 → 100.0 (spread'i biraz genişlet, kazanç için)
-  b: 35.0    # Gerçekçi: 30.0 → 35.0 (spread'i biraz genişlet)
+  # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
+  a: 60.0   # 100.0 → 60.0: spread'i daralt (daha agresif, daha fazla işlem)
+  b: 20.0    # 35.0 → 20.0: spread'i daralt (daha agresif, daha fazla işlem)
   base_size: "20.0"  # 20 → 50 (daha fazla kazanç/işlem)
   
   # --- Spread ve Fiyatlama Eşikleri ---
-  min_spread_bps: 2.0               # Minimum spread floor (bps) - dinamik spread ile birleştirilir (maker fee + $0.50 net hedefi)
+  # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
+  min_spread_bps: 1.0               # Minimum spread floor (bps) - 2.0 → 1.0: daha dar spread (daha agresif)
   max_spread_bps: 200.0            # Maksimum spread (bps) (150 → 200: daha toleranslı)
   spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
   spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)
@@ -141,10 +143,14 @@ internal:
   fill_rate_partial_fill_bonus: 0.02  # Partial fill sonrası fill rate artış bonusu
   fill_rate_reconnect_factor: 0.95  # Reconnect sonrası fill rate artış faktörü
   fill_rate_reconnect_bonus: 0.05  # Reconnect sonrası fill rate artış bonusu
+  fill_rate_periodic_decay_factor: 0.9  # Periyodik decay faktörü (30 saniyede bir %10 azalt)
+  strategy_sigma: 0.5  # Volatility coefficient for strategy (default: 0.5)
   
   # Emir fiyat mesafesi eşikleri (decimal)
-  order_price_distance_with_position: 0.01  # %1 (pozisyon varsa)
-  order_price_distance_no_position: 0.005     # %0.5 (pozisyon yoksa)
+  # KRİTİK: Küçük kar hedefi ($0.50) için çok agresif - market'e çok yakın emirler
+  # Tek amaç: artacak mı azalacak mı - hızlı fill için çok yakın fiyat
+  order_price_distance_with_position: 0.005  # %0.5 (pozisyon varsa) - çok agresif, market'e çok yakın
+  order_price_distance_no_position: 0.003     # %0.3 (pozisyon yoksa) - çok agresif, market'e çok yakın
   order_price_change_threshold: 0.001         # %0.1 fiyat değişimi eşiği (0.0001 → 0.001: gereksiz güncellemeleri azalt)
   min_quote_life_ms: 1500                    # Minimum quote ömrü (ms) - rate limit koruması için
   

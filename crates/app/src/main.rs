@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
-use utils::{calc_net_pnl_usd, calc_qty_from_margin, clamp_price_to_market_distance, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
+use utils::{adjust_price_for_aggressiveness, calc_net_pnl_usd, calc_qty_from_margin, clamp_price_to_market_distance, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
 
 use std::cmp::max;
 use std::collections::HashMap;
@@ -224,8 +224,10 @@ async fn main() -> Result<()> {
     };
 
     // Always use futures, no enum needed
-    let price_tick_dec = Decimal::from_f64_retain(cfg.price_tick).unwrap_or(Decimal::ZERO);
-    let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
+    let price_tick_dec = Decimal::from_f64_retain(cfg.price_tick)
+        .ok_or_else(|| anyhow!("Failed to convert price_tick {} to Decimal", cfg.price_tick))?;
+    let qty_step_dec = Decimal::from_f64_retain(cfg.qty_step)
+        .ok_or_else(|| anyhow!("Failed to convert qty_step {} to Decimal", cfg.qty_step))?;
     let price_precision = decimal_places(price_tick_dec);
     let qty_precision = decimal_places(qty_step_dec);
     // Initialize rate limiter for futures
@@ -315,7 +317,17 @@ async fn main() -> Result<()> {
 
             // --- opsiyonel: başlangıçta bakiye tabanlı ön eleme ---
             let have_min = cfg.min_usd_per_order.unwrap_or(0.0);
-            let avail = venue.available_balance(&meta.quote_asset).await?.to_f64().unwrap_or(0.0);
+            let avail = match venue.available_balance(&meta.quote_asset).await?.to_f64() {
+                Some(b) => b,
+                None => {
+                    warn!(
+                        symbol = %meta.symbol,
+                        quote_asset = %meta.quote_asset,
+                        "Failed to convert balance to f64, using 0.0"
+                    );
+                    0.0
+                }
+            };
                     if avail < have_min {
                         warn!(
                             symbol = %sym,
@@ -1325,8 +1337,32 @@ async fn main() -> Result<()> {
         for quote_asset in &unique_quote_assets {
             rate_limit_guard(10).await; // GET /api/v3/account or /fapi/v2/balance: Weight 10/5
             let balance = match tokio::time::timeout(Duration::from_secs(5), venue.available_balance(quote_asset)).await {
-                        Ok(Ok(b)) => b.to_f64().unwrap_or(0.0),
-                        _ => 0.0,
+                Ok(Ok(b)) => match b.to_f64() {
+                    Some(bal) => bal,
+                    None => {
+                        warn!(
+                            quote_asset = %quote_asset,
+                            balance_decimal = %b,
+                            "Failed to convert balance to f64, using 0.0"
+                        );
+                        0.0
+                    }
+                },
+                Ok(Err(e)) => {
+                    warn!(
+                        quote_asset = %quote_asset,
+                        error = %e,
+                        "Failed to fetch balance, using 0.0"
+                    );
+                    0.0
+                }
+                Err(_) => {
+                    warn!(
+                        quote_asset = %quote_asset,
+                        "Timeout while fetching balance, using 0.0"
+                    );
+                    0.0
+                }
             };
             quote_balances.insert(quote_asset.clone(), balance);
         }
@@ -1726,7 +1762,18 @@ async fn main() -> Result<()> {
             };
             
             // Pozisyon boyutu hesapla (order analizi ve pozisyon analizi için kullanılacak)
-            let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
+            let position_size_notional = match (mark_px.0 * pos.qty.0.abs()).to_f64() {
+                Some(notional) => notional,
+                None => {
+                    warn!(
+                        symbol = %state.meta.symbol,
+                        mark_price = %mark_px.0,
+                        qty = %pos.qty.0,
+                        "Failed to convert position notional to f64, using 0.0"
+                    );
+                    0.0
+                }
+            };
             
             // --- AKILLI EMİR ANALİZİ: Mevcut emirleri zeka ile değerlendir ---
             // 1. Emir fiyatlarını market ile karşılaştır
@@ -1736,7 +1783,18 @@ async fn main() -> Result<()> {
                 let mut orders_to_cancel: Vec<String> = Vec::new();
                 
                 for (order_id, order) in &state.active_orders {
-                    let order_price_f64 = order.price.0.to_f64().unwrap_or(0.0);
+                    let order_price_f64 = match order.price.0.to_f64() {
+                        Some(price) => price,
+                        None => {
+                            warn!(
+                                symbol = %state.meta.symbol,
+                                order_id = %order.order_id,
+                                price_decimal = %order.price.0,
+                                "Failed to convert order price to f64, using 0.0"
+                            );
+                            0.0
+                        }
+                    };
                     let order_age_ms = order.created_at.elapsed().as_millis() as u64;
                     
                     // Market fiyatı ile karşılaştır
@@ -2310,16 +2368,19 @@ async fn main() -> Result<()> {
                 // Kural 1: Sabit TP ($0.50) - Her zaman çalışır (yaş sınırı yok)
                 let should_close_tp = net_pnl >= tp_usd;
                 
-                // Kural 2: Time-box (ilk 20 saniye içinde net > 0 ise kapat, 20 saniyeden sonra sadece $0.50+ kâr varsa kapat)
-                // Not: 20 saniyeden sonra sabit TP kuralı devreye girer ($0.50+)
+                // Kural 2: Time-box ve direkt kazanç alma
+                // - İlk 20 saniye: Net kâr >= $0.50 ise kapat (hedef kar)
+                // - 20 saniyeden sonra: Direkt kazancı al (net_pnl > 0 ise kapat)
+                // Tek amaç: artacak mı azalacak mı - küçük kazançları hızlı al
                 let should_close_timebox = if let Some(entry_time) = state.position_entry_time {
                     let age_secs = entry_time.elapsed().as_secs();
                     if age_secs <= timebox_secs {
-                        // İlk 20 saniye: Net kâr > 0 ise kapat (agresif - hızlı kâr al)
-                        net_pnl > 0.0
+                        // İlk 20 saniye: Net kâr >= $0.50 ise kapat (hedef kar)
+                        net_pnl >= tp_usd
                     } else {
-                        // 20 saniyeden sonra: Time-box kuralı devre dışı, sadece sabit TP ($0.50) çalışır
-                        false
+                        // 20 saniyeden sonra: Direkt kazancı al (net_pnl > 0 ise kapat)
+                        // Küçük kazançlar peşindeyiz, beklemeden al
+                        net_pnl > 0.0
                     }
                 } else {
                     false
@@ -3229,19 +3290,31 @@ async fn main() -> Result<()> {
                     let max_chunks = cfg.risk.max_open_chunks_per_symbol_per_side;
                     
                     if let Some((px, qty)) = quotes.bid {
-                        // KRİTİK DÜZELTME: Market distance clamp - emir öncesi fiyatı clamp et
-                        // Mid price hesapla (best_bid + best_ask) / 2
-                        let mid_price = (bid.0 + ask.0) / Decimal::from(2u32);
+                        // KRİTİK: Agresif fiyatlandırma - küçük kar hedefi için market'e çok yakın
+                        // Trend-aware ve opportunity mode-aware agresif fiyatlandırma
+                        let is_opportunity_mode = state.strategy.is_opportunity_mode();
                         
                         // Pozisyon varsa daha toleranslı, yoksa daha sıkı
                         let max_distance_pct = if position_size_notional > 0.0 {
-                            cfg.internal.order_price_distance_with_position // %1
+                            cfg.internal.order_price_distance_with_position // %0.5
                         } else {
-                            cfg.internal.order_price_distance_no_position // %0.5
+                            cfg.internal.order_price_distance_no_position // %0.3
                         };
                         
-                        // Fiyatı clamp et
-                        let px_clamped = clamp_price_to_market_distance(px.0, mid_price, max_distance_pct);
+                        // Trend bilgisi: Strategy'den al (şimdilik 0, ileride entegre edilebilir)
+                        // TODO: Strategy trait'ine get_trend_bps() metodu eklenebilir
+                        let trend_bps = 0.0;
+                        
+                        // Agresif fiyatlandırma: best_bid'e çok yakın (hızlı fill için)
+                        let px_clamped = adjust_price_for_aggressiveness(
+                            px.0,
+                            bid.0,
+                            ask.0,
+                            Side::Buy,
+                            is_opportunity_mode,
+                            trend_bps,
+                            max_distance_pct,
+                        );
                         let px = Px(px_clamped);
                         
                         // KRİTİK: Margin chunking - available margin'ı 10-100 USD chunk'larına böl
@@ -3591,19 +3664,31 @@ async fn main() -> Result<()> {
                     // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
                     // NOT: effective_leverage_ask config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     if let Some((px, qty)) = quotes.ask {
-                        // KRİTİK DÜZELTME: Market distance clamp - emir öncesi fiyatı clamp et
-                        // Mid price hesapla (best_bid + best_ask) / 2
-                        let mid_price = (bid.0 + ask.0) / Decimal::from(2u32);
+                        // KRİTİK: Agresif fiyatlandırma - küçük kar hedefi için market'e çok yakın
+                        // Trend-aware ve opportunity mode-aware agresif fiyatlandırma
+                        let is_opportunity_mode = state.strategy.is_opportunity_mode();
                         
                         // Pozisyon varsa daha toleranslı, yoksa daha sıkı
                         let max_distance_pct = if position_size_notional > 0.0 {
-                            cfg.internal.order_price_distance_with_position // %1
-                                            } else {
-                            cfg.internal.order_price_distance_no_position // %0.5
+                            cfg.internal.order_price_distance_with_position // %0.5
+                        } else {
+                            cfg.internal.order_price_distance_no_position // %0.3
                         };
                         
-                        // Fiyatı clamp et
-                        let px_clamped = clamp_price_to_market_distance(px.0, mid_price, max_distance_pct);
+                        // Trend bilgisi: Strategy'den al (şimdilik 0, ileride entegre edilebilir)
+                        // TODO: Strategy trait'ine get_trend_bps() metodu eklenebilir
+                        let trend_bps = 0.0;
+                        
+                        // Agresif fiyatlandırma: best_ask'e çok yakın (hızlı fill için)
+                        let px_clamped = adjust_price_for_aggressiveness(
+                            px.0,
+                            bid.0,
+                            ask.0,
+                            Side::Sell,
+                            is_opportunity_mode,
+                            trend_bps,
+                            max_distance_pct,
+                        );
                         let px = Px(px_clamped);
                         
                         let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı

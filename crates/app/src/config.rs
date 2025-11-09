@@ -251,6 +251,10 @@ pub struct InternalCfg {
     pub fill_rate_reconnect_factor: f64,
     #[serde(default = "default_fill_rate_reconnect_bonus")]
     pub fill_rate_reconnect_bonus: f64,
+    #[serde(default = "default_strategy_sigma")]
+    pub strategy_sigma: f64, // Volatility coefficient for strategy (default: 0.5)
+    #[serde(default = "default_fill_rate_periodic_decay_factor")]
+    pub fill_rate_periodic_decay_factor: f64, // Fill rate decay factor for periodic decay (default: 0.9)
 }
 
 #[derive(Debug, Deserialize)]
@@ -366,8 +370,8 @@ fn default_fill_rate_increase_bonus() -> f64 { 0.05 }
 fn default_fill_rate_decrease_factor() -> f64 { 0.98 }
 fn default_fill_rate_slow_decrease_factor() -> f64 { 0.995 }
 fn default_fill_rate_slow_decrease_bonus() -> f64 { 0.005 }
-fn default_order_price_distance_with_position() -> f64 { 0.01 }
-fn default_order_price_distance_no_position() -> f64 { 0.005 }
+fn default_order_price_distance_with_position() -> f64 { 0.005 } // %0.5 (çok agresif - market'e çok yakın)
+fn default_order_price_distance_no_position() -> f64 { 0.003 } // %0.3 (çok agresif - market'e çok yakın)
 fn default_order_price_change_threshold() -> f64 { 0.001 }
 fn default_min_quote_life_ms() -> u64 { 1500 }
 fn default_inventory_reconcile_threshold() -> String { "0.00000001".to_string() }
@@ -444,6 +448,8 @@ fn default_fill_rate_partial_fill_factor() -> f64 { 0.98 }
 fn default_fill_rate_partial_fill_bonus() -> f64 { 0.02 }
 fn default_fill_rate_reconnect_factor() -> f64 { 0.95 }
 fn default_fill_rate_reconnect_bonus() -> f64 { 0.05 }
+fn default_strategy_sigma() -> f64 { 0.5 } // Default volatility coefficient
+fn default_fill_rate_periodic_decay_factor() -> f64 { 0.9 } // Default periodic decay factor
 fn default_trend_analysis_min_history() -> usize { 10 }
 fn default_trend_analysis_threshold_negative() -> f64 { -0.15 }
 fn default_trend_analysis_threshold_strong_negative() -> f64 { -0.20 }

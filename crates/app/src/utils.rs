@@ -427,6 +427,103 @@ pub fn clamp_price_to_market_distance(
     price.max(min_price).min(max_price)
 }
 
+/// Adjust price for aggressiveness based on trend and manipulation
+/// 
+/// # Arguments
+/// * `price` - Raw price from strategy
+/// * `best_bid` - Best bid price
+/// * `best_ask` - Best ask price
+/// * `side` - Order side (Buy or Sell)
+/// * `is_opportunity_mode` - Is manipulation opportunity active?
+/// * `trend_bps` - Trend in basis points (positive = uptrend, negative = downtrend)
+/// * `max_distance_pct` - Maximum distance from best bid/ask
+/// 
+/// # Returns
+/// Adjusted price that is closer to market when trend/opportunity is strong
+pub fn adjust_price_for_aggressiveness(
+    price: Decimal,
+    best_bid: Decimal,
+    best_ask: Decimal,
+    side: bot_core::types::Side,
+    is_opportunity_mode: bool,
+    trend_bps: f64,
+    max_distance_pct: f64,
+) -> Decimal {
+    if best_bid <= Decimal::ZERO || best_ask <= Decimal::ZERO || price <= Decimal::ZERO {
+        return price;
+    }
+    
+    let max_distance_pct_dec = match Decimal::try_from(max_distance_pct) {
+        Ok(d) => d,
+        Err(_) => return price,
+    };
+    
+    match side {
+        bot_core::types::Side::Buy => {
+            // BID: best_bid'e yakın olmalı
+            let max_distance = best_bid * max_distance_pct_dec;
+            
+            // Trend-aware adjustment: Uptrend varsa bid'i yukarı çek
+            let trend_factor = if trend_bps > 50.0 {
+                // Güçlü uptrend: bid'i %50 daha yakın yap
+                0.5
+            } else if trend_bps > 0.0 {
+                // Zayıf uptrend: bid'i %25 daha yakın yap
+                0.75
+            } else {
+                1.0 // Downtrend: normal mesafe
+            };
+            
+            // Opportunity mode: Manipülasyon varsa daha agresif
+            let opportunity_factor = if is_opportunity_mode {
+                0.2 // %80 daha yakın (çok agresif - küçük kar hedefi için)
+            } else {
+                0.5 // Normal modda bile %50 daha yakın (küçük kar hedefi için agresif)
+            };
+            
+            // Kombine faktör (en agresif olanı seç)
+            let adjustment_factor = if trend_factor < opportunity_factor { trend_factor } else { opportunity_factor };
+            let adjustment_factor_dec = Decimal::try_from(adjustment_factor).unwrap_or(Decimal::ONE);
+            let adjusted_min = best_bid - (max_distance * adjustment_factor_dec);
+            
+            // Clamp: strategy price ile adjusted min arasında en yakın olanı seç
+            // Küçük kar hedefi için best_bid'e mümkün olduğunca yakın
+            price.max(adjusted_min).min(best_bid)
+        }
+        bot_core::types::Side::Sell => {
+            // ASK: best_ask'e yakın olmalı
+            let max_distance = best_ask * max_distance_pct_dec;
+            
+            // Trend-aware adjustment: Downtrend varsa ask'i aşağı çek
+            let trend_factor = if trend_bps < -50.0 {
+                // Güçlü downtrend: ask'i %50 daha yakın yap
+                0.5
+            } else if trend_bps < 0.0 {
+                // Zayıf downtrend: ask'i %25 daha yakın yap
+                0.75
+            } else {
+                1.0 // Uptrend: normal mesafe
+            };
+            
+            // Opportunity mode: Manipülasyon varsa daha agresif
+            let opportunity_factor = if is_opportunity_mode {
+                0.2 // %80 daha yakın (çok agresif - küçük kar hedefi için)
+            } else {
+                0.5 // Normal modda bile %50 daha yakın (küçük kar hedefi için agresif)
+            };
+            
+            // Kombine faktör (en agresif olanı seç)
+            let adjustment_factor = if trend_factor < opportunity_factor { trend_factor } else { opportunity_factor };
+            let adjustment_factor_dec = Decimal::try_from(adjustment_factor).unwrap_or(Decimal::ONE);
+            let adjusted_max = best_ask + (max_distance * adjustment_factor_dec);
+            
+            // Clamp: strategy price ile adjusted max arasında en yakın olanı seç
+            // Küçük kar hedefi için best_ask'e mümkün olduğunca yakın
+            price.max(best_ask).min(adjusted_max)
+        }
+    }
+}
+
 /// Helper trait for ceiling division by step
 trait CeilStep {
     fn ceil_div_step(self, step: f64) -> f64;
