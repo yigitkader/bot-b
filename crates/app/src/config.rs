@@ -389,10 +389,10 @@ fn default_stop_loss_threshold() -> f64 { -0.005 }
 fn default_stop_loss_time_threshold_ms() -> u64 { 120_000 }
 fn default_stop_loss_trend_threshold() -> f64 { -0.2 }
 fn default_max_position_size_buffer() -> f64 { 10.0 }
-fn default_opportunity_mode_position_multiplier() -> f64 { 2.0 }
+fn default_opportunity_mode_position_multiplier() -> f64 { 1.5 } // 2.0 → 1.5: daha konservatif
 fn default_opportunity_mode_leverage_reduction() -> f64 { 0.5 }
-fn default_opportunity_mode_soft_limit_ratio() -> f64 { 0.95 } // %95'te yeni emirleri durdur
-fn default_opportunity_mode_medium_limit_ratio() -> f64 { 1.0 } // %100'de mevcut emirleri azalt (hard limit)
+fn default_opportunity_mode_soft_limit_ratio() -> f64 { 0.80 } // %80'de yeni emirleri durdur (0.95 → 0.80: daha erken dur)
+fn default_opportunity_mode_medium_limit_ratio() -> f64 { 0.90 } // %90'da mevcut emirleri azalt (1.0 → 0.90: daha erken azalt)
 fn default_opportunity_mode_hard_limit_ratio() -> f64 { 1.0 } // %100'de force-close
 fn default_min_risk_reward_ratio() -> f64 { 2.0 }
 fn default_take_profit_position_size_threshold() -> f64 { 100.0 }

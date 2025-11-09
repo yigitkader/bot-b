@@ -178,10 +178,10 @@ internal:
   
   # Pozisyon boyutu risk kontrolü
   max_position_size_buffer: 10.0  # 10x buffer (5.0 → 10.0: daha fazla pozisyon boyutuna izin ver)
-  opportunity_mode_position_multiplier: 2.0  # Fırsat modunda pozisyon çarpanı (normal 1x)
+  opportunity_mode_position_multiplier: 1.5  # Fırsat modunda pozisyon çarpanı (2.0 → 1.5: daha konservatif)
   opportunity_mode_leverage_reduction: 0.5  # Fırsat modunda leverage azaltma faktörü (0.5 = yarıya düşür)
-  opportunity_mode_soft_limit_ratio: 0.95  # Soft limit: Yeni emirleri durdur (%95) (0.8 → 0.95: daha yüksek threshold)
-  opportunity_mode_medium_limit_ratio: 1.0  # Medium limit: Mevcut emirleri azalt (%100) (0.9 → 1.0: hard limit)
+  opportunity_mode_soft_limit_ratio: 0.80  # Soft limit: Yeni emirleri durdur (%80) (0.95 → 0.80: daha erken dur)
+  opportunity_mode_medium_limit_ratio: 0.90  # Medium limit: Mevcut emirleri azalt (%90) (1.0 → 0.90: daha erken azalt)
   opportunity_mode_hard_limit_ratio: 1.0  # Hard limit: Force-close (%100)
   
   # Risk/Reward ve Profit Guarantee

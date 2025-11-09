@@ -1405,35 +1405,34 @@ async fn main() -> Result<()> {
             // Cache'den bakiye oku (loop başında çekildi)
             let q_free = quote_balances.get(&quote_asset).copied().unwrap_or(0.0);
             
-                    // Futures için: leverage ile toplam kullanılabilir miktar
+            // KRİTİK DÜZELTME: Futures için margin kontrolü (leverage uygulanmadan)
+            // q_free zaten margin (hesaptan çıkan para), leverage ile çarpmak yanlış
+            // Leverage sadece pozisyon büyüklüğünü belirler, hesaptan çıkan parayı etkilemez
             let has_balance = {
+                if is_debug_symbol {
+                    info!(
+                        %symbol,
+                        quote_asset = %quote_asset,
+                        available_margin = q_free,
+                        min_required = min_usd_per_order,
+                        "balance check for debug symbol (futures, margin-based, from cache)"
+                    );
+                }
+                if q_free < cfg.min_quote_balance_usd {
+                    false // Bakiye çok düşük, skip
+                } else {
+                    // Margin >= min_usd_per_order kontrolü (leverage uygulanmadan)
+                    let has_enough = q_free >= min_usd_per_order;
                     if is_debug_symbol {
                         info!(
                             %symbol,
-                            quote_asset = %quote_asset,
-                            available_balance = q_free,
+                            available_margin = q_free,
                             min_required = min_usd_per_order,
-                            "balance check for debug symbol (futures, from cache)"
+                            has_enough,
+                            "balance check result (futures, margin-based)"
                         );
                     }
-                    if q_free < cfg.min_quote_balance_usd {
-                        false // Bakiye çok düşük, skip
-                    } else {
-                        // Leverage ile toplam kullanılabilir miktar
-                        let total = q_free * effective_leverage;
-                        let has_enough = total >= min_usd_per_order;
-                        if is_debug_symbol {
-                            info!(
-                                %symbol,
-                                available_balance = q_free,
-                                effective_leverage,
-                                total_with_leverage = total,
-                                min_required = min_usd_per_order,
-                                has_enough,
-                                "balance check result (from cache)"
-                            );
-                        }
-                        has_enough
+                    has_enough
                 }
             };
             
@@ -2900,33 +2899,26 @@ async fn main() -> Result<()> {
 
             // ---- CAP HESABI (sembolün kendi quote'u ile) ----
             // Futures only - spot removed
+            // KRİTİK DÜZELTME: Cache'den oku (loop başında zaten fetch edilmiş, gereksiz fetch'i kaldır)
             let caps = {
-                    let avail = match venue.available_balance(&quote_asset).await {
-                        Ok(a) => {
-                            let avail_f64 = a.to_f64().unwrap_or(0.0);
-                            // HIZLI KONTROL: Config'deki minimum eşikten azsa işlem yapma
-                            // Eğer o quote asset'te yeterli bakiye yoksa, bu sembolü skip et
-                            if avail_f64 < cfg.min_quote_balance_usd {
-                                info!(
-                                    %symbol,
-                                    quote_asset = %quote_asset,
-                                    available_balance = avail_f64,
-                                    min_required = cfg.min_quote_balance_usd,
-                                    "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
-                                );
-                                0.0 // Bakiye çok düşük, bu sembolü skip et
-                            } else if avail_f64 == 0.0 {
-                                warn!(%symbol, quote_asset = %quote_asset, available_balance = %a, "available balance is zero or failed to convert to f64");
-                                0.0
-                            } else {
-                                avail_f64
-                            }
-                        },
-                        Err(err) => {
-                            warn!(%symbol, quote_asset = %quote_asset, ?err, "failed to fetch available balance, using zero");
-                            0.0
+                    // Cache'den balance al (loop başında fetch edilmiş)
+                    let avail = *quote_balances.get(&quote_asset).unwrap_or(&0.0);
+                    
+                    if avail < cfg.min_quote_balance_usd {
+                        info!(
+                            %symbol,
+                            quote_asset = %quote_asset,
+                            available_balance = avail,
+                            min_required = cfg.min_quote_balance_usd,
+                            "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
+                        );
+                        // Caps'i sıfırla, bu sembolü skip et
+                        Caps {
+                            buy_notional: 0.0,
+                            sell_notional: 0.0,
+                            buy_total: 0.0,
                         }
-                    };
+                    } else {
                     // NOT: effective_leverage config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     // (Futures için leverage sembol bazında değişmez, config'den gelir)
                     
@@ -2987,15 +2979,16 @@ async fn main() -> Result<()> {
                         per_order_limit_notional_usd = per_order_notional,
                         "calculated futures caps: max_usable_from_account is max USD that will leave your account, leverage only affects position size (existing position margin deducted, opportunity mode reduces leverage by 50%)"
                     );
-                    Caps {
-                        buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
-                        sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
-                        // buy_total: Hesaptan giden para (margin)
-                        // - 20 USD varsa → 20 USD kullanılır (tamamı)
-                        // - 100 USD varsa → 100 USD kullanılır (tamamı)
-                        // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
-                        buy_total: max_usable_from_account,
-                }
+                        Caps {
+                            buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
+                            sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
+                            // buy_total: Hesaptan giden para (margin)
+                            // - 20 USD varsa → 20 USD kullanılır (tamamı)
+                            // - 100 USD varsa → 100 USD kullanılır (tamamı)
+                            // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
+                            buy_total: max_usable_from_account,
+                        }
+                    }
             };
 
             // Her taraf bağımsız: bid ve ask her biri max 100 USD kullanabilir
@@ -3142,10 +3135,12 @@ async fn main() -> Result<()> {
                     quotes.bid = None;
                 } else {
                     // 1. USD clamp
-                    // KRİTİK DÜZELTME: Futures için gerçek kullanılabilir notional (margin * leverage) kullan
-                    // Futures için: caps.buy_notional = per_order_notional (300), ama gerçek kullanılabilir = buy_total * leverage (26.63 * 3 = 79.89)
-                    // Futures için gerçek kullanılabilir notional (margin * leverage)
-                    let effective_buy_notional = caps.buy_total * effective_leverage;
+                    // KRİTİK DÜZELTME: Margin chunking kullanıldığı için leverage uygulama burada yapılmamalı
+                    // caps.buy_total zaten margin (hesaptan çıkan para)
+                    // calc_qty_from_margin içinde leverage uygulanıyor: notional = margin * leverage
+                    // Bu yüzden burada sadece margin'i kullan (caps.buy_total)
+                    // NOT: Bu kod artık kullanılmıyor çünkü margin chunking sistemi var, ama yine de düzeltelim
+                    let effective_buy_notional = caps.buy_total; // Margin (leverage uygulanmadan)
                     let nq = clamp_qty_by_usd(q, px, effective_buy_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
@@ -3184,10 +3179,10 @@ async fn main() -> Result<()> {
                 } else {
                     // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Quantize, 3) Min notional check
                     // 1. USD clamp
-                    // KRİTİK DÜZELTME: Futures için gerçek kullanılabilir notional (margin * leverage) kullan
-                    // Futures için: caps.sell_notional = per_order_notional (300), ama gerçek kullanılabilir = buy_total * leverage (26.63 * 3 = 79.89)
-                    // Futures için gerçek kullanılabilir notional (margin * leverage)
-                    let effective_sell_notional = caps.buy_total * effective_leverage;
+                    // KRİTİK DÜZELTME: Margin chunking kullanıldığı için leverage uygulama burada yapılmamalı
+                    // caps.buy_total zaten margin (hesaptan çıkan para)
+                    // calc_qty_from_margin içinde leverage uygulanıyor
+                    let effective_sell_notional = caps.buy_total; // Margin (leverage uygulanmadan)
                     let nq = clamp_qty_by_usd(q, px, effective_sell_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO

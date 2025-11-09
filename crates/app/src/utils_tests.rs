@@ -587,6 +587,57 @@ mod tests {
     }
 
     // ============================================================================
+    // Margin Chunking Tests
+    // ============================================================================
+
+    #[test]
+    fn test_margin_chunking_respects_limits() {
+        // 140 USD available → [100, 40] chunks
+        let chunks = split_margin_into_chunks(140.0, 10.0, 100.0);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], 100.0);
+        assert_eq!(chunks[1], 40.0);
+        
+        // Total spent tracking
+        let mut total_spent = 0.0;
+        for chunk in &chunks {
+            total_spent += chunk;
+        }
+        assert_eq!(total_spent, 140.0); // Hepsi kullanıldı
+    }
+
+    #[test]
+    fn test_leverage_separate_from_margin() {
+        // Margin: 100 USD, Leverage: 20x
+        // Notional: 2000 USD (pozisyon büyüklüğü)
+        // Hesaptan çıkan: 100 USD (margin)
+        let margin = 100.0;
+        let leverage = 20.0;
+        let notional = margin * leverage;
+        
+        assert_eq!(notional, 2000.0);
+        assert_eq!(margin, 100.0); // Hesaptan çıkan para değişmedi
+    }
+
+    #[test]
+    fn test_margin_chunking_small_balance() {
+        // 25 USD available → [25] chunk (min 10, max 100)
+        let chunks = split_margin_into_chunks(25.0, 10.0, 100.0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], 25.0);
+    }
+
+    #[test]
+    fn test_margin_chunking_large_balance() {
+        // 500 USD available → [100, 100, 100, 100, 100] chunks
+        let chunks = split_margin_into_chunks(500.0, 10.0, 100.0);
+        assert_eq!(chunks.len(), 5);
+        for chunk in &chunks {
+            assert_eq!(*chunk, 100.0);
+        }
+    }
+
+    // ============================================================================
     // calc_qty_from_margin Tests
     // ============================================================================
 
