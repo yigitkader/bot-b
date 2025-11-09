@@ -402,7 +402,7 @@ fn default_min_risk_reward_ratio() -> f64 { 2.0 }
 fn default_take_profit_position_size_threshold() -> f64 { 100.0 }
 
 // TP ve time-box default'ları
-fn default_tp_timebox_secs() -> u64 { 30 }
+fn default_tp_timebox_secs() -> u64 { 15 } // 30 → 15: Daha çevik, daha fazla işlem
 fn default_position_close_cooldown_ms() -> u64 { 500 }
 
 // Long/Short seçimi default'ları

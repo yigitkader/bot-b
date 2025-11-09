@@ -38,6 +38,7 @@ pub struct SymbolState {
     pub consecutive_no_fills: u32,
     pub last_fill_time: Option<Instant>, // Son fill zamanı (zaman bazlı fill rate için)
     pub last_inventory_update: Option<Instant>, // Son envanter güncelleme zamanı (race condition önleme için)
+    pub last_decay_period: Option<u64>, // Son fill rate decay period (optimizasyon için)
     
     // Position management
     pub position_entry_time: Option<Instant>,

@@ -568,7 +568,7 @@ async fn main() -> Result<()> {
     // KRİTİK: Startup'ta cache'i temizle (fresh rules fetch için)
     info!("clearing cached exchange rules for fresh startup");
     exec::binance::FUT_RULES.clear();
-    
+
     // Per-symbol metadata'yı başlangıçta çek (quantize için)
     info!("fetching per-symbol metadata for quantization...");
     let mut states: Vec<SymbolState> = Vec::new();
@@ -624,6 +624,7 @@ async fn main() -> Result<()> {
             consecutive_no_fills: 0,
             last_fill_time: None, // Zaman bazlı fill rate için
             last_inventory_update: None, // Envanter güncelleme race condition önleme için
+            last_decay_period: None, // Fill rate decay period tracking (optimizasyon için)
             position_entry_time: None,
             peak_pnl: Decimal::ZERO,
             position_hold_duration_ms: 0,
@@ -1146,6 +1147,21 @@ async fn main() -> Result<()> {
                                 // İlk pozisyon → entry price = fill price
                                 state.avg_entry_price = Some(price.0);
                             }
+                            
+                            // ✅ HIGH FIX: Position entry time race condition - WebSocket event önce gelebilir
+                            // Pozisyon ilk kez açılıyorsa entry time set et (WebSocket fill event'te)
+                            if old_inv.is_zero() && !inv.is_zero() {
+                                if state.position_entry_time.is_none() {
+                                    state.position_entry_time = Some(std::time::Instant::now());
+                                    info!(
+                                        %symbol,
+                                        entry_time_set = "from_websocket_fill",
+                                        fill_price = %price.0,
+                                        fill_qty = %fill_increment,
+                                        "position entry time set from WebSocket fill event"
+                                    );
+                                }
+                            }
                         }
                         
                         // Pozisyon sıfıra düştüyse avg_entry_price'ı sıfırla
@@ -1445,30 +1461,30 @@ async fn main() -> Result<()> {
             // q_free zaten margin (hesaptan çıkan para), leverage ile çarpmak yanlış
             // Leverage sadece pozisyon büyüklüğünü belirler, hesaptan çıkan parayı etkilemez
             let has_balance = {
-                if is_debug_symbol {
-                    info!(
-                        %symbol,
-                        quote_asset = %quote_asset,
-                        available_margin = q_free,
-                        min_required = min_usd_per_order,
-                        "balance check for debug symbol (futures, margin-based, from cache)"
-                    );
-                }
-                if q_free < cfg.min_quote_balance_usd {
-                    false // Bakiye çok düşük, skip
-                } else {
-                    // Margin >= min_usd_per_order kontrolü (leverage uygulanmadan)
-                    let has_enough = q_free >= min_usd_per_order;
                     if is_debug_symbol {
                         info!(
                             %symbol,
-                            available_margin = q_free,
+                            quote_asset = %quote_asset,
+                        available_margin = q_free,
                             min_required = min_usd_per_order,
-                            has_enough,
-                            "balance check result (futures, margin-based)"
+                        "balance check for debug symbol (futures, margin-based, from cache)"
                         );
                     }
-                    has_enough
+                    if q_free < cfg.min_quote_balance_usd {
+                        false // Bakiye çok düşük, skip
+                    } else {
+                    // Margin >= min_usd_per_order kontrolü (leverage uygulanmadan)
+                    let has_enough = q_free >= min_usd_per_order;
+                        if is_debug_symbol {
+                            info!(
+                                %symbol,
+                            available_margin = q_free,
+                                min_required = min_usd_per_order,
+                                has_enough,
+                            "balance check result (futures, margin-based)"
+                            );
+                        }
+                        has_enough
                 }
             };
             
@@ -2738,19 +2754,17 @@ async fn main() -> Result<()> {
                 const DECAY_INTERVAL_SEC: u64 = 30; // Her 30 saniyede bir decay uygula
                 
                 if seconds_since_fill >= TIME_BASED_DECAY_THRESHOLD_SEC {
-                    // Her 30 saniyelik aralıkta bir kez decay uygula (her tick'te değil)
-                    // Örnek: 30-59 saniye arası → 1 kez, 60-89 saniye arası → 1 kez, vb.
-                    // Period hesapla: 30-59 → period 1, 60-89 → period 2, vb.
+                    // ✅ LOW FIX: Fill rate decay overhead optimizasyonu - period flag bazlı
+                    // Her 30 saniyelik aralıkta bir kez decay uygula (period flag ile)
                     let current_period = seconds_since_fill / DECAY_INTERVAL_SEC;
-                    // Bir önceki tick'teki period'u tahmin et (1 saniye önce)
-                    let previous_period = seconds_since_fill.saturating_sub(1) / DECAY_INTERVAL_SEC;
                     
                     // Eğer yeni bir 30 saniyelik period'a geçtiysek decay uygula
-                    // Bu, her 30 saniyede bir kez decay yapılmasını garanti eder
-                    if current_period > previous_period {
+                    // Period flag ile her period'da sadece bir kez decay yapılmasını garanti eder
+                    if Some(current_period) != state.last_decay_period {
                         // 30 saniyedir fill yok - fill rate'i düşür
                         state.order_fill_rate *= 0.9; // %10 azalt
                         state.consecutive_no_fills += 1; // Geriye dönük uyumluluk için
+                        state.last_decay_period = Some(current_period); // Period flag güncelle
                         
                         debug!(
                             symbol = %state.meta.symbol,
@@ -2764,6 +2778,9 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+            } else {
+                // Fill oldu, decay period'u sıfırla
+                state.last_decay_period = None;
             }
             
             if state.active_orders.len() > 0 {
@@ -3048,13 +3065,13 @@ async fn main() -> Result<()> {
                     let avail = *quote_balances.get(&quote_asset).unwrap_or(&0.0);
                     
                     if avail < cfg.min_quote_balance_usd {
-                        info!(
-                            %symbol,
-                            quote_asset = %quote_asset,
+                                info!(
+                                    %symbol,
+                                    quote_asset = %quote_asset,
                             available_balance = avail,
-                            min_required = cfg.min_quote_balance_usd,
-                            "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
-                        );
+                                    min_required = cfg.min_quote_balance_usd,
+                                    "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
+                                );
                         // Caps'i sıfırla, bu sembolü skip et
                         Caps {
                             buy_notional: 0.0,
@@ -3122,16 +3139,16 @@ async fn main() -> Result<()> {
                         per_order_limit_notional_usd = per_order_notional,
                         "calculated futures caps: max_usable_from_account is max USD that will leave your account, leverage only affects position size (existing position margin deducted, opportunity mode reduces leverage by 50%)"
                     );
-                        Caps {
-                            buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
-                            sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
-                            // buy_total: Hesaptan giden para (margin)
-                            // - 20 USD varsa → 20 USD kullanılır (tamamı)
-                            // - 100 USD varsa → 100 USD kullanılır (tamamı)
-                            // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
-                            buy_total: max_usable_from_account,
+                    Caps {
+                        buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
+                        sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
+                        // buy_total: Hesaptan giden para (margin)
+                        // - 20 USD varsa → 20 USD kullanılır (tamamı)
+                        // - 100 USD varsa → 100 USD kullanılır (tamamı)
+                        // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
+                        buy_total: max_usable_from_account,
                         }
-                    }
+                }
             };
 
             // Her taraf bağımsız: bid ve ask her biri max 100 USD kullanabilir
@@ -3581,11 +3598,22 @@ async fn main() -> Result<()> {
                                     let tick_size = rules.tick_size;
                                     let tp_quantized = exec::quant_utils_ceil_to_step(tp, tick_size);
                                     
-                                    // KRİTİK DÜZELTME: TP spread kontrolü kaldırıldı
-                                    // TP zaten entry_price üzerinden $0.50 kâr garantisi veriyor
-                                    // Entry price best_bid'den düşük olabilir, bu yüzden TP best_ask'ten düşük çıkabilir
-                                    // Bu normal ve kabul edilebilir - TP hesaplaması entry_price üzerinden yapılıyor
-                                    // Spread kontrolü gereksiz ve yanlış chunk'ları atıyor
+                                    // ✅ CRITICAL FIX: TP spread kontrolü - TP emri maker olmalı
+                                    // Long pozisyon: TP = sell exit price, best_ask'ten en az 1 tick yüksek olmalı
+                                    let min_tp_for_maker = ask.0 + tick_size;
+                                    if tp_quantized < min_tp_for_maker {
+                                        // TP çok düşük, maker order olamaz (taker olur → daha yüksek fee)
+                                        warn!(
+                                            %symbol,
+                                            chunk_idx,
+                                            tp_calculated = %tp_quantized,
+                                            min_required = %min_tp_for_maker,
+                                            best_ask = %ask.0,
+                                            tick_size = %tick_size,
+                                            "TP below min maker price (best_ask + tick_size), skipping chunk (would be taker order)"
+                                        );
+                                        continue;
+                                    }
                                     
                                     Some(tp_quantized)
                                 }
@@ -3807,7 +3835,7 @@ async fn main() -> Result<()> {
                         // Pozisyon varsa daha toleranslı, yoksa daha sıkı
                         let base_distance_pct = if position_size_notional > 0.0 {
                             cfg.internal.order_price_distance_with_position // %0.5
-                        } else {
+                                            } else {
                             cfg.internal.order_price_distance_no_position // %0.3
                         };
                         
@@ -3919,7 +3947,7 @@ async fn main() -> Result<()> {
                             // calc_qty_from_margin kullanarak qty hesapla
                             let effective_leverage_for_chunk = if state.strategy.is_opportunity_mode() {
                                 effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
-                            } else {
+                                            } else {
                                 effective_leverage_ask
                             };
                             
@@ -4018,11 +4046,22 @@ async fn main() -> Result<()> {
                                     let tick_size = rules.tick_size;
                                     let tp_quantized = exec::quant_utils_floor_to_step(tp, tick_size);
                                     
-                                    // KRİTİK DÜZELTME: TP spread kontrolü kaldırıldı
-                                    // TP zaten entry_price üzerinden $0.50 kâr garantisi veriyor
-                                    // Entry price best_ask'ten yüksek olabilir, bu yüzden TP best_bid'den yüksek çıkabilir
-                                    // Bu normal ve kabul edilebilir - TP hesaplaması entry_price üzerinden yapılıyor
-                                    // Spread kontrolü gereksiz ve yanlış chunk'ları atıyor
+                                    // ✅ CRITICAL FIX: TP spread kontrolü - TP emri maker olmalı
+                                    // Short pozisyon: TP = buy exit price, best_bid'ten en az 1 tick düşük olmalı
+                                    let max_tp_for_maker = bid.0 - tick_size;
+                                    if tp_quantized > max_tp_for_maker {
+                                        // TP çok yüksek, maker order olamaz (taker olur → daha yüksek fee)
+                                        warn!(
+                                            %symbol,
+                                            chunk_idx,
+                                            tp_calculated = %tp_quantized,
+                                            max_required = %max_tp_for_maker,
+                                            best_bid = %bid.0,
+                                            tick_size = %tick_size,
+                                            "TP above max maker price (best_bid - tick_size), skipping chunk (would be taker order)"
+                                        );
+                                        continue;
+                                    }
                                     
                                     Some(tp_quantized)
                                 }
@@ -4329,7 +4368,8 @@ fn update_fill_rate_on_fill(
     increase_bonus: f64,
 ) {
     state.consecutive_no_fills = 0;
-    state.last_fill_time = Some(std::time::Instant::now()); // Zaman bazlı fill rate için
+                        state.last_fill_time = Some(std::time::Instant::now());
+                        state.last_decay_period = None; // Fill oldu, decay period'u sıfırla // Zaman bazlı fill rate için
     state.order_fill_rate = (state.order_fill_rate * increase_factor + increase_bonus)
         .min(1.0);
 }
