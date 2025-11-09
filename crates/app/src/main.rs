@@ -2304,13 +2304,20 @@ async fn main() -> Result<()> {
                     .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
                     .unwrap_or(true);
                 
-                // Kural 1: Sabit TP ($0.50)
+                // Kural 1: Sabit TP ($0.50) - Her zaman çalışır (yaş sınırı yok)
                 let should_close_tp = net_pnl >= tp_usd;
                 
-                // Kural 2: Time-box (20 saniye içinde net > 0)
+                // Kural 2: Time-box (ilk 20 saniye içinde net > 0 ise kapat, 20 saniyeden sonra sadece $0.50+ kâr varsa kapat)
+                // Not: 20 saniyeden sonra sabit TP kuralı devreye girer ($0.50+)
                 let should_close_timebox = if let Some(entry_time) = state.position_entry_time {
                     let age_secs = entry_time.elapsed().as_secs();
-                    age_secs <= timebox_secs && net_pnl > 0.0
+                    if age_secs <= timebox_secs {
+                        // İlk 20 saniye: Net kâr > 0 ise kapat (agresif - hızlı kâr al)
+                        net_pnl > 0.0
+                    } else {
+                        // 20 saniyeden sonra: Time-box kuralı devre dışı, sadece sabit TP ($0.50) çalışır
+                        false
+                    }
                 } else {
                     false
                 };
@@ -3366,27 +3373,11 @@ async fn main() -> Result<()> {
                                     let tick_size = rules.tick_size;
                                     let tp_quantized = exec::quant_utils_ceil_to_step(tp, tick_size);
                                     
-                                    // Spread kontrolü: TP fiyatı best_ask'ten yeterince uzak mı?
-                                    let best_ask_dec = ask.0;
-                                    let spread_bps = if best_ask_dec > Decimal::ZERO {
-                                        ((tp_quantized - best_ask_dec) / best_ask_dec).to_f64().unwrap_or(0.0) * 10000.0
-                                    } else {
-                                        0.0
-                                    };
-                                    
-                                    // Min spread kontrolü (dynamic spread)
-                                    if spread_bps < dyn_cfg.min_spread_bps {
-                                        warn!(
-                                            %symbol,
-                                            chunk_idx,
-                                            tp_price = %tp_quantized,
-                                            best_ask = %best_ask_dec,
-                                            spread_bps,
-                                            min_spread_bps = dyn_cfg.min_spread_bps,
-                                            "TP price too close to market (bid), skipping chunk (cannot guarantee $0.50 profit)"
-                                        );
-                                        continue;
-                                    }
+                                    // KRİTİK DÜZELTME: TP spread kontrolü kaldırıldı
+                                    // TP zaten entry_price üzerinden $0.50 kâr garantisi veriyor
+                                    // Entry price best_bid'den düşük olabilir, bu yüzden TP best_ask'ten düşük çıkabilir
+                                    // Bu normal ve kabul edilebilir - TP hesaplaması entry_price üzerinden yapılıyor
+                                    // Spread kontrolü gereksiz ve yanlış chunk'ları atıyor
                                     
                                     Some(tp_quantized)
                                 }
@@ -3712,27 +3703,11 @@ async fn main() -> Result<()> {
                                     let tick_size = rules.tick_size;
                                     let tp_quantized = exec::quant_utils_floor_to_step(tp, tick_size);
                                     
-                                    // Spread kontrolü: TP fiyatı best_bid'den yeterince uzak mı?
-                                    let best_bid_dec = bid.0;
-                                    let spread_bps = if best_bid_dec > Decimal::ZERO {
-                                        ((best_bid_dec - tp_quantized) / best_bid_dec).to_f64().unwrap_or(0.0) * 10000.0
-                                    } else {
-                                        0.0
-                                    };
-                                    
-                                    // Min spread kontrolü (dynamic spread)
-                                    if spread_bps < dyn_cfg.min_spread_bps {
-                                        warn!(
-                                            %symbol,
-                                            chunk_idx,
-                                            tp_price = %tp_quantized,
-                                            best_bid = %best_bid_dec,
-                                            spread_bps,
-                                            min_spread_bps = dyn_cfg.min_spread_bps,
-                                            "TP price too close to market (ask), skipping chunk (cannot guarantee $0.50 profit)"
-                                        );
-                                        continue;
-                                    }
+                                    // KRİTİK DÜZELTME: TP spread kontrolü kaldırıldı
+                                    // TP zaten entry_price üzerinden $0.50 kâr garantisi veriyor
+                                    // Entry price best_ask'ten yüksek olabilir, bu yüzden TP best_bid'den yüksek çıkabilir
+                                    // Bu normal ve kabul edilebilir - TP hesaplaması entry_price üzerinden yapılıyor
+                                    // Spread kontrolü gereksiz ve yanlış chunk'ları atıyor
                                     
                                     Some(tp_quantized)
                                 }
