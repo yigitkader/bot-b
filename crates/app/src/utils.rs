@@ -168,22 +168,53 @@ pub fn calc_qty_from_margin(
     if tick_size <= Decimal::ZERO {
         return None;
     }
-    let price_quantized = match side {
-        Side::Buy => exec::quant_utils_floor_to_step(price, tick_size),
-        Side::Sell => exec::quant_utils_ceil_to_step(price, tick_size),
+    
+    // KRİTİK DÜZELTME: tick_size çok büyükse (price'dan büyük veya eşitse) rounding yapma!
+    // Örnek: price=0.29376, tick_size=0.1 -> floor_to_step(0.29376, 0.1) = 0.2 (YANLIŞ!)
+    // Doğrusu: tick_size=0.00001 olmalı, o zaman floor_to_step(0.29376, 0.00001) = 0.29376 (DOĞRU)
+    let price_quantized = if tick_size >= price {
+        tracing::warn!(
+            price = %price,
+            tick_size = %tick_size,
+            "tick_size >= price, skipping quantization (using raw price) - tick_size may be incorrectly parsed"
+        );
+        price // Rounding yapma, raw price kullan
+    } else {
+        match side {
+            Side::Buy => exec::quant_utils_floor_to_step(price, tick_size),
+            Side::Sell => exec::quant_utils_ceil_to_step(price, tick_size),
+        }
     };
     
-    // KRİTİK: Quantized price sıfır kontrolü (tick_size çok büyükse price_quantized sıfır olabilir)
-    // Örnek: price=0.01283, tick_size=0.10 -> floor_to_step(0.01283, 0.10) = 0.0
+    // KRİTİK: Quantized price sıfır kontrolü
     if price_quantized <= Decimal::ZERO {
-        // Debug: tick_size çok büyük olabilir
-        tracing::debug!(
+        tracing::error!(
             price = %price,
             tick_size = %tick_size,
             price_quantized = %price_quantized,
-            "price_quantized is zero, likely tick_size too large for price"
+            side = ?side,
+            "price_quantized is zero after rounding, this should not happen"
         );
         return None;
+    }
+    
+    // KRİTİK: Quantized price ile raw price arasındaki fark kontrolü (debug için)
+    let price_diff_bps = if price > Decimal::ZERO {
+        ((price_quantized - price).abs() / price * Decimal::from(10000)).to_f64().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    
+    if price_diff_bps > 100.0 {
+        // %1'den fazla fark varsa uyar (tick_size çok büyük olabilir)
+        tracing::warn!(
+            price_raw = %price,
+            price_quantized = %price_quantized,
+            tick_size = %tick_size,
+            diff_bps = price_diff_bps,
+            side = ?side,
+            "large price difference after quantization (>1%), check tick_size"
+        );
     }
     
     // KRİTİK DÜZELTME: Precision/Decimal - minQty ve minNotional kontrolleri Decimal ile

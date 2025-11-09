@@ -553,6 +553,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    // KRİTİK: Startup'ta cache'i temizle (fresh rules fetch için)
+    info!("clearing cached exchange rules for fresh startup");
+    exec::binance::FUT_RULES.clear();
+    
     // Per-symbol metadata'yı başlangıçta çek (quantize için)
     info!("fetching per-symbol metadata for quantization...");
     let mut states: Vec<SymbolState> = Vec::new();
@@ -3396,14 +3400,53 @@ async fn main() -> Result<()> {
                             // İlk chunk için test order (sadece bir kez)
                             if chunk_idx == 0 && !state.test_order_passed {
                             rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                                
+                                // Test order öncesi rules'ı logla
+                                info!(
+                                    %symbol,
+                                    tick_size = %rules.tick_size,
+                                    step_size = %rules.step_size,
+                                    price_precision = rules.price_precision,
+                                    qty_precision = rules.qty_precision,
+                                    min_notional = %rules.min_notional,
+                                    raw_price = %chunk_price.0,
+                                    raw_qty = %chunk_qty.0,
+                                    price_str = %price_str,
+                                    qty_str = %qty_str,
+                                    "rules and params before test_order (bid)"
+                                );
+                                
                                 match venue.test_order(&symbol, Side::Buy, chunk_price, chunk_qty, tif).await {
                                 Ok(_) => {
                                     state.test_order_passed = true;
-                                        info!(%symbol, "test order passed, proceeding with real orders");
+                                        info!(
+                                            %symbol,
+                                            price_quantized = %chunk_price.0,
+                                            qty_quantized = %chunk_qty.0,
+                                            price_str = %price_str,
+                                            qty_str = %qty_str,
+                                            "test order passed, proceeding with real orders"
+                                        );
                                 }
                                 Err(e) => {
                                     let error_str = e.to_string();
                                     let error_lower = error_str.to_lowercase();
+                                    
+                                    // Hata detayları
+                                    error!(
+                                        %symbol,
+                                        error = %e,
+                                        error_contains_1111 = error_lower.contains("-1111"),
+                                        price_quantized = %chunk_price.0,
+                                        qty_quantized = %chunk_qty.0,
+                                        price_str = %price_str,
+                                        qty_str = %qty_str,
+                                        tick_size = %rules.tick_size,
+                                        step_size = %rules.step_size,
+                                        price_precision = rules.price_precision,
+                                        qty_precision = rules.qty_precision,
+                                        "test order failed with detailed context (bid)"
+                                    );
                                     
                                     if error_lower.contains("precision is over") || error_lower.contains("-1111") {
                                         error!(%symbol, error = %e, "test order failed with -1111, disabling symbol and refreshing rules");
@@ -3728,14 +3771,53 @@ async fn main() -> Result<()> {
                             // İlk chunk için test order (sadece bir kez, ask için)
                             if chunk_idx == 0 && !state.test_order_passed {
                             rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                                
+                                // Test order öncesi rules'ı logla
+                                info!(
+                                    %symbol,
+                                    tick_size = %rules.tick_size,
+                                    step_size = %rules.step_size,
+                                    price_precision = rules.price_precision,
+                                    qty_precision = rules.qty_precision,
+                                    min_notional = %rules.min_notional,
+                                    raw_price = %chunk_price.0,
+                                    raw_qty = %chunk_qty.0,
+                                    price_str = %price_str,
+                                    qty_str = %qty_str,
+                                    "rules and params before test_order (ask)"
+                                );
+                                
                                 match venue.test_order(&symbol, Side::Sell, chunk_price, chunk_qty, tif).await {
                                 Ok(_) => {
                                     state.test_order_passed = true;
-                                        info!(%symbol, "test order passed (ask), proceeding with real orders");
+                                        info!(
+                                            %symbol,
+                                            price_quantized = %chunk_price.0,
+                                            qty_quantized = %chunk_qty.0,
+                                            price_str = %price_str,
+                                            qty_str = %qty_str,
+                                            "test order passed (ask), proceeding with real orders"
+                                        );
                                 }
                                 Err(e) => {
                                     let error_str = e.to_string();
                                     let error_lower = error_str.to_lowercase();
+                                    
+                                    // Hata detayları
+                                    error!(
+                                        %symbol,
+                                        error = %e,
+                                        error_contains_1111 = error_lower.contains("-1111"),
+                                        price_quantized = %chunk_price.0,
+                                        qty_quantized = %chunk_qty.0,
+                                        price_str = %price_str,
+                                        qty_str = %qty_str,
+                                        tick_size = %rules.tick_size,
+                                        step_size = %rules.step_size,
+                                        price_precision = rules.price_precision,
+                                        qty_precision = rules.qty_precision,
+                                        "test order failed with detailed context (ask)"
+                                    );
                                     
                                     if error_lower.contains("precision is over") || error_lower.contains("-1111") {
                                         error!(%symbol, error = %e, "test order failed with -1111 (ask), disabling symbol and refreshing rules");

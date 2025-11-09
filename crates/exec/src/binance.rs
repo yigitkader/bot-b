@@ -64,7 +64,7 @@ struct FutExchangeSymbol {
     qty_precision: Option<usize>,
 }
 
-static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
+pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
 
 fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
     Decimal::from_str_radix(s.as_ref(), 10).unwrap_or(Decimal::ZERO)
@@ -92,27 +92,88 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
 
     for f in sym.filters {
         match f {
-            FutFilter::PriceFilter { tickSize } => tick = str_dec(tickSize),
-            FutFilter::LotSize { stepSize } => step = str_dec(stepSize),
-            FutFilter::MinNotional { notional } => min_notional = str_dec(notional),
+            FutFilter::PriceFilter { tickSize } => {
+                tick = str_dec(&tickSize);
+                tracing::debug!(
+                    symbol = %sym.symbol,
+                    tick_size_raw = %tickSize,
+                    tick_size_parsed = %tick,
+                    "parsed PRICE_FILTER tickSize"
+                );
+            }
+            FutFilter::LotSize { stepSize } => {
+                step = str_dec(&stepSize);
+                tracing::debug!(
+                    symbol = %sym.symbol,
+                    step_size_raw = %stepSize,
+                    step_size_parsed = %step,
+                    "parsed LOT_SIZE stepSize"
+                );
+            }
+            FutFilter::MinNotional { notional } => {
+                min_notional = str_dec(&notional);
+                tracing::debug!(
+                    symbol = %sym.symbol,
+                    min_notional_raw = %notional,
+                    min_notional_parsed = %min_notional,
+                    "parsed MIN_NOTIONAL"
+                );
+            }
             FutFilter::Other => {}
         }
     }
 
-    let p_prec = sym.price_precision.unwrap_or_else(|| scale_from_step(tick));
-    let q_prec = sym.qty_precision.unwrap_or_else(|| scale_from_step(step));
+    // KRİTİK: Precision hesaplama scale_from_step ile değil, doğrudan API'den al
+    let p_prec = sym.price_precision.unwrap_or_else(|| {
+        let calc = scale_from_step(tick);
+        tracing::warn!(
+            symbol = %sym.symbol,
+            tick_size = %tick,
+            calculated_precision = calc,
+            "pricePrecision missing from API, calculated from tickSize"
+        );
+        calc
+    });
+    
+    let q_prec = sym.qty_precision.unwrap_or_else(|| {
+        let calc = scale_from_step(step);
+        tracing::warn!(
+            symbol = %sym.symbol,
+            step_size = %step,
+            calculated_precision = calc,
+            "quantityPrecision missing from API, calculated from stepSize"
+        );
+        calc
+    });
+
+    // KRİTİK: Fallback değerleri daha makul yap
+    let final_tick = if tick.is_zero() {
+        tracing::warn!(symbol = %sym.symbol, "tickSize is zero, using fallback 0.01");
+        Decimal::new(1, 2) // 0.01
+    } else {
+        tick
+    };
+    
+    let final_step = if step.is_zero() {
+        tracing::warn!(symbol = %sym.symbol, "stepSize is zero, using fallback 0.001");
+        Decimal::new(1, 3) // 0.001
+    } else {
+        step
+    };
+
+    tracing::info!(
+        symbol = %sym.symbol,
+        tick_size = %final_tick,
+        step_size = %final_step,
+        price_precision = p_prec,
+        qty_precision = q_prec,
+        min_notional = %min_notional,
+        "symbol rules parsed from exchangeInfo"
+    );
 
     SymbolRules {
-        tick_size: if tick.is_zero() {
-            Decimal::new(1, 2)
-        } else {
-            tick
-        },
-        step_size: if step.is_zero() {
-            Decimal::new(1, 3)
-        } else {
-            step
-        },
+        tick_size: final_tick,
+        step_size: final_step,
         price_precision: p_prec,
         qty_precision: q_prec,
         min_notional,
