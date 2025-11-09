@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
-use utils::{calc_qty_from_margin, clamp_qty_by_usd, compute_drawdown_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, split_margin_into_chunks};
+use utils::{calc_net_pnl_usd, calc_qty_from_margin, clamp_price_to_market_distance, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
 
 use std::cmp::max;
 use std::collections::HashMap;
@@ -624,6 +624,14 @@ async fn main() -> Result<()> {
             // PnL tracking
             last_daily_reset: None,
             avg_entry_price: None,
+            // Long/Short seçimi için histerezis ve cooldown
+            last_direction_change: None,
+            current_direction: None,
+            direction_signal_strength: 0.0,
+            regime: None,
+            // Position closing control
+            position_closing: false,
+            last_close_attempt: None,
         });
     }
 
@@ -634,33 +642,121 @@ async fn main() -> Result<()> {
         .unwrap_or(1); // Default: 1x (en güvenli)
     
     if cfg.mode == "futures" {
-        // KRİTİK: Isolated margin ayarla (her sembol için)
+        // KRİTİK DÜZELTME: API idempotency - önce oku, sonra set et
+        // Isolated margin ayarla (her sembol için)
         let use_isolated = cfg.risk.use_isolated_margin;
         if use_isolated {
-            info!("setting isolated margin for all symbols");
-            for state in &states {
-                let symbol = &state.meta.symbol;
-                // API Rate Limit koruması
-                rate_limit_guard(1).await; // POST /fapi/v1/marginType: Weight 1
-                if let Err(err) = venue.set_margin_type(symbol, true).await {
-                    warn!(%symbol, error = %err, "failed to set isolated margin, continuing anyway");
-                    // Hata olsa bile devam et (margin type zaten doğru olabilir)
-                }
-            }
-            info!("isolated margin set for all symbols");
-        }
-        
-        info!(leverage = leverage_to_set, "setting leverage for all symbols");
+            let mut isolated_set_count = 0;
+            let mut isolated_skip_count = 0;
+            let mut isolated_fail_count = 0;
+            
+            info!("checking and setting isolated margin for all symbols");
         for state in &states {
             let symbol = &state.meta.symbol;
-            // API Rate Limit koruması
+                
+                // Önce mevcut margin type'ı oku
+                rate_limit_guard(1).await; // GET /fapi/v2/positionRisk: Weight 5
+                match venue.get_margin_type(symbol).await {
+                    Ok(current_is_isolated) => {
+                        if current_is_isolated == use_isolated {
+                            // Zaten doğru, set etme
+                            isolated_skip_count += 1;
+                            debug!(%symbol, "margin type already set to isolated, skipping");
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        // Okuma başarısız, yine de set etmeyi dene (pozisyon yoksa hata verebilir)
+                        warn!(%symbol, error = %e, "failed to get margin type, will attempt to set anyway");
+                    }
+                }
+                
+                // Farklıysa set et
+                rate_limit_guard(1).await; // POST /fapi/v1/marginType: Weight 1
+                match venue.set_margin_type(symbol, true).await {
+                    Ok(_) => {
+                        isolated_set_count += 1;
+                        info!(%symbol, "isolated margin set successfully");
+                    }
+                    Err(err) => {
+                        let error_str = err.to_string();
+                        let error_lower = error_str.to_lowercase();
+                        
+                        // -4046 "No need to change margin type" hatası normal (zaten doğru)
+                        if error_lower.contains("-4046") || error_lower.contains("no need to change") {
+                            isolated_skip_count += 1;
+                            debug!(%symbol, "margin type already isolated, no change needed");
+                        } else {
+                            isolated_fail_count += 1;
+                            warn!(%symbol, error = %err, "failed to set isolated margin");
+                        }
+                    }
+                }
+            }
+            
+            info!(
+                isolated_set = isolated_set_count,
+                isolated_skip = isolated_skip_count,
+                isolated_fail = isolated_fail_count,
+                "isolated margin setup completed"
+            );
+        }
+        
+        // Leverage ayarla (her sembol için)
+        let mut leverage_set_count = 0;
+        let mut leverage_skip_count = 0;
+        let mut leverage_fail_count = 0;
+        
+        info!(leverage = leverage_to_set, "checking and setting leverage for all symbols");
+        for state in &states {
+            let symbol = &state.meta.symbol;
+            
+            // Önce mevcut leverage'i oku
+            rate_limit_guard(5).await; // GET /fapi/v2/positionRisk: Weight 5
+            match venue.get_leverage(symbol).await {
+                Ok(current_leverage) => {
+                    if current_leverage == leverage_to_set {
+                        // Zaten doğru, set etme
+                        leverage_skip_count += 1;
+                        debug!(%symbol, leverage = current_leverage, "leverage already set, skipping");
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    // Okuma başarısız, yine de set etmeyi dene (pozisyon yoksa hata verebilir)
+                    warn!(%symbol, error = %e, "failed to get leverage, will attempt to set anyway");
+                }
+            }
+            
+            // Farklıysa set et
             rate_limit_guard(1).await; // POST /fapi/v1/leverage: Weight 1
-            if let Err(err) = venue.set_leverage(symbol, leverage_to_set).await {
-                warn!(%symbol, leverage = leverage_to_set, error = %err, "failed to set leverage, continuing anyway");
-                // Hata olsa bile devam et (leverage zaten doğru olabilir)
+            match venue.set_leverage(symbol, leverage_to_set).await {
+                Ok(_) => {
+                    leverage_set_count += 1;
+                    info!(%symbol, leverage = leverage_to_set, "leverage set successfully");
+                }
+                Err(err) => {
+                    let error_str = err.to_string();
+                    let error_lower = error_str.to_lowercase();
+                    
+                    // -4059 "No need to change leverage" hatası normal (zaten doğru)
+                    if error_lower.contains("-4059") || error_lower.contains("no need to change") {
+                        leverage_skip_count += 1;
+                        debug!(%symbol, leverage = leverage_to_set, "leverage already set, no change needed");
+                    } else {
+                        leverage_fail_count += 1;
+                        warn!(%symbol, leverage = leverage_to_set, error = %err, "failed to set leverage");
+                    }
+                }
             }
         }
-        info!("leverage set for all symbols");
+        
+        info!(
+            leverage_set = leverage_set_count,
+            leverage_skip = leverage_skip_count,
+            leverage_fail = leverage_fail_count,
+            "leverage setup completed"
+        );
     }
 
     let symbol_list: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
@@ -2166,6 +2262,121 @@ async fn main() -> Result<()> {
                     (entry_price_f64 - mark_price_f64) / entry_price_f64
                 };
                 
+                // KRİTİK: İki kural - Sabit $0.50 TP ve 20 saniye time-box
+                // Kural 1: Net +$0.50 kâr görülür görmez pozisyonu kapat
+                // Kural 2: İlk 20 saniye içinde net kâr > 0 oluşursa, beklemeden kârı al ve çık
+                
+                // Pozisyon side belirle
+                let position_side = if pos.qty.0.is_sign_positive() {
+                    Side::Buy // Long
+                } else {
+                    Side::Sell // Short
+                };
+                
+                // Exit price: Long için bid, Short için ask (konservatif)
+                let exit_price = match position_side {
+                    Side::Buy => bid.0,  // Long kapatırken bid
+                    Side::Sell => ask.0, // Short kapatırken ask
+                };
+                
+                // Fee hesaplama: Entry için maker (post-only), exit için taker (market IOC)
+                let entry_fee_bps = maker_fee_rate * 10000.0; // Maker fee (bps)
+                let exit_fee_bps = estimate_close_fee_bps(true, maker_fee_rate * 10000.0, taker_fee_rate * 10000.0); // Market exit = taker
+                
+                // Net PnL hesapla (fees dahil)
+                let qty_abs = pos.qty.0.abs();
+                let net_pnl = calc_net_pnl_usd(
+                    pos.entry.0,
+                    exit_price,
+                    qty_abs,
+                    &position_side,
+                    entry_fee_bps,
+                    exit_fee_bps,
+                );
+                
+                // TP hedefi ve time-box parametreleri (config'den)
+                let tp_usd = min_profit_usd;
+                let timebox_secs = cfg.strategy.tp_timebox_secs.unwrap_or(20);
+                
+                // Cooldown kontrolü (spam önleme) - config'den
+                let close_cooldown_ms = cfg.strategy.position_close_cooldown_ms.unwrap_or(500) as u128;
+                let can_attempt_close = state.last_close_attempt
+                    .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
+                    .unwrap_or(true);
+                
+                // Kural 1: Sabit TP ($0.50)
+                let should_close_tp = net_pnl >= tp_usd;
+                
+                // Kural 2: Time-box (20 saniye içinde net > 0)
+                let should_close_timebox = if let Some(entry_time) = state.position_entry_time {
+                    let age_secs = entry_time.elapsed().as_secs();
+                    age_secs <= timebox_secs && net_pnl > 0.0
+                } else {
+                    false
+                };
+                
+                // Kapatma kararı
+                if (should_close_tp || should_close_timebox) && !state.position_closing && can_attempt_close {
+                    state.position_closing = true;
+                    state.last_close_attempt = Some(Instant::now());
+                    
+                    let reason = if should_close_tp {
+                        format!("fixed_tp_{:.2}_usd", net_pnl)
+                    } else {
+                        format!("timebox_20s_net_{:.2}_usd", net_pnl)
+                    };
+                    
+                    info!(
+                        %symbol,
+                        reason,
+                        net_pnl,
+                        entry_price = %pos.entry.0,
+                        exit_price = %exit_price,
+                        qty = %qty_abs,
+                        position_side = ?position_side,
+                        should_close_tp,
+                        should_close_timebox,
+                        "KRİTİK: Closing position (fixed TP or time-box rule triggered)"
+                    );
+                    
+                    // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
+                    // API Rate Limit koruması
+                    rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
+                    let cancel_result = venue.cancel_all(&symbol).await;
+                    if let Err(err) = cancel_result {
+                        warn!(%symbol, ?err, "failed to cancel orders before position close (TP/time-box)");
+                    }
+                    
+                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile)
+                    rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                    let result = venue.close_position(&symbol).await;
+                    
+                    // KRİTİK: Pozisyon kapatma sonrası doğrulama
+                    if result.is_ok() {
+                        state.position_closing = false; // Başarılı, reset
+                        state.position_entry_time = None;
+                        state.avg_entry_price = None;
+                        info!(
+                            %symbol,
+                            reason,
+                            net_pnl,
+                            "position closed successfully (TP/time-box rule)"
+                        );
+                    } else {
+                        // Başarısız, tekrar deneme şansı bırak
+                        state.position_closing = false;
+                        warn!(
+                            %symbol,
+                            error = ?result.as_ref().err(),
+                            "position close failed (TP/time-box), will retry on next tick"
+                        );
+                    }
+                    
+                    // Bu tick'te diğer kontrollere devam etme (zaten kapatma işlemi başlatıldı)
+                    // Not: Bu sembol için bu tick'teki işlemler tamamlandı, bir sonraki sembole geç
+                    // (Bu if bloğundan çıkıp bir sonraki sembol işlemine geçilecek)
+                }
+                
                 // Kar al mantığı: Daha büyük kazançlar için optimize edildi
                 // Küçük kazançlar için erken kar alma, büyük kazançlar için daha uzun tut
                 let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
@@ -2502,6 +2713,133 @@ async fn main() -> Result<()> {
                 tick_size: tick_size_decimal, // Per-symbol tick_size (crossing guard için)
             };
             let mut quotes = state.strategy.on_tick(&ctx);
+            
+            // KRİTİK: Long/Short seçimi - Orderbook imbalance ve histerezis kontrolü
+            // Orderbook imbalance hesapla (top-K levels varsa kullan, yoksa best bid/ask)
+            let (bid_vol, ask_vol) = if let (Some(ref top_bids), Some(ref top_asks)) = (&ctx.ob.top_bids, &ctx.ob.top_asks) {
+                // Top-K levels mevcut: tüm level'ların volume'larını topla
+                let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
+                let ask_vol_sum: Decimal = top_asks.iter().map(|a| a.qty.0).sum();
+                (bid_vol_sum.max(Decimal::ONE), ask_vol_sum.max(Decimal::ONE))
+            } else {
+                // Fallback: best bid/ask volumes
+                let bid_vol = ctx.ob.best_bid.map(|b| b.qty.0).unwrap_or(Decimal::ONE);
+                let ask_vol = ctx.ob.best_ask.map(|a| a.qty.0).unwrap_or(Decimal::ONE);
+                (bid_vol, ask_vol)
+            };
+            
+            // Orderbook imbalance ratio
+            let imbalance_ratio = if ask_vol > Decimal::ZERO {
+                bid_vol / ask_vol
+            } else {
+                Decimal::ONE
+            };
+            let imbalance_ratio_f64 = imbalance_ratio.to_f64().unwrap_or(1.0);
+            
+            // Long/Short sinyal gücü hesapla (config'den threshold'lar)
+            let imbalance_long_threshold = cfg.strategy.orderbook_imbalance_long_threshold.unwrap_or(1.2);
+            let imbalance_short_threshold = cfg.strategy.orderbook_imbalance_short_threshold.unwrap_or(0.83);
+            
+            let long_signal_strength = if imbalance_ratio_f64 > imbalance_long_threshold {
+                // Bid vol > Ask vol → Long lehine
+                let range = imbalance_long_threshold - 1.0;
+                if range > 0.0 {
+                    ((imbalance_ratio_f64 - 1.0) / range).min(1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            
+            let short_signal_strength = if imbalance_ratio_f64 < imbalance_short_threshold {
+                // Ask vol > Bid vol → Short lehine
+                let range = 1.0 - imbalance_short_threshold;
+                if range > 0.0 {
+                    ((1.0 - imbalance_ratio_f64) / range).min(1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            
+            // Histerezis ve cooldown kontrolü (config'den)
+            let cooldown_secs = cfg.strategy.direction_cooldown_secs.unwrap_or(60);
+            let signal_strength_threshold = cfg.strategy.direction_signal_strength_threshold.unwrap_or(0.2);
+            
+            let now = Instant::now();
+            let can_change_direction = state.last_direction_change
+                .map(|last| now.duration_since(last).as_secs() >= cooldown_secs)
+                .unwrap_or(true); // İlk seferde değiştirebilir
+            
+            // Yön seçimi
+            let new_direction = if long_signal_strength > short_signal_strength + signal_strength_threshold {
+                Some(Side::Buy) // Long
+            } else if short_signal_strength > long_signal_strength + signal_strength_threshold {
+                Some(Side::Sell) // Short
+            } else {
+                state.current_direction // Mevcut yönü koru
+            };
+            
+            // Yön değişikliği kontrolü
+            let direction_changed = new_direction != state.current_direction;
+            if direction_changed && can_change_direction {
+                state.current_direction = new_direction;
+                state.last_direction_change = Some(now);
+                state.direction_signal_strength = long_signal_strength.max(short_signal_strength);
+                debug!(
+                    %symbol,
+                    new_direction = ?new_direction,
+                    signal_strength = state.direction_signal_strength,
+                    imbalance_ratio = imbalance_ratio_f64,
+                    "direction changed (long/short selection)"
+                );
+            } else if direction_changed && !can_change_direction {
+                // Cooldown'da, yön değiştirme
+                debug!(
+                    %symbol,
+                    requested_direction = ?new_direction,
+                    current_direction = ?state.current_direction,
+                    "direction change blocked by cooldown"
+                );
+            }
+            
+            // Long/Short filtreleme: Sadece seçilen yönde emir yerleştir (config'den threshold'lar)
+            let min_signal_strength = cfg.strategy.direction_min_signal_strength.unwrap_or(0.3);
+            let strong_imbalance_long = imbalance_long_threshold + 0.3; // Default: 1.5
+            let strong_imbalance_short = imbalance_short_threshold - 0.16; // Default: 0.67
+            
+            if let Some(current_dir) = state.current_direction {
+                match current_dir {
+                    Side::Buy => {
+                        // Long seçildi → sadece bid (buy) emirleri
+                        quotes.ask = None;
+                        if quotes.bid.is_none() && long_signal_strength < min_signal_strength {
+                            // Sinyal çok zayıf, emir yerleştirme
+                            debug!(%symbol, "long signal too weak, skipping bid orders");
+                        }
+                    }
+                    Side::Sell => {
+                        // Short seçildi → sadece ask (sell) emirleri
+                        quotes.bid = None;
+                        if quotes.ask.is_none() && short_signal_strength < min_signal_strength {
+                            // Sinyal çok zayıf, emir yerleştirme
+                            debug!(%symbol, "short signal too weak, skipping ask orders");
+                        }
+                    }
+                }
+            } else {
+                // İlk seferde, her iki yönde de emir yerleştir (başlangıç)
+                // Ancak imbalance çok güçlüyse tek yöne odaklan
+                if imbalance_ratio_f64 > strong_imbalance_long {
+                    quotes.ask = None; // Sadece long
+                    state.current_direction = Some(Side::Buy);
+                } else if imbalance_ratio_f64 < strong_imbalance_short {
+                    quotes.bid = None; // Sadece short
+                    state.current_direction = Some(Side::Sell);
+                }
+            }
             
             // KRİTİK: Opportunity mode soft-limit kontrolü - yeni emirleri durdur
             if should_block_new_orders {
@@ -2885,6 +3223,21 @@ async fn main() -> Result<()> {
                     let max_chunks = cfg.risk.max_open_chunks_per_symbol_per_side;
                     
                     if let Some((px, qty)) = quotes.bid {
+                        // KRİTİK DÜZELTME: Market distance clamp - emir öncesi fiyatı clamp et
+                        // Mid price hesapla (best_bid + best_ask) / 2
+                        let mid_price = (bid.0 + ask.0) / Decimal::from(2u32);
+                        
+                        // Pozisyon varsa daha toleranslı, yoksa daha sıkı
+                        let max_distance_pct = if position_size_notional > 0.0 {
+                            cfg.internal.order_price_distance_with_position // %1
+                        } else {
+                            cfg.internal.order_price_distance_no_position // %0.5
+                        };
+                        
+                        // Fiyatı clamp et
+                        let px_clamped = clamp_price_to_market_distance(px.0, mid_price, max_distance_pct);
+                        let px = Px(px_clamped);
+                        
                         // KRİTİK: Margin chunking - available margin'ı 10-100 USD chunk'larına böl
                         let available_margin_for_bids = (caps.buy_total - total_spent_on_bids).max(0.0);
                         let min_margin = cfg.min_usd_per_order.unwrap_or(10.0);
@@ -2940,6 +3293,7 @@ async fn main() -> Result<()> {
                                 effective_leverage_for_chunk,
                                 px.0,
                                 rules,
+                                Side::Buy, // BID için
                             );
                             
                             let (qty_str, price_str) = match qty_price_result {
@@ -2947,8 +3301,14 @@ async fn main() -> Result<()> {
                                 None => {
                                     warn!(
                                         %symbol,
-                                        margin_chunk,
-                                        "calc_qty_from_margin returned None, skipping chunk"
+                                        margin_chunk = *margin_chunk,
+                                        price = %px.0,
+                                        leverage = effective_leverage_for_chunk,
+                                        tick_size = ?rules.tick_size,
+                                        step_size = ?rules.step_size,
+                                        price_precision = rules.price_precision,
+                                        qty_precision = rules.qty_precision,
+                                        "calc_qty_from_margin returned None (bid), skipping chunk"
                                     );
                                     continue;
                                 }
@@ -2971,139 +3331,199 @@ async fn main() -> Result<()> {
                                 }
                             };
                             
-                            // Min notional kontrolü
-                            let chunk_notional = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
-                            let min_req = state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk);
-                            if chunk_notional < min_req {
+                            // KRİTİK DÜZELTME: Precision/Decimal - min notional kontrolü Decimal ile
+                            let chunk_notional = chunk_price.0 * chunk_qty.0;
+                            let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk)).unwrap_or(Decimal::ZERO);
+                            if chunk_notional < min_req_dec {
                                 warn!(
                                     %symbol,
-                                    chunk_notional,
-                                    min_req,
+                                    chunk_notional = %chunk_notional,
+                                    min_req = %min_req_dec,
                                     "chunk notional below min_notional, skipping"
                                 );
                                 continue;
                             }
                             
+                            // KRİTİK: Net $0.50 kâr garantisi - required_take_profit_price hesapla (BID/LONG)
+                            // En kötü senaryo: taker+taker (giriş ve çıkış taker olabilir)
+                            let fee_bps_entry = taker_fee_rate * 10000.0; // Taker fee (bps)
+                            let fee_bps_exit = taker_fee_rate * 10000.0; // Taker fee (bps)
+                            let min_profit_usd = cfg.strategy.min_profit_usd.unwrap_or(0.50);
+                            
+                            // Long pozisyon için TP hesapla (Buy entry -> Sell exit)
+                            let tp_price_raw = required_take_profit_price(
+                                Side::Buy, // Long: Buy entry
+                                chunk_price.0,
+                                chunk_qty.0,
+                                fee_bps_entry,
+                                fee_bps_exit,
+                                min_profit_usd,
+                            );
+                            
+                            let tp_price = match tp_price_raw {
+                                Some(tp) => {
+                                    // TP fiyatını tick_size'a göre quantize et (yukarı yuvarla - long için)
+                                    let tick_size = rules.tick_size;
+                                    let tp_quantized = exec::quant_utils_ceil_to_step(tp, tick_size);
+                                    
+                                    // Spread kontrolü: TP fiyatı best_ask'ten yeterince uzak mı?
+                                    let best_ask_dec = ask.0;
+                                    let spread_bps = if best_ask_dec > Decimal::ZERO {
+                                        ((tp_quantized - best_ask_dec) / best_ask_dec).to_f64().unwrap_or(0.0) * 10000.0
+                                    } else {
+                                        0.0
+                                    };
+                                    
+                                    // Min spread kontrolü (dynamic spread)
+                                    if spread_bps < dyn_cfg.min_spread_bps {
+                                        warn!(
+                                            %symbol,
+                                            chunk_idx,
+                                            tp_price = %tp_quantized,
+                                            best_ask = %best_ask_dec,
+                                            spread_bps,
+                                            min_spread_bps = dyn_cfg.min_spread_bps,
+                                            "TP price too close to market (bid), skipping chunk (cannot guarantee $0.50 profit)"
+                                        );
+                                        continue;
+                                    }
+                                    
+                                    Some(tp_quantized)
+                                }
+                                None => {
+                                    warn!(
+                                        %symbol,
+                                        chunk_idx,
+                                        "required_take_profit_price returned None (bid), skipping chunk (cannot guarantee $0.50 profit)"
+                                    );
+                                    continue;
+                                }
+                            };
+                            
+                            // TP fiyatı hesaplandı ve geçerli, emir yerleştir
+                            
                             // İlk chunk için test order (sadece bir kez)
                             if chunk_idx == 0 && !state.test_order_passed {
                             rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
                                 match venue.test_order(&symbol, Side::Buy, chunk_price, chunk_qty, tif).await {
-                                    Ok(_) => {
-                                        state.test_order_passed = true;
+                                Ok(_) => {
+                                    state.test_order_passed = true;
                                         info!(%symbol, "test order passed, proceeding with real orders");
-                                    }
-                                    Err(e) => {
-                                        let error_str = e.to_string();
-                                        let error_lower = error_str.to_lowercase();
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    let error_lower = error_str.to_lowercase();
+                                    
+                                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                                        error!(%symbol, error = %e, "test order failed with -1111, disabling symbol and refreshing rules");
                                         
-                                        if error_lower.contains("precision is over") || error_lower.contains("-1111") {
-                                            error!(%symbol, error = %e, "test order failed with -1111, disabling symbol and refreshing rules");
-                                            
-                                            match venue.rules_for(&symbol).await {
-                                                Ok(new_rules) => {
-                                                    state.symbol_rules = Some(new_rules);
-                                                    state.rules_fetch_failed = false;
-                                                    state.disabled = false;
-                                                    info!(%symbol, "rules refreshed after test order -1111, symbol re-enabled");
+                                        match venue.rules_for(&symbol).await {
+                                            Ok(new_rules) => {
+                                                state.symbol_rules = Some(new_rules);
+                                                state.rules_fetch_failed = false;
+                                                state.disabled = false;
+                                                info!(%symbol, "rules refreshed after test order -1111, symbol re-enabled");
                                                     // Test order'ı tekrar dene
-                                                    rate_limit_guard(1).await;
+                                                rate_limit_guard(1).await;
                                                     match venue.test_order(&symbol, Side::Buy, chunk_price, chunk_qty, tif).await {
-                                                        Ok(_) => {
-                                                            state.test_order_passed = true;
-                                                            info!(%symbol, "test order passed after rules refresh");
-                                                        }
-                                                        Err(e2) => {
-                                                            error!(%symbol, error = %e2, "test order still failed after rules refresh, disabling symbol");
-                                                            state.disabled = true;
-                                                            state.rules_fetch_failed = true;
+                                                    Ok(_) => {
+                                                        state.test_order_passed = true;
+                                                        info!(%symbol, "test order passed after rules refresh");
+                                                    }
+                                                    Err(e2) => {
+                                                        error!(%symbol, error = %e2, "test order still failed after rules refresh, disabling symbol");
+                                                        state.disabled = true;
+                                                        state.rules_fetch_failed = true;
                                                             break; // Chunk loop'undan çık
-                                                        }
                                                     }
                                                 }
-                                                Err(e2) => {
-                                                    error!(%symbol, error = %e2, "failed to refresh rules after test order -1111, disabling symbol");
-                                                    state.disabled = true;
-                                                    state.rules_fetch_failed = true;
-                                                    break; // Chunk loop'undan çık
-                                                }
                                             }
-                                        } else {
-                                            warn!(%symbol, error = %e, "test order failed (non-precision error), disabling symbol");
-                                            state.disabled = true;
-                                            break; // Chunk loop'undan çık
+                                            Err(e2) => {
+                                                error!(%symbol, error = %e2, "failed to refresh rules after test order -1111, disabling symbol");
+                                                state.disabled = true;
+                                                state.rules_fetch_failed = true;
+                                                    break; // Chunk loop'undan çık
+                                            }
                                         }
+                                    } else {
+                                        warn!(%symbol, error = %e, "test order failed (non-precision error), disabling symbol");
+                                        state.disabled = true;
+                                            break; // Chunk loop'undan çık
                                     }
                                 }
                             }
-                            
-                            // API Rate Limit koruması
-                            rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                            
+                        }
+                        
+                        // API Rate Limit koruması
+                        rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                        
                             // ClientOrderId oluştur
-                            let timestamp_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis();
+                        let timestamp_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
                             let random_suffix = (timestamp_ms % 10000) as u64;
                             let client_order_id = format!("{}_{}_C{}_{}_{}", 
                                 symbol.replace("-", "_").replace("/", "_"),
                                 "B",
                                 chunk_idx,
-                                timestamp_ms,
-                                random_suffix
-                            );
-                            let client_order_id = if client_order_id.len() > 36 {
-                                let symbol_short = symbol.chars().take(8).collect::<String>();
+                            timestamp_ms,
+                            random_suffix
+                        );
+                        let client_order_id = if client_order_id.len() > 36 {
+                            let symbol_short = symbol.chars().take(8).collect::<String>();
                                 format!("{}_{}_C{}_{}", symbol_short, "B", chunk_idx, timestamp_ms)
-                                    .chars().take(36).collect::<String>()
-                            } else {
-                                client_order_id
-                            };
-                            
+                                .chars().take(36).collect::<String>()
+                        } else {
+                            client_order_id
+                        };
+                        
+                            // KRİTİK DÜZELTME: Pre-place debug log (Decimal'i f64'e çevir)
+                            let chunk_notional_f64 = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
                             info!(
                                 %symbol,
                                 chunk_idx,
                                 margin_chunk,
                                 ?chunk_price,
                                 ?chunk_qty,
-                                chunk_notional,
+                                chunk_notional = chunk_notional_f64,
                                 "placing futures bid order (chunk)"
                             );
                             
                             match venue.place_limit_with_client_id(&symbol, Side::Buy, chunk_price, chunk_qty, tif, &client_order_id).await {
-                                Ok((order_id, returned_client_id)) => {
-                                    let info = OrderInfo { 
-                                        order_id: order_id.clone(), 
-                                        client_order_id: returned_client_id.or(Some(client_order_id)),
-                                        side: Side::Buy, 
+                            Ok((order_id, returned_client_id)) => {
+                let info = OrderInfo { 
+                    order_id: order_id.clone(), 
+                    client_order_id: returned_client_id.or(Some(client_order_id)),
+                    side: Side::Buy, 
                                         price: chunk_price, 
                                         qty: chunk_qty, 
-                                        filled_qty: Qty(Decimal::ZERO),
+                    filled_qty: Qty(Decimal::ZERO),
                                         remaining_qty: chunk_qty,
-                                        created_at: Instant::now(),
-                                        last_fill_time: None,
-                                    };
-                                    state.active_orders.insert(order_id.clone(), info.clone());
-                                    state.last_order_price_update.insert(order_id.clone(), info.price);
-                                    
+                    created_at: Instant::now(),
+                    last_fill_time: None,
+                };
+                state.active_orders.insert(order_id.clone(), info.clone());
+                                state.last_order_price_update.insert(order_id.clone(), info.price);
+                
                                     // Spent güncelle (hesaptan giden para = margin)
                                     total_spent_on_bids += *margin_chunk;
                                     
                                     // JSON log
-                                    if let Ok(logger) = json_logger.lock() {
-                                        logger.log_order_created(
-                                            &symbol,
-                                            &order_id,
-                                            Side::Buy,
+                if let Ok(logger) = json_logger.lock() {
+                    logger.log_order_created(
+                &symbol,
+                &order_id,
+                Side::Buy,
                                             chunk_price,
                                             chunk_qty,
-                                            "spread_opportunity",
-                                            &cfg.exec.tif,
-                                        );
-                                    }
+                "spread_opportunity",
+                &cfg.exec.tif,
+                    );
+                }
                                     
                                     // Logging metrics: margin_chunk, lev, notional, qty_str, px_str, min_spread_bps_used
-                                    let chunk_notional_log = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
+                                    let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
                                     let min_spread_bps_used = dyn_cfg.min_spread_bps;
                                     info!(
                                         %symbol,
@@ -3117,8 +3537,8 @@ async fn main() -> Result<()> {
                                         min_spread_bps_used,
                                         "bid order created successfully (chunk)"
                                     );
-                                }
-                                Err(err) => {
+                            }
+                            Err(err) => {
                                     warn!(
                                         %symbol,
                                         chunk_idx,
@@ -3140,6 +3560,21 @@ async fn main() -> Result<()> {
                     // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
                     // NOT: effective_leverage_ask config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
                     if let Some((px, qty)) = quotes.ask {
+                        // KRİTİK DÜZELTME: Market distance clamp - emir öncesi fiyatı clamp et
+                        // Mid price hesapla (best_bid + best_ask) / 2
+                        let mid_price = (bid.0 + ask.0) / Decimal::from(2u32);
+                        
+                        // Pozisyon varsa daha toleranslı, yoksa daha sıkı
+                        let max_distance_pct = if position_size_notional > 0.0 {
+                            cfg.internal.order_price_distance_with_position // %1
+                                            } else {
+                            cfg.internal.order_price_distance_no_position // %0.5
+                        };
+                        
+                        // Fiyatı clamp et
+                        let px_clamped = clamp_price_to_market_distance(px.0, mid_price, max_distance_pct);
+                        let px = Px(px_clamped);
+                        
                         let mut total_spent_on_asks = 0.0f64; // Hesaptan giden para (margin) toplamı
                         
                         // Açık ask emir sayısını kontrol et (max chunks kontrolü)
@@ -3195,7 +3630,7 @@ async fn main() -> Result<()> {
                             // calc_qty_from_margin kullanarak qty hesapla
                             let effective_leverage_for_chunk = if state.strategy.is_opportunity_mode() {
                                 effective_leverage_ask * cfg.internal.opportunity_mode_leverage_reduction
-                            } else {
+                                            } else {
                                 effective_leverage_ask
                             };
                             
@@ -3204,6 +3639,7 @@ async fn main() -> Result<()> {
                                 effective_leverage_for_chunk,
                                 px.0,
                                 rules,
+                                Side::Sell, // ASK için
                             );
                             
                             let (qty_str, price_str) = match qty_price_result {
@@ -3211,8 +3647,14 @@ async fn main() -> Result<()> {
                                 None => {
                                     warn!(
                                         %symbol,
-                                        margin_chunk,
-                                        "calc_qty_from_margin returned None, skipping chunk"
+                                        margin_chunk = *margin_chunk,
+                                        price = %px.0,
+                                        leverage = effective_leverage_for_chunk,
+                                        tick_size = ?rules.tick_size,
+                                        step_size = ?rules.step_size,
+                                        price_precision = rules.price_precision,
+                                        qty_precision = rules.qty_precision,
+                                        "calc_qty_from_margin returned None (ask), skipping chunk"
                                     );
                                     continue;
                                 }
@@ -3235,139 +3677,199 @@ async fn main() -> Result<()> {
                                 }
                             };
                             
-                            // Min notional kontrolü
-                            let chunk_notional = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
-                            let min_req = state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk);
-                            if chunk_notional < min_req {
+                            // KRİTİK DÜZELTME: Precision/Decimal - min notional kontrolü Decimal ile
+                            let chunk_notional = chunk_price.0 * chunk_qty.0;
+                            let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk)).unwrap_or(Decimal::ZERO);
+                            if chunk_notional < min_req_dec {
                                 warn!(
                                     %symbol,
-                                    chunk_notional,
-                                    min_req,
+                                    chunk_notional = %chunk_notional,
+                                    min_req = %min_req_dec,
                                     "chunk notional below min_notional, skipping"
                                 );
                                 continue;
                             }
                             
+                            // KRİTİK: Net $0.50 kâr garantisi - required_take_profit_price hesapla (ASK/SHORT)
+                            // En kötü senaryo: taker+taker (giriş ve çıkış taker olabilir)
+                            let fee_bps_entry = taker_fee_rate * 10000.0; // Taker fee (bps)
+                            let fee_bps_exit = taker_fee_rate * 10000.0; // Taker fee (bps)
+                            let min_profit_usd = cfg.strategy.min_profit_usd.unwrap_or(0.50);
+                            
+                            // Short pozisyon için TP hesapla (Sell entry -> Buy exit)
+                            let tp_price_raw = required_take_profit_price(
+                                Side::Sell, // Short: Sell entry
+                                chunk_price.0,
+                                chunk_qty.0,
+                                fee_bps_entry,
+                                fee_bps_exit,
+                                min_profit_usd,
+                            );
+                            
+                            let tp_price = match tp_price_raw {
+                                Some(tp) => {
+                                    // TP fiyatını tick_size'a göre quantize et (aşağı yuvarla - short için)
+                                    let tick_size = rules.tick_size;
+                                    let tp_quantized = exec::quant_utils_floor_to_step(tp, tick_size);
+                                    
+                                    // Spread kontrolü: TP fiyatı best_bid'den yeterince uzak mı?
+                                    let best_bid_dec = bid.0;
+                                    let spread_bps = if best_bid_dec > Decimal::ZERO {
+                                        ((best_bid_dec - tp_quantized) / best_bid_dec).to_f64().unwrap_or(0.0) * 10000.0
+                                    } else {
+                                        0.0
+                                    };
+                                    
+                                    // Min spread kontrolü (dynamic spread)
+                                    if spread_bps < dyn_cfg.min_spread_bps {
+                                        warn!(
+                                            %symbol,
+                                            chunk_idx,
+                                            tp_price = %tp_quantized,
+                                            best_bid = %best_bid_dec,
+                                            spread_bps,
+                                            min_spread_bps = dyn_cfg.min_spread_bps,
+                                            "TP price too close to market (ask), skipping chunk (cannot guarantee $0.50 profit)"
+                                        );
+                                        continue;
+                                    }
+                                    
+                                    Some(tp_quantized)
+                                }
+                                None => {
+                                    warn!(
+                                        %symbol,
+                                        chunk_idx,
+                                        "required_take_profit_price returned None (ask), skipping chunk (cannot guarantee $0.50 profit)"
+                                    );
+                                    continue;
+                                }
+                            };
+                            
+                            // TP fiyatı hesaplandı ve geçerli, emir yerleştir
+                            
                             // İlk chunk için test order (sadece bir kez, ask için)
                             if chunk_idx == 0 && !state.test_order_passed {
-                                rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
+                            rate_limit_guard(1).await; // POST /fapi/v1/order/test: Weight 1
                                 match venue.test_order(&symbol, Side::Sell, chunk_price, chunk_qty, tif).await {
-                                    Ok(_) => {
-                                        state.test_order_passed = true;
+                                Ok(_) => {
+                                    state.test_order_passed = true;
                                         info!(%symbol, "test order passed (ask), proceeding with real orders");
-                                    }
-                                    Err(e) => {
-                                        let error_str = e.to_string();
-                                        let error_lower = error_str.to_lowercase();
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    let error_lower = error_str.to_lowercase();
+                                    
+                                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                                        error!(%symbol, error = %e, "test order failed with -1111 (ask), disabling symbol and refreshing rules");
                                         
-                                        if error_lower.contains("precision is over") || error_lower.contains("-1111") {
-                                            error!(%symbol, error = %e, "test order failed with -1111 (ask), disabling symbol and refreshing rules");
-                                            
-                                            match venue.rules_for(&symbol).await {
-                                                Ok(new_rules) => {
-                                                    state.symbol_rules = Some(new_rules);
-                                                    state.rules_fetch_failed = false;
-                                                    state.disabled = false;
-                                                    info!(%symbol, "rules refreshed after test order -1111 (ask), symbol re-enabled");
+                                        match venue.rules_for(&symbol).await {
+                                            Ok(new_rules) => {
+                                                state.symbol_rules = Some(new_rules);
+                                                state.rules_fetch_failed = false;
+                                                state.disabled = false;
+                                                info!(%symbol, "rules refreshed after test order -1111 (ask), symbol re-enabled");
                                                     // Test order'ı tekrar dene
-                                                    rate_limit_guard(1).await;
+                                                rate_limit_guard(1).await;
                                                     match venue.test_order(&symbol, Side::Sell, chunk_price, chunk_qty, tif).await {
-                                                        Ok(_) => {
-                                                            state.test_order_passed = true;
-                                                            info!(%symbol, "test order passed after rules refresh (ask)");
-                                                        }
-                                                        Err(e2) => {
-                                                            error!(%symbol, error = %e2, "test order still failed after rules refresh (ask), disabling symbol");
-                                                            state.disabled = true;
-                                                            state.rules_fetch_failed = true;
+                                                    Ok(_) => {
+                                                        state.test_order_passed = true;
+                                                        info!(%symbol, "test order passed after rules refresh (ask)");
+                                                    }
+                                                    Err(e2) => {
+                                                        error!(%symbol, error = %e2, "test order still failed after rules refresh (ask), disabling symbol");
+                                                        state.disabled = true;
+                                                        state.rules_fetch_failed = true;
                                                             break; // Chunk loop'undan çık
-                                                        }
                                                     }
                                                 }
-                                                Err(e2) => {
-                                                    error!(%symbol, error = %e2, "failed to refresh rules after test order -1111 (ask), disabling symbol");
-                                                    state.disabled = true;
-                                                    state.rules_fetch_failed = true;
-                                                    break; // Chunk loop'undan çık
-                                                }
                                             }
-                                        } else {
-                                            warn!(%symbol, error = %e, "test order failed (ask, non-precision error), disabling symbol");
-                                            state.disabled = true;
-                                            break; // Chunk loop'undan çık
+                                            Err(e2) => {
+                                                error!(%symbol, error = %e2, "failed to refresh rules after test order -1111 (ask), disabling symbol");
+                                                state.disabled = true;
+                                                state.rules_fetch_failed = true;
+                                                    break; // Chunk loop'undan çık
+                                            }
                                         }
+                                    } else {
+                                        warn!(%symbol, error = %e, "test order failed (ask, non-precision error), disabling symbol");
+                                        state.disabled = true;
+                                            break; // Chunk loop'undan çık
                                     }
                                 }
                             }
-                            
-                            // API Rate Limit koruması
-                            rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
-                            
+                        }
+                        
+                        // API Rate Limit koruması
+                        rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                        
                             // ClientOrderId oluştur
-                            let timestamp_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis();
-                            let random_suffix = (timestamp_ms % 10000) as u64;
+                        let timestamp_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis();
+                        let random_suffix = (timestamp_ms % 10000) as u64;
                             let client_order_id = format!("{}_{}_C{}_{}_{}", 
-                                symbol.replace("-", "_").replace("/", "_"),
+                            symbol.replace("-", "_").replace("/", "_"),
                                 "S",
                                 chunk_idx,
-                                timestamp_ms,
-                                random_suffix
-                            );
-                            let client_order_id = if client_order_id.len() > 36 {
-                                let symbol_short = symbol.chars().take(8).collect::<String>();
+                            timestamp_ms,
+                            random_suffix
+                        );
+                        let client_order_id = if client_order_id.len() > 36 {
+                            let symbol_short = symbol.chars().take(8).collect::<String>();
                                 format!("{}_{}_C{}_{}", symbol_short, "S", chunk_idx, timestamp_ms)
-                                    .chars().take(36).collect::<String>()
-                            } else {
-                                client_order_id
-                            };
-                            
+                                .chars().take(36).collect::<String>()
+                        } else {
+                            client_order_id
+                        };
+                        
+                            // KRİTİK DÜZELTME: Pre-place debug log (Decimal'i f64'e çevir)
+                            let chunk_notional_f64 = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
                             info!(
                                 %symbol,
                                 chunk_idx,
                                 margin_chunk,
                                 ?chunk_price,
                                 ?chunk_qty,
-                                chunk_notional,
+                                chunk_notional = chunk_notional_f64,
                                 "placing futures ask order (chunk)"
                             );
                             
                             match venue.place_limit_with_client_id(&symbol, Side::Sell, chunk_price, chunk_qty, tif, &client_order_id).await {
-                                Ok((order_id, returned_client_id)) => {
-                                    let info = OrderInfo { 
-                                        order_id: order_id.clone(), 
-                                        client_order_id: returned_client_id.or(Some(client_order_id)),
-                                        side: Side::Sell, 
+                            Ok((order_id, returned_client_id)) => {
+                        let info = OrderInfo { 
+                            order_id: order_id.clone(), 
+                            client_order_id: returned_client_id.or(Some(client_order_id)),
+                            side: Side::Sell, 
                                         price: chunk_price, 
                                         qty: chunk_qty, 
-                                        filled_qty: Qty(Decimal::ZERO),
+                            filled_qty: Qty(Decimal::ZERO),
                                         remaining_qty: chunk_qty,
-                                        created_at: Instant::now(),
-                                        last_fill_time: None,
-                                    };
-                                    state.active_orders.insert(order_id.clone(), info.clone());
-                                    state.last_order_price_update.insert(order_id.clone(), info.price);
-                                    
+                            created_at: Instant::now(),
+                            last_fill_time: None,
+                            };
+                            state.active_orders.insert(order_id.clone(), info.clone());
+                            state.last_order_price_update.insert(order_id.clone(), info.price);
+                            
                                     // Spent güncelle (hesaptan giden para = margin)
                                     total_spent_on_asks += *margin_chunk;
                                     
                                     // JSON log
-                                    if let Ok(logger) = json_logger.lock() {
-                                        logger.log_order_created(
-                                            &symbol,
-                                            &order_id,
-                                            Side::Sell,
+                            if let Ok(logger) = json_logger.lock() {
+                            logger.log_order_created(
+                            &symbol,
+                            &order_id,
+                            Side::Sell,
                                             chunk_price,
                                             chunk_qty,
-                                            "spread_opportunity",
-                                            &cfg.exec.tif,
-                                        );
-                                    }
+                            "spread_opportunity",
+                            &cfg.exec.tif,
+                            );
+                            }
                                     
                                     // Logging metrics: margin_chunk, lev, notional, qty_str, px_str, min_spread_bps_used
-                                    let chunk_notional_log = chunk_price.0.to_f64().unwrap_or(0.0) * chunk_qty.0.to_f64().unwrap_or(0.0);
+                                    let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
                                     let min_spread_bps_used = dyn_cfg.min_spread_bps;
                                     info!(
                                         %symbol,

@@ -124,6 +124,7 @@ pub fn split_margin_into_chunks(
 /// * `leverage` - Leverage (20-50x)
 /// * `price` - Current price
 /// * `rules` - Exchange rules (stepSize, tickSize, minQty, minNotional, precisions)
+/// * `side` - Order side (Buy = floor price, Sell = ceil price for side-aware rounding)
 /// 
 /// # Returns
 /// Option<(qty_string, price_string)> if valid, None if cannot satisfy rules
@@ -132,64 +133,267 @@ pub fn calc_qty_from_margin(
     leverage: f64,
     price: Decimal,
     rules: &SymbolRules,
+    side: bot_core::types::Side,
 ) -> Option<(String, String)> {
-    // Calculate notional = margin * leverage
-    let notional = margin_chunk * leverage;
+    // KRİTİK DÜZELTME: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
+    // Calculate notional = margin * leverage (Decimal olarak)
+    let margin_dec = Decimal::try_from(margin_chunk).unwrap_or(Decimal::ZERO);
+    let leverage_dec = Decimal::try_from(leverage).unwrap_or(Decimal::ZERO);
+    let notional = margin_dec * leverage_dec;
     
-    // Calculate raw quantity = notional / price
-    let price_f64 = price.to_f64().unwrap_or(0.0);
-    if price_f64 <= 0.0 {
+    if price <= Decimal::ZERO || notional <= Decimal::ZERO {
         return None;
     }
     
-    let qty_raw = notional / price_f64;
+    // Calculate raw quantity = notional / price (Decimal olarak)
+    // KRİTİK: Division by zero kontrolü
+    if price <= Decimal::ZERO {
+        return None;
+    }
+    let qty_raw = notional / price;
     
-    // Floor to step size
-    let step_size_f64 = rules.step_size.to_f64().unwrap_or(0.001);
-    let qty_floor = qty_raw.floor_div_step(step_size_f64);
+    // Floor to step size (Decimal olarak)
+    let step_size = rules.step_size;
+    // KRİTİK: Division by zero kontrolü - step_size sıfır olamaz
+    if step_size <= Decimal::ZERO {
+        return None;
+    }
+    let qty_floor = exec::quant_utils_floor_to_step(qty_raw, step_size);
     
-    // Floor price to tick size
-    let tick_size_f64 = rules.tick_size.to_f64().unwrap_or(0.001);
-    let price_floor = price_f64.floor_div_step(tick_size_f64);
+    // KRİTİK DÜZELTME: Side-aware price rounding
+    // BID: floor to tick (daha aşağı, maker olarak kal)
+    // ASK: ceil to tick (daha yukarı, maker olarak kal)
+    let tick_size = rules.tick_size;
+    // KRİTİK: Division by zero kontrolü - tick_size sıfır olamaz
+    if tick_size <= Decimal::ZERO {
+        return None;
+    }
+    let price_quantized = match side {
+        Side::Buy => exec::quant_utils_floor_to_step(price, tick_size),
+        Side::Sell => exec::quant_utils_ceil_to_step(price, tick_size),
+    };
     
-    // Check minQty
-    let min_qty_f64 = rules.step_size.to_f64().unwrap_or(0.0); // minQty usually = stepSize
-    if qty_floor < min_qty_f64 {
+    // KRİTİK: Quantized price sıfır kontrolü (tick_size çok büyükse price_quantized sıfır olabilir)
+    // Örnek: price=0.01283, tick_size=0.10 -> floor_to_step(0.01283, 0.10) = 0.0
+    if price_quantized <= Decimal::ZERO {
+        // Debug: tick_size çok büyük olabilir
+        tracing::debug!(
+            price = %price,
+            tick_size = %tick_size,
+            price_quantized = %price_quantized,
+            "price_quantized is zero, likely tick_size too large for price"
+        );
+        return None;
+    }
+    
+    // KRİTİK DÜZELTME: Precision/Decimal - minQty ve minNotional kontrolleri Decimal ile
+    let min_qty = rules.step_size; // minQty usually = stepSize
+    if qty_floor < min_qty {
         // Try to increase to minQty
-        let qty_ceil = (min_qty_f64 / step_size_f64).ceil() * step_size_f64;
-        let notional_check = qty_ceil * price_floor;
-        let min_notional_f64 = rules.min_notional.to_f64().unwrap_or(0.0);
+        let qty_ceil = exec::quant_utils_ceil_to_step(min_qty, step_size);
+        // KRİTİK: Division by zero kontrolü (price_quantized zaten yukarıda kontrol edildi)
+        if qty_ceil <= Decimal::ZERO {
+            return None;
+        }
+        let notional_check = qty_ceil * price_quantized;
+        let min_notional = rules.min_notional;
         
-        if notional_check >= min_notional_f64 {
-            // Format with precision
+        if notional_check >= min_notional {
+            // Format with precision (Decimal kullanarak)
             let qty_str = format_qty_with_precision(qty_ceil, rules.qty_precision);
-            let price_str = format_price_with_precision(price_floor, rules.price_precision);
+            let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
             return Some((qty_str, price_str));
         } else {
             return None; // Cannot satisfy minNotional even with minQty
         }
     }
     
-    // Check minNotional
-    let notional_check = qty_floor * price_floor;
-    let min_notional_f64 = rules.min_notional.to_f64().unwrap_or(0.0);
+    // Check minNotional (Decimal olarak)
+    let notional_check = qty_floor * price_quantized;
+    let min_notional = rules.min_notional;
     
-    if notional_check < min_notional_f64 {
+    if notional_check < min_notional {
         // Try to increase qty to satisfy minNotional
-        let qty_needed = (min_notional_f64 / price_floor).ceil_div_step(step_size_f64);
-        if qty_needed >= min_qty_f64 {
+        // KRİTİK: Division by zero kontrolü
+        if price_quantized <= Decimal::ZERO {
+            return None;
+        }
+        let qty_needed_raw = min_notional / price_quantized;
+        let qty_needed = exec::quant_utils_ceil_to_step(qty_needed_raw, step_size);
+        if qty_needed >= min_qty {
+            // Format with precision (Decimal kullanarak)
             let qty_str = format_qty_with_precision(qty_needed, rules.qty_precision);
-            let price_str = format_price_with_precision(price_floor, rules.price_precision);
+            let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
             return Some((qty_str, price_str));
         } else {
             return None; // Cannot satisfy both minQty and minNotional
         }
     }
     
-    // Format with precision
+    // Format with precision (Decimal kullanarak)
     let qty_str = format_qty_with_precision(qty_floor, rules.qty_precision);
-    let price_str = format_price_with_precision(price_floor, rules.price_precision);
+    let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
     Some((qty_str, price_str))
+}
+
+/// Calculate required take profit price to guarantee net profit ≥ min_profit_usd
+/// 
+/// # Arguments
+/// * `side` - "Long" (buy->sell) or "Short" (sell->buy)
+/// * `entry_price` - Entry price (limit order price)
+/// * `qty` - Quantity
+/// * `fee_bps_entry` - Entry fee in basis points (e.g., 2.0 = 0.02%)
+/// * `fee_bps_exit` - Exit fee in basis points (e.g., 4.0 = 0.04%)
+/// * `min_profit_usd` - Minimum net profit in USD (e.g., 0.50)
+/// 
+/// # Returns
+/// Required take profit price (must be quantized to tick_size)
+/// 
+/// # Formula
+/// Long: exit_price >= entry_price + (min_profit + fee_entry + fee_exit) / qty
+/// Short: exit_price <= entry_price - (min_profit + fee_entry + fee_exit) / qty
+pub fn required_take_profit_price(
+    side: bot_core::types::Side,
+    entry_price: Decimal,
+    qty: Decimal,
+    fee_bps_entry: f64,
+    fee_bps_exit: f64,
+    min_profit_usd: f64,
+) -> Option<Decimal> {
+    if entry_price <= Decimal::ZERO || qty <= Decimal::ZERO {
+        return None;
+    }
+    
+    let notional_entry = entry_price * qty;
+    let fee_entry = notional_entry * Decimal::try_from(fee_bps_entry / 10_000.0).unwrap_or(Decimal::ZERO);
+    let min_profit_dec = Decimal::try_from(min_profit_usd).unwrap_or(Decimal::ZERO);
+    
+    match side {
+        bot_core::types::Side::Buy => {
+            // Long position: buy entry, sell exit
+            // Net profit = exit_price * qty - fee_exit - (entry_price * qty + fee_entry) >= min_profit
+            // => exit_price * qty * (1 - fee_bps_exit/10000) >= entry_price * qty + fee_entry + min_profit
+            // => exit_price >= (entry_price * qty + fee_entry + min_profit) / (qty * (1 - fee_bps_exit/10000))
+            let bps = Decimal::try_from(fee_bps_exit / 10_000.0).unwrap_or(Decimal::ZERO);
+            let denominator = qty * (Decimal::ONE - bps);
+            if denominator <= Decimal::ZERO {
+                return None;
+            }
+            let numerator = notional_entry + fee_entry + min_profit_dec;
+            Some(numerator / denominator)
+        }
+        bot_core::types::Side::Sell => {
+            // Short position: sell entry, buy exit
+            // Net profit = (entry_price * qty - fee_entry) - (exit_price * qty + fee_exit) >= min_profit
+            // => entry_price * qty - fee_entry - exit_price * qty - fee_exit >= min_profit
+            // => exit_price * qty * (1 + fee_bps_exit/10000) <= entry_price * qty - fee_entry - min_profit
+            // => exit_price <= (entry_price * qty - fee_entry - min_profit) / (qty * (1 + fee_bps_exit/10000))
+            let bps = Decimal::try_from(fee_bps_exit / 10_000.0).unwrap_or(Decimal::ZERO);
+            let denominator = qty * (Decimal::ONE + bps);
+            if denominator <= Decimal::ZERO {
+                return None;
+            }
+            let numerator = notional_entry - fee_entry - min_profit_dec;
+            if numerator <= Decimal::ZERO {
+                return None; // Cannot achieve min profit
+            }
+            Some(numerator / denominator)
+        }
+    }
+}
+
+/// Calculate side multiplier for PnL calculation
+/// Long: +1.0, Short: -1.0
+pub fn side_mult(side: &bot_core::types::Side) -> f64 {
+    match side {
+        bot_core::types::Side::Buy => 1.0,  // Long
+        bot_core::types::Side::Sell => -1.0, // Short
+    }
+}
+
+/// Estimate exit fee BPS based on exit type
+/// Market exit uses taker fee, limit exit uses maker fee
+pub fn estimate_close_fee_bps(is_market_exit: bool, maker_bps: f64, taker_bps: f64) -> f64 {
+    if is_market_exit {
+        taker_bps
+    } else {
+        maker_bps
+    }
+}
+
+/// Calculate net PnL in USD (fees included)
+/// 
+/// # Arguments
+/// * `entry_price` - Entry price (Decimal)
+/// * `exit_price` - Current/exit price (Decimal)
+/// * `qty` - Position quantity (Decimal, absolute value)
+/// * `side` - Position side (Buy=Long, Sell=Short)
+/// * `entry_fee_bps` - Entry fee in basis points
+/// * `exit_fee_bps` - Exit fee in basis points
+/// 
+/// # Returns
+/// Net PnL in USD (fees deducted)
+pub fn calc_net_pnl_usd(
+    entry_price: Decimal,
+    exit_price: Decimal,
+    qty: Decimal,
+    side: &bot_core::types::Side,
+    entry_fee_bps: f64,
+    exit_fee_bps: f64,
+) -> f64 {
+    let mult = side_mult(side);
+    
+    // Gross PnL = (exit_price - entry_price) * qty * mult
+    let price_diff = exit_price - entry_price;
+    let gross_pnl = price_diff * qty * Decimal::try_from(mult).unwrap_or(Decimal::ONE);
+    
+    // Notionals for fee calculation
+    let notional_entry = entry_price * qty;
+    let notional_exit = exit_price * qty;
+    
+    // Fees
+    let entry_fee_bps_dec = Decimal::try_from(entry_fee_bps / 10_000.0).unwrap_or(Decimal::ZERO);
+    let exit_fee_bps_dec = Decimal::try_from(exit_fee_bps / 10_000.0).unwrap_or(Decimal::ZERO);
+    
+    let fees_open = notional_entry * entry_fee_bps_dec;
+    let fees_close = notional_exit * exit_fee_bps_dec;
+    
+    // Net PnL = gross - fees
+    let net_pnl = gross_pnl - fees_open - fees_close;
+    
+    net_pnl.to_f64().unwrap_or(0.0)
+}
+
+/// Clamp price to market distance (mid ± max_distance_pct)
+/// 
+/// # Arguments
+/// * `price` - Raw price from strategy
+/// * `mid` - Mid price (best_bid + best_ask) / 2
+/// * `max_distance_pct` - Maximum distance from mid (e.g., 0.01 = 1%)
+/// 
+/// # Returns
+/// Clamped price within mid ± max_distance_pct
+pub fn clamp_price_to_market_distance(
+    price: Decimal,
+    mid: Decimal,
+    max_distance_pct: f64,
+) -> Decimal {
+    // KRİTİK: Division by zero ve invalid input kontrolleri
+    if mid <= Decimal::ZERO || max_distance_pct <= 0.0 || price <= Decimal::ZERO {
+        return price;
+    }
+    
+    let max_distance_pct_dec = match Decimal::try_from(max_distance_pct) {
+        Ok(d) => d,
+        Err(_) => return price, // Invalid conversion
+    };
+    
+    let max_distance = mid * max_distance_pct_dec;
+    let min_price = mid - max_distance;
+    let max_price = mid + max_distance;
+    
+    // Clamp to valid range
+    price.max(min_price).min(max_price)
 }
 
 /// Helper trait for ceiling division by step
@@ -207,17 +411,19 @@ impl CeilStep for f64 {
 }
 
 /// Format quantity with precision (truncate, don't round)
-fn format_qty_with_precision(qty: f64, precision: usize) -> String {
-    let multiplier = 10_f64.powi(precision as i32);
-    let truncated = (qty * multiplier).floor() / multiplier;
-    format!("{:.prec$}", truncated, prec = precision)
+/// KRİTİK: Decimal kullanarak precision kaybını önle
+fn format_qty_with_precision(qty: Decimal, precision: usize) -> String {
+    use exec::binance::format_decimal_fixed;
+    format_decimal_fixed(qty, precision)
 }
 
 /// Format price with precision (truncate, don't round)
-fn format_price_with_precision(price: f64, precision: usize) -> String {
-    let multiplier = 10_f64.powi(precision as i32);
-    let truncated = (price * multiplier).floor() / multiplier;
-    format!("{:.prec$}", truncated, prec = precision)
+/// KRİTİK: Decimal kullanarak precision kaybını önle
+/// NOT: Side-aware rounding artık quantization aşamasında yapılıyor (calc_qty_from_margin içinde)
+/// Burada sadece format ediyoruz
+fn format_price_with_precision(price: Decimal, precision: usize, _side: bot_core::types::Side) -> String {
+    use exec::binance::format_decimal_fixed;
+    format_decimal_fixed(price, precision)
 }
 
 // ============================================================================

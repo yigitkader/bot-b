@@ -61,6 +61,16 @@ pub struct SymbolState {
     // PnL tracking
     pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı
     pub avg_entry_price: Option<Decimal>, // Ortalama entry price (pozisyon açılırken güncellenir)
+    
+    // Long/Short seçimi için histerezis ve cooldown
+    pub last_direction_change: Option<Instant>, // Son yön değişikliği zamanı
+    pub current_direction: Option<bot_core::types::Side>, // Mevcut yön (Long=Buy, Short=Sell)
+    pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
+    pub regime: Option<String>, // "trend" veya "sideways"
+    
+    // Position closing control
+    pub position_closing: bool, // Pozisyon kapatma süreci başlamış mı (spam önleme)
+    pub last_close_attempt: Option<Instant>, // Son kapatma denemesi zamanı (cooldown için)
 }
 
 // ============================================================================

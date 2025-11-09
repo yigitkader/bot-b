@@ -91,6 +91,24 @@ pub struct StratCfg {
     #[serde(default)]
     pub taker_fee_rate: Option<f64>, // Taker fee oranı (default: 0.0004 = 4 bps)
     // Not: slippage_bps_reserve artık RiskCfg altında (risk.slippage_bps_reserve)
+    
+    // TP ve time-box ayarları
+    #[serde(default)]
+    pub tp_timebox_secs: Option<u64>, // Time-box süresi (saniye) - default: 20
+    #[serde(default)]
+    pub position_close_cooldown_ms: Option<u64>, // Pozisyon kapatma cooldown (ms) - default: 500
+    
+    // Long/Short seçimi ayarları
+    #[serde(default)]
+    pub direction_cooldown_secs: Option<u64>, // Yön değişikliği cooldown (saniye) - default: 60
+    #[serde(default)]
+    pub direction_signal_strength_threshold: Option<f64>, // Sinyal gücü farkı eşiği - default: 0.2
+    #[serde(default)]
+    pub direction_min_signal_strength: Option<f64>, // Minimum sinyal gücü (emir yerleştirme için) - default: 0.3
+    #[serde(default)]
+    pub orderbook_imbalance_long_threshold: Option<f64>, // Long için imbalance threshold (bid_vol/ask_vol) - default: 1.2
+    #[serde(default)]
+    pub orderbook_imbalance_short_threshold: Option<f64>, // Short için imbalance threshold (bid_vol/ask_vol) - default: 0.83
 }
 
 #[derive(Debug, Deserialize)]
@@ -378,6 +396,17 @@ fn default_opportunity_mode_medium_limit_ratio() -> f64 { 0.9 } // %90'da mevcut
 fn default_opportunity_mode_hard_limit_ratio() -> f64 { 1.0 } // %100'de force-close
 fn default_min_risk_reward_ratio() -> f64 { 2.0 }
 fn default_take_profit_position_size_threshold() -> f64 { 100.0 }
+
+// TP ve time-box default'ları
+fn default_tp_timebox_secs() -> u64 { 30 }
+fn default_position_close_cooldown_ms() -> u64 { 500 }
+
+// Long/Short seçimi default'ları
+fn default_direction_cooldown_secs() -> u64 { 60 }
+fn default_direction_signal_strength_threshold() -> f64 { 0.2 }
+fn default_direction_min_signal_strength() -> f64 { 0.3 }
+fn default_orderbook_imbalance_long_threshold() -> f64 { 1.2 }
+fn default_orderbook_imbalance_short_threshold() -> f64 { 0.83 }
 fn default_initial_fill_rate() -> f64 { 0.5 }
 fn default_no_fill_threshold_sec() -> f64 { 5.0 }
 fn default_fill_rate_decrease_on_no_fill() -> f64 { 0.90 }

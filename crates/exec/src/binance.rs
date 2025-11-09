@@ -209,6 +209,8 @@ struct FutPosition {
     liquidation_price: String,
     #[serde(rename = "positionSide", default)]
     position_side: Option<String>, // "LONG" | "SHORT" | "BOTH" (hedge mode) veya None (one-way mode)
+    #[serde(rename = "marginType", default)]
+    margin_type: String, // "isolated" or "cross"
 }
 
 #[derive(Deserialize)]
@@ -451,6 +453,42 @@ impl BinanceFutures {
         Ok(res)
     }
 
+    /// Get current margin type for a symbol
+    /// Returns true if isolated, false if crossed
+    pub async fn get_margin_type(&self, sym: &str) -> Result<bool> {
+        let qs = format!(
+            "symbol={}&timestamp={}&recvWindow={}",
+            sym,
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!(
+            "{}/fapi/v2/positionRisk?{}&signature={}",
+            self.base, qs, sig
+        );
+        let mut positions: Vec<FutPosition> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
+        let pos = positions
+            .drain(..)
+            .find(|p| p.symbol.eq_ignore_ascii_case(sym))
+            .ok_or_else(|| anyhow!("position not found for symbol"))?;
+        // marginType: "isolated" or "cross"
+        let is_isolated = pos.margin_type.eq_ignore_ascii_case("isolated");
+        Ok(is_isolated)
+    }
+    
+    /// Get current leverage for a symbol
+    pub async fn get_leverage(&self, sym: &str) -> Result<u32> {
+        let pos = self.fetch_position(sym).await?;
+        Ok(pos.leverage)
+    }
+    
     pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
@@ -1190,7 +1228,7 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     result
 }
 
-fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
+pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     // KRİTİK DÜZELTME: Edge case'ler için ek kontroller
     // Precision overflow kontrolü (max 28 decimal places)
     let precision = precision.min(28);
