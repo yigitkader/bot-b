@@ -960,6 +960,20 @@ async fn main() -> Result<()> {
                                                 debug!(symbol = %state.meta.symbol, "reconnect sync: position closed, cleared position_orders");
                                             }
                                             
+                                            // ✅ KRİTİK FIX: Reconnect sonrası pozisyon varsa entry_time set et
+                                            // Pozisyon açıldıysa (old_inv.is_zero() && !pos.qty.0.is_zero()) entry_time set et
+                                            if old_inv.is_zero() && !pos.qty.0.is_zero() {
+                                                if state.position_entry_time.is_none() {
+                                                    state.position_entry_time = Some(std::time::Instant::now());
+                                                    info!(
+                                                        symbol = %state.meta.symbol,
+                                                        entry_time_set = "from_reconnect_sync",
+                                                        inv_change = %(pos.qty.0 - old_inv),
+                                                        "position entry time set from reconnect sync"
+                                                    );
+                                                }
+                                            }
+                                            
                                             info!(
                                                 symbol = %state.meta.symbol,
                                                 removed_orders = removed_orders.len(),
@@ -2393,7 +2407,18 @@ async fn main() -> Result<()> {
                 // 5. Peak PnL trailing: En yüksek kardan belirli bir düşüş varsa kapat
                 // 6. Drawdown: Belirli bir zarara ulaşırsa kapat
                 // 7. Recovery: Zarardan kâra dönüşünce hemen kapat (küçük kâr bile olsa)
-                let should_close_smart = if let Some(entry_time) = state.position_entry_time {
+                // ✅ KRİTİK FIX: position_entry_time None ise (reconnect sonrası) pozisyon yaşı 0 olarak kabul et
+                let should_close_smart = {
+                    // Entry time yoksa şimdi set et (reconnect sonrası olabilir)
+                    if state.position_entry_time.is_none() {
+                        state.position_entry_time = Some(Instant::now());
+                        info!(
+                            %symbol,
+                            entry_time_set = "from_position_check",
+                            "position entry time set from position check (reconnect recovery)"
+                        );
+                    }
+                    let entry_time = state.position_entry_time.unwrap(); // Artık Some olduğundan eminiz
                     let age_secs = entry_time.elapsed().as_secs();
                     let age_secs_f64 = age_secs as f64;
                     
@@ -2468,8 +2493,6 @@ async fn main() -> Result<()> {
                     let should_close_by_threshold = net_pnl >= combined_threshold;
                     
                     should_close_by_threshold || should_close_trailing || should_close_drawdown || should_close_recovery
-                } else {
-                    false
                 };
                 
                 // Kapatma kararı
@@ -3603,19 +3626,45 @@ async fn main() -> Result<()> {
                                     let min_tp_for_maker = ask.0 + tick_size;
                                     if tp_quantized < min_tp_for_maker {
                                         // TP çok düşük, maker order olamaz (taker olur → daha yüksek fee)
-                                        warn!(
-                                            %symbol,
-                                            chunk_idx,
-                                            tp_calculated = %tp_quantized,
-                                            min_required = %min_tp_for_maker,
-                                            best_ask = %ask.0,
-                                            tick_size = %tick_size,
-                                            "TP below min maker price (best_ask + tick_size), skipping chunk (would be taker order)"
+                                        // ✅ DÜZELTME: Taker fee ile de çalışabiliriz - spread yeterli değilse taker TP kullan
+                                        let tp_with_taker_fee = required_take_profit_price(
+                                            Side::Buy,
+                                            chunk_price.0,
+                                            chunk_qty.0,
+                                            taker_fee_rate * 10000.0, // Entry taker
+                                            taker_fee_rate * 10000.0, // Exit taker (TP emri taker olacak)
+                                            min_profit_usd,
                                         );
-                                        continue;
+                                        
+                                        if let Some(tp_taker) = tp_with_taker_fee {
+                                            let tp_taker_quantized = exec::quant_utils_ceil_to_step(tp_taker, tick_size);
+                                            // Taker fee ile TP kullan (maker olamıyorsa taker kabul et)
+                                            warn!(
+                                                %symbol,
+                                                chunk_idx,
+                                                tp_maker_calculated = %tp_quantized,
+                                                tp_taker_calculated = %tp_taker_quantized,
+                                                min_required = %min_tp_for_maker,
+                                                "TP below min maker price, using taker fee TP (acceptable for $0.50 profit)"
+                                            );
+                                            // Taker TP'yi kullan (maker olamıyorsa taker kabul edilebilir)
+                                            Some(tp_taker_quantized)
+                                        } else {
+                                            // Taker fee ile de TP hesaplanamıyorsa skip
+                                            warn!(
+                                                %symbol,
+                                                chunk_idx,
+                                                tp_calculated = %tp_quantized,
+                                                min_required = %min_tp_for_maker,
+                                                best_ask = %ask.0,
+                                                tick_size = %tick_size,
+                                                "TP below min maker price and taker fee TP calculation failed, skipping chunk"
+                                            );
+                                            continue;
+                                        }
+                                    } else {
+                                        Some(tp_quantized)
                                     }
-                                    
-                                    Some(tp_quantized)
                                 }
                                 None => {
                                     warn!(
@@ -4051,19 +4100,45 @@ async fn main() -> Result<()> {
                                     let max_tp_for_maker = bid.0 - tick_size;
                                     if tp_quantized > max_tp_for_maker {
                                         // TP çok yüksek, maker order olamaz (taker olur → daha yüksek fee)
-                                        warn!(
-                                            %symbol,
-                                            chunk_idx,
-                                            tp_calculated = %tp_quantized,
-                                            max_required = %max_tp_for_maker,
-                                            best_bid = %bid.0,
-                                            tick_size = %tick_size,
-                                            "TP above max maker price (best_bid - tick_size), skipping chunk (would be taker order)"
+                                        // ✅ DÜZELTME: Taker fee ile de çalışabiliriz - spread yeterli değilse taker TP kullan
+                                        let tp_with_taker_fee = required_take_profit_price(
+                                            Side::Sell,
+                                            chunk_price.0,
+                                            chunk_qty.0,
+                                            taker_fee_rate * 10000.0, // Entry taker
+                                            taker_fee_rate * 10000.0, // Exit taker (TP emri taker olacak)
+                                            min_profit_usd,
                                         );
-                                        continue;
+                                        
+                                        if let Some(tp_taker) = tp_with_taker_fee {
+                                            let tp_taker_quantized = exec::quant_utils_floor_to_step(tp_taker, tick_size);
+                                            // Taker fee ile TP kullan (maker olamıyorsa taker kabul et)
+                                            warn!(
+                                                %symbol,
+                                                chunk_idx,
+                                                tp_maker_calculated = %tp_quantized,
+                                                tp_taker_calculated = %tp_taker_quantized,
+                                                max_required = %max_tp_for_maker,
+                                                "TP above max maker price, using taker fee TP (acceptable for $0.50 profit)"
+                                            );
+                                            // Taker TP'yi kullan (maker olamıyorsa taker kabul edilebilir)
+                                            Some(tp_taker_quantized)
+                                        } else {
+                                            // Taker fee ile de TP hesaplanamıyorsa skip
+                                            warn!(
+                                                %symbol,
+                                                chunk_idx,
+                                                tp_calculated = %tp_quantized,
+                                                max_required = %max_tp_for_maker,
+                                                best_bid = %bid.0,
+                                                tick_size = %tick_size,
+                                                "TP above max maker price and taker fee TP calculation failed, skipping chunk"
+                                            );
+                                            continue;
+                                        }
+                                    } else {
+                                        Some(tp_quantized)
                                     }
-                                    
-                                    Some(tp_quantized)
                                 }
                                 None => {
                                     warn!(
