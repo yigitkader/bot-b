@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use bot_core::types::*;
+    use crate::core::types::*;
     use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;

@@ -1,7 +1,7 @@
 //location: /crates/exec/src/binance.rs
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use bot_core::types::*;
+use crate::core::types::*;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use urlencoding::encode;
 
-use super::{Venue, VenueOrder};
+use crate::exec::{Venue, VenueOrder};
 
 #[derive(Clone, Debug)]
 pub struct SymbolRules {

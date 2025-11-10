@@ -6,22 +6,27 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 config = { workspace = true }
-bot_core = { path = "../bot_core" }
-exec = { path = "../exec" }
-monitor = { path = "../monitor" }
-risk = { path = "../risk" }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-strategy = { path = "../strategy" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
-data = { path = "../data" }
 chrono = "0.4"
+metrics-exporter-prometheus = { workspace = true }
+# Binance dependencies
+dashmap = { workspace = true }
+once_cell = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = "1"
