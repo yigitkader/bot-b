@@ -1,22 +1,37 @@
 //location: /crates/app/src/main.rs
 // Main application entry point and trading loop
 
+mod binance_exec;
+mod binance_rest;
+mod binance_ws;
+mod cap_manager;
 mod config;
+mod core;
+mod exec;
 mod logger;
+mod monitor;
+mod order_manager;
+mod position_manager;
+mod quote_generator;
+mod risk;
+mod risk_manager;
+mod strategy;
+mod symbol_discovery;
 mod types;
 mod utils;
 
 use anyhow::{anyhow, Result};
-use bot_core::types::*;
+use crate::core::types::*;
+use cap_manager::Caps;
 use config::load_config;
-use data::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
-use exec::binance::{BinanceCommon, BinanceFutures, SymbolMeta};
-use exec::{decimal_places, Venue};
-use risk::{RiskAction, RiskLimits};
+use crate::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
+use crate::binance_exec::{BinanceCommon, BinanceFutures, SymbolMeta};
+use crate::exec::{decimal_places, Venue};
+use crate::risk::{RiskAction, RiskLimits};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
-use strategy::{Context, DynMm, DynMmCfg, Strategy};
+use crate::strategy::{Context, DynMm, DynMmCfg, Strategy};
 use tokio::sync::mpsc;
 // ✅ FIX: tokio::time::timeout kullanılmıyor, kaldırıldı
 use tracing::{debug, error, info, warn};
@@ -74,7 +89,7 @@ async fn main() -> Result<()> {
         return Err(anyhow!("max_usd_per_order must be positive"));
     }
     if let Some(port) = cfg.metrics_port {
-        monitor::init_prom(port);
+        crate::monitor::init_prom(port);
     }
 
     // Initialize JSON logger
@@ -153,66 +168,8 @@ async fn main() -> Result<()> {
         trend_analysis_threshold_negative: Some(cfg.strategy_internal.trend_analysis_threshold_negative),
         trend_analysis_threshold_strong_negative: Some(cfg.strategy_internal.trend_analysis_threshold_strong_negative),
     };
-    // Always use futures mode
+    // Strategy configuration is now handled in symbol_discovery module
     let strategy_name = cfg.strategy.r#type.clone();
-    let build_strategy = |symbol: &str| -> Box<dyn Strategy> {
-        // DynMmCfg Clone edilebilir (derive(Clone) ile)
-        let dyn_cfg_clone = DynMmCfg {
-            a: dyn_cfg.a,
-            b: dyn_cfg.b,
-            base_size: dyn_cfg.base_size,
-            inv_cap: dyn_cfg.inv_cap,
-            min_spread_bps: dyn_cfg.min_spread_bps,
-            max_spread_bps: dyn_cfg.max_spread_bps,
-            spread_arbitrage_min_bps: dyn_cfg.spread_arbitrage_min_bps,
-            spread_arbitrage_max_bps: dyn_cfg.spread_arbitrage_max_bps,
-            strong_trend_bps: dyn_cfg.strong_trend_bps,
-            momentum_strong_bps: dyn_cfg.momentum_strong_bps,
-            trend_bias_multiplier: dyn_cfg.trend_bias_multiplier,
-            adverse_selection_threshold_on: dyn_cfg.adverse_selection_threshold_on,
-            adverse_selection_threshold_off: dyn_cfg.adverse_selection_threshold_off,
-            opportunity_threshold_on: dyn_cfg.opportunity_threshold_on,
-            opportunity_threshold_off: dyn_cfg.opportunity_threshold_off,
-            price_jump_threshold_bps: dyn_cfg.price_jump_threshold_bps,
-            fake_breakout_threshold_bps: dyn_cfg.fake_breakout_threshold_bps,
-            liquidity_drop_threshold: dyn_cfg.liquidity_drop_threshold,
-            inventory_threshold_ratio: dyn_cfg.inventory_threshold_ratio,
-            volatility_coefficient: dyn_cfg.volatility_coefficient,
-            ofi_coefficient: dyn_cfg.ofi_coefficient,
-            min_liquidity_required: dyn_cfg.min_liquidity_required,
-            min_24h_volume_usd: dyn_cfg.min_24h_volume_usd,
-            min_book_depth_usd: dyn_cfg.min_book_depth_usd,
-            opportunity_size_multiplier: dyn_cfg.opportunity_size_multiplier,
-            strong_trend_multiplier: dyn_cfg.strong_trend_multiplier,
-            manipulation_volume_ratio_threshold: dyn_cfg.manipulation_volume_ratio_threshold,
-            manipulation_time_threshold_ms: dyn_cfg.manipulation_time_threshold_ms,
-            manipulation_price_history_min_len: dyn_cfg.manipulation_price_history_min_len,
-            manipulation_price_history_max_len: dyn_cfg.manipulation_price_history_max_len,
-            flash_crash_recovery_window_ms: dyn_cfg.flash_crash_recovery_window_ms,
-            flash_crash_recovery_min_points: dyn_cfg.flash_crash_recovery_min_points,
-            flash_crash_recovery_min_ratio: dyn_cfg.flash_crash_recovery_min_ratio,
-            confidence_price_drop_max: dyn_cfg.confidence_price_drop_max,
-            confidence_volume_ratio_min: dyn_cfg.confidence_volume_ratio_min,
-            confidence_volume_ratio_max: dyn_cfg.confidence_volume_ratio_max,
-            confidence_spread_min: dyn_cfg.confidence_spread_min,
-            confidence_spread_max: dyn_cfg.confidence_spread_max,
-            confidence_bonus_multiplier: dyn_cfg.confidence_bonus_multiplier,
-            confidence_max_multiplier: dyn_cfg.confidence_max_multiplier,
-            confidence_min_threshold: dyn_cfg.confidence_min_threshold,
-            default_confidence: dyn_cfg.default_confidence,
-            min_confidence_value: dyn_cfg.min_confidence_value,
-            trend_analysis_min_history: dyn_cfg.trend_analysis_min_history,
-            trend_analysis_threshold_negative: dyn_cfg.trend_analysis_threshold_negative,
-            trend_analysis_threshold_strong_negative: dyn_cfg.trend_analysis_threshold_strong_negative,
-        };
-        match strategy_name.as_str() {
-            "dyn_mm" => Box::new(DynMm::from(dyn_cfg_clone)),
-            other => {
-                warn!(symbol = %symbol, strategy = %other, "unknown strategy type, defaulting dyn_mm");
-                Box::new(DynMm::from(dyn_cfg_clone))
-            }
-        }
-    };
 
     // Venue seçimi
     let tif = tif_from_cfg(&cfg.exec.tif);
@@ -257,339 +214,47 @@ async fn main() -> Result<()> {
 
     let metadata = venue.symbol_metadata().await?;
 
-    let mut requested: Vec<String> = cfg.symbols.clone();
-    if let Some(sym) = cfg.symbol.clone() {
-        requested.push(sym);
-    }
+    // Discover symbols using the new module
+    let mut selected = symbol_discovery::discover_symbols(&venue, &cfg, &metadata).await?;
 
-    let mut normalized = Vec::new();
-    for sym in requested {
-        let s = sym.trim().to_uppercase();
-        if s.is_empty() {
-            continue;
-        }
-        if !normalized.iter().any(|existing: &String| existing == &s) {
-            normalized.push(s);
-        }
-    }
-
-    let mut selected: Vec<SymbolMeta> = Vec::new();
-    for sym in &normalized {
-        // Özel karakterli sembolleri filtrele (API signature hatalarına neden olur)
-        if !sym.is_ascii() {
-            warn!(
-                symbol = %sym,
-                "skipping symbol with non-ASCII characters (causes API signature errors)"
-            );
-            continue;
-        }
-        
-        if let Some(meta) = metadata.iter().find(|m| &m.symbol == sym) {
-            // --- quote eşleşmesi ya birebir ya da USD-stable grubu uyumu ---
-            let exact_quote = meta.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset);
-            let group_quote = is_usd_stable(&cfg.quote_asset) && is_usd_stable(&meta.quote_asset);
-            if !(exact_quote || group_quote) {
-                warn!(
-                    symbol = %sym,
-                    quote_asset = %meta.quote_asset,
-                    required_quote = %cfg.quote_asset,
-                    "skipping configured symbol that is not in required quote group"
-                );
-                continue;
-            }
-            if let Some(status) = meta.status.as_deref() {
-                if status != "TRADING" {
-                    warn!(symbol = %sym, status, "skipping configured symbol that is not trading");
-                    continue;
-                }
-            }
-            // Only accept PERPETUAL futures contracts
-                match meta.contract_type.as_deref() {
-                    Some("PERPETUAL") => {}
-                    Some(other) => {
-                        warn!(symbol = %sym, contract_type = %other, "skipping non-perpetual futures symbol");
-                        continue;
-                    }
-                    None => {
-                        warn!(symbol = %sym, "skipping futures symbol with missing contract type metadata");
-                        continue;
-                }
-            }
-
-            // --- opsiyonel: başlangıçta bakiye tabanlı ön eleme ---
-            let have_min = cfg.min_usd_per_order.unwrap_or(0.0);
-            let avail = match venue.available_balance(&meta.quote_asset).await?.to_f64() {
-                Some(b) => b,
-                None => {
-                    warn!(
-                        symbol = %meta.symbol,
-                        quote_asset = %meta.quote_asset,
-                        "Failed to convert balance to f64, using 0.0"
-                    );
-                    0.0
-                }
-            };
-                    if avail < have_min {
-                        warn!(
-                            symbol = %sym,
-                            quote = %meta.quote_asset,
-                            avail,
-                            min_needed = have_min,
-                            "skipping symbol at discovery: zero/low quote balance for futures wallet"
-                        );
-                        continue;
-            }
-
-            selected.push(meta.clone());
-        } else {
-            warn!(symbol = %sym, "configured symbol not found on venue");
-        }
-    }
-
-    if selected.is_empty() && cfg.auto_discover_quote {
-        // --- auto-discover: USD-stable grup kuralı + USDT seçeneği ---
-        let want_group = is_usd_stable(&cfg.quote_asset);
-        let mut auto: Vec<SymbolMeta> = metadata
-            .iter()
-            .filter(|m| {
-                // Ana quote asset kontrolü
-                let match_primary_quote = if want_group {
-                    is_usd_stable(&m.quote_asset)
-                } else {
-                    m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
-                };
-                
-                // USDT/USDC seçeneği: allow_usdt_quote true ise karşılıklı olarak ekle
-                let match_cross_quote = if cfg.allow_usdt_quote {
-                    let cfg_quote_upper = cfg.quote_asset.to_uppercase();
-                    if cfg_quote_upper == "USDC" {
-                        m.quote_asset.eq_ignore_ascii_case("USDT")
-                    } else if cfg_quote_upper == "USDT" {
-                        m.quote_asset.eq_ignore_ascii_case("USDC")
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                
-                let match_quote = match_primary_quote || match_cross_quote;
-                
-                match_quote
-                    && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
-                    && m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        
-        // --- QUOTE ASSET BAKİYE FİLTRESİ: Yetersiz bakiye olan quote asset'li sembolleri filtrele ---
-        // Tüm quote asset'lerin bakiyelerini kontrol et ve yetersiz olanları baştan filtrele
-        // Böylece gereksiz işlem yapılmaz
-        let mut quote_asset_balances: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-        
-                // Tüm benzersiz quote asset'leri bul
-                let unique_quotes: std::collections::HashSet<String> = auto.iter()
-                    .map(|m| m.quote_asset.clone())
-                    .collect();
-                
-        // Her quote asset için bakiye kontrolü yap (futures)
-                for quote in unique_quotes {
-            let balance = venue.available_balance(&quote).await.ok()
-                        .and_then(|b| b.to_f64())
-                        .unwrap_or(0.0);
-                    quote_asset_balances.insert(quote.clone(), balance);
-                    
-                    if balance < cfg.min_quote_balance_usd {
-                        info!(
-                            quote_asset = %quote,
-                            balance,
-                            min_required = cfg.min_quote_balance_usd,
-                            "FILTERING: quote asset balance insufficient, removing all symbols with this quote asset"
-                        );
-            }
-        }
-        
-        // Yetersiz bakiye olan quote asset'li sembolleri filtrele
-        auto.retain(|m| {
-            if let Some(&balance) = quote_asset_balances.get(&m.quote_asset) {
-                if balance >= cfg.min_quote_balance_usd {
-                    true // Yeterli bakiye var, tut
-                } else {
-                    false // Yetersiz bakiye, filtrele
-                }
-            } else {
-                // Bakiye bilgisi yok, güvenli tarafta kal ve filtrele
-                false
-            }
-        });
-        
-        info!(
-            symbols_after_filtering = auto.len(),
-            "filtered symbols by quote asset balance"
-        );
-        
-        // Özel karakterli sembolleri filtrele (API signature hatalarına neden olur)
-        auto.retain(|m| {
-            // Sadece ASCII karakterler içeren sembolleri kabul et
-            m.symbol.is_ascii()
-        });
-        
-        // USDC ve USDT eşit muamele görmeli - alfabetik sırala
-        auto.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-        info!(
-            count = auto.len(),
-            quote_asset = %cfg.quote_asset,
-            "auto-discovered symbols"
-        );
-        selected = auto;
-    }
-
-    // Bakiye yetersizse, bakiye gelene kadar bekle (kod durmamalı)
+    // Wait for balance if no symbols found
     if selected.is_empty() {
         warn!(
             quote_asset = %cfg.quote_asset,
             min_required = cfg.min_quote_balance_usd,
             "no eligible symbols found - waiting for balance to become available"
         );
-        
-        // Bakiye gelene kadar döngüde bekle
-        loop {
-            use tokio::time::{sleep, Duration};
-            sleep(Duration::from_secs(cfg.internal.symbol_discovery_retry_interval_sec)).await;
-            
-            // Tekrar sembol keşfi yap
-            let mut retry_selected: Vec<SymbolMeta> = Vec::new();
-            if cfg.auto_discover_quote {
-                let want_group = is_usd_stable(&cfg.quote_asset);
-                let mut retry_auto: Vec<SymbolMeta> = metadata
-                    .iter()
-                    .filter(|m| {
-                        // Ana quote asset kontrolü
-                        let match_primary_quote = if want_group {
-                            is_usd_stable(&m.quote_asset)
-                        } else {
-                            m.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset)
-                        };
-                        
-                        // USDT/USDC seçeneği: allow_usdt_quote true ise karşılıklı olarak ekle
-                        let match_cross_quote = if cfg.allow_usdt_quote {
-                            let cfg_quote_upper = cfg.quote_asset.to_uppercase();
-                            if cfg_quote_upper == "USDC" {
-                                m.quote_asset.eq_ignore_ascii_case("USDT")
-                            } else if cfg_quote_upper == "USDT" {
-                                m.quote_asset.eq_ignore_ascii_case("USDC")
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        
-                        let match_quote = match_primary_quote || match_cross_quote;
-                        
-                        match_quote
-                            && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
-                            && m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect();
-                
-                // Bakiye kontrolü
-                let mut retry_quote_balances: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-                // Futures only - spot removed
-                        let unique_quotes: std::collections::HashSet<String> = retry_auto.iter()
-                            .map(|m| m.quote_asset.clone())
-                            .collect();
-                        for quote in unique_quotes {
-                    let balance = venue.available_balance(&quote).await.ok()
-                                .and_then(|b| b.to_f64())
-                                .unwrap_or(0.0);
-                            retry_quote_balances.insert(quote.clone(), balance);
-                }
-                
-                retry_auto.retain(|m| {
-                    if let Some(&balance) = retry_quote_balances.get(&m.quote_asset) {
-                        balance >= cfg.min_quote_balance_usd
-                    } else {
-                        false
-                    }
-                });
-                
-                retry_selected = retry_auto;
-            } else {
-                // Manuel sembol listesi için de aynı kontrol
-                for sym in &normalized {
-                    if let Some(meta) = metadata.iter().find(|m| &m.symbol == sym) {
-                        let exact_quote = meta.quote_asset.eq_ignore_ascii_case(&cfg.quote_asset);
-                        let group_quote = is_usd_stable(&cfg.quote_asset) && is_usd_stable(&meta.quote_asset);
-                        if !(exact_quote || group_quote) {
-                            continue;
-                        }
-                        if let Some(status) = meta.status.as_deref() {
-                            if status != "TRADING" {
-                                continue;
-                            }
-                        }
-                        // Only accept PERPETUAL futures contracts
-                            match meta.contract_type.as_deref() {
-                                Some("PERPETUAL") => {}
-                                _ => continue,
-                        }
-                        
-                        // Bakiye kontrolü (futures only)
-                        let has_balance = venue.available_balance(&meta.quote_asset).await.ok()
-                                    .and_then(|b| b.to_f64())
-                            .unwrap_or(0.0) >= cfg.min_quote_balance_usd;
-                        
-                        if has_balance {
-                            retry_selected.push(meta.clone());
-                        }
-                    }
-                }
-            }
-            
-            if !retry_selected.is_empty() {
-                info!(
-                    count = retry_selected.len(),
-                    quote_asset = %cfg.quote_asset,
-                    "balance became available, proceeding with symbol initialization"
-                );
-                selected = retry_selected;
-                break; // Bakiye geldi, döngüden çık
-            } else {
-                info!(
-                    quote_asset = %cfg.quote_asset,
-                    min_required = cfg.min_quote_balance_usd,
-                    "still waiting for balance to become available..."
-                );
-            }
-        }
+        selected = symbol_discovery::wait_and_retry_discovery(&venue, &cfg, &metadata).await?;
     }
 
     // KRİTİK: Startup'ta cache'i temizle (fresh rules fetch için)
     info!("clearing cached exchange rules for fresh startup");
-    exec::binance::FUT_RULES.clear();
+    binance_exec::FUT_RULES.clear();
 
-    // Per-symbol metadata'yı başlangıçta çek (quantize için)
+    // Initialize symbol states
+    let mut states = symbol_discovery::initialize_symbol_states(selected, &dyn_cfg, &strategy_name, &cfg);
+    
+    // Fetch per-symbol metadata and update states
     info!("fetching per-symbol metadata for quantization...");
-    let mut states: Vec<SymbolState> = Vec::new();
     let mut symbol_index: HashMap<String, usize> = HashMap::new();
-    for meta in selected {
+    for (idx, state) in states.iter_mut().enumerate() {
+        let symbol = &state.meta.symbol;
+        symbol_index.insert(symbol.clone(), idx);
+        
         info!(
-            symbol = %meta.symbol,
-            base_asset = %meta.base_asset,
-            quote_asset = %meta.quote_asset,
+            symbol = %symbol,
+            base_asset = %state.meta.base_asset,
+            quote_asset = %state.meta.quote_asset,
             mode = %cfg.mode,
             "bot initialized assets"
         );
         
-        // KRİTİK: Eager warmup - Per-symbol metadata çek (exchangeInfo)
-        // Başarısız olursa sembolü disable et (kuralsız sembolde trade etme)
-        let symbol_rules = venue.rules_for(&meta.symbol).await.ok();
+        // Fetch exchange rules
+        let symbol_rules = venue.rules_for(symbol).await.ok();
         let rules_fetch_failed = symbol_rules.is_none();
         if let Some(ref rules) = symbol_rules {
             info!(
-                symbol = %meta.symbol,
+                symbol = %symbol,
                 tick_size = %rules.tick_size,
                 step_size = %rules.step_size,
                 price_precision = rules.price_precision,
@@ -599,191 +264,23 @@ async fn main() -> Result<()> {
             );
         } else {
             warn!(
-                symbol = %meta.symbol,
+                symbol = %symbol,
                 "CRITICAL: failed to fetch per-symbol metadata, symbol DISABLED (will not trade)"
             );
         }
         
-        let strategy = build_strategy(&meta.symbol);
-        let idx = states.len();
-        symbol_index.insert(meta.symbol.clone(), idx);
-        states.push(SymbolState {
-            meta,
-            inv: Qty(Decimal::ZERO),
-            strategy,
-            active_orders: HashMap::new(),
-            pnl_history: Vec::new(),
-            min_notional_req: None,
-            disabled: rules_fetch_failed, // KRİTİK: ExchangeInfo başarısızsa disable et
-            disabled_until: None, // Disabled semboller için cooldown
-            symbol_rules, // Per-symbol metadata (fallback: None, global cfg kullanılır)
-            rules_fetch_failed, // ExchangeInfo fetch durumu
-            last_rules_retry: None, // Periyodik retry için
-            test_order_passed: false, // İlk emir öncesi test order henüz yapılmadı
-            // ✅ KRİTİK FIX: test_order_passed_buy ve test_order_passed_sell kaldırıldı (kullanılmıyordu)
-            last_position_check: None,
-            last_order_sync: None,
-            order_fill_rate: cfg.internal.initial_fill_rate,
-            consecutive_no_fills: 0,
-            last_fill_time: None,
-            last_inventory_update: None,
-            last_decay_period: None,
-            last_decay_check: None,
-            position_entry_time: None,
-            peak_pnl: Decimal::ZERO,
-            last_peak_update: None,
-            position_hold_duration_ms: 0,
-            last_order_price_update: HashMap::new(),
-            // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu, sadece overhead yaratıyordu)
-            // Eğer gelecekte partial close veya order-to-position mapping gerekirse, o zaman eklenebilir
-            last_cancel_all_time: None,
-            cancel_all_attempt_count: 0,
-            daily_pnl: Decimal::ZERO,
-            total_funding_cost: Decimal::ZERO,
-            position_size_notional_history: Vec::with_capacity(cfg.internal.position_size_history_max_len),
-            last_pnl_alert: None,
-            cumulative_pnl: Decimal::ZERO,
-            last_applied_funding_time: None,
-            last_daily_reset: None,
-            last_daily_reset_date: None,
-            avg_entry_price: None,
-            last_direction_change: None,
-            current_direction: None,
-            direction_signal_strength: 0.0,
-            regime: None,
-            position_closing: false,
-            last_close_attempt: None,
-        });
+        state.disabled = rules_fetch_failed;
+        state.symbol_rules = symbol_rules;
+        state.rules_fetch_failed = rules_fetch_failed;
     }
 
-    // KRİTİK: Başlangıçta her sembol için leverage'i açıkça ayarla
-    // Config'den leverage al: exec.default_leverage veya cfg.leverage (fallback)
-    let leverage_to_set = cfg.exec.default_leverage
-        .or(cfg.leverage)
-        .unwrap_or(1); // Default: 1x (en güvenli)
-    
-    if cfg.mode == "futures" {
-        // KRİTİK DÜZELTME: API idempotency - önce oku, sonra set et
-        // Isolated margin ayarla (her sembol için)
-        let use_isolated = cfg.risk.use_isolated_margin;
-        if use_isolated {
-            let mut isolated_set_count = 0;
-            let mut isolated_skip_count = 0;
-            let mut isolated_fail_count = 0;
-            
-            info!("checking and setting isolated margin for all symbols");
-        for state in &states {
-            let symbol = &state.meta.symbol;
-                
-                // Önce mevcut margin type'ı oku
-                rate_limit_guard(1).await; // GET /fapi/v2/positionRisk: Weight 5
-                match venue.get_margin_type(symbol).await {
-                    Ok(current_is_isolated) => {
-                        if current_is_isolated == use_isolated {
-                            // Zaten doğru, set etme
-                            isolated_skip_count += 1;
-                            debug!(%symbol, "margin type already set to isolated, skipping");
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        // Okuma başarısız, yine de set etmeyi dene (pozisyon yoksa hata verebilir)
-                        warn!(%symbol, error = %e, "failed to get margin type, will attempt to set anyway");
-                    }
-                }
-                
-                // Farklıysa set et
-                rate_limit_guard(1).await; // POST /fapi/v1/marginType: Weight 1
-                match venue.set_margin_type(symbol, true).await {
-                    Ok(_) => {
-                        isolated_set_count += 1;
-                        info!(%symbol, "isolated margin set successfully");
-                    }
-                    Err(err) => {
-                        let error_str = err.to_string();
-                        let error_lower = error_str.to_lowercase();
-                        
-                        // -4046 "No need to change margin type" hatası normal (zaten doğru)
-                        if error_lower.contains("-4046") || error_lower.contains("no need to change") {
-                            isolated_skip_count += 1;
-                            debug!(%symbol, "margin type already isolated, no change needed");
-                        } else {
-                            isolated_fail_count += 1;
-                            warn!(%symbol, error = %err, "failed to set isolated margin");
-                        }
-                    }
-                }
-            }
-            
-            info!(
-                isolated_set = isolated_set_count,
-                isolated_skip = isolated_skip_count,
-                isolated_fail = isolated_fail_count,
-                "isolated margin setup completed"
-            );
-        }
-        
-        // Leverage ayarla (her sembol için)
-        let mut leverage_set_count = 0;
-        let mut leverage_skip_count = 0;
-        let mut leverage_fail_count = 0;
-        
-        info!(leverage = leverage_to_set, "checking and setting leverage for all symbols");
-        for state in &states {
-            let symbol = &state.meta.symbol;
-            
-            // Önce mevcut leverage'i oku
-            rate_limit_guard(5).await; // GET /fapi/v2/positionRisk: Weight 5
-            match venue.get_leverage(symbol).await {
-                Ok(current_leverage) => {
-                    if current_leverage == leverage_to_set {
-                        // Zaten doğru, set etme
-                        leverage_skip_count += 1;
-                        debug!(%symbol, leverage = current_leverage, "leverage already set, skipping");
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    // Okuma başarısız, yine de set etmeyi dene (pozisyon yoksa hata verebilir)
-                    warn!(%symbol, error = %e, "failed to get leverage, will attempt to set anyway");
-                }
-            }
-            
-            // Farklıysa set et
-            rate_limit_guard(1).await; // POST /fapi/v1/leverage: Weight 1
-            match venue.set_leverage(symbol, leverage_to_set).await {
-                Ok(_) => {
-                    leverage_set_count += 1;
-                    info!(%symbol, leverage = leverage_to_set, "leverage set successfully");
-                }
-                Err(err) => {
-                    let error_str = err.to_string();
-                    let error_lower = error_str.to_lowercase();
-                    
-                    // -4059 "No need to change leverage" hatası normal (zaten doğru)
-                    if error_lower.contains("-4059") || error_lower.contains("no need to change") {
-                        leverage_skip_count += 1;
-                        debug!(%symbol, leverage = leverage_to_set, "leverage already set, no change needed");
-                    } else {
-                        leverage_fail_count += 1;
-                        warn!(%symbol, leverage = leverage_to_set, error = %err, "failed to set leverage");
-                    }
-                }
-            }
-        }
-        
-        info!(
-            leverage_set = leverage_set_count,
-            leverage_skip = leverage_skip_count,
-            leverage_fail = leverage_fail_count,
-            "leverage setup completed"
-        );
-    }
+    // Setup margin and leverage for all symbols
+    symbol_discovery::setup_margin_and_leverage(&venue, &mut states, &cfg).await?;
 
     let symbol_list: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
     info!(symbols = ?symbol_list, mode = %cfg.mode, "bot started with real Binance venue");
 
-    let risk_limits = RiskLimits {
+    let risk_limits = crate::risk::RiskLimits {
         inv_cap: Qty(Decimal::from_str_radix(&cfg.risk.inv_cap, 10)
             .map_err(|e| anyhow!("invalid risk.inv_cap: {}", e))?),
         min_liq_gap_bps: cfg.risk.min_liq_gap_bps,
@@ -843,11 +340,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    struct Caps {
-        buy_notional: f64,      // Notional (leverage dahil) - pozisyon boyutu (örn 2000 USD = 100 USD margin * 20x)
-        sell_notional: f64,    // Notional (leverage dahil) - pozisyon boyutu (örn 2000 USD = 100 USD margin * 20x)
-        buy_total: f64,         // Margin (leverage yok) - hesaptan çıkan para (örn 100 USD)
-    }
+    // Caps struct moved to cap_manager module
 
     let tick_ms = max(cfg.internal.min_tick_interval_ms, cfg.exec.cancel_replace_interval_ms);
     let min_usd_per_order = cfg.min_usd_per_order.unwrap_or(0.0);
@@ -1766,124 +1259,24 @@ async fn main() -> Result<()> {
                 }
             };
             
-            // --- AKILLI EMİR ANALİZİ: Mevcut emirleri zeka ile değerlendir ---
-            // 1. Emir fiyatlarını market ile karşılaştır
-            // 2. Çok uzakta olan emirleri iptal et veya güncelle
-            // 3. Stale emirleri temizle
+            // Analyze and cancel stale/far orders using order_manager
             if !state.active_orders.is_empty() {
-                let mut orders_to_cancel: Vec<String> = Vec::new();
+                let orders_to_cancel = order_manager::analyze_orders(
+                    state,
+                    bid,
+                    ask,
+                    position_size_notional,
+                    &cfg,
+                );
                 
-                for (order_id, order) in &state.active_orders {
-                    let order_price_f64 = match order.price.0.to_f64() {
-                        Some(price) => price,
-                        None => {
-                            warn!(
-                                symbol = %state.meta.symbol,
-                                order_id = %order.order_id,
-                                price_decimal = %order.price.0,
-                                "Failed to convert order price to f64, using 0.0"
-                            );
-                            0.0
-                        }
-                    };
-                    let order_age_ms = order.created_at.elapsed().as_millis() as u64;
-                    
-                    // Market fiyatı ile karşılaştır
-                    let market_distance_pct = match order.side {
-                        Side::Buy => {
-                            // Bid emri: ask'ten ne kadar uzakta?
-                            let ask_f64 = ask.0.to_f64().unwrap_or(0.0);
-                            if ask_f64 > 0.0 {
-                                (ask_f64 - order_price_f64) / ask_f64
-                            } else {
-                                0.0
-                            }
-                        }
-                        Side::Sell => {
-                            // Ask emri: bid'den ne kadar uzakta?
-                            let bid_f64 = bid.0.to_f64().unwrap_or(0.0);
-                            if bid_f64 > 0.0 {
-                                (order_price_f64 - bid_f64) / bid_f64
-                            } else {
-                                0.0
-                            }
-                        }
-                    };
-                    
-                    // Akıllı karar: Emir çok uzakta mı?
-                    // Pozisyon varsa daha toleranslı ol (pozisyon kapatmak için emir gerekebilir)
-                    let max_distance_pct = if position_size_notional > 0.0 {
-                        cfg.internal.order_price_distance_with_position // Config'den: %1 (pozisyon varsa daha toleranslı)
-                    } else {
-                        cfg.internal.order_price_distance_no_position // Config'den: %0.5 (pozisyon yoksa daha sıkı)
-                    };
-                    let should_cancel_far = market_distance_pct.abs() > max_distance_pct;
-                    
-                    // Akıllı karar: Emir çok eski mi?
-                    // Pozisyon varsa stale emirleri daha hızlı temizle (pozisyon yönetimi için)
-                    // KRİTİK İYİLEŞTİRME: 1/2 → 2/3 (daha az agresif, yarıya düşürmek çok agresif)
-                    let max_age_for_stale = if position_size_notional > 0.0 {
-                        (cfg.exec.max_order_age_ms * 2) / 3 // Pozisyon varsa 2/3 süre (daha az agresif)
-                    } else {
-                        cfg.exec.max_order_age_ms
-                    };
-                    let should_cancel_stale = order_age_ms > max_age_for_stale;
-                    
-                    // Akıllı karar: Fiyat değişti mi? (son güncellemeden beri)
-                    let price_changed = state.last_order_price_update
-                        .get(order_id)
-                        .map(|last_px| {
-                            let price_diff = (order.price.0 - last_px.0).abs();
-                            let price_diff_pct = if order.price.0 > Decimal::ZERO {
-                                price_diff / order.price.0
-                            } else {
-                                Decimal::ZERO
-                            };
-                            price_diff_pct > Decimal::from_f64_retain(cfg.internal.order_price_change_threshold).unwrap_or(Decimal::new(1, 4)) // Config'den: %0.01'den fazla değişmiş
-                        })
-                        .unwrap_or(true); // İlk kez görülüyorsa güncelle
-                    
-                    if should_cancel_far || should_cancel_stale {
-                        orders_to_cancel.push(order_id.clone());
-                        info!(
-                            %symbol,
-                            order_id = %order_id,
-                            side = ?order.side,
-                            order_price = %order.price.0,
-                            market_distance_pct = market_distance_pct * 100.0,
-                            order_age_ms,
-                            reason = if should_cancel_far { "too_far_from_market" } else { "stale" },
-                            "intelligent order analysis: canceling order"
-                        );
-                    } else if price_changed && order_age_ms > 5_000 {
-                        // Fiyat değişti ve emir 5 saniyeden eski, güncelleme öner
-                        // (Strateji yeni fiyat üretecek, bu sadece bilgilendirme)
-                        info!(
-                            %symbol,
-                            order_id = %order_id,
-                            side = ?order.side,
-                            order_price = %order.price.0,
-                            market_distance_pct = market_distance_pct * 100.0,
-                            "intelligent order analysis: order price may need update"
-                        );
-                    }
-                }
-                
-                // İptal edilecek emirleri iptal et (STAGGER: Her iptal arasında kısa gecikme)
-                let stagger_delay_ms = cfg.internal.cancel_stagger_delay_ms; // Config'den: Her iptal arasında bekleme süresi
-                for (idx, order_id) in orders_to_cancel.iter().enumerate() {
-                    if idx > 0 {
-                        // İlk iptal hariç, her iptal arasında bekle (stagger)
-                        tokio::time::sleep(Duration::from_millis(stagger_delay_ms)).await;
-                    }
-                    // API Rate Limit koruması
-                    rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1
-                    if let Err(err) = venue.cancel(order_id, &symbol).await {
-                                warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order");
-                            } else {
-                                state.active_orders.remove(order_id);
-                                state.last_order_price_update.remove(order_id);
-                    }
+                if !orders_to_cancel.is_empty() {
+                    order_manager::cancel_orders(
+                        &venue,
+                        &symbol,
+                        &orders_to_cancel,
+                        state,
+                        cfg.internal.cancel_stagger_delay_ms,
+                    ).await?;
                 }
             }
             
@@ -1900,824 +1293,165 @@ async fn main() -> Result<()> {
                 top_asks: None, // Top-K levels not available from best_prices()
             };
 
-            // Pozisyon ve mark price zaten yukarıda alındı, tekrar almayalım
-            // Envanter senkronizasyonu yap
-            // KRİTİK DÜZELTME: WebSocket reconnect sonrası pozisyon sync'i
-            // Reconnect sonrası sadece emirleri değil, pozisyonları da sync et
-            // force_sync_all true ise TAM sync yap (reconnect sonrası)
-            // RACE CONDITION ÖNLEME: Son envanter güncellemesinden 500ms geçmeden sync yapma
-            // WebSocket event'i ile REST API sync arasında 200-500ms gecikme normal
-            let inv_diff = (state.inv.0 - pos.qty.0).abs();
-            
-            // KRİTİK İYİLEŞTİRME: Threshold çok küçük (0.00000001) rounding error'ları false positive yaratabilir
-            // Daha makul bir threshold kullan: minimum step_size veya 0.0001 (0.01% of a unit)
-            // Config'den gelen threshold'u kullan, yoksa daha makul bir default (0.0001)
+            // Sync inventory with API position using position_manager
             let reconcile_threshold = Decimal::from_str_radix(&cfg.internal.inventory_reconcile_threshold, 10)
-                .unwrap_or(Decimal::new(1, 4)); // 0.0001 instead of 0.00000001 (100x larger, prevents rounding errors)
-            let is_reconnect_sync = force_sync_all;
-            
-            // Son envanter güncellemesinden bu yana geçen süre (race condition önleme)
-            // KRİTİK İYİLEŞTİRME: 100ms → 500ms (WebSocket/REST API gecikmesi için)
-            const MIN_SYNC_INTERVAL_MS: u128 = 500; // 200-500ms gecikme normal, 500ms güvenli
-            let time_since_last_update = state.last_inventory_update
-                .map(|t| t.elapsed().as_millis())
-                .unwrap_or(1000); // Eğer hiç güncelleme yoksa, sync yap
-            
-            // Reconnect sonrası veya normal durumda uyumsuzluk varsa sync yap
-            // KRİTİK İYİLEŞTİRME: Force sync mantığı - reconnect sonrası her zaman sync yap
-            // Normal durumda daha toleranslı ol (threshold + timing kontrolü)
-            if is_reconnect_sync {
-                // Reconnect sonrası: Her zaman sync yap (uyumsuzluk olsun ya da olmasın)
-                // Timing kontrolü yok - reconnect sonrası hemen sync yap
-                info!(
-                    %symbol,
-                    ws_inv = %state.inv.0,
-                    api_inv = %pos.qty.0,
-                    diff = %inv_diff,
-                    "force syncing position after reconnect (full sync)"
-                );
-                let old_inv = state.inv.0;
-                state.inv = pos.qty; // Force sync
-                state.last_inventory_update = Some(std::time::Instant::now());
-                // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
-            } else if inv_diff > reconcile_threshold && time_since_last_update > MIN_SYNC_INTERVAL_MS {
-                // Normal durumda: Sadece uyumsuzluk varsa ve son güncellemeden 500ms geçtiyse sync yap
-                // Daha toleranslı: threshold daha büyük (rounding error'ları ignore et)
-                warn!(
-                    %symbol,
-                    ws_inv = %state.inv.0,
-                    api_inv = %pos.qty.0,
-                    diff = %inv_diff,
-                    threshold = %reconcile_threshold,
-                    time_since_last_update_ms = time_since_last_update,
-                    "inventory mismatch detected, syncing with API position (race condition safe)"
-                );
-                let old_inv = state.inv.0;
-                state.inv = pos.qty; // Force sync
-                state.last_inventory_update = Some(std::time::Instant::now());
-                // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
-            }
+                .unwrap_or(Decimal::new(1, 4));
+            const MIN_SYNC_INTERVAL_MS: u128 = 500;
+            position_manager::sync_inventory(
+                state,
+                &pos,
+                force_sync_all,
+                reconcile_threshold,
+                MIN_SYNC_INTERVAL_MS,
+            );
 
-            record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px, cfg.internal.pnl_history_max_len);
+            // Update position tracking
+            position_manager::update_position_tracking(state, &pos, mark_px, &cfg);
             
-            // --- AKILLI POZİSYON ANALİZİ: Durumu detaylı incele ---
-            // ✅ KRİTİK FIX: current_pnl sadece görüntüleme/analiz için hesaplanıyor
-            // daily_pnl veya cumulative_pnl'e EKLENMİYOR (double counting önleme)
-            // PnL sadece fill event'te (pozisyon kapanırken) realize ediliyor
+            // Calculate current PnL for analysis
             let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
             let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
-            // position_size_notional zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
             
-            // KRİTİK DÜZELTME: Günlük PnL reset mekanizması (gün başında reset)
-            // Her gün başında (00:00 UTC) daily_pnl'i sıfırla
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
+            // Update daily PnL reset if needed
+            position_manager::update_daily_pnl_reset(state);
             
-            let should_reset_daily = if let Some(last_reset) = state.last_daily_reset {
-                // Son reset'ten bu yana 24 saat geçti mi?
-                const DAY_MS: u64 = 24 * 3600 * 1000;
-                now_ms.saturating_sub(last_reset) >= DAY_MS
-            } else {
-                // İlk kez, reset yap
-                true
-            };
+            // Apply funding cost if needed
+            position_manager::apply_funding_cost(
+                state,
+                funding_rate,
+                next_funding_time,
+                position_size_notional,
+            );
             
-            if should_reset_daily {
-                let old_daily_pnl = state.daily_pnl;
-                state.daily_pnl = Decimal::ZERO;
-                state.last_daily_reset = Some(now_ms);
-                info!(
-                    %symbol,
-                    old_daily_pnl = %old_daily_pnl,
-                    "daily PnL reset (new day started)"
-                );
-            }
+            // Check position size risk using risk_manager
+            let total_active_orders_notional = risk_manager::calculate_total_active_orders_notional(state);
+            let (risk_level, max_position_size_usd, should_block_new_orders) = risk_manager::check_position_size_risk(
+                state,
+                position_size_notional,
+                total_active_orders_notional,
+                cfg.max_usd_per_order,
+                effective_leverage,
+                &cfg,
+            );
             
-            // KRİTİK DÜZELTME: Avg entry price'ı pozisyon bilgisinden güncelle
-            // Binance'tan gelen pozisyon bilgisinde entry price var, bunu kullan
-            if !pos.qty.0.is_zero() {
-                state.avg_entry_price = Some(pos.entry.0);
-            } else {
-                state.avg_entry_price = None;
-            }
-            
-            // --- GELİŞMİŞ RİSK VE KAZANÇ TAKİBİ: Detaylı analiz ---
-            
-            // NOT: daily_pnl ve cumulative_pnl artık fill event'lerinden akümüle ediliyor
-            // Burada sadece anlık PnL hesaplanıyor (risk analizi için)
-            
-            // 2. Funding cost takibi (futures için)
-            // KRİTİK DÜZELTME: Funding 8 saatte bir işler; sadece funding anında tek seferde uygula
-            // next_funding_time: Gelecekteki funding time (Unix timestamp ms)
-            // Bu funding time geçmişse, bir önceki funding (next_funding_ts - 8 hours) uygulanmış demektir
-            // Kontrol: Son uygulanan funding time'dan sonra yeni bir funding geldi mi?
-            if let (Some(funding_rate), Some(next_funding_ts)) = (funding_rate, next_funding_time) {
-                const FUNDING_INTERVAL_MS: u64 = 8 * 3600 * 1000; // 8 saat = 28800000 ms
-                let this_funding_ts = next_funding_ts.saturating_sub(FUNDING_INTERVAL_MS); // Bu funding time
-                
-                // Bu funding time daha önce uygulanmamış mı?
-                let should_apply = if let Some(last_applied) = state.last_applied_funding_time {
-                    this_funding_ts > last_applied // Yeni bir funding time
-                } else {
-                    true // İlk kez
-                };
-                
-                if should_apply && position_size_notional > 0.0 {
-                    // Funding cost = funding_rate * position_size_notional (8 saatte bir, tek seferde)
-                    let funding_cost = funding_rate * position_size_notional;
-                    state.total_funding_cost += Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
-                    state.last_applied_funding_time = Some(this_funding_ts);
-                    
-                    info!(
+            // Handle risk levels
+            let mut should_block = should_block_new_orders;
+            match risk_level {
+                risk_manager::PositionRiskLevel::Hard => {
+                    warn!(
                         %symbol,
-                        funding_rate,
-                        this_funding_ts,
-                        next_funding_ts,
                         position_size_notional,
-                        funding_cost,
-                        total_funding_cost = %state.total_funding_cost,
-                        "funding cost applied (8-hour interval, single application)"
-                    );
-                }
-            }
-            
-            // 3. Pozisyon boyutu geçmişi (risk analizi için)
-            state.position_size_notional_history.push(position_size_notional);
-            if state.position_size_notional_history.len() > cfg.internal.position_size_history_max_len {
-                state.position_size_notional_history.remove(0);
-            }
-            
-            // NOT: cumulative_pnl artık fill event'lerinden akümüle ediliyor
-            // Burada sadece anlık PnL hesaplanıyor (risk analizi için)
-            
-            // 5. Pozisyon boyutu risk kontrolü: Çok büyük pozisyonlar riskli
-            // KRİTİK: Opportunity mode için soft-limit mekanizması
-            let is_opportunity_mode = state.strategy.is_opportunity_mode();
-            let max_position_multiplier = if is_opportunity_mode {
-                cfg.internal.opportunity_mode_position_multiplier
-            } else {
-                1.0
-            };
-            
-            // KRİTİK: max_position_size_usd hesabını exchange pozisyon riskine göre hesapla
-            // Mark-price vs entry-price: Exchange risk hesaplaması için mark-price kullanılmalı
-            // Ancak entry-price ile karşılaştırma yaparak risk değerlendirmesi yapılabilir
-            let position_size_notional_mark = position_size_notional; // Mark-price ile (mevcut)
-            let _position_size_notional_entry = (pos.entry.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0); // Entry-price ile (✅ FIX: Kullanılmıyor, prefix eklendi)
-            
-            // Exchange risk hesaplaması: Mark-price bazlı (exchange'in gördüğü risk)
-            // Ancak entry-price ile karşılaştırma yaparak gerçek risk değerlendirmesi
-            let max_position_size_usd = cfg.max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer * max_position_multiplier;
-            
-            // KRİTİK: Multiple open orders ve toplam notional birikimi reconcile et
-            // Active orders'ın toplam notional'ını hesapla
-            let total_active_orders_notional: f64 = state.active_orders.values()
-                .map(|order| {
-                    let order_notional = (order.price.0 * order.remaining_qty.0).to_f64().unwrap_or(0.0);
-                    order_notional
-                })
-                .sum();
-            
-            // Toplam risk: Mevcut pozisyon + açık emirler
-            let total_exposure_notional = position_size_notional_mark + total_active_orders_notional;
-            
-            // Opportunity mode için soft-limit mekanizması
-            let soft_limit = max_position_size_usd * cfg.internal.opportunity_mode_soft_limit_ratio;
-            let medium_limit = max_position_size_usd * cfg.internal.opportunity_mode_medium_limit_ratio;
-            let hard_limit = max_position_size_usd * cfg.internal.opportunity_mode_hard_limit_ratio;
-            
-            // Risk seviyesi belirleme
-            let position_size_risk_level = if total_exposure_notional >= hard_limit {
-                "hard" // Force-close
-            } else if total_exposure_notional >= medium_limit {
-                "medium" // Mevcut emirleri azalt
-            } else if total_exposure_notional >= soft_limit {
-                "soft" // Yeni emirleri durdur
-            } else {
-                "ok" // Normal
-            };
-            
-            // KRİTİK: Opportunity mode için soft-limit flag'i
-            // quotes henüz tanımlanmadı, bu yüzden flag kullanıyoruz
-            let mut should_block_new_orders = false;
-            
-            // Opportunity mode'da soft-limit uygula
-            if is_opportunity_mode {
-                match position_size_risk_level {
-                    "hard" => {
-                        // ✅ KRİTİK FIX: Hard limit'te de yeni emirleri durdur (tutarlılık için)
-                        should_block_new_orders = true;
-                        
-                        // KRİTİK: Hard limit - Force-close
-                warn!(
-                    %symbol,
-                            position_size_notional = position_size_notional_mark,
-                            total_exposure_notional,
-                    max_allowed = max_position_size_usd,
-                            hard_limit,
-                            active_orders_count = state.active_orders.len(),
-                            active_orders_notional = total_active_orders_notional,
-                            "OPPORTUNITY MODE HARD LIMIT: position + orders exceed hard limit, force closing"
-                        );
-                        // ✅ KRİTİK FIX: Position closing flag'i set et (deadlock önleme)
-                        state.position_closing = true;
-                        state.last_close_attempt = Some(Instant::now());
-                        
-                        // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
-                        // cancel_all ve close_position ardışık çağrılar, tek guard ile rate limit korunur
-                        rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
-                        if let Err(err) = venue.cancel_all(&symbol).await {
-                            warn!(%symbol, ?err, "failed to cancel all orders before force-close");
-                        }
-                        // Sonra pozisyonu kapat (aynı guard bloğu içinde)
-                        let close_result = venue.close_position(&symbol).await;
-                        
-                        // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
-                        state.position_closing = false;
-                        
-                        if let Err(err) = close_result {
-                            // Başarısız, cooldown başlat (spam önleme)
-                            state.last_close_attempt = Some(Instant::now());
-                            error!(%symbol, ?err, "failed to close position due to hard limit, will retry after cooldown");
-                        } else {
-                            info!(%symbol, "closed position due to hard limit");
-                        }
-                        
-                        continue; // Bu tick'i atla
-                    }
-                    "medium" => {
-                        // Medium limit - Mevcut emirleri kademeli azalt
-                        warn!(
-                            %symbol,
-                            position_size_notional = position_size_notional_mark,
-                            total_exposure_notional,
-                            max_allowed = max_position_size_usd,
-                            medium_limit,
-                            active_orders_count = state.active_orders.len(),
-                            active_orders_notional = total_active_orders_notional,
-                            "OPPORTUNITY MODE MEDIUM LIMIT: reducing active orders gradually"
-                        );
-                        // En eski emirlerin %50'sini iptal et (kademeli azaltma)
-                        let mut orders_with_times: Vec<(String, Instant)> = state.active_orders.iter()
-                            .map(|(order_id, order)| (order_id.clone(), order.created_at))
-                            .collect();
-                        // En eski önce sırala
-                        orders_with_times.sort_by(|a, b| a.1.cmp(&b.1));
-                        let orders_to_cancel: Vec<String> = orders_with_times
-                            .into_iter()
-                            .take((state.active_orders.len() / 2).max(1)) // En az 1 emir iptal et
-                            .map(|(order_id, _)| order_id)
-                            .collect();
-                        
-                        for order_id in &orders_to_cancel {
-                            rate_limit_guard(1).await;
-                            if let Err(err) = venue.cancel(order_id, &symbol).await {
-                                warn!(%symbol, order_id = %order_id, ?err, "failed to cancel order in medium limit");
-                        } else {
-                                state.active_orders.remove(order_id);
-                                state.last_order_price_update.remove(order_id);
-                            }
-                        }
-                        // Yeni emirleri de durdur (soft limit davranışı)
-                        should_block_new_orders = true;
-                    }
-                    "soft" => {
-                        // Soft limit - Yeni emirleri durdur
-                        info!(
-                            %symbol,
-                            position_size_notional = position_size_notional_mark,
-                            total_exposure_notional,
-                            max_allowed = max_position_size_usd,
-                            soft_limit,
-                            active_orders_count = state.active_orders.len(),
-                            active_orders_notional = total_active_orders_notional,
-                            "OPPORTUNITY MODE SOFT LIMIT: stopping new orders, keeping existing orders"
-                        );
-                        // Yeni emirleri durdur
-                        should_block_new_orders = true;
-                    }
-                    _ => {
-                        // Normal - Yeni emirler verilebilir
-                    }
-                }
-            } else {
-                // Normal mode: Eski davranış (anında force-close)
-                if position_size_notional_mark > max_position_size_usd {
-                    warn!(
-                        %symbol,
-                        position_size_notional = position_size_notional_mark,
+                        total_exposure = position_size_notional + total_active_orders_notional,
                         max_allowed = max_position_size_usd,
-                        "POSITION SIZE RISK: position too large, force closing (normal mode)"
+                        "HARD LIMIT: force closing position"
                     );
-                
-                // ✅ KRİTİK FIX: Position closing flag'i set et (deadlock önleme)
-                state.position_closing = true;
-                state.last_close_attempt = Some(Instant::now());
-                
-                rate_limit_guard(1).await;
-                let close_result = venue.close_position(&symbol).await;
-                
-                // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
-                state.position_closing = false;
-                
-                if let Err(err) = close_result {
-                    // Başarısız, cooldown başlat (spam önleme)
-                    state.last_close_attempt = Some(Instant::now());
-                    error!(%symbol, ?err, "failed to close position due to size risk, will retry after cooldown");
-                } else {
-                    info!(%symbol, "closed position due to size risk");
-                }
-                
-                continue; // Bu tick'i atla
-                }
-            }
-            
-            // 6. Real-time PnL alerts: Kritik seviyelerde uyarı
-            // ÖNEMLİ: PnL her tick'te kontrol ediliyor, sadece alert spam'ini önle
-            let pnl_alert_threshold_positive = cfg.internal.pnl_alert_threshold_positive; // Config'den: %5 kar
-            let pnl_alert_threshold_negative = cfg.internal.pnl_alert_threshold_negative; // Config'den: %3 zarar
-            let should_alert = state.last_pnl_alert
-                .map(|last| last.elapsed().as_secs() >= cfg.internal.pnl_alert_interval_sec) // Config'den: Alert interval
-                .unwrap_or(true);
-            
-            if should_alert {
-                if pnl_f64 > 0.0 && position_size_notional > 0.0 {
-                    let pnl_pct = pnl_f64 / position_size_notional;
-                    if pnl_pct >= pnl_alert_threshold_positive {
-                        info!(
-                            %symbol,
-                            pnl = pnl_f64,
-                            pnl_pct = pnl_pct * 100.0,
-                            position_size = position_size_notional,
-                            "PNL ALERT: Significant profit achieved"
-                        );
-                        state.last_pnl_alert = Some(Instant::now());
-                    }
-                }
-                if pnl_f64 < 0.0 && position_size_notional > 0.0 {
-                    let pnl_pct = pnl_f64 / position_size_notional;
-                    if pnl_pct <= pnl_alert_threshold_negative {
-                        warn!(
-                            %symbol,
-                            pnl = pnl_f64,
-                            pnl_pct = pnl_pct * 100.0,
-                            position_size = position_size_notional,
-                            "PNL ALERT: Significant loss detected"
-                        );
-                        state.last_pnl_alert = Some(Instant::now());
-                    }
-                }
-            }
-            
-            // Peak PnL takibi: En yüksek karı kaydet (kar al için)
-            if current_pnl > state.peak_pnl {
-                state.peak_pnl = current_pnl;
-            }
-            
-            // Pozisyon tutma süresi takibi
-            let position_qty_threshold = Decimal::from_str_radix(&cfg.internal.position_qty_threshold, 10)
-                .unwrap_or(Decimal::new(1, 8));
-            if pos.qty.0.abs() > position_qty_threshold {
-                // Pozisyon var
-                // ✅ KRİTİK FIX: Position entry time race condition
-                // WebSocket fill event EN GÜVENİLİR kaynak (gerçek fill zamanı)
-                // Position check sadece FALLBACK olmalı (reconnect recovery için)
-                // WebSocket event gelmediyse (reconnect sonrası) burada set et
-                if state.position_entry_time.is_none() {
-                    state.position_entry_time = Some(Instant::now());
-                    warn!(
-                        %symbol,
-                        entry_time_set = "from_position_check_fallback",
-                        "position entry time set from position check (FALLBACK - WebSocket event may be delayed)"
-                    );
-                    
-                    // JSON log: Position opened
-                    if let Ok(logger) = json_logger.lock() {
-                        let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
-                        logger.log_position_opened(
-                            &symbol,
-                            side,
-                            pos.entry,
-                            pos.qty,
-                            pos.leverage,
-                            "order_filled",
-                        );
-                    }
-                }
-                if let Some(entry_time) = state.position_entry_time {
-                    state.position_hold_duration_ms = entry_time.elapsed().as_millis() as u64;
-                }
-            } else {
-                // Pozisyon yok, sıfırla
-                state.position_entry_time = None;
-                state.peak_pnl = Decimal::ZERO;
-                state.position_hold_duration_ms = 0;
-                // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
-            }
-            
-            // Pozisyon trend analizi: Son 10 snapshot'a bak
-            let pnl_trend = if state.pnl_history.len() >= 10 {
-                let recent = &state.pnl_history[state.pnl_history.len().saturating_sub(10)..];
-                let first = recent[0];
-                let last = recent[recent.len() - 1];
-                if first > Decimal::ZERO {
-                    ((last - first) / first).to_f64().unwrap_or(0.0)
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
-            
-            // --- AKILLI POZİSYON YÖNETİMİ: Kar al / Zarar durdur mantığı ---
-            let entry_price_f64 = pos.entry.0.to_f64().unwrap_or(0.0);
-            let mark_price_f64 = mark_px.0.to_f64().unwrap_or(0.0);
-            let position_qty_f64 = pos.qty.0.to_f64().unwrap_or(0.0);
-            
-            // Pozisyon varsa akıllı karar ver
-            if position_qty_f64.abs() > 0.0001 && entry_price_f64 > 0.0 && mark_price_f64 > 0.0 {
-                let price_change_pct = if pos.qty.0.is_sign_positive() {
-                    // Long pozisyon: fiyat artışı = kar
-                    (mark_price_f64 - entry_price_f64) / entry_price_f64
-                } else {
-                    // Short pozisyon: fiyat düşüşü = kar
-                    (entry_price_f64 - mark_price_f64) / entry_price_f64
-                };
-                
-                // KRİTİK: İki kural - Sabit $0.50 TP ve 20 saniye time-box
-                // Kural 1: Net +$0.50 kâr görülür görmez pozisyonu kapat
-                // Kural 2: İlk 20 saniye içinde net kâr > 0 oluşursa, beklemeden kârı al ve çık
-                
-                // Pozisyon side belirle
-                let position_side = if pos.qty.0.is_sign_positive() {
-                    Side::Buy // Long
-                } else {
-                    Side::Sell // Short
-                };
-                
-                // Exit price: Long için bid, Short için ask (konservatif)
-                let exit_price = match position_side {
-                    Side::Buy => bid.0,  // Long kapatırken bid
-                    Side::Sell => ask.0, // Short kapatırken ask
-                };
-                
-                // Fee hesaplama: Entry için maker (post-only), exit için taker (market IOC)
-                let entry_fee_bps = maker_fee_rate * 10000.0; // Maker fee (bps)
-                let exit_fee_bps = estimate_close_fee_bps(true, maker_fee_rate * 10000.0, taker_fee_rate * 10000.0); // Market exit = taker
-                
-                // Net PnL hesapla (fees dahil)
-                let qty_abs = pos.qty.0.abs();
-                let net_pnl = calc_net_pnl_usd(
-                    pos.entry.0,
-                    exit_price,
-                    qty_abs,
-                    &position_side,
-                    entry_fee_bps,
-                    exit_fee_bps,
-                );
-                
-                // TP hedefi ve time-box parametreleri (config'den)
-                let tp_usd = min_profit_usd;
-                let _timebox_secs = cfg.strategy.tp_timebox_secs.unwrap_or(20); // ✅ FIX: Kullanılmıyor, prefix eklendi
-                
-                // Cooldown kontrolü (spam önleme) - config'den
-                let close_cooldown_ms = cfg.strategy.position_close_cooldown_ms.unwrap_or(500) as u128;
-                let can_attempt_close = state.last_close_attempt
-                    .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
-                    .unwrap_or(true);
-                
-                // Kural 1: Sabit TP ($0.50) - Her zaman çalışır (yaş sınırı yok)
-                let should_close_tp = net_pnl >= tp_usd;
-                
-                // Kural 2: AKILLI POZİSYON YÖNETİMİ - Çoklu faktör analizi
-                // Faktörler:
-                // 1. Time-weighted profit: İlk saniyelerde daha agresif, sonra daha toleranslı
-                // 2. Trend takibi: Pozisyon yönü ile trend aynı yöndeyse daha uzun tut
-                // 3. Momentum: Hızlı hareket varsa daha agresif kapat
-                // 4. Volatilite: Yüksek volatilitede daha hızlı kapat
-                // 5. Peak PnL trailing: En yüksek kardan belirli bir düşüş varsa kapat
-                // 6. Drawdown: Belirli bir zarara ulaşırsa kapat
-                // 7. Recovery: Zarardan kâra dönüşünce hemen kapat (küçük kâr bile olsa)
-                // ✅ KRİTİK FIX: position_entry_time None ise (reconnect sonrası) pozisyon yaşı 0 olarak kabul et
-                let should_close_smart = {
-                    // Entry time yoksa şimdi set et (reconnect sonrası olabilir - son fallback)
-                    // WebSocket event veya position check'te set edilmiş olmalı, ama yoksa burada set et
-                    if state.position_entry_time.is_none() {
-                        state.position_entry_time = Some(Instant::now());
-                        warn!(
-                            %symbol,
-                            entry_time_set = "from_tp_calculation_fallback",
-                            "position entry time set from TP calculation (LAST RESORT FALLBACK - should not happen normally)"
-                        );
-                    }
-                    let entry_time = state.position_entry_time.unwrap(); // Artık Some olduğundan eminiz
-                    let age_secs = entry_time.elapsed().as_secs();
-                    let age_secs_f64 = age_secs as f64;
-                    
-                    // 1. TIME-WEIGHTED PROFIT: İlk saniyelerde daha agresif
-                    // İlk 10 saniye: $0.30+ kâr varsa kapat (çok agresif)
-                    // 10-20 saniye: $0.50+ kâr varsa kapat (hedef kar)
-                    // 20-60 saniye: $0.20+ kâr varsa kapat (toleranslı)
-                    // 60+ saniye: $0.10+ kâr varsa kapat (çok toleranslı)
-                    let time_weighted_threshold = if age_secs_f64 <= 10.0 {
-                        tp_usd * 0.6  // İlk 10 saniye: $0.30
-                    } else if age_secs_f64 <= 20.0 {
-                        tp_usd       // 10-20 saniye: $0.50
-                    } else if age_secs_f64 <= 60.0 {
-                        tp_usd * 0.4 // 20-60 saniye: $0.20
-                    } else {
-                        tp_usd * 0.2 // 60+ saniye: $0.10
-                    };
-                    
-                    // 2. TREND TAKİBİ: Pozisyon yönü ile trend aynı yöndeyse daha uzun tut
-                    let trend_bps = state.strategy.get_trend_bps();
-                    let position_side = if pos.qty.0.is_sign_positive() { 1.0 } else { -1.0 };
-                    let trend_aligned = (trend_bps > 0.0 && position_side > 0.0) || (trend_bps < 0.0 && position_side < 0.0);
-                    let trend_factor = if trend_aligned {
-                        1.3  // Trend ile aynı yönde: %30 daha toleranslı (daha uzun tut)
-                    } else {
-                        0.8  // Trend ile ters yönde: %20 daha agresif (daha hızlı kapat)
-                    };
-                    
-                    // 3. MOMENTUM: PnL trend'ine bak (son 10 snapshot)
-                    let momentum_factor = if pnl_trend > 0.1 {
-                        1.2  // Pozitif momentum: %20 daha toleranslı (daha uzun tut)
-                    } else if pnl_trend < -0.1 {
-                        0.7  // Negatif momentum: %30 daha agresif (daha hızlı kapat)
-                } else {
-                        1.0  // Nötr momentum: Normal
-                    };
-                    
-                    // 4. VOLATİLİTE: Yüksek volatilitede daha hızlı kapat
-                    let volatility = state.strategy.get_volatility();
-                    let volatility_factor = if volatility > 0.05 {
-                        0.7  // Yüksek volatilite: %30 daha agresif
-                    } else if volatility < 0.01 {
-                        1.2  // Düşük volatilite: %20 daha toleranslı
-                    } else {
-                        1.0  // Normal volatilite: Normal
-                    };
-                    
-                    // 5. PEAK PNL TRAILING: En yüksek kardan belirli bir düşüş varsa kapat
-                    let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
-                    let drawdown_from_peak = peak_pnl_f64 - net_pnl;
-                    let trailing_stop_threshold = tp_usd * 0.5; // $0.25 trailing stop
-                    let should_close_trailing = peak_pnl_f64 > tp_usd && drawdown_from_peak > trailing_stop_threshold;
-                    
-                    // 6. DRAWDOWN: Belirli bir zarara ulaşırsa kapat (risk yönetimi)
-                    let max_loss_threshold = -tp_usd * 2.0; // -$1.00 max loss
-                    let should_close_drawdown = net_pnl < max_loss_threshold;
-                    
-                    // 7. RECOVERY (ZARARDAN KURTULMA): Zarardan kâra dönüşünce hemen kapat
-                    // Senaryo: 20 saniye geçti, zarardasın, 30 saniye sonra kar ettin
-                    // Çözüm: Zarardan kurtulunca (net_pnl > 0) hemen kapat (küçük kâr bile olsa)
-                    let was_in_loss = state.pnl_history.len() >= 2 && {
-                        // Son 2 snapshot'a bak: Zararda mıydık?
-                        let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);
-                        prev_pnl < 0.0
-                    };
-                    let should_close_recovery = was_in_loss && net_pnl > 0.0;
-                    
-                    // Kombine threshold: Tüm faktörleri birleştir
-                    let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
-                    
-                    // Kapatma kararı: Threshold'u geçtiyse veya trailing/drawdown/recovery tetiklendiyse
-                    let should_close_by_threshold = net_pnl >= combined_threshold;
-                    
-                    should_close_by_threshold || should_close_trailing || should_close_drawdown || should_close_recovery
-                };
-                
-                // Kapatma kararı
-                if (should_close_tp || should_close_smart) && !state.position_closing && can_attempt_close {
-                        state.position_closing = true;
-                        state.last_close_attempt = Some(Instant::now());
-                    
-                    // Recovery durumunu kontrol et (zarardan kâra dönüş)
-                    let was_in_loss = state.pnl_history.len() >= 2 && {
-                        let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);
-                        prev_pnl < 0.0
-                    };
-                    let is_recovery = was_in_loss && net_pnl > 0.0;
-                    
-                    let reason = if should_close_tp {
-                        format!("fixed_tp_{:.2}_usd", net_pnl)
-                    } else if is_recovery {
-                        format!("recovery_exit_{:.2}_usd", net_pnl)
-                    } else {
-                        format!("smart_exit_{:.2}_usd", net_pnl)
-                    };
-                    
-                    info!(
-                        %symbol,
-                        reason,
-                        net_pnl,
-                        entry_price = %pos.entry.0,
-                        exit_price = %exit_price,
-                        qty = %qty_abs,
-                        position_side = ?position_side,
-                        should_close_tp,
-                        should_close_smart,
-                        "KRİTİK: Closing position (fixed TP or smart exit rule triggered)"
-                    );
-                    
-                    // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
-                    // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
-                    rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
-                    let cancel_result = venue.cancel_all(&symbol).await;
-                    if let Err(err) = cancel_result {
-                        warn!(%symbol, ?err, "failed to cancel orders before position close (TP/time-box)");
-                    }
-                    
-                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile) - aynı guard bloğu içinde
-                    let result = venue.close_position(&symbol).await;
-                    
-                    // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
-                    // Başarılı veya başarısız, her durumda flag'i reset et ki bir sonraki tick'te tekrar deneyebilsin
-                    state.position_closing = false;
-                    
-                    // KRİTİK: Pozisyon kapatma sonrası doğrulama
-                    if result.is_ok() {
-                        state.position_entry_time = None;
-                        state.avg_entry_price = None;
-                        info!(
-                            %symbol,
-                            reason,
-                            net_pnl,
-                            action = "🟡 CLOSE",
-                            "position closed successfully (TP/time-box rule)"
-                        );
-                    } else {
-                        // Başarısız, cooldown başlat (spam önleme)
-                        state.last_close_attempt = Some(Instant::now());
-                        warn!(
-                            %symbol,
-                            error = ?result.as_ref().err(),
-                            "position close failed (TP/time-box), will retry after cooldown"
-                        );
-                    }
-                    
-                    // Bu tick'te diğer kontrollere devam etme (zaten kapatma işlemi başlatıldı)
-                    // Not: Bu sembol için bu tick'teki işlemler tamamlandı, bir sonraki sembole geç
-                    // (Bu if bloğundan çıkıp bir sonraki sembol işlemine geçilecek)
-                }
-                
-                // Kar al mantığı: Daha büyük kazançlar için optimize edildi
-                // Küçük kazançlar için erken kar alma, büyük kazançlar için daha uzun tut
-                let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
-                let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
-                
-                if current_pnl_f64 > peak_pnl_f64 {
-                    state.peak_pnl = current_pnl;
-                }
-                
-                let (should_close, reason) = should_close_position(
-                    current_pnl,
-                    state.peak_pnl,
-                    price_change_pct,
-                    position_size_notional,
-                    state.position_hold_duration_ms,
-                    pnl_trend,
-                    &cfg.internal,
-                    &cfg.strategy_internal,
-                );
-                
-                // Akıllı karar: Pozisyonu kapat
-                if should_close {
-                    
-                    warn!(
-                        %symbol,
-                        reason,
-                        current_pnl = pnl_f64,
-                        price_change_pct = price_change_pct * 100.0,
-                        peak_pnl = peak_pnl_f64,
-                        position_hold_duration_ms = state.position_hold_duration_ms,
-                        pnl_trend,
-                        action = "🟡 CLOSE",
-                        "intelligent position management: closing position"
-                    );
-                    
-                    // ✅ KRİTİK FIX: Position closing flag'i set et (deadlock önleme)
+                    should_block = true;
                     state.position_closing = true;
                     state.last_close_attempt = Some(Instant::now());
                     
-                    // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
-                    // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
-                    rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
-                    let cancel_result = venue.cancel_all(&symbol).await;
-                    if let Err(err) = cancel_result {
-                        warn!(%symbol, ?err, "failed to cancel orders before position close");
+                    rate_limit_guard(2).await;
+                    if let Err(err) = venue.cancel_all(&symbol).await {
+                        warn!(%symbol, ?err, "failed to cancel all orders before force-close");
                     }
-                    
-                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile) - aynı guard bloğu içinde
-                    // close_position fonksiyonu içinde:
-                    // 1. reduceOnly=true garantisi (futures için)
-                    // 2. Market order (post-only değil)
-                    // 3. Pozisyon kapatma sonrası doğrulama
-                    // 4. Kısmi kapatma durumunda otomatik retry (3 deneme)
-                    // Futures için özel kontrol: Pozisyon kapatma sonrası doğrulama
-                    let result = venue.close_position(&symbol).await;
-                    
-                    // KRİTİK: Pozisyon kapatma sonrası doğrulama
-                    if result.is_ok() {
-                        // Kısa bir bekleme (exchange'in işlemesi için)
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        
-                        // Pozisyon durumunu kontrol et
-                        rate_limit_guard(5).await; // GET /fapi/v2/positionRisk: Weight 5
-                        match venue.get_position(&symbol).await {
-                            Ok(verify_pos) => {
-                                if !verify_pos.qty.0.is_zero() {
-                                    warn!(
-                                        %symbol,
-                                        remaining_qty = %verify_pos.qty.0,
-                                        "position not fully closed after close_position call, this should not happen (retry mechanism should handle this)"
-                                    );
-                                    // close_position içinde retry mekanizması var, burada sadece log
-                                } else {
-                                    info!(
-                                        %symbol,
-                                        "position fully closed and verified"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    %symbol,
-                                    error = %e,
-                                    "failed to verify position closure"
-                                );
-                            }
-                        }
+                    if let Err(err) = venue.close_position(&symbol).await {
+                        state.last_close_attempt = Some(Instant::now());
+                        error!(%symbol, ?err, "failed to close position due to hard limit");
+                    } else {
+                        info!(%symbol, "closed position due to hard limit");
                     }
-                    
-                    // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
-                    // Başarılı veya başarısız, her durumda flag'i reset et ki bir sonraki tick'te tekrar deneyebilsin
                     state.position_closing = false;
+                    continue;
+                }
+                risk_manager::PositionRiskLevel::Medium => {
+                    warn!(
+                        %symbol,
+                        position_size_notional,
+                        total_exposure = position_size_notional + total_active_orders_notional,
+                        "MEDIUM LIMIT: reducing active orders"
+                    );
+                    // Cancel oldest 50% of orders
+                    let mut orders_with_times: Vec<(String, Instant)> = state.active_orders.iter()
+                        .map(|(order_id, order)| (order_id.clone(), order.created_at))
+                        .collect();
+                    orders_with_times.sort_by(|a, b| a.1.cmp(&b.1));
+                    let orders_to_cancel: Vec<String> = orders_with_times
+                        .into_iter()
+                        .take((state.active_orders.len() / 2).max(1))
+                        .map(|(order_id, _)| order_id)
+                        .collect();
                     
-                    // JSON log ve state sıfırlama (sadece başarılı durumda)
-                    match result {
-                        Ok(_) => {
-                            // JSON log: Position closed
-                            if let Ok(logger) = json_logger.lock() {
-                                let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
-                                let leverage = pos.leverage;
-                                logger.log_position_closed(
-                                    &symbol,
-                                    side,
-                                    pos.entry,
-                                    mark_px,
-                                    pos.qty,
-                                    leverage,
-                                    &reason,
-                                );
-                                
-                                // Also log as completed trade
-                                let fees = 0.0; // Fees calculated separately if needed
-                                logger.log_trade_completed(
-                                    &symbol,
-                                    side,
-                                    pos.entry,
-                                    mark_px,
-                                    pos.qty,
-                                    fees,
-                                    leverage,
-                                );
-                            }
-                            
-                            info!(
-                                %symbol,
-                                reason,
-                                final_pnl = pnl_f64,
-                                entry_price = %pos.entry.0,
-                                exit_price = %mark_px.0,
-                                quantity = %pos.qty.0,
-                                leverage = pos.leverage,
-                                "position closed successfully with reduceOnly guarantee"
-                            );
-                            
-                            // State'i sıfırla (sadece başarılı durumda)
-                            state.position_entry_time = None;
-                            state.peak_pnl = Decimal::ZERO;
-                            state.position_hold_duration_ms = 0;
-                            // NOT: daily_pnl sıfırlanmıyor - fill event'lerinden akümüle ediliyor, gün başında reset ediliyor
-                            // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
-                            state.avg_entry_price = None; // Pozisyon kapandı, entry price sıfırla
-                        }
-                        Err(err) => {
-                            // Başarısız, cooldown başlat (spam önleme)
-                            state.last_close_attempt = Some(Instant::now());
-                            error!(
-                                %symbol,
-                                error = %err,
-                                reason,
-                                "CRITICAL: failed to close position, will retry after cooldown"
-                            );
-                            // Hata durumunda state'i sıfırlamaya devam et (pozisyon hala açık olabilir)
+                    for order_id in &orders_to_cancel {
+                        rate_limit_guard(1).await;
+                        if venue.cancel(order_id, &symbol).await.is_ok() {
+                            state.active_orders.remove(order_id);
+                            state.last_order_price_update.remove(order_id);
                         }
                     }
+                    should_block = true;
                 }
+                risk_manager::PositionRiskLevel::Soft => {
+                    info!(
+                        %symbol,
+                        position_size_notional,
+                        total_exposure = position_size_notional + total_active_orders_notional,
+                        "SOFT LIMIT: blocking new orders"
+                    );
+                    should_block = true;
+                }
+                risk_manager::PositionRiskLevel::Ok => {
+                    // Normal operation
+                }
+            }
+            
+            // Check PnL alerts
+            risk_manager::check_pnl_alerts(state, pnl_f64, position_size_notional, &cfg);
+            
+            // Update peak PnL
+            risk_manager::update_peak_pnl(state, current_pnl);
+            
+            // Check if position should be closed using position_manager
+            let position_side = if pos.qty.0.is_sign_positive() {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let exit_price = match position_side {
+                Side::Buy => bid.0,
+                Side::Sell => ask.0,
+            };
+            
+            let (should_close, reason) = position_manager::should_close_position_smart(
+                state,
+                &pos,
+                mark_px,
+                bid,
+                ask,
+                min_profit_usd,
+                maker_fee_rate,
+                taker_fee_rate,
+            );
+            
+            // Cooldown check
+            let close_cooldown_ms = cfg.strategy.position_close_cooldown_ms.unwrap_or(500) as u128;
+            let can_attempt_close = state.last_close_attempt
+                .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
+                .unwrap_or(true);
+            
+            if should_close && !state.position_closing && can_attempt_close {
+                info!(
+                    %symbol,
+                    reason = %reason,
+                    "closing position based on smart position management"
+                );
+                
+                // Close position using position_manager
+                position_manager::close_position(&venue, &symbol, state).await?;
+                
+                // Reset position tracking after close
+                state.position_entry_time = None;
+                state.avg_entry_price = None;
+                state.peak_pnl = Decimal::ZERO;
+                state.position_hold_duration_ms = 0;
             }
             
             // Pozisyon durumu logla (sadece önemli değişikliklerde)
@@ -2748,7 +1482,18 @@ async fn main() -> Result<()> {
                     mark_price = %mark_px.0,
                     current_pnl = pnl_f64,
                     position_size_notional = position_size_notional,
-                    pnl_trend = pnl_trend,
+                    pnl_trend = if state.pnl_history.len() >= 10 {
+                        let recent = &state.pnl_history[state.pnl_history.len().saturating_sub(10)..];
+                        let first = recent[0];
+                        let last = recent[recent.len() - 1];
+                        if first > Decimal::ZERO {
+                            ((last - first) / first).to_f64().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    },
                     active_orders = state.active_orders.len(),
                     order_fill_rate = state.order_fill_rate,
                     consecutive_no_fills = state.consecutive_no_fills,
@@ -2770,7 +1515,7 @@ async fn main() -> Result<()> {
             };
 
             let dd_bps = compute_drawdown_bps(&state.pnl_history);
-            let risk_action = risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, &risk_limits);
+            let risk_action = crate::risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, &risk_limits);
             
             // --- AKILLI FILL ORANI TAKİBİ: Zaman bazlı fill rate kontrolü ---
             // KRİTİK DÜZELTME: Tick sayısı yerine zaman bazlı kontrol (1 saniye = 1000 tick yerine gerçek zaman)
@@ -3077,158 +1822,46 @@ async fn main() -> Result<()> {
                 RiskAction::Halt => {}
             }
 
-            // ---- CAP HESABI (sembolün kendi quote'u ile) ----
-            // Futures only - spot removed
-            // KRİTİK DÜZELTME: Cache'den oku (loop başında zaten fetch edilmiş, gereksiz fetch'i kaldır)
-            let caps = {
-                    // Cache'den balance al (loop başında fetch edilmiş)
-                    let avail = *quote_balances.get(&quote_asset).unwrap_or(&0.0);
-                    
-                    if avail < cfg.min_quote_balance_usd {
-                                info!(
-                                    %symbol,
-                                    quote_asset = %quote_asset,
-                            available_balance = avail,
-                                    min_required = cfg.min_quote_balance_usd,
-                                    "SKIPPING: quote asset balance below minimum threshold, will try other quote assets if available"
-                                );
-                        // Caps'i sıfırla, bu sembolü skip et
-                        Caps {
-                            buy_notional: 0.0,
-                            sell_notional: 0.0,
-                            buy_total: 0.0,
-                        }
-                    } else {
-                    // NOT: effective_leverage config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
-                    // (Futures için leverage sembol bazında değişmez, config'den gelir)
-                    
-                    // MEVCUT POZİSYONLARIN GERÇEK MARGİN'İNİ ÇIKAR: Unrealized PnL hesaba katılmalı
-                    // KRİTİK DÜZELTME: Zarar eden pozisyon margin'i tüketir ama kod bunu görmüyordu
-                    // Mevcut pozisyonun GERÇEK margin'i = (pozisyon notional / leverage) - unrealized PnL
-                    // position_size_notional ve current_pnl zaten yukarıda hesaplandı
-                    let existing_position_margin = if position_size_notional > 0.0 {
-                        // Base margin: Pozisyon açmak için gereken margin
-                        let base_margin = position_size_notional / effective_leverage;
-                        // Unrealized PnL: Zarar eden pozisyon margin'i tüketir, kar eden pozisyon margin'i serbest bırakır
-                        let position_pnl = current_pnl.to_f64().unwrap_or(0.0);
-                        // Gerçek margin kullanımı = base_margin - position_pnl
-                        // Negatif PnL (zarar) margin'i tüketir, pozitif PnL (kar) margin'i serbest bırakır
-                        (base_margin - position_pnl).max(0.0) // Negatif olamaz
-                    } else {
-                        0.0
-                    };
-                    let available_after_position = (avail - existing_position_margin).max(0.0);
-                    
-                    // ÖNEMLİ: Hesaptan giden para mantığı:
-                    // - 20 USD varsa → 20 USD kullanılır (tamamı)
-                    // - 100 USD varsa → 100 USD kullanılır (tamamı)
-                    // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
-                    // Leverage sadece pozisyon boyutunu belirler, hesaptan giden parayı etkilemez
-                    // Örnek: 20 USD bakiye, 20x leverage → hesaptan 20 USD gider, pozisyon 400 USD olur
-                    // Örnek: 200 USD bakiye, 20x leverage → hesaptan 100 USD gider (max limit), pozisyon 2000 USD olur
-                    // MEVCUT POZİSYON DİKKATE ALINARAK: Mevcut pozisyonun margin'i çıkarıldıktan sonra kalan bakiye kullanılır
-                    let max_usable_from_account = available_after_position.min(cfg.max_usd_per_order);
-                    
-                    // KRİTİK DÜZELTME: Fırsat modunda leverage'i yarıya düşür
-                    let is_opportunity_mode = state.strategy.is_opportunity_mode();
-                    let effective_leverage_for_caps = if is_opportunity_mode {
-                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
-                    } else {
-                        effective_leverage
-                    };
-                    
-                    // Leverage ile açılan pozisyon boyutu (sadece bilgi amaçlı)
-                    let position_size_with_leverage = max_usable_from_account * effective_leverage_for_caps;
-                    
-                    // per_order_cap = margin (hesaptan giden para) = 100 USD
-                    // per_order_notional = pozisyon boyutu = margin * leverage = 100 * 20 = 2000 USD
-                    let per_order_cap_margin = cfg.max_usd_per_order;
-                    let per_order_notional = per_order_cap_margin * effective_leverage_for_caps;
-                    info!(
-                        %symbol,
-                        quote_asset = %quote_asset,
-                        available_balance = avail,
-                        existing_position_margin,
-                        available_after_position,
-                        effective_leverage,
-                        effective_leverage_for_caps,
-                        is_opportunity_mode,
-                        max_usable_from_account,
-                        position_size_with_leverage,
-                        per_order_limit_margin_usd = per_order_cap_margin,
-                        per_order_limit_notional_usd = per_order_notional,
-                        "calculated futures caps: max_usable_from_account is max USD that will leave your account, leverage only affects position size (existing position margin deducted, opportunity mode reduces leverage by 50%)"
-                    );
-                    Caps {
-                        buy_notional: per_order_notional,  // Her bid emri max 2000 USD pozisyon (100 USD margin * 20x)
-                        sell_notional: per_order_notional, // Her ask emri max 2000 USD pozisyon (100 USD margin * 20x)
-                        // buy_total: Hesaptan giden para (margin)
-                        // - 20 USD varsa → 20 USD kullanılır (tamamı)
-                        // - 100 USD varsa → 100 USD kullanılır (tamamı)
-                        // - 200 USD varsa → 100 USD kullanılır (max limit), kalan 100 başka semboller için
-                        buy_total: max_usable_from_account,
-                        }
-                }
-            };
-
-            // Her taraf bağımsız: bid ve ask her biri max 100 USD kullanabilir
-            // Toplam varlık paylaşılır (spent tracking ile)
-            // Örnek: 300 USD varsa → bid için 100, ask için 100, kalan 100 ile ikinci bid yapılabilir
-            // İki taraf için bölme yok, her taraf bağımsız max_usd_per_order'a kadar kullanabilir
-
-            info!(
-                %symbol,
-                buy_notional = caps.buy_notional,
-                sell_notional = caps.sell_notional,
-                buy_total = caps.buy_total,
-                "calculated order caps"
+            // Calculate caps using cap_manager
+            let caps = cap_manager::calculate_caps(
+                state,
+                &quote_asset,
+                &quote_balances,
+                position_size_notional,
+                current_pnl,
+                effective_leverage,
+                &cfg,
             );
 
-            // Quote asset bakiye kontrolü: Yetersiz bakiye varsa skip et
+
+            // Check if caps are sufficient
             if caps.buy_total < cfg.min_quote_balance_usd {
                 info!(
                     %symbol,
                     quote_asset = %quote_asset,
                     buy_total = caps.buy_total,
                     min_required = cfg.min_quote_balance_usd,
-                    "SKIPPING SYMBOL: quote asset balance below minimum threshold, will try other quote assets if available"
+                    "SKIPPING SYMBOL: quote asset balance below minimum threshold"
                 );
-                continue; // Bu sembolü skip et, diğer quote asset'li sembollere devam et
+                continue;
             }
 
-            // --- min notional bilgisi varsa, kapasite bunun altındaysa tick'i atla ---
-            if let Some(min_req) = state.min_notional_req {
-                let buy_ok = caps.buy_notional >= min_req;
-                let sell_ok = caps.sell_notional >= min_req;
-                if !buy_ok && !sell_ok {
-                    info!(
-                        %symbol,
-                        min_notional_req = min_req,
-                        buy_notional = caps.buy_notional,
-                        sell_notional = caps.sell_notional,
-                        "skip tick: notional caps below exchange min_notional"
-                    );
-                    continue;
-                }
-            }
+            let (buy_cap_ok, sell_cap_ok) = cap_manager::check_caps_sufficient(
+                &caps,
+                min_usd_per_order,
+                state.min_notional_req,
+            );
 
-            // --- bakiye/min_emir hızlı kontrolü: gürültüyü kes ---
-            // ✅ KRİTİK FIX: buy_notional/sell_notional notional (leverage dahil), ama min_usd_per_order margin için
-            // Bu yüzden buy_total (margin) kullanılmalı
-            let _px_bid_f = bid.0.to_f64().unwrap_or(0.0); // ✅ FIX: Kullanılmıyor, prefix eklendi
-            let _px_ask_f = ask.0.to_f64().unwrap_or(0.0); // ✅ FIX: Kullanılmıyor, prefix eklendi
-            let buy_cap_ok = caps.buy_total >= min_usd_per_order; // ✅ FIX: buy_total (margin) kullanılmalı, buy_notional (notional) değil
-            let sell_cap_ok = caps.buy_total >= min_usd_per_order; // ✅ FIX: buy_total (margin) kullanılmalı, sell_notional (notional) değil
-            // Futures only - no base balance check needed
             if !buy_cap_ok && !sell_cap_ok {
                 info!(
                     %symbol,
                     buy_total = caps.buy_total,
                     min_usd_per_order,
-                    "skip tick: zero/insufficient balance for this symbol"
+                    "skip tick: insufficient balance or below min_notional"
                 );
                 continue;
             }
+
             if !buy_cap_ok {
                 quotes.bid = None;
             }

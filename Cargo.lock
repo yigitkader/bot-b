@@ -60,23 +60,27 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bot_core",
+ "async-trait",
  "chrono",
  "config",
- "data",
- "exec",
- "monitor",
+ "dashmap",
+ "futures-util",
+ "hex",
+ "hmac",
+ "metrics-exporter-prometheus",
+ "once_cell",
  "reqwest",
- "risk",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "serde_yaml",
- "strategy",
+ "sha2",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]
@@ -135,14 +139,6 @@ dependencies = [
  "cmake",
  "dunce",
  "fs_extra",
-]
-
-[[package]]
-name = "backtest"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bot_core",
 ]
 
 [[package]]
@@ -228,16 +224,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.108",
-]
-
-[[package]]
-name = "bot_core"
-version = "0.1.0"
-dependencies = [
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -474,22 +460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "data"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bot_core",
- "futures-util",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -552,28 +522,6 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "exec"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bot_core",
- "dashmap",
- "hex",
- "hmac",
- "once_cell",
- "reqwest",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
- "urlencoding",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1216,15 +1164,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "monitor"
-version = "0.1.0"
-dependencies = [
- "metrics",
- "metrics-exporter-prometheus",
- "tracing",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1695,15 +1634,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "risk"
-version = "0.1.0"
-dependencies = [
- "bot_core",
- "rust_decimal",
- "rust_decimal_macros",
-]
-
-[[package]]
 name = "rkyv"
 version = "0.7.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2114,18 +2044,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "strategy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bot_core",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "tracing",
-]
 
 [[package]]
 name = "subtle"

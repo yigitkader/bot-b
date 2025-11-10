@@ -1,12 +1,66 @@
 //location: /crates/app/src/utils.rs
 // Utility functions and helpers
 
-use bot_core::types::*;
-use exec::binance::SymbolRules;
-use exec;
+use crate::core::types::*;
+use crate::exec::binance::SymbolRules;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::RoundingStrategy;
 
+
+// ============================================================================
+// Quantization Helpers (moved from exec/mod.rs to avoid duplication)
+// ============================================================================
+
+/// Floor value to nearest step multiple
+pub fn quant_utils_floor_to_step(val: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() {
+        return val;
+    }
+    (val / step).floor() * step
+}
+
+/// Ceil value to nearest step multiple
+pub fn quant_utils_ceil_to_step(val: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() {
+        return val;
+    }
+    (val / step).ceil() * step
+}
+
+/// Snap price to tick (is_buy=true -> floor, is_buy=false -> ceil)
+pub fn quant_utils_snap_price(raw: Decimal, tick: Decimal, is_buy: bool) -> Decimal {
+    if is_buy {
+        quant_utils_floor_to_step(raw, tick)
+    } else {
+        quant_utils_ceil_to_step(raw, tick)
+    }
+}
+
+/// Calculate quantity from quote amount, floor to lot step
+pub fn quant_utils_qty_from_quote(quote: Decimal, price: Decimal, lot_step: Decimal) -> Decimal {
+    if price.is_zero() {
+        return Decimal::ZERO;
+    }
+    quant_utils_floor_to_step(quote / price, lot_step)
+}
+
+/// Calculate basis points difference: (|new-old|/old)*1e4
+pub fn quant_utils_bps_diff(old_px: Decimal, new_px: Decimal) -> f64 {
+    if old_px.is_zero() {
+        return f64::INFINITY;
+    }
+    let num = (new_px - old_px).abs();
+    (num / old_px).to_f64().unwrap_or(0.0) * 10_000.0
+}
+
+/// Quantize decimal value to step (alias for floor_to_step for consistency)
+pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() || step.is_sign_negative() {
+        return value;
+    }
+    quant_utils_floor_to_step(value, step)
+}
 
 // ============================================================================
 // Quantity and Price Helpers
@@ -48,18 +102,17 @@ pub fn quantize_order(
     rules: &SymbolRules,
 ) -> (String, String, Decimal, Decimal) {
     // 1. Quantize: price to tick, qty to step
-    let price_quantized = exec::quant_utils_floor_to_step(price, rules.tick_size);
-    let qty_quantized = exec::quant_utils_floor_to_step(qty.abs(), rules.step_size);
+    let price_quantized = quant_utils_floor_to_step(price, rules.tick_size);
+    let qty_quantized = quant_utils_floor_to_step(qty.abs(), rules.step_size);
     
-    // 2. Format: precision'a göre string'e çevir (exec::binance modülünden kullan)
-    use exec::binance::format_decimal_fixed;
+    // 2. Format: precision'a göre string'e çevir
     let price_str = format_decimal_fixed(price_quantized, rules.price_precision);
     let qty_str = format_decimal_fixed(qty_quantized, rules.qty_precision);
     
     (price_str, qty_str, price_quantized, qty_quantized)
 }
 
-// format_decimal_fixed exec::binance'da mevcut, oradan kullan
+// format_decimal_fixed moved here to avoid duplication
 
 /// Helper trait for floor division by step
 pub trait FloorStep {
@@ -163,7 +216,7 @@ pub fn calc_qty_from_margin(
     leverage: f64,
     price: Decimal,
     rules: &SymbolRules,
-    side: bot_core::types::Side,
+    side: crate::core::types::Side,
 ) -> Option<(String, String)> {
     // KRİTİK DÜZELTME: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
     // Calculate notional = margin * leverage (Decimal olarak)
@@ -188,7 +241,7 @@ pub fn calc_qty_from_margin(
     if step_size <= Decimal::ZERO {
         return None;
     }
-    let qty_floor = exec::quant_utils_floor_to_step(qty_raw, step_size);
+    let qty_floor = quant_utils_floor_to_step(qty_raw, step_size);
     
     // KRİTİK DÜZELTME: Side-aware price rounding
     // BID: floor to tick (daha aşağı, maker olarak kal)
@@ -211,8 +264,8 @@ pub fn calc_qty_from_margin(
         price // Rounding yapma, raw price kullan
     } else {
         match side {
-            Side::Buy => exec::quant_utils_floor_to_step(price, tick_size),
-            Side::Sell => exec::quant_utils_ceil_to_step(price, tick_size),
+            Side::Buy => quant_utils_floor_to_step(price, tick_size),
+            Side::Sell => quant_utils_ceil_to_step(price, tick_size),
         }
     };
     
@@ -251,7 +304,7 @@ pub fn calc_qty_from_margin(
     let min_qty = rules.step_size; // minQty usually = stepSize
     if qty_floor < min_qty {
         // Try to increase to minQty
-        let qty_ceil = exec::quant_utils_ceil_to_step(min_qty, step_size);
+        let qty_ceil = quant_utils_ceil_to_step(min_qty, step_size);
         // KRİTİK: Division by zero kontrolü (price_quantized zaten yukarıda kontrol edildi)
         if qty_ceil <= Decimal::ZERO {
             return None;
@@ -280,7 +333,7 @@ pub fn calc_qty_from_margin(
             return None;
         }
         let qty_needed_raw = min_notional / price_quantized;
-        let qty_needed = exec::quant_utils_ceil_to_step(qty_needed_raw, step_size);
+        let qty_needed = quant_utils_ceil_to_step(qty_needed_raw, step_size);
         if qty_needed >= min_qty {
             // Format with precision (Decimal kullanarak)
             let qty_str = format_qty_with_precision(qty_needed, rules.qty_precision);
@@ -314,7 +367,7 @@ pub fn calc_qty_from_margin(
 /// # Returns
 /// (tp_price_quantized, is_taker_fallback, reason_code)
 pub fn required_take_profit_price_with_fallback(
-    side: bot_core::types::Side,
+    side: crate::core::types::Side,
     entry_price: Decimal,
     qty: Decimal,
     maker_fee_rate: f64,
@@ -339,17 +392,17 @@ pub fn required_take_profit_price_with_fallback(
     
     // Quantize et
     let tp_quantized = match side {
-        bot_core::types::Side::Buy => exec::quant_utils_ceil_to_step(tp_maker, tick_size),
-        bot_core::types::Side::Sell => exec::quant_utils_floor_to_step(tp_maker, tick_size),
+        crate::core::types::Side::Buy => quant_utils_ceil_to_step(tp_maker, tick_size),
+        crate::core::types::Side::Sell => quant_utils_floor_to_step(tp_maker, tick_size),
     };
     
     // Maker kontrolü
     let is_maker = match side {
-        bot_core::types::Side::Buy => {
+        crate::core::types::Side::Buy => {
             // Long: TP = sell exit, best_ask'ten en az 1 tick yüksek olmalı
             tp_quantized >= best_ask + tick_size
         }
-        bot_core::types::Side::Sell => {
+        crate::core::types::Side::Sell => {
             // Short: TP = buy exit, best_bid'ten en az 1 tick düşük olmalı
             tp_quantized <= best_bid - tick_size
         }
@@ -370,8 +423,8 @@ pub fn required_take_profit_price_with_fallback(
     )?;
     
     let tp_taker_quantized = match side {
-        bot_core::types::Side::Buy => exec::quant_utils_ceil_to_step(tp_taker, tick_size),
-        bot_core::types::Side::Sell => exec::quant_utils_floor_to_step(tp_taker, tick_size),
+        crate::core::types::Side::Buy => quant_utils_ceil_to_step(tp_taker, tick_size),
+        crate::core::types::Side::Sell => quant_utils_floor_to_step(tp_taker, tick_size),
     };
     
     Some((tp_taker_quantized, true, "TP_TAKER_FALLBACK"))
@@ -394,7 +447,7 @@ pub fn required_take_profit_price_with_fallback(
 /// Long: exit_price >= entry_price + (min_profit + fee_entry + fee_exit) / qty
 /// Short: exit_price <= entry_price - (min_profit + fee_entry + fee_exit) / qty
 pub fn required_take_profit_price(
-    side: bot_core::types::Side,
+    side: crate::core::types::Side,
     entry_price: Decimal,
     qty: Decimal,
     fee_bps_entry: f64,
@@ -410,7 +463,7 @@ pub fn required_take_profit_price(
     let min_profit_dec = Decimal::try_from(min_profit_usd).unwrap_or(Decimal::ZERO);
     
     match side {
-        bot_core::types::Side::Buy => {
+        crate::core::types::Side::Buy => {
             // Long position: buy entry, sell exit
             // Net profit = exit_price * qty - fee_exit - (entry_price * qty + fee_entry) >= min_profit
             // => exit_price * qty * (1 - fee_bps_exit/10000) >= entry_price * qty + fee_entry + min_profit
@@ -423,7 +476,7 @@ pub fn required_take_profit_price(
             let numerator = notional_entry + fee_entry + min_profit_dec;
             Some(numerator / denominator)
         }
-        bot_core::types::Side::Sell => {
+        crate::core::types::Side::Sell => {
             // Short position: sell entry, buy exit
             // Net profit = (entry_price * qty - fee_entry) - (exit_price * qty + fee_exit) >= min_profit
             // => entry_price * qty - fee_entry - exit_price * qty - fee_exit >= min_profit
@@ -445,10 +498,10 @@ pub fn required_take_profit_price(
 
 /// Calculate side multiplier for PnL calculation
 /// Long: +1.0, Short: -1.0
-pub fn side_mult(side: &bot_core::types::Side) -> f64 {
+pub fn side_mult(side: &crate::core::types::Side) -> f64 {
     match side {
-        bot_core::types::Side::Buy => 1.0,  // Long
-        bot_core::types::Side::Sell => -1.0, // Short
+        crate::core::types::Side::Buy => 1.0,  // Long
+        crate::core::types::Side::Sell => -1.0, // Short
     }
 }
 
@@ -478,7 +531,7 @@ pub fn calc_net_pnl_usd(
     entry_price: Decimal,
     exit_price: Decimal,
     qty: Decimal,
-    side: &bot_core::types::Side,
+    side: &crate::core::types::Side,
     entry_fee_bps: f64,
     exit_fee_bps: f64,
 ) -> f64 {
@@ -549,14 +602,14 @@ pub fn clamp_price_to_market_distance(
 /// # Returns
 /// Optimal price based on depth analysis, or best_bid/best_ask if no suitable level found
 pub fn find_optimal_price_from_depth(
-    order_book: &bot_core::types::OrderBook,
-    side: bot_core::types::Side,
+    order_book: &crate::core::types::OrderBook,
+    side: crate::core::types::Side,
     min_required_volume_usd: f64,
     best_bid: Decimal,
     best_ask: Decimal,
 ) -> Decimal {
     match side {
-        bot_core::types::Side::Buy => {
+        crate::core::types::Side::Buy => {
             // BID: En yüksek volume'lu level'ı bul (best_bid'e yakın)
             if let Some(top_bids) = &order_book.top_bids {
                 for level in top_bids.iter() {
@@ -570,7 +623,7 @@ pub fn find_optimal_price_from_depth(
             // Fallback: best_bid
             best_bid
         }
-        bot_core::types::Side::Sell => {
+        crate::core::types::Side::Sell => {
             // ASK: En yüksek volume'lu level'ı bul (best_ask'e yakın)
             if let Some(top_asks) = &order_book.top_asks {
                 for level in top_asks.iter() {
@@ -604,7 +657,7 @@ pub fn adjust_price_for_aggressiveness(
     price: Decimal,
     best_bid: Decimal,
     best_ask: Decimal,
-    side: bot_core::types::Side,
+    side: crate::core::types::Side,
     is_opportunity_mode: bool,
     trend_bps: f64,
     max_distance_pct: f64,
@@ -619,7 +672,7 @@ pub fn adjust_price_for_aggressiveness(
     };
     
     match side {
-        bot_core::types::Side::Buy => {
+        crate::core::types::Side::Buy => {
             // BID: best_bid'e yakın olmalı
             let max_distance = best_bid * max_distance_pct_dec;
             
@@ -650,7 +703,7 @@ pub fn adjust_price_for_aggressiveness(
             // Küçük kar hedefi için best_bid'e mümkün olduğunca yakın
             price.max(adjusted_min).min(best_bid)
         }
-        bot_core::types::Side::Sell => {
+        crate::core::types::Side::Sell => {
             // ASK: best_ask'e yakın olmalı
             let max_distance = best_ask * max_distance_pct_dec;
             
@@ -698,19 +751,37 @@ impl CeilStep for f64 {
     }
 }
 
-/// Format quantity with precision (truncate, don't round)
+/// Format decimal with fixed precision (truncate, don't round)
 /// KRİTİK: Decimal kullanarak precision kaybını önle
+/// Precision overflow kontrolü (max 28 decimal places)
+pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
+    let precision = precision.min(28);
+    let scale = precision as u32;
+    
+    // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
+    // KRİTİK: round_dp_with_strategy ile kesinlikle precision'a kadar yuvarla
+    // ToZero strategy kullanarak fazla basamakları kes
+    let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
+    
+    // KRİTİK: String formatlamada kesinlikle precision'dan fazla basamak gösterme
+    // Decimal'in to_string() metodu bazen internal precision'ı gösterebilir
+    // Bu yüzden format! makrosu ile precision kontrolü yapıyoruz
+    if precision == 0 {
+        format!("{:.0}", truncated)
+    } else {
+        // Precision kadar ondalık basamak göster
+        let formatted = format!("{:.prec$}", truncated, prec = precision);
+        formatted
+    }
+}
+
+/// Format quantity with precision (wrapper for consistency)
 fn format_qty_with_precision(qty: Decimal, precision: usize) -> String {
-    use exec::binance::format_decimal_fixed;
     format_decimal_fixed(qty, precision)
 }
 
-/// Format price with precision (truncate, don't round)
-/// KRİTİK: Decimal kullanarak precision kaybını önle
-/// NOT: Side-aware rounding artık quantization aşamasında yapılıyor (calc_qty_from_margin içinde)
-/// Burada sadece format ediyoruz
-fn format_price_with_precision(price: Decimal, precision: usize, _side: bot_core::types::Side) -> String {
-    use exec::binance::format_decimal_fixed;
+/// Format price with precision (wrapper for consistency)
+fn format_price_with_precision(price: Decimal, precision: usize, _side: crate::core::types::Side) -> String {
     format_decimal_fixed(price, precision)
 }
 

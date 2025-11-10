@@ -1,12 +1,12 @@
 //location: /crates/app/src/types.rs
 // Core types and structures for the trading bot
 
-use bot_core::types::*;
-use exec::binance::SymbolMeta;
+use crate::core::types::*;
+use crate::exec::binance::SymbolMeta;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::Instant;
-use strategy::Strategy;
+use crate::strategy::Strategy;
 
 // ============================================================================
 // Symbol State
@@ -26,7 +26,7 @@ pub struct SymbolState {
     pub disabled_until: Option<std::time::Instant>, // Disabled semboller için cooldown (5 dk)
     
     // Per-symbol metadata
-    pub symbol_rules: Option<std::sync::Arc<exec::binance::SymbolRules>>,
+    pub symbol_rules: Option<std::sync::Arc<crate::exec::binance::SymbolRules>>,
     // KRİTİK: ExchangeInfo fetch durumu - başarısızsa trade etme
     pub rules_fetch_failed: bool, // ExchangeInfo çekilemediyse true (trade etme)
     pub last_rules_retry: Option<Instant>, // Son retry zamanı (periyodik retry için)
@@ -73,13 +73,26 @@ pub struct SymbolState {
     
     // Long/Short seçimi için histerezis ve cooldown
     pub last_direction_change: Option<Instant>, // Son yön değişikliği zamanı
-    pub current_direction: Option<bot_core::types::Side>, // Mevcut yön (Long=Buy, Short=Sell)
+    pub current_direction: Option<crate::core::types::Side>, // Mevcut yön (Long=Buy, Short=Sell)
     pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
     pub regime: Option<String>, // "trend" veya "sideways"
     
     // Position closing control
     pub position_closing: bool, // Pozisyon kapatma süreci başlamış mı (spam önleme)
     pub last_close_attempt: Option<Instant>, // Son kapatma denemesi zamanı (cooldown için)
+}
+
+// ============================================================================
+// Risk Action
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RiskAction {
+    Ok,
+    Narrow,
+    Widen,
+    Reduce,
+    Halt,
 }
 
 // ============================================================================

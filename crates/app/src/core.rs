@@ -1,4 +1,6 @@
-//location: /crates/bot_core/src/lib.rs
+//location: /crates/app/src/core/mod.rs
+// Core domain types (moved from bot_core crate)
+
 pub mod types {
     use rust_decimal::Decimal;
     use serde::{Deserialize, Serialize};
@@ -166,3 +168,4 @@ mod tests {
         assert_eq!(pos.leverage, deserialized.leverage);
     }
 }
+

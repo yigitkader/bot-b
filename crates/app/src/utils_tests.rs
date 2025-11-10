@@ -7,7 +7,7 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
     use rust_decimal_macros::dec;
-    use exec::binance::SymbolRules;
+    use crate::exec::binance::SymbolRules;
 
     // ============================================================================
     // is_usd_stable Tests

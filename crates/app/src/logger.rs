@@ -1,7 +1,7 @@
 //location: /crates/app/src/logger.rs
 // Structured JSON logging system for trading events
 
-use bot_core::types::*;
+use crate::core::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 use std::fs::OpenOptions;

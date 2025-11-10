@@ -1,13 +1,8 @@
 [workspace]
 members = [
-    "crates/bot_core",
-    "crates/strategy",
-    "crates/risk",
-    "crates/exec",
-    "crates/data",
-    "crates/monitor",
-    "crates/backtest",
     "crates/app",
+    # Note: All crates (bot_core, strategy, exec, data) moved to app/ modules
+    # Note: risk and monitor also moved to app/ modules
 ]
 resolver = "2"
 

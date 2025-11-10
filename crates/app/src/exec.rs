@@ -1,7 +1,8 @@
 //location: /crates/exec/src/lib.rs
 use anyhow::Result;
 use async_trait::async_trait;
-use bot_core::types::*;
+use crate::core::types::*;
+use rust_decimal::Decimal;
 
 #[derive(Clone, Debug)]
 pub struct VenueOrder {
@@ -11,7 +12,7 @@ pub struct VenueOrder {
     pub qty: Qty,
 }
 
-pub mod binance;
+// binance_exec is a separate module file
 
 #[async_trait]
 pub trait Venue: Send + Sync {
@@ -50,51 +51,22 @@ pub trait Venue: Send + Sync {
     }
 }
 
-// ======================= BEGIN: quant helpers =======================
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
-
-/// step'e göre floor: val -> en yakın aşağı step katı
-pub fn quant_utils_floor_to_step(val: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() {
-        return val;
-    }
-    (val / step).floor() * step
+// Quantization helpers moved to utils.rs to avoid duplication
+// Re-export for backward compatibility
+// Re-export binance_exec types for convenience (binance_exec is a separate module)
+pub mod binance {
+    pub use crate::binance_exec::*;
 }
 
-/// step'e göre ceil: val -> en yakın yukarı step katı
-pub fn quant_utils_ceil_to_step(val: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() {
-        return val;
-    }
-    (val / step).ceil() * step
-}
-
-/// tick'e snap (is_buy=true -> floor, is_buy=false -> ceil)
-pub fn quant_utils_snap_price(raw: Decimal, tick: Decimal, is_buy: bool) -> Decimal {
-    if is_buy {
-        quant_utils_floor_to_step(raw, tick)
-    } else {
-        quant_utils_ceil_to_step(raw, tick)
-    }
-}
-
-/// quote (USDT/USDC) bütçeden qty hesapla, lot step'e floor et
-pub fn quant_utils_qty_from_quote(quote: Decimal, price: Decimal, lot_step: Decimal) -> Decimal {
-    if price.is_zero() {
-        return Decimal::ZERO;
-    }
-    quant_utils_floor_to_step(quote / price, lot_step)
-}
-
-/// bps farkı (|new-old|/old)*1e4
-pub fn quant_utils_bps_diff(old_px: Decimal, new_px: Decimal) -> f64 {
-    if old_px.is_zero() {
-        return f64::INFINITY;
-    }
-    let num = (new_px - old_px).abs();
-    (num / old_px).to_f64().unwrap_or(0.0) * 10_000.0
-}
+// Re-export quantization helpers from utils
+pub use crate::utils::{
+    quant_utils_floor_to_step,
+    quant_utils_ceil_to_step,
+    quant_utils_snap_price,
+    quant_utils_qty_from_quote,
+    quant_utils_bps_diff,
+    quantize_decimal,
+};
 
 /// Decimal adımından hassasiyet (ondalık hane sayısı) çıkarır
 pub fn decimal_places(step: Decimal) -> usize {
@@ -108,4 +80,3 @@ pub fn decimal_places(step: Decimal) -> usize {
         0
     }
 }
-// ======================== END: quant helpers ========================
