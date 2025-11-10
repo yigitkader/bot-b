@@ -30,9 +30,8 @@ pub struct SymbolState {
     // KRİTİK: ExchangeInfo fetch durumu - başarısızsa trade etme
     pub rules_fetch_failed: bool, // ExchangeInfo çekilemediyse true (trade etme)
     pub last_rules_retry: Option<Instant>, // Son retry zamanı (periyodik retry için)
-    pub test_order_passed: bool, // İlk emir öncesi test order başarılı mı? (deprecated, use test_order_passed_buy/sell)
-    pub test_order_passed_buy: bool, // Buy tarafı için test order başarılı mı?
-    pub test_order_passed_sell: bool, // Sell tarafı için test order başarılı mı?
+    pub test_order_passed: bool, // İlk emir öncesi test order başarılı mı?
+    // ✅ KRİTİK FIX: test_order_passed_buy ve test_order_passed_sell kaldırıldı (kullanılmıyordu)
     
     // Position and order tracking
     pub last_position_check: Option<Instant>,
@@ -42,6 +41,7 @@ pub struct SymbolState {
     pub last_fill_time: Option<Instant>, // Son fill zamanı (zaman bazlı fill rate için)
     pub last_inventory_update: Option<Instant>, // Son envanter güncelleme zamanı (race condition önleme için)
     pub last_decay_period: Option<u64>, // Son fill rate decay period (optimizasyon için)
+    pub last_decay_check: Option<Instant>, // Son decay kontrol zamanı (overhead önleme için)
     
     // Position management
     pub position_entry_time: Option<Instant>,
@@ -49,8 +49,8 @@ pub struct SymbolState {
     pub last_peak_update: Option<Instant>, // Peak PnL güncelleme cooldown için
     pub position_hold_duration_ms: u64,
     pub last_order_price_update: HashMap<String, Px>,
-    // KRİTİK İYİLEŞTİRME: Order-to-position mapping - hangi order'lar bu pozisyonu oluşturdu?
-    pub position_orders: Vec<String>, // Bu pozisyonu oluşturan order ID'ler (fill olan order'lar)
+    // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu, sadece overhead yaratıyordu)
+    // Eğer gelecekte partial close veya order-to-position mapping gerekirse, o zaman eklenebilir
     // Cancel-replace debounce ve backoff
     pub last_cancel_all_time: Option<Instant>, // Son cancel_all zamanı (debounce için)
     pub cancel_all_attempt_count: u32, // Cancel_all deneme sayısı (backoff için)

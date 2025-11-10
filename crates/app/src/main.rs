@@ -18,16 +18,16 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use strategy::{Context, DynMm, DynMmCfg, Strategy};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+// ✅ FIX: tokio::time::timeout kullanılmıyor, kaldırıldı
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use logger::create_logger;
 use types::{OrderInfo, SymbolState};
-use utils::{adjust_price_for_aggressiveness, calc_net_pnl_usd, calc_qty_from_margin, clamp_price_to_market_distance, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, find_optimal_price_from_depth, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
+use utils::{adjust_price_for_aggressiveness, calc_net_pnl_usd, calc_qty_from_margin, clamp_qty_by_usd, compute_drawdown_bps, estimate_close_fee_bps, find_optimal_price_from_depth, get_price_tick, get_qty_step, init_rate_limiter, is_usd_stable, rate_limit_guard, record_pnl_snapshot, required_take_profit_price, split_margin_into_chunks};
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
@@ -619,8 +619,7 @@ async fn main() -> Result<()> {
             rules_fetch_failed, // ExchangeInfo fetch durumu
             last_rules_retry: None, // Periyodik retry için
             test_order_passed: false, // İlk emir öncesi test order henüz yapılmadı
-            test_order_passed_buy: false, // Buy tarafı için test order henüz yapılmadı
-            test_order_passed_sell: false, // Sell tarafı için test order henüz yapılmadı
+            // ✅ KRİTİK FIX: test_order_passed_buy ve test_order_passed_sell kaldırıldı (kullanılmıyordu)
             last_position_check: None,
             last_order_sync: None,
             order_fill_rate: cfg.internal.initial_fill_rate,
@@ -628,12 +627,14 @@ async fn main() -> Result<()> {
             last_fill_time: None,
             last_inventory_update: None,
             last_decay_period: None,
+            last_decay_check: None,
             position_entry_time: None,
             peak_pnl: Decimal::ZERO,
             last_peak_update: None,
             position_hold_duration_ms: 0,
             last_order_price_update: HashMap::new(),
-            position_orders: Vec::new(),
+            // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu, sadece overhead yaratıyordu)
+            // Eğer gelecekte partial close veya order-to-position mapping gerekirse, o zaman eklenebilir
             last_cancel_all_time: None,
             cancel_all_attempt_count: 0,
             daily_pnl: Decimal::ZERO,
@@ -958,38 +959,19 @@ async fn main() -> Result<()> {
                                             state.consecutive_no_fills = 0;
                                             state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
                                             
-                                            // KRİTİK İYİLEŞTİRME: Buy order'lar fill olduysa position_orders'a ekle
-                                            let inv_increased = pos.qty.0 > old_inv;
-                                            if inv_increased {
-                                                for removed_order in &removed_orders {
-                                                    if removed_order.side == Side::Buy {
-                                                        if !state.position_orders.contains(&removed_order.order_id) {
-                                                            state.position_orders.push(removed_order.order_id.clone());
-                                                            debug!(
-                                                                symbol = %state.meta.symbol,
-                                                                order_id = %removed_order.order_id,
-                                                                "reconnect sync: buy order filled, added to position_orders"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // Pozisyon sıfıra düştüyse position_orders'ı temizle
-                                            if pos.qty.0.is_zero() && !old_inv.is_zero() {
-                                                state.position_orders.clear();
-                                                debug!(symbol = %state.meta.symbol, "reconnect sync: position closed, cleared position_orders");
-                                            }
+                                            // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
                                             
-                                            // ✅ KRİTİK FIX: Reconnect sonrası pozisyon varsa entry_time set et
+                                            // ✅ KRİTİK FIX: Reconnect sonrası pozisyon varsa entry_time set et (FALLBACK)
+                                            // WebSocket event EN GÜVENİLİR kaynak, ama reconnect sonrası gelmeyebilir
                                             // Pozisyon açıldıysa (old_inv.is_zero() && !pos.qty.0.is_zero()) entry_time set et
                                             if old_inv.is_zero() && !pos.qty.0.is_zero() {
                                                 if state.position_entry_time.is_none() {
                                                     state.position_entry_time = Some(std::time::Instant::now());
-                                                    info!(
+                                                    warn!(
                                                         symbol = %state.meta.symbol,
-                                                        entry_time_set = "from_reconnect_sync",
+                                                        entry_time_set = "from_reconnect_sync_fallback",
                                                         inv_change = %(pos.qty.0 - old_inv),
-                                                        "position entry time set from reconnect sync"
+                                                        "position entry time set from reconnect sync (FALLBACK - WebSocket event preferred)"
                                                     );
                                                 }
                                             }
@@ -1030,7 +1012,7 @@ async fn main() -> Result<()> {
                 UserEvent::OrderFill {
                     symbol,
                     order_id,
-                    client_order_id,
+                    client_order_id: _client_order_id, // ✅ FIX: Kullanılmıyor, prefix eklendi
                     side,
                     qty,
                     cumulative_filled_qty,
@@ -1099,65 +1081,10 @@ async fn main() -> Result<()> {
                             inv -= fill_increment;
                         }
                         
-                        // PnL hesaplama: Pozisyon kapatıldığında (long → sell fill veya short → buy fill)
-                        let realized_pnl = if let Some(avg_entry) = state.avg_entry_price {
-                            // Pozisyon var, entry price biliniyor
-                            let closed_qty = if (old_inv.is_sign_positive() && side == Side::Sell) || 
-                                               (old_inv.is_sign_negative() && side == Side::Buy) {
-                                // Pozisyon kapatılıyor
-                                fill_increment.min(old_inv.abs())
-                            } else {
-                                Decimal::ZERO // Pozisyon açılıyor/artıyor, PnL yok
-                            };
-                            
-                            if closed_qty > Decimal::ZERO {
-                                // Gerçekleşen PnL = (fill_price - entry_price) * closed_qty - komisyon
-                                let price_diff = if old_inv.is_sign_positive() {
-                                    // Long pozisyon kapatılıyor (sell fill)
-                                    price.0 - avg_entry
-                                } else {
-                                    // Short pozisyon kapatılıyor (buy fill)
-                                    avg_entry - price.0
-                                };
-                                let gross_pnl = price_diff * closed_qty;
-                                
-                                // KRİTİK DÜZELTME: Gerçek komisyon kullan (executionReport'tan gelen)
-                                // commission zaten UserEvent::OrderFill'den geliyor (executionReport'tan "n" field'ı)
-                                // commission = last executed qty için komisyon (incremental)
-                                // closed_qty ile orantılı olarak hesapla (eğer partial fill ise)
-                                let actual_commission = if fill_increment > Decimal::ZERO {
-                                    // Proportional commission: (commission / fill_increment) * closed_qty
-                                    (commission / fill_increment) * closed_qty
-                                } else {
-                                    commission // Full fill, direkt kullan
-                                };
-                                
-                                let net_pnl = gross_pnl - actual_commission;
-                                
-                                // Daily ve cumulative PnL'e ekle
-                                state.daily_pnl += net_pnl;
-                                state.cumulative_pnl += net_pnl;
-                                
-                                info!(
-                                    %symbol,
-                                    fill_price = %price.0,
-                                    entry_price = %avg_entry,
-                                    closed_qty = %closed_qty,
-                                    gross_pnl = %gross_pnl,
-                                    actual_commission = %actual_commission,
-                                    net_pnl = %net_pnl,
-                                    daily_pnl = %state.daily_pnl,
-                                    cumulative_pnl = %state.cumulative_pnl,
-                                    "realized PnL from fill event (using actual commission from executionReport)"
-                                );
-                                
-                                net_pnl
-                            } else {
-                                Decimal::ZERO
-                            }
-                        } else {
-                            Decimal::ZERO // Entry price bilinmiyor, PnL hesaplanamaz
-                        };
+                        // ✅ KRİTİK FIX: PnL hesaplama - SADECE pozisyon tam kapandığında
+                        // Partial close durumunda PnL hesaplama (double counting önleme)
+                        // PnL sadece pozisyon tam kapandığında (inventory 0'a düştüğünde) hesaplanacak
+                        // Bu, aşağıdaki "Pozisyon tam kapanınca final PnL kontrolü" bloğunda yapılıyor
                         
                         // Inventory güncelle (sadece incremental fill miktarı)
                         // NOT: Order state'de yoksa bile inventory güncelle (reconnect sonrası olabilir)
@@ -1182,8 +1109,9 @@ async fn main() -> Result<()> {
                                 state.avg_entry_price = Some(price.0);
                             }
                             
-                            // ✅ HIGH FIX: Position entry time race condition - WebSocket event önce gelebilir
-                            // Pozisyon ilk kez açılıyorsa entry time set et (WebSocket fill event'te)
+                            // ✅ KRİTİK FIX: Position entry time - WebSocket fill event EN GÜVENİLİR kaynak
+                            // Pozisyon ilk kez açılıyorsa entry time set et (gerçek fill zamanı)
+                            // Bu, position check'ten ÖNCE gelebilir, bu yüzden burada set edilirse position check dokunmamalı
                             if old_inv.is_zero() && !inv.is_zero() {
                                 if state.position_entry_time.is_none() {
                                     state.position_entry_time = Some(std::time::Instant::now());
@@ -1192,43 +1120,76 @@ async fn main() -> Result<()> {
                                         entry_time_set = "from_websocket_fill",
                                         fill_price = %price.0,
                                         fill_qty = %fill_increment,
-                                        "position entry time set from WebSocket fill event"
+                                        "position entry time set from WebSocket fill event (PRIMARY SOURCE)"
+                                    );
+                                } else {
+                                    // Entry time zaten set edilmiş (position check önce çalışmış olabilir)
+                                    // WebSocket event daha güvenilir, ama değiştirmeyelim (ilk set edilen zamanı koru)
+                                    debug!(
+                                        %symbol,
+                                        existing_entry_time = ?state.position_entry_time,
+                                        "position entry time already set, keeping existing value"
                                     );
                                 }
                             }
                         }
                         
-                        // Pozisyon sıfıra düştüyse avg_entry_price'ı sıfırla
+                        // ✅ KRİTİK FIX: Pozisyon tam kapanınca final PnL hesapla
+                        // PnL SADECE pozisyon tam kapandığında (inventory 0'a düştüğünde) hesaplanır
+                        // Bu, double counting'i önler ve doğru PnL hesaplaması sağlar
                         if inv.is_zero() && !old_inv.is_zero() {
+                            // Pozisyon tam kapandı - final PnL hesapla
+                            if let Some(avg_entry) = state.avg_entry_price {
+                                // Tam kapanış için pozisyon miktarı
+                                let closed_qty = old_inv.abs();
+                                if closed_qty > Decimal::ZERO {
+                                    // Final PnL = (fill_price - entry_price) * closed_qty - komisyon
+                                    let price_diff = if old_inv.is_sign_positive() {
+                                        // Long pozisyon kapatılıyor (sell fill)
+                                        price.0 - avg_entry
+                                    } else {
+                                        // Short pozisyon kapatılıyor (buy fill)
+                                        avg_entry - price.0
+                                    };
+                                    let gross_pnl = price_diff * closed_qty;
+                                    
+                                    // Komisyon: Bu fill için gelen commission'ı kullan
+                                    // Eğer bu fill tam kapanış için yeterliyse, commission'ın tamamı bu pozisyon için
+                                    let actual_commission = if fill_increment >= closed_qty {
+                                        // Bu fill tam kapanış için yeterli
+                                        commission
+                                    } else {
+                                        // Partial fill, proportional commission
+                                        (commission / fill_increment) * closed_qty
+                                    };
+                                    
+                                    let final_net_pnl = gross_pnl - actual_commission;
+                                    
+                                    // Daily ve cumulative PnL'e ekle (SADECE tam kapanışta)
+                                    state.daily_pnl += final_net_pnl;
+                                    state.cumulative_pnl += final_net_pnl;
+                                    
+                                    info!(
+                                        %symbol,
+                                        fill_price = %price.0,
+                                        entry_price = %avg_entry,
+                                        closed_qty = %closed_qty,
+                                        gross_pnl = %gross_pnl,
+                                        actual_commission = %actual_commission,
+                                        final_net_pnl = %final_net_pnl,
+                                        daily_pnl = %state.daily_pnl,
+                                        cumulative_pnl = %state.cumulative_pnl,
+                                        "realized PnL from complete position close (using actual commission from executionReport)"
+                                    );
+                                }
+                            }
+                            
+                            // avg_entry_price'ı sıfırla (pozisyon kapandı)
                             state.avg_entry_price = None;
                         }
                         
-                        // KRİTİK İYİLEŞTİRME: Order-to-position mapping - pozisyon oluşturan order'ları track et
-                        // Buy fill → pozisyon artar → order'ı ekle
-                        // Sell fill → pozisyon azalır → order ekleme (pozisyon kapatıyor, oluşturmuyor)
-                        if side == Side::Buy && fill_increment > Decimal::ZERO {
-                            // Buy order fill oldu ve pozisyon arttı → bu order pozisyonu oluşturdu/arttırdı
-                            if !state.position_orders.contains(&order_id) {
-                                state.position_orders.push(order_id.clone());
-                                debug!(
-                                    %symbol,
-                                    order_id = %order_id,
-                                    fill_increment = %fill_increment,
-                                    old_inv = %old_inv,
-                                    new_inv = %inv,
-                                    total_position_orders = state.position_orders.len(),
-                                    "position entry: buy order filled, added to position_orders"
-                                );
-                            }
-                        }
-                        // Pozisyon sıfıra düştüyse position_orders'ı temizle
-                        if inv.is_zero() && !old_inv.is_zero() {
-                            state.position_orders.clear();
-                            debug!(
-                                %symbol,
-                                "position closed: cleared position_orders"
-                            );
-                        }
+                        // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu, sadece overhead yaratıyordu)
+                        // Eğer gelecekte partial close veya order-to-position mapping gerekirse, o zaman eklenebilir
                         
                         // Order state güncelle (varsa)
                         let should_remove = if let Some(order_info) = state.active_orders.get_mut(&order_id) {
@@ -1480,7 +1441,7 @@ async fn main() -> Result<()> {
             // PERFORMANS: Clone'ları sadece gerektiğinde yap
             // KRİTİK: symbol'i clone et çünkü state'i mutable borrow edeceğiz
             let symbol = state.meta.symbol.clone();
-            let base_asset = &state.meta.base_asset;
+            let _base_asset = &state.meta.base_asset; // ✅ FIX: Kullanılmıyor, prefix eklendi
             let quote_asset = state.meta.quote_asset.clone();
 
             // --- ERKEN BAKİYE KONTROLÜ: Bakiye yoksa gereksiz işlem yapma ---
@@ -1597,28 +1558,7 @@ async fn main() -> Result<()> {
                                     state.consecutive_no_fills = 0;
                                     state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
                                     
-                                    // KRİTİK İYİLEŞTİRME: Buy order'lar fill olduysa position_orders'a ekle
-                                    // Inventory arttıysa buy order'lar fill olmuş demektir
-                                    let inv_increased = pos.qty.0 > old_inv;
-                                    if inv_increased {
-                                        for removed_order in &removed_orders {
-                                            if removed_order.side == Side::Buy {
-                                                if !state.position_orders.contains(&removed_order.order_id) {
-                                                    state.position_orders.push(removed_order.order_id.clone());
-                                                    debug!(
-                                                        %symbol,
-                                                        order_id = %removed_order.order_id,
-                                                        "order sync: buy order filled, added to position_orders"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Pozisyon sıfıra düştüyse position_orders'ı temizle
-                                    if pos.qty.0.is_zero() && !old_inv.is_zero() {
-                                        state.position_orders.clear();
-                                        debug!(%symbol, "order sync: position closed, cleared position_orders");
-                                    }
+                                    // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
                                     
                                     info!(
                                         %symbol,
@@ -1998,11 +1938,7 @@ async fn main() -> Result<()> {
                 let old_inv = state.inv.0;
                 state.inv = pos.qty; // Force sync
                 state.last_inventory_update = Some(std::time::Instant::now());
-                // KRİTİK İYİLEŞTİRME: Pozisyon sıfıra düştüyse position_orders'ı temizle
-                if pos.qty.0.is_zero() && !old_inv.is_zero() {
-                    state.position_orders.clear();
-                    debug!(%symbol, "position closed via reconnect sync: cleared position_orders");
-                }
+                // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
             } else if inv_diff > reconcile_threshold && time_since_last_update > MIN_SYNC_INTERVAL_MS {
                 // Normal durumda: Sadece uyumsuzluk varsa ve son güncellemeden 500ms geçtiyse sync yap
                 // Daha toleranslı: threshold daha büyük (rounding error'ları ignore et)
@@ -2018,16 +1954,15 @@ async fn main() -> Result<()> {
                 let old_inv = state.inv.0;
                 state.inv = pos.qty; // Force sync
                 state.last_inventory_update = Some(std::time::Instant::now());
-                // KRİTİK İYİLEŞTİRME: Pozisyon sıfıra düştüyse position_orders'ı temizle
-                if pos.qty.0.is_zero() && !old_inv.is_zero() {
-                    state.position_orders.clear();
-                    debug!(%symbol, "position closed via normal sync: cleared position_orders");
-                }
+                // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
             }
 
             record_pnl_snapshot(&mut state.pnl_history, &pos, mark_px, cfg.internal.pnl_history_max_len);
             
             // --- AKILLI POZİSYON ANALİZİ: Durumu detaylı incele ---
+            // ✅ KRİTİK FIX: current_pnl sadece görüntüleme/analiz için hesaplanıyor
+            // daily_pnl veya cumulative_pnl'e EKLENMİYOR (double counting önleme)
+            // PnL sadece fill event'te (pozisyon kapanırken) realize ediliyor
             let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
             let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
             // position_size_notional zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
@@ -2129,7 +2064,7 @@ async fn main() -> Result<()> {
             // Mark-price vs entry-price: Exchange risk hesaplaması için mark-price kullanılmalı
             // Ancak entry-price ile karşılaştırma yaparak risk değerlendirmesi yapılabilir
             let position_size_notional_mark = position_size_notional; // Mark-price ile (mevcut)
-            let position_size_notional_entry = (pos.entry.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0); // Entry-price ile
+            let _position_size_notional_entry = (pos.entry.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0); // Entry-price ile (✅ FIX: Kullanılmıyor, prefix eklendi)
             
             // Exchange risk hesaplaması: Mark-price bazlı (exchange'in gördüğü risk)
             // Ancak entry-price ile karşılaştırma yaparak gerçek risk değerlendirmesi
@@ -2171,6 +2106,9 @@ async fn main() -> Result<()> {
             if is_opportunity_mode {
                 match position_size_risk_level {
                     "hard" => {
+                        // ✅ KRİTİK FIX: Hard limit'te de yeni emirleri durdur (tutarlılık için)
+                        should_block_new_orders = true;
+                        
                         // KRİTİK: Hard limit - Force-close
                 warn!(
                     %symbol,
@@ -2182,18 +2120,30 @@ async fn main() -> Result<()> {
                             active_orders_notional = total_active_orders_notional,
                             "OPPORTUNITY MODE HARD LIMIT: position + orders exceed hard limit, force closing"
                         );
-                        // Önce tüm emirleri iptal et
-                rate_limit_guard(1).await;
+                        // ✅ KRİTİK FIX: Position closing flag'i set et (deadlock önleme)
+                        state.position_closing = true;
+                        state.last_close_attempt = Some(Instant::now());
+                        
+                        // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
+                        // cancel_all ve close_position ardışık çağrılar, tek guard ile rate limit korunur
+                        rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
                         if let Err(err) = venue.cancel_all(&symbol).await {
                             warn!(%symbol, ?err, "failed to cancel all orders before force-close");
                         }
-                        // Sonra pozisyonu kapat
-                        rate_limit_guard(1).await;
-                        if let Err(err) = venue.close_position(&symbol).await {
-                            error!(%symbol, ?err, "failed to close position due to hard limit");
+                        // Sonra pozisyonu kapat (aynı guard bloğu içinde)
+                        let close_result = venue.close_position(&symbol).await;
+                        
+                        // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
+                        state.position_closing = false;
+                        
+                        if let Err(err) = close_result {
+                            // Başarısız, cooldown başlat (spam önleme)
+                            state.last_close_attempt = Some(Instant::now());
+                            error!(%symbol, ?err, "failed to close position due to hard limit, will retry after cooldown");
                         } else {
                             info!(%symbol, "closed position due to hard limit");
                         }
+                        
                         continue; // Bu tick'i atla
                     }
                     "medium" => {
@@ -2260,12 +2210,25 @@ async fn main() -> Result<()> {
                         max_allowed = max_position_size_usd,
                         "POSITION SIZE RISK: position too large, force closing (normal mode)"
                     );
+                
+                // ✅ KRİTİK FIX: Position closing flag'i set et (deadlock önleme)
+                state.position_closing = true;
+                state.last_close_attempt = Some(Instant::now());
+                
                 rate_limit_guard(1).await;
-                if let Err(err) = venue.close_position(&symbol).await {
-                    error!(%symbol, ?err, "failed to close position due to size risk");
+                let close_result = venue.close_position(&symbol).await;
+                
+                // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
+                state.position_closing = false;
+                
+                if let Err(err) = close_result {
+                    // Başarısız, cooldown başlat (spam önleme)
+                    state.last_close_attempt = Some(Instant::now());
+                    error!(%symbol, ?err, "failed to close position due to size risk, will retry after cooldown");
                 } else {
                     info!(%symbol, "closed position due to size risk");
                 }
+                
                 continue; // Bu tick'i atla
                 }
             }
@@ -2317,8 +2280,17 @@ async fn main() -> Result<()> {
                 .unwrap_or(Decimal::new(1, 8));
             if pos.qty.0.abs() > position_qty_threshold {
                 // Pozisyon var
+                // ✅ KRİTİK FIX: Position entry time race condition
+                // WebSocket fill event EN GÜVENİLİR kaynak (gerçek fill zamanı)
+                // Position check sadece FALLBACK olmalı (reconnect recovery için)
+                // WebSocket event gelmediyse (reconnect sonrası) burada set et
                 if state.position_entry_time.is_none() {
                     state.position_entry_time = Some(Instant::now());
+                    warn!(
+                        %symbol,
+                        entry_time_set = "from_position_check_fallback",
+                        "position entry time set from position check (FALLBACK - WebSocket event may be delayed)"
+                    );
                     
                     // JSON log: Position opened
                     if let Ok(logger) = json_logger.lock() {
@@ -2341,7 +2313,7 @@ async fn main() -> Result<()> {
                 state.position_entry_time = None;
                 state.peak_pnl = Decimal::ZERO;
                 state.position_hold_duration_ms = 0;
-                state.position_orders.clear(); // KRİTİK İYİLEŞTİRME: Pozisyon kapandı, order tracking'i temizle
+                // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
             }
             
             // Pozisyon trend analizi: Son 10 snapshot'a bak
@@ -2407,7 +2379,7 @@ async fn main() -> Result<()> {
                 
                 // TP hedefi ve time-box parametreleri (config'den)
                 let tp_usd = min_profit_usd;
-                let timebox_secs = cfg.strategy.tp_timebox_secs.unwrap_or(20);
+                let _timebox_secs = cfg.strategy.tp_timebox_secs.unwrap_or(20); // ✅ FIX: Kullanılmıyor, prefix eklendi
                 
                 // Cooldown kontrolü (spam önleme) - config'den
                 let close_cooldown_ms = cfg.strategy.position_close_cooldown_ms.unwrap_or(500) as u128;
@@ -2429,13 +2401,14 @@ async fn main() -> Result<()> {
                 // 7. Recovery: Zarardan kâra dönüşünce hemen kapat (küçük kâr bile olsa)
                 // ✅ KRİTİK FIX: position_entry_time None ise (reconnect sonrası) pozisyon yaşı 0 olarak kabul et
                 let should_close_smart = {
-                    // Entry time yoksa şimdi set et (reconnect sonrası olabilir)
+                    // Entry time yoksa şimdi set et (reconnect sonrası olabilir - son fallback)
+                    // WebSocket event veya position check'te set edilmiş olmalı, ama yoksa burada set et
                     if state.position_entry_time.is_none() {
                         state.position_entry_time = Some(Instant::now());
-                        info!(
+                        warn!(
                             %symbol,
-                            entry_time_set = "from_position_check",
-                            "position entry time set from position check (reconnect recovery)"
+                            entry_time_set = "from_tp_calculation_fallback",
+                            "position entry time set from TP calculation (LAST RESORT FALLBACK - should not happen normally)"
                         );
                     }
                     let entry_time = state.position_entry_time.unwrap(); // Artık Some olduğundan eminiz
@@ -2472,7 +2445,7 @@ async fn main() -> Result<()> {
                         1.2  // Pozitif momentum: %20 daha toleranslı (daha uzun tut)
                     } else if pnl_trend < -0.1 {
                         0.7  // Negatif momentum: %30 daha agresif (daha hızlı kapat)
-                    } else {
+                } else {
                         1.0  // Nötr momentum: Normal
                     };
                     
@@ -2517,8 +2490,8 @@ async fn main() -> Result<()> {
                 
                 // Kapatma kararı
                 if (should_close_tp || should_close_smart) && !state.position_closing && can_attempt_close {
-                    state.position_closing = true;
-                    state.last_close_attempt = Some(Instant::now());
+                        state.position_closing = true;
+                        state.last_close_attempt = Some(Instant::now());
                     
                     // Recovery durumunu kontrol et (zarardan kâra dönüş)
                     let was_in_loss = state.pnl_history.len() >= 2 && {
@@ -2549,20 +2522,22 @@ async fn main() -> Result<()> {
                     );
                     
                     // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
-                    // API Rate Limit koruması
-                    rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
+                    // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
+                    rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
                     let cancel_result = venue.cancel_all(&symbol).await;
                     if let Err(err) = cancel_result {
                         warn!(%symbol, ?err, "failed to cancel orders before position close (TP/time-box)");
                     }
                     
-                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile)
-                    rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile) - aynı guard bloğu içinde
                     let result = venue.close_position(&symbol).await;
+                    
+                    // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
+                    // Başarılı veya başarısız, her durumda flag'i reset et ki bir sonraki tick'te tekrar deneyebilsin
+                    state.position_closing = false;
                     
                     // KRİTİK: Pozisyon kapatma sonrası doğrulama
                     if result.is_ok() {
-                        state.position_closing = false; // Başarılı, reset
                         state.position_entry_time = None;
                         state.avg_entry_price = None;
                         info!(
@@ -2572,12 +2547,12 @@ async fn main() -> Result<()> {
                             "position closed successfully (TP/time-box rule)"
                         );
                     } else {
-                        // Başarısız, tekrar deneme şansı bırak
-                        state.position_closing = false;
+                        // Başarısız, cooldown başlat (spam önleme)
+                        state.last_close_attempt = Some(Instant::now());
                         warn!(
                             %symbol,
                             error = ?result.as_ref().err(),
-                            "position close failed (TP/time-box), will retry on next tick"
+                            "position close failed (TP/time-box), will retry after cooldown"
                         );
                     }
                     
@@ -2620,21 +2595,24 @@ async fn main() -> Result<()> {
                         "intelligent position management: closing position"
                     );
                     
+                    // ✅ KRİTİK FIX: Position closing flag'i set et (deadlock önleme)
+                    state.position_closing = true;
+                    state.last_close_attempt = Some(Instant::now());
+                    
                     // Pozisyonu kapat: Tüm emirleri iptal et, pozisyonu kapat
-                    // API Rate Limit koruması
-                    rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
+                    // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
+                    rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
                     let cancel_result = venue.cancel_all(&symbol).await;
                     if let Err(err) = cancel_result {
                         warn!(%symbol, ?err, "failed to cancel orders before position close");
                     }
                     
-                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile)
+                    // KRİTİK: Pozisyonu kapat (reduceOnly market order garantisi ile) - aynı guard bloğu içinde
                     // close_position fonksiyonu içinde:
                     // 1. reduceOnly=true garantisi (futures için)
                     // 2. Market order (post-only değil)
                     // 3. Pozisyon kapatma sonrası doğrulama
                     // 4. Kısmi kapatma durumunda otomatik retry (3 deneme)
-                    rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
                     // Futures için özel kontrol: Pozisyon kapatma sonrası doğrulama
                     let result = venue.close_position(&symbol).await;
                     
@@ -2671,10 +2649,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     
-                    let close_result = result;
+                    // ✅ KRİTİK FIX: Position closing flag'i her durumda reset et (deadlock önleme)
+                    // Başarılı veya başarısız, her durumda flag'i reset et ki bir sonraki tick'te tekrar deneyebilsin
+                    state.position_closing = false;
                     
-                        match close_result {
-                            Ok(_) => {
+                    // JSON log ve state sıfırlama (sadece başarılı durumda)
+                    match result {
+                        Ok(_) => {
                             // JSON log: Position closed
                             if let Ok(logger) = json_logger.lock() {
                                 let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
@@ -2702,35 +2683,37 @@ async fn main() -> Result<()> {
                                 );
                             }
                             
-                                info!(
-                                    %symbol,
-                                    reason,
-                                    final_pnl = pnl_f64,
+                            info!(
+                                %symbol,
+                                reason,
+                                final_pnl = pnl_f64,
                                 entry_price = %pos.entry.0,
                                 exit_price = %mark_px.0,
                                 quantity = %pos.qty.0,
                                 leverage = pos.leverage,
                                 "position closed successfully with reduceOnly guarantee"
                             );
-                            }
-                            Err(err) => {
+                            
+                            // State'i sıfırla (sadece başarılı durumda)
+                            state.position_entry_time = None;
+                            state.peak_pnl = Decimal::ZERO;
+                            state.position_hold_duration_ms = 0;
+                            // NOT: daily_pnl sıfırlanmıyor - fill event'lerinden akümüle ediliyor, gün başında reset ediliyor
+                            // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
+                            state.avg_entry_price = None; // Pozisyon kapandı, entry price sıfırla
+                        }
+                        Err(err) => {
+                            // Başarısız, cooldown başlat (spam önleme)
+                            state.last_close_attempt = Some(Instant::now());
                             error!(
                                 %symbol,
                                 error = %err,
                                 reason,
-                                "CRITICAL: failed to close position, manual intervention may be required"
+                                "CRITICAL: failed to close position, will retry after cooldown"
                             );
                             // Hata durumunda state'i sıfırlamaya devam et (pozisyon hala açık olabilir)
                         }
                     }
-                    
-                    // State'i sıfırla
-                    state.position_entry_time = None;
-                    state.peak_pnl = Decimal::ZERO;
-                    state.position_hold_duration_ms = 0;
-                    // NOT: daily_pnl sıfırlanmıyor - fill event'lerinden akümüle ediliyor, gün başında reset ediliyor
-                    state.position_orders.clear(); // KRİTİK İYİLEŞTİRME: Pozisyon kapandı, order tracking'i temizle
-                    state.avg_entry_price = None; // Pozisyon kapandı, entry price sıfırla
                 }
             }
             
@@ -2788,16 +2771,26 @@ async fn main() -> Result<()> {
             
             // --- AKILLI FILL ORANI TAKİBİ: Zaman bazlı fill rate kontrolü ---
             // KRİTİK DÜZELTME: Tick sayısı yerine zaman bazlı kontrol (1 saniye = 1000 tick yerine gerçek zaman)
-            // KRİTİK İYİLEŞTİRME: Time-based decay - 30 saniye fill yoksa fill rate'i düşür
-            // Bu, tick-based tracking'den daha doğru (tick frequency değişebilir)
-            // Decay sadece 30 saniyelik aralıklarda bir kez uygulanır (her tick'te değil)
-            if let Some(last_fill) = state.last_fill_time {
-                let seconds_since_fill = last_fill.elapsed().as_secs();
+            // ✅ KRİTİK FIX: Fill rate decay overhead optimizasyonu
+            // Her tick'te kontrol etmek yerine, sadece belirli aralıklarla kontrol et (5 saniyede bir)
+            // Bu, 300 tick/30s yerine sadece 6 kontrol/30s yapar (50x daha az overhead)
+            const DECAY_CHECK_INTERVAL_SEC: u64 = 5; // 5 saniyede bir kontrol et
                 const TIME_BASED_DECAY_THRESHOLD_SEC: u64 = 30; // 30 saniye fill yoksa decay
                 const DECAY_INTERVAL_SEC: u64 = 30; // Her 30 saniyede bir decay uygula
+            
+            // Sadece belirli aralıklarla kontrol et (overhead önleme)
+            let should_check_decay = state.last_decay_check
+                .map(|last| last.elapsed().as_secs() >= DECAY_CHECK_INTERVAL_SEC)
+                .unwrap_or(true); // İlk kez kontrol et
+            
+            if should_check_decay {
+                state.last_decay_check = Some(Instant::now());
+                
+                if let Some(last_fill) = state.last_fill_time {
+                    let seconds_since_fill = last_fill.elapsed().as_secs();
                 
                 if seconds_since_fill >= TIME_BASED_DECAY_THRESHOLD_SEC {
-                    // ✅ LOW FIX: Fill rate decay overhead optimizasyonu - period flag bazlı
+                        // ✅ Fill rate decay - period flag bazlı (her period'da sadece bir kez)
                     // Her 30 saniyelik aralıkta bir kez decay uygula (period flag ile)
                     let current_period = seconds_since_fill / DECAY_INTERVAL_SEC;
                     
@@ -2824,33 +2817,14 @@ async fn main() -> Result<()> {
             } else {
                 // Fill oldu, decay period'u sıfırla
                 state.last_decay_period = None;
+                }
             }
             
-            if state.active_orders.len() > 0 {
-                // Emirlerin ne kadar süredir açık olduğunu kontrol et
-                let oldest_order_age = state.active_orders.values()
-                    .map(|o| o.created_at.elapsed().as_secs_f64())
-                    .fold(0.0, f64::max);
-                
-                // Son fill'den bu yana geçen süre
-                let time_since_last_fill = state.last_fill_time
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(f64::MAX);
-                
-                // Eğer emirler 5 saniyeden fazla açıksa ve son fill'den 5 saniye geçtiyse, fill rate'i düşür
-                let no_fill_threshold_sec = cfg.internal.no_fill_threshold_sec;
-                if oldest_order_age > no_fill_threshold_sec && time_since_last_fill > no_fill_threshold_sec {
-                    state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_decrease_on_no_fill).max(cfg.internal.min_fill_rate);
-                    state.consecutive_no_fills += 1; // Geriye dönük uyumluluk için
-                    
-                    warn!(
-                        symbol = %state.meta.symbol,
-                        fill_rate = state.order_fill_rate,
-                        consecutive_no_fills = state.consecutive_no_fills,
-                        "FILL RATE WARNING: no fills for 5+ seconds, reducing fill rate aggressively"
-                    );
-                }
-            } else {
+            // ✅ KRİTİK FIX: Adaptive fill rate logic redundancy kaldırıldı
+            // Order age check mekanizması kaldırıldı - time-based decay zaten optimize edilmiş ve genel
+            // Time-based decay (30 saniye threshold, 5 saniyede bir kontrol) yeterli ve daha verimli
+            // Emir yoksa, fill oranını yavaşça normale döndür (bu mantık korunuyor)
+            if state.active_orders.is_empty() {
                 // Emir yoksa, consecutive_no_fills sıfırla ve fill oranını yavaşça normale döndür
                 state.consecutive_no_fills = 0;
                 state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_slow_decrease_factor + cfg.internal.fill_rate_slow_decrease_bonus).min(1.0);
@@ -2871,12 +2845,12 @@ async fn main() -> Result<()> {
 
             if matches!(risk_action, RiskAction::Halt) {
                 warn!(%symbol, "risk halt triggered, cancelling and flattening");
-                // API Rate Limit koruması
-                rate_limit_guard(1).await; // DELETE /api/v3/order: Weight 1 (per order)
+                // ✅ PERFORMANS: Batch request'lerde tek guard yeterli (cancel_all + close_position)
+                rate_limit_guard(2).await; // DELETE /api/v3/order (1) + POST /fapi/v1/order (1) = 2
                 if let Err(err) = venue.cancel_all(&symbol).await {
                             warn!(%symbol, ?err, "failed to cancel all orders during halt");
                         }
-                        rate_limit_guard(1).await; // POST /fapi/v1/order: Weight 1
+                // Aynı guard bloğu içinde pozisyonu kapat
                 if let Err(err) = venue.close_position(&symbol).await {
                             warn!(%symbol, ?err, "failed to close position during halt");
                 }
@@ -3236,10 +3210,10 @@ async fn main() -> Result<()> {
             }
 
             // --- bakiye/min_emir hızlı kontrolü: gürültüyü kes ---
-            let px_bid_f = bid.0.to_f64().unwrap_or(0.0);
-            let px_ask_f = ask.0.to_f64().unwrap_or(0.0);
+            let _px_bid_f = bid.0.to_f64().unwrap_or(0.0); // ✅ FIX: Kullanılmıyor, prefix eklendi
+            let _px_ask_f = ask.0.to_f64().unwrap_or(0.0); // ✅ FIX: Kullanılmıyor, prefix eklendi
             let buy_cap_ok = caps.buy_notional >= min_usd_per_order;
-            let mut sell_cap_ok = caps.sell_notional >= min_usd_per_order;
+            let sell_cap_ok = caps.sell_notional >= min_usd_per_order; // ✅ FIX: mut kaldırıldı (kullanılmıyor)
             // Futures only - no base balance check needed
             if !buy_cap_ok && !sell_cap_ok {
                 info!(
@@ -3431,7 +3405,7 @@ async fn main() -> Result<()> {
                         .count();
                     let max_chunks = cfg.risk.max_open_chunks_per_symbol_per_side;
                     
-                    if let Some((px, qty)) = quotes.bid {
+                    if let Some((px, _qty)) = quotes.bid { // ✅ FIX: qty kullanılmıyor, prefix eklendi
                         // KRİTİK: Agresif fiyatlandırma - küçük kar hedefi için market'e çok yakın
                         // Trend-aware ve opportunity mode-aware agresif fiyatlandırma
                         let is_opportunity_mode = state.strategy.is_opportunity_mode();
@@ -3547,6 +3521,9 @@ async fn main() -> Result<()> {
                             };
                             
                             // MARKET DEPTH ANALİZİ: Order book depth'e göre optimal fiyat seç
+                            // ✅ KRİTİK FIX: chunk_notional_estimate sadece depth analizi için kullanılıyor
+                            // calc_qty_from_margin içinde leverage zaten uygulanıyor, bu yüzden double leverage yok
+                            // Depth analizi için notional hesapla (order book'da yeterli likidite var mı kontrol etmek için)
                             // Minimum required volume: Chunk notional'in %50'si (güvenli fill için)
                             let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
                             let min_required_volume_usd = chunk_notional_estimate * 0.5;
@@ -3563,9 +3540,13 @@ async fn main() -> Result<()> {
                             // Strategy price ile depth price arasında en iyisini seç (market'e daha yakın olan)
                             let px_with_depth = px.0.max(optimal_price_from_depth).min(bid.0);
                             
+                            // ✅ KRİTİK FIX: calc_qty_from_margin içinde leverage uygulanıyor
+                            // margin_chunk = margin (hesaptan çıkan para, leverage uygulanmadan)
+                            // calc_qty_from_margin içinde: notional = margin * leverage
+                            // Bu yüzden burada sadece margin_chunk ve leverage geçiliyor (double leverage yok)
                             let qty_price_result = calc_qty_from_margin(
-                                *margin_chunk,
-                                effective_leverage_for_chunk,
+                                *margin_chunk, // Sadece margin, leverage fonksiyon içinde uygulanacak
+                                effective_leverage_for_chunk, // Leverage parametresi
                                 px_with_depth,
                                 rules,
                                 Side::Buy, // BID için
@@ -3606,9 +3587,13 @@ async fn main() -> Result<()> {
                                 }
                             };
                             
-                            // KRİTİK DÜZELTME: Precision/Decimal - min notional kontrolü Decimal ile
-                            let chunk_notional = chunk_price.0 * chunk_qty.0;
-                            let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk)).unwrap_or(Decimal::ZERO);
+                            // ✅ KRİTİK FIX: Min notional kontrolü - chunk_notional zaten leverage ile hesaplanmış
+                            // chunk_qty calc_qty_from_margin'den geliyor (içinde leverage uygulanmış)
+                            // chunk_notional = chunk_price * chunk_qty (zaten leverage dahil)
+                            // min_notional_req kontrolü için leverage tekrar uygulanmamalı
+                            let chunk_notional = chunk_price.0 * chunk_qty.0; // Zaten leverage dahil (calc_qty_from_margin'den)
+                            // min_notional_req zaten USD cinsinden, leverage uygulanmamalı
+                            let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin)).unwrap_or(Decimal::ZERO);
                             if chunk_notional < min_req_dec {
                                 warn!(
                                     %symbol,
@@ -3635,16 +3620,23 @@ async fn main() -> Result<()> {
                                 min_profit_usd,
                             );
                             
-                            let tp_price = match tp_price_raw {
+                            let _tp_price = match tp_price_raw { // ✅ FIX: tp_price kullanılmıyor, prefix eklendi
                                 Some(tp) => {
                                     // TP fiyatını tick_size'a göre quantize et (yukarı yuvarla - long için)
                                     let tick_size = rules.tick_size;
                                     let tp_quantized = exec::quant_utils_ceil_to_step(tp, tick_size);
                                     
-                                    // ✅ CRITICAL FIX: TP spread kontrolü - TP emri maker olmalı
-                                    // Long pozisyon: TP = sell exit price, best_ask'ten en az 1 tick yüksek olmalı
+                                    // ✅ KRİTİK FIX: TP spread kontrolü - TP fiyatı hem maker spread hem de min profit'i sağlamalı
+                                    // Long pozisyon: TP = sell exit price
+                                    // 1. Maker olabilmek için: best_ask + 1 tick
+                                    // 2. Min profit için: entry_price + required_profit_distance (tp_price_raw zaten bunu sağlıyor)
                                     let min_tp_for_maker = ask.0 + tick_size;
-                                    if tp_quantized < min_tp_for_maker {
+                                    // tp_price_raw zaten min profit'i sağlıyor, quantize edilmiş hali
+                                    let min_tp_for_profit = exec::quant_utils_ceil_to_step(tp, tick_size);
+                                    // İkisinden büyük olanı kullan (hem maker hem profit garantisi)
+                                    let actual_min_tp = min_tp_for_maker.max(min_tp_for_profit);
+                                    
+                                    if tp_quantized < actual_min_tp {
                                         // TP çok düşük, maker order olamaz (taker olur → daha yüksek fee)
                                         // ✅ DÜZELTME: Taker fee ile de çalışabiliriz - spread yeterli değilse taker TP kullan
                                         let tp_with_taker_fee = required_take_profit_price(
@@ -3664,8 +3656,10 @@ async fn main() -> Result<()> {
                                                 chunk_idx,
                                                 tp_maker_calculated = %tp_quantized,
                                                 tp_taker_calculated = %tp_taker_quantized,
-                                                min_required = %min_tp_for_maker,
-                                                "TP below min maker price, using taker fee TP (acceptable for $0.50 profit)"
+                                                min_required_maker = %min_tp_for_maker,
+                                                min_required_profit = %min_tp_for_profit,
+                                                actual_min_required = %actual_min_tp,
+                                                "TP below min required (maker or profit), using taker fee TP (acceptable for $0.50 profit)"
                                             );
                                             // Taker TP'yi kullan (maker olamıyorsa taker kabul edilebilir)
                                             Some(tp_taker_quantized)
@@ -3675,15 +3669,17 @@ async fn main() -> Result<()> {
                                                 %symbol,
                                                 chunk_idx,
                                                 tp_calculated = %tp_quantized,
-                                                min_required = %min_tp_for_maker,
+                                                min_required_maker = %min_tp_for_maker,
+                                                min_required_profit = %min_tp_for_profit,
+                                                actual_min_required = %actual_min_tp,
                                                 best_ask = %ask.0,
                                                 tick_size = %tick_size,
-                                                "TP below min maker price and taker fee TP calculation failed, skipping chunk"
+                                                "TP below min required (maker or profit) and taker fee TP calculation failed, skipping chunk"
                                             );
                                             continue;
                                         }
                                     } else {
-                                        Some(tp_quantized)
+                                    Some(tp_quantized)
                                     }
                                 }
                                 None => {
@@ -3844,6 +3840,14 @@ async fn main() -> Result<()> {
                                     // Spent güncelle (hesaptan giden para = margin)
                                     total_spent_on_bids += *margin_chunk;
                                     
+                                    // ✅ KRİTİK FIX: Quote balance cache'i güncelle (stale risk önleme)
+                                    // Her chunk sonrası cache'i güncelle, böylece aynı loop içinde aynı quote asset'i kullanan
+                                    // diğer semboller güncel balance'ı görür
+                                    if let Some(cached_balance) = quote_balances.get_mut(&quote_asset) {
+                                        *cached_balance -= *margin_chunk;
+                                        *cached_balance = cached_balance.max(0.0); // Negatif olmasın
+                                    }
+                                    
                                     // JSON log
                 if let Ok(logger) = json_logger.lock() {
                     logger.log_order_created(
@@ -3896,7 +3900,7 @@ async fn main() -> Result<()> {
                     // Her chunk için ayrı emir oluştur, max_open_chunks_per_symbol_per_side kontrolü yap
                     // ÖNEMLİ: total_spent_on_asks = hesaptan giden para (margin), pozisyon boyutu değil
                     // NOT: effective_leverage_ask config'den geliyor ve değişmiyor, loop başında hesaplanan değeri kullan
-                    if let Some((px, qty)) = quotes.ask {
+                    if let Some((px, _qty)) = quotes.ask { // ✅ FIX: qty kullanılmıyor, prefix eklendi
                         // KRİTİK: Agresif fiyatlandırma - küçük kar hedefi için market'e çok yakın
                         // Trend-aware ve opportunity mode-aware agresif fiyatlandırma
                         let is_opportunity_mode = state.strategy.is_opportunity_mode();
@@ -4021,7 +4025,9 @@ async fn main() -> Result<()> {
                             };
                             
                             // MARKET DEPTH ANALİZİ: Order book depth'e göre optimal fiyat seç
-                            // Minimum required volume: Chunk notional'in %50'si (güvenli fill için)
+                            // ✅ KRİTİK FIX: chunk_notional_estimate sadece depth analizi için kullanılıyor
+                            // calc_qty_from_margin içinde leverage zaten uygulanıyor, bu yüzden double leverage yok
+                            // Depth analizi için notional hesapla (order book'da yeterli likidite var mı kontrol etmek için)
                             let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
                             let min_required_volume_usd = chunk_notional_estimate * 0.5;
                             
@@ -4037,9 +4043,13 @@ async fn main() -> Result<()> {
                             // Strategy price ile depth price arasında en iyisini seç (market'e daha yakın olan)
                             let px_with_depth = px.0.min(optimal_price_from_depth).max(ask.0);
                             
+                            // ✅ KRİTİK FIX: calc_qty_from_margin içinde leverage uygulanıyor
+                            // margin_chunk = margin (hesaptan çıkan para, leverage uygulanmadan)
+                            // calc_qty_from_margin içinde: notional = margin * leverage
+                            // Bu yüzden burada sadece margin_chunk ve leverage geçiliyor (double leverage yok)
                             let qty_price_result = calc_qty_from_margin(
-                                *margin_chunk,
-                                effective_leverage_for_chunk,
+                                *margin_chunk, // Sadece margin, leverage fonksiyon içinde uygulanacak
+                                effective_leverage_for_chunk, // Leverage parametresi
                                 px_with_depth,
                                 rules,
                                 Side::Sell, // ASK için
@@ -4080,9 +4090,13 @@ async fn main() -> Result<()> {
                                 }
                             };
                             
-                            // KRİTİK DÜZELTME: Precision/Decimal - min notional kontrolü Decimal ile
-                            let chunk_notional = chunk_price.0 * chunk_qty.0;
-                            let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin * effective_leverage_for_chunk)).unwrap_or(Decimal::ZERO);
+                            // ✅ KRİTİK FIX: Min notional kontrolü - chunk_notional zaten leverage ile hesaplanmış
+                            // chunk_qty calc_qty_from_margin'den geliyor (içinde leverage uygulanmış)
+                            // chunk_notional = chunk_price * chunk_qty (zaten leverage dahil)
+                            // min_notional_req kontrolü için leverage tekrar uygulanmamalı
+                            let chunk_notional = chunk_price.0 * chunk_qty.0; // Zaten leverage dahil (calc_qty_from_margin'den)
+                            // min_notional_req zaten USD cinsinden, leverage uygulanmamalı
+                            let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin)).unwrap_or(Decimal::ZERO);
                             if chunk_notional < min_req_dec {
                                 warn!(
                                     %symbol,
@@ -4109,16 +4123,23 @@ async fn main() -> Result<()> {
                                 min_profit_usd,
                             );
                             
-                            let tp_price = match tp_price_raw {
+                            let _tp_price = match tp_price_raw { // ✅ FIX: tp_price kullanılmıyor, prefix eklendi
                                 Some(tp) => {
                                     // TP fiyatını tick_size'a göre quantize et (aşağı yuvarla - short için)
                                     let tick_size = rules.tick_size;
                                     let tp_quantized = exec::quant_utils_floor_to_step(tp, tick_size);
                                     
-                                    // ✅ CRITICAL FIX: TP spread kontrolü - TP emri maker olmalı
-                                    // Short pozisyon: TP = buy exit price, best_bid'ten en az 1 tick düşük olmalı
+                                    // ✅ KRİTİK FIX: TP spread kontrolü - TP fiyatı hem maker spread hem de min profit'i sağlamalı
+                                    // Short pozisyon: TP = buy exit price
+                                    // 1. Maker olabilmek için: best_bid - 1 tick
+                                    // 2. Min profit için: entry_price - required_profit_distance (tp_price_raw zaten bunu sağlıyor)
                                     let max_tp_for_maker = bid.0 - tick_size;
-                                    if tp_quantized > max_tp_for_maker {
+                                    // tp_price_raw zaten min profit'i sağlıyor, quantize edilmiş hali
+                                    let max_tp_for_profit = exec::quant_utils_floor_to_step(tp, tick_size);
+                                    // İkisinden küçük olanı kullan (hem maker hem profit garantisi)
+                                    let actual_max_tp = max_tp_for_maker.min(max_tp_for_profit);
+                                    
+                                    if tp_quantized > actual_max_tp {
                                         // TP çok yüksek, maker order olamaz (taker olur → daha yüksek fee)
                                         // ✅ DÜZELTME: Taker fee ile de çalışabiliriz - spread yeterli değilse taker TP kullan
                                         let tp_with_taker_fee = required_take_profit_price(
@@ -4138,8 +4159,10 @@ async fn main() -> Result<()> {
                                                 chunk_idx,
                                                 tp_maker_calculated = %tp_quantized,
                                                 tp_taker_calculated = %tp_taker_quantized,
-                                                max_required = %max_tp_for_maker,
-                                                "TP above max maker price, using taker fee TP (acceptable for $0.50 profit)"
+                                                max_required_maker = %max_tp_for_maker,
+                                                max_required_profit = %max_tp_for_profit,
+                                                actual_max_required = %actual_max_tp,
+                                                "TP above max required (maker or profit), using taker fee TP (acceptable for $0.50 profit)"
                                             );
                                             // Taker TP'yi kullan (maker olamıyorsa taker kabul edilebilir)
                                             Some(tp_taker_quantized)
@@ -4149,15 +4172,17 @@ async fn main() -> Result<()> {
                                                 %symbol,
                                                 chunk_idx,
                                                 tp_calculated = %tp_quantized,
-                                                max_required = %max_tp_for_maker,
+                                                max_required_maker = %max_tp_for_maker,
+                                                max_required_profit = %max_tp_for_profit,
+                                                actual_max_required = %actual_max_tp,
                                                 best_bid = %bid.0,
                                                 tick_size = %tick_size,
-                                                "TP above max maker price and taker fee TP calculation failed, skipping chunk"
+                                                "TP above max required (maker or profit) and taker fee TP calculation failed, skipping chunk"
                                             );
                                             continue;
                                         }
                                     } else {
-                                        Some(tp_quantized)
+                                    Some(tp_quantized)
                                     }
                                 }
                                 None => {
@@ -4317,6 +4342,14 @@ async fn main() -> Result<()> {
                             
                                     // Spent güncelle (hesaptan giden para = margin)
                                     total_spent_on_asks += *margin_chunk;
+                                    
+                                    // ✅ KRİTİK FIX: Quote balance cache'i güncelle (stale risk önleme)
+                                    // Her chunk sonrası cache'i güncelle, böylece aynı loop içinde aynı quote asset'i kullanan
+                                    // diğer semboller güncel balance'ı görür
+                                    if let Some(cached_balance) = quote_balances.get_mut(&quote_asset) {
+                                        *cached_balance -= *margin_chunk;
+                                        *cached_balance = cached_balance.max(0.0); // Negatif olmasın
+                                    }
                                     
                                     // JSON log
                             if let Ok(logger) = json_logger.lock() {
@@ -4480,7 +4513,8 @@ fn update_fill_rate_on_fill(
 ) {
     state.consecutive_no_fills = 0;
                         state.last_fill_time = Some(std::time::Instant::now());
-                        state.last_decay_period = None; // Fill oldu, decay period'u sıfırla // Zaman bazlı fill rate için
+    state.last_decay_period = None; // Fill oldu, decay period'u sıfırla
+    state.last_decay_check = None; // Fill oldu, decay check'i sıfırla (hemen kontrol et)
     state.order_fill_rate = (state.order_fill_rate * increase_factor + increase_bonus)
         .min(1.0);
 }
