@@ -58,14 +58,10 @@ pub mod binance {
     pub use crate::binance_exec::*;
 }
 
-// Re-export quantization helpers from utils
+// Re-export quantization helpers from utils (only commonly used ones)
 pub use crate::utils::{
     quant_utils_floor_to_step,
     quant_utils_ceil_to_step,
-    quant_utils_snap_price,
-    quant_utils_qty_from_quote,
-    quant_utils_bps_diff,
-    quantize_decimal,
 };
 
 /// Decimal adımından hassasiyet (ondalık hane sayısı) çıkarır

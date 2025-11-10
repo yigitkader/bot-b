@@ -4,7 +4,7 @@
 use anyhow::Result;
 use crate::core::types::*;
 use rust_decimal::Decimal;
-use crate::strategy::{Context, Strategy};
+use crate::strategy::Context;
 use tracing::info;
 use crate::config::AppCfg;
 use crate::types::SymbolState;
