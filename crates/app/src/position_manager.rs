@@ -323,6 +323,7 @@ pub fn should_close_position_smart(
 }
 
 /// Close position with retry mechanism
+/// KRİTİK: Race condition önleme - WebSocket event sync kontrolü
 pub async fn close_position(
     venue: &BinanceFutures,
     symbol: &str,
@@ -330,6 +331,26 @@ pub async fn close_position(
 ) -> Result<()> {
     state.position_closing = true;
     state.last_close_attempt = Some(Instant::now());
+
+    // KRİTİK RACE CONDITION FIX: WebSocket event sonrası inventory sync kontrolü
+    // Eğer son 2 saniye içinde inventory güncellemesi varsa ve inventory sıfırsa,
+    // pozisyon zaten kapalı kabul edilmeli (WebSocket event handler tarafından kapatılmış olabilir)
+    if let Some(last_update) = state.last_inventory_update {
+        let time_since_update = last_update.elapsed().as_millis();
+        if time_since_update < 2000 {
+            // Son 2 saniye içinde güncelleme var
+            if state.inv.0.is_zero() {
+                // Inventory sıfır = pozisyon kapalı
+                info!(
+                    symbol = %symbol,
+                    time_since_update_ms = time_since_update,
+                    "position already closed (WebSocket sync detected)"
+                );
+                state.position_closing = false;
+                return Ok(());
+            }
+        }
+    }
 
     // KRİTİK: Önce tüm açık emirleri iptal et (pozisyon kapatmadan önce)
     rate_limit_guard(1).await;
@@ -342,6 +363,23 @@ pub async fn close_position(
     let mut last_error = None;
     
     for attempt in 1..=max_retries {
+        // KRİTİK RACE CONDITION FIX: Her attempt öncesi WebSocket sync kontrolü
+        // Retry sırasında WebSocket event handler pozisyonu kapatmış olabilir
+        if let Some(last_update) = state.last_inventory_update {
+            let time_since_update = last_update.elapsed().as_millis();
+            if time_since_update < 2000 && state.inv.0.is_zero() {
+                // Son 2 saniye içinde güncelleme var ve inventory sıfır
+                info!(
+                    symbol = %symbol,
+                    attempt,
+                    time_since_update_ms = time_since_update,
+                    "position closed during retry (WebSocket sync detected)"
+                );
+                state.position_closing = false;
+                return Ok(());
+            }
+        }
+        
         rate_limit_guard(1).await;
         match venue.close_position(symbol).await {
             Ok(_) => {

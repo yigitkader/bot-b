@@ -37,6 +37,7 @@ pub struct Context {
     pub tick_size: Option<Decimal>, // Per-symbol tick_size (crossing guard için)
 }
 
+/// Base Strategy trait - Tüm stratejiler için ortak metodlar
 pub trait Strategy: Send + Sync {
     fn on_tick(&mut self, ctx: &Context) -> Quotes;
     /// Fırsat modu aktif mi? (manipulation_opportunity var mı?)
@@ -71,6 +72,40 @@ pub trait Strategy: Send + Sync {
     /// OFI (Order Flow Imbalance) sinyalini döndür
     fn get_ofi_signal(&self) -> f64 {
         0.0 // Default: OFI bilgisi yok
+    }
+    
+    /// Strateji kendi long/short kararını veriyor mu? (GERİYE DÖNÜK UYUMLULUK)
+    /// true: Strateji zaten bid/ask kararını veriyor, main.rs'de direction filter uygulanmamalı
+    /// false: main.rs'de current_direction filtresi uygulanmalı (DynMm gibi)
+    /// 
+    /// NOT: Bu metod geriye dönük uyumluluk için korunuyor.
+    /// Yeni stratejiler DirectionalStrategy veya MarketMakingStrategy trait'lerini kullanmalı.
+    fn applies_own_direction_filter(&self) -> bool {
+        false // Default: main.rs'de filter uygulanır
+    }
+}
+
+/// Market Making Strategy: Her iki tarafta quote üretir (bid ve ask)
+/// Örnek: DynMm - spread'den kazanç, her iki tarafta likidite sağlar
+/// 
+/// Market making stratejileri her iki tarafta quote üretir.
+/// Bu metod zaten Strategy::on_tick() içinde implement edilmiş olmalı.
+/// Bu trait sadece tip güvenliği ve açıklık için.
+pub trait MarketMakingStrategy: Strategy {
+    // Marker trait: Her iki tarafta quote üretir (bid ve ask)
+}
+
+/// Directional Strategy: Tek taraf için quote üretir (long veya short)
+/// Örnek: QMelStrategy - direction prediction yapar, tek yönde pozisyon alır
+pub trait DirectionalStrategy: Strategy {
+    /// Direction prediction: Hangi yönde trade yapılmalı?
+    /// Returns: Some(Side::Buy) = Long, Some(Side::Sell) = Short, None = No trade
+    fn predict_direction(&self, ctx: &Context) -> Option<Side>;
+    
+    /// Directional stratejiler kendi long/short kararını verir
+    /// main.rs'de direction filter uygulanmamalı
+    fn applies_own_direction_filter(&self) -> bool {
+        true // Default: kendi direction kararını veriyor
     }
 }
 
@@ -551,8 +586,9 @@ impl DynMm {
         if self.price_history.len() < 10 {
             return 0.0; // Yeterli veri yok
         }
-        // KRİTİK DÜZELTME: price_history.iter().rev() ile ters çevrilmiş
-        // recent[0] = en yeni fiyat, recent[9] = en eski fiyat
+        // KRİTİK DÜZELTME: Timestamp'e göre sıralı kullan
+        // price_history timestamp'e göre sıralı olmalı (en eski → en yeni)
+        // Son 10 elemanı al (en yeni 10 fiyat)
         let recent: Vec<Decimal> = self
             .price_history
             .iter()
@@ -560,6 +596,7 @@ impl DynMm {
             .take(10)
             .map(|(_, p)| *p)
             .collect();
+        // recent[0] = en yeni fiyat, recent[9] = en eski fiyat (reverse order'da)
         // take(5) = en yeni 5 fiyat (recent[0..5])
         // skip(5) = eski 5 fiyat (recent[5..10])
         let newer_avg: Decimal = recent.iter().take(5).sum::<Decimal>() / Decimal::from(5);
@@ -729,15 +766,31 @@ impl Strategy for DynMm {
                     let recovery_check_result = {
                     let window_start_ms = now_ms.saturating_sub(self.flash_crash_recovery_window_ms);
                     
-                    // Zaman penceresi içindeki fiyatları filtrele
-                    let recent_prices: Vec<(u64, Decimal)> = self
+                    // KRİTİK DÜZELTME: Timestamp'e göre sıralı kullan
+                    // price_history timestamp'e göre sıralı olmalı (en eski → en yeni)
+                    // Zaman penceresi içindeki fiyatları filtrele ve timestamp'e göre sırala
+                    let mut recent_prices: Vec<(u64, Decimal)> = self
                         .price_history
                         .iter()
-                        .rev()
                         .filter(|(ts, _)| *ts >= window_start_ms)
-                        .take(self.flash_crash_recovery_min_points * 2) // Yeterli veri için 2x al
                         .map(|(ts, p)| (*ts, *p))
                         .collect();
+                    
+                    // KRİTİK: Timestamp'e göre sırala (en eski → en yeni)
+                    // Bu, iter().rev() sonrası index karışıklığını önler
+                    recent_prices.sort_by_key(|(ts, _)| *ts);
+                    
+                    // Son N elemanı al (en yeni fiyatlar)
+                    if recent_prices.len() > self.flash_crash_recovery_min_points * 2 {
+                        recent_prices = recent_prices
+                            .iter()
+                            .rev()
+                            .take(self.flash_crash_recovery_min_points * 2)
+                            .copied()
+                            .collect();
+                        // Tekrar sırala (en eski → en yeni)
+                        recent_prices.sort_by_key(|(ts, _)| *ts);
+                    }
                     
                     if recent_prices.len() >= self.flash_crash_recovery_min_points {
                         if price_change_bps < -self.price_jump_threshold_bps {
@@ -1134,6 +1187,8 @@ impl Strategy for DynMm {
                 let dummy_timestamp = now_ms.saturating_sub((warm_up_count as u64 - i as u64) * 100); // 100ms aralıklarla
                 self.price_history.push((dummy_timestamp, c.mark_price.0));
             }
+            // KRİTİK DÜZELTME: Timestamp'e göre sırala (warm-up sonrası)
+            self.price_history.sort_by_key(|(ts, _)| *ts);
             // Warm-up başlat: İlk 20 tick'te recovery check'i skip et
             self.warm_up_ticks_remaining = warm_up_count;
         }
@@ -1150,6 +1205,12 @@ impl Strategy for DynMm {
         if self.price_history.len() > self.manipulation_price_history_max_len {
             self.price_history.remove(0);
         }
+        
+        // KRİTİK DÜZELTME: Timestamp'e göre sıralı tut (en eski → en yeni)
+        // Bu, detect_trend() ve flash_crash_recovery'de index karışıklığını önler
+        // NOT: push() ve remove(0) kullanıldığı için genelde sıralı kalır,
+        // ama warm-up sırasında dummy timestamp'ler eklenebilir, bu yüzden sıralama güvenli
+        self.price_history.sort_by_key(|(ts, _)| *ts);
 
         // --- VOLATİLİTE VE OFI GÜNCELLEME ---
         // EWMA volatilite güncelle (microprice kullan)
@@ -1674,6 +1735,11 @@ impl Strategy for DynMm {
     fn get_ofi_signal(&self) -> f64 {
         self.ofi_signal
     }
+}
+
+impl MarketMakingStrategy for DynMm {
+    // Market making stratejisi: Her iki tarafta quote üretir (bid ve ask)
+    // on_tick() zaten hem bid hem ask döndürüyor
 }
 
 #[cfg(test)]

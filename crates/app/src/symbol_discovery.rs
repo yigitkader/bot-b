@@ -11,7 +11,7 @@ use crate::types::SymbolState;
 use crate::strategy::{DynMm, DynMmCfg, Strategy};
 use crate::qmel::QMelStrategy;
 use crate::core::types::Qty;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -312,6 +312,8 @@ pub fn initialize_symbol_states(
             regime: None,
             position_closing: false,
             last_close_attempt: None,
+            processed_events: HashSet::new(),
+            last_event_cleanup: None,
         });
     }
     

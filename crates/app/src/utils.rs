@@ -239,11 +239,26 @@ pub fn split_margin_into_chunks(
 /// 2. qty = notional / price
 /// 3. Quantize qty and price according to exchange rules
 /// 
-/// # Consistency
-/// Bu fonksiyon cap_manager'daki hesaplamalarla uyumludur:
-/// - cap_manager: per_order_notional = per_order_cap_margin * effective_leverage
-/// - calc_qty_from_margin: notional = margin_chunk * leverage
-/// Her ikisi de aynı formülü kullanır: margin * leverage = notional
+/// # KRİTİK DÜZELTME: Leverage uygulaması - ÇİFT SAYMA ÖNLEME
+/// 
+/// PROBLEM: Eğer hem burada hem cap_manager'da leverage uygulanırsa leverage^2 etkisi oluşur!
+/// 
+/// ÇÖZÜM: Leverage SADECE BİR YER'de uygulanmalı
+/// - cap_manager: per_order_notional = per_order_cap_margin * effective_leverage (NOTIONAL LIMIT)
+/// - calc_qty_from_margin: notional = margin_chunk * leverage (GERÇEK ORDER NOTIONAL)
+/// 
+/// Bu iki değer FARKLI amaçlar için:
+/// - cap_manager: Limit kontrolü (max notional per order)
+/// - calc_qty_from_margin: Gerçek order quantity hesaplama
+/// 
+/// ✅ DOĞRU KULLANIM:
+/// - margin_chunk: leverage uygulanmamış margin (USD)
+/// - leverage: leverage değeri
+/// - Bu fonksiyon: notional = margin * leverage hesaplar
+/// - cap_manager: per_order_notional = margin_limit * leverage hesaplar (limit için)
+/// 
+/// ❌ YANLIŞ KULLANIM:
+/// - margin_chunk zaten leverage uygulanmış ise → leverage^2 etkisi!
 pub fn calc_qty_from_margin(
     margin_chunk: f64,
     leverage: f64,
@@ -253,8 +268,10 @@ pub fn calc_qty_from_margin(
 ) -> Option<(String, String)> {
     // ✅ KRİTİK: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
     // Calculate notional = margin * leverage (Decimal olarak)
-    // margin: hesaptan çıkan para (USD)
+    // margin_chunk: hesaptan çıkan para (USD) - leverage uygulanmamış olmalı
     // notional: pozisyon büyüklüğü (USD) = margin * leverage
+    // KRİTİK: margin_chunk zaten leverage uygulanmamış olmalı (split_margin_into_chunks'dan geliyor)
+    // Eğer margin_chunk zaten leverage uygulanmış ise, burada tekrar leverage uygulanmamalı!
     let margin_dec = Decimal::try_from(margin_chunk).unwrap_or(Decimal::ZERO);
     let leverage_dec = Decimal::try_from(leverage).unwrap_or(Decimal::ZERO);
     let notional = margin_dec * leverage_dec;

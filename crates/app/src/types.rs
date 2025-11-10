@@ -4,7 +4,7 @@
 use crate::core::types::*;
 use crate::exec::binance::SymbolMeta;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use crate::strategy::Strategy;
 
@@ -91,6 +91,10 @@ pub struct SymbolState {
     pub largest_loss: Decimal, // En büyük zarar
     pub total_fees_paid: Decimal, // Toplam ödenen fees
     pub last_pnl_summary_time: Option<Instant>, // Son PnL özeti zamanı
+    
+    // WebSocket event deduplication
+    pub processed_events: HashSet<String>, // İşlenmiş event ID'leri (duplicate önleme için)
+    pub last_event_cleanup: Option<Instant>, // Son event cleanup zamanı (memory leak önleme için)
 }
 
 // ============================================================================

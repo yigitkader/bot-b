@@ -533,10 +533,31 @@ async fn main() -> Result<()> {
                         let state = &mut states[*idx];
                         
                         // KRİTİK: Event-based state management - sadece event'lerle state güncelle
-                        // KRİTİK İYİLEŞTİRME: Duplicate detection - cumulative_filled_qty + order_status kontrolü
-                        // Aynı cumulative_filled_qty birden fazla gelebilir (network retry), bu yüzden
-                        // sadece cumulative qty değil, order state'i de kontrol et
-                        let is_duplicate = if let Some(existing_order) = state.active_orders.get(&order_id) {
+                        // KRİTİK İYİLEŞTİRME: Event ID bazlı duplicate detection
+                        // Network retry'de aynı event 2 kez gelebilir, bu yüzden event ID bazlı dedupe yapıyoruz
+                        // Event ID format: "{order_id}-{cumulative_filled_qty}-{timestamp}"
+                        // Timestamp event'in geldiği zaman (SystemTime::now()) kullanılır
+                        let event_timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let event_id = format!("{}-{}-{}", order_id, cumulative_filled_qty.0, event_timestamp);
+                        
+                        // Event ID bazlı duplicate kontrolü
+                        if state.processed_events.contains(&event_id) {
+                            warn!(
+                                %symbol,
+                                order_id = %order_id,
+                                cumulative_filled_qty = %cumulative_filled_qty.0,
+                                event_id = %event_id,
+                                "duplicate fill event ignored (event ID already processed)"
+                            );
+                            continue; // Duplicate event'i ignore et
+                        }
+                        
+                        // Eski duplicate detection (geriye dönük uyumluluk için)
+                        // Event ID kontrolü yeterli ama ekstra güvenlik için
+                        let is_duplicate_legacy = if let Some(existing_order) = state.active_orders.get(&order_id) {
                             // Eğer cumulative qty aynı VE status değişmemişse duplicate
                             // (Status değişmişse yeni bir event olabilir, örneğin PARTIALLY_FILLED -> FILLED)
                             existing_order.filled_qty.0 >= cumulative_filled_qty.0
@@ -552,15 +573,32 @@ async fn main() -> Result<()> {
                             false // Inventory'yi güncelle ama order state'i yok
                         };
                         
-                        if is_duplicate {
+                        if is_duplicate_legacy {
                             warn!(
                                 %symbol,
                                 order_id = %order_id,
                                 cumulative_filled_qty = %cumulative_filled_qty.0,
                                 order_status = %order_status,
-                                "duplicate fill event ignored"
+                                "duplicate fill event ignored (legacy check: cumulative_qty already processed)"
                             );
                             continue; // Duplicate event'i ignore et
+                        }
+                        
+                        // Event ID'yi kaydet (duplicate önleme için)
+                        state.processed_events.insert(event_id.clone());
+                        
+                        // Memory leak önleme: Eski event ID'leri temizle (her 1000 event'te bir)
+                        if state.processed_events.len() > 1000 {
+                            if let Some(last_cleanup) = state.last_event_cleanup {
+                                if last_cleanup.elapsed().as_secs() > 3600 {
+                                    // 1 saatte bir temizle (eski event ID'leri kaldır)
+                                    state.processed_events.clear();
+                                    state.last_event_cleanup = Some(std::time::Instant::now());
+                                    info!(%symbol, "cleaned up processed_events (memory leak prevention)");
+                                }
+                            } else {
+                                state.last_event_cleanup = Some(std::time::Instant::now());
+                            }
                         }
                         
                         // Post-Only doğrulaması: Post-only emirler maker olarak fill olmalı
@@ -1917,39 +1955,50 @@ async fn main() -> Result<()> {
             }
             
             // Long/Short filtreleme: Sadece seçilen yönde emir yerleştir (config'den threshold'lar)
-            let min_signal_strength = cfg.strategy.direction_min_signal_strength.unwrap_or(0.3);
-            let strong_imbalance_long = imbalance_long_threshold + 0.3; // Default: 1.5
-            let strong_imbalance_short = imbalance_short_threshold - 0.16; // Default: 0.67
-            
-            if let Some(current_dir) = state.current_direction {
-                match current_dir {
-                    Side::Buy => {
-                        // Long seçildi → sadece bid (buy) emirleri
-                        quotes.ask = None;
-                        if quotes.bid.is_none() && long_signal_strength < min_signal_strength {
-                            // Sinyal çok zayıf, emir yerleştirme
-                            debug!(%symbol, "long signal too weak, skipping bid orders");
+            // KRİTİK DÜZELTME: Strateji kendi long/short kararını veriyorsa (QMelStrategy gibi)
+            // main.rs'de direction filter uygulanmamalı - stratejinin mantığını bozmamak için
+            // Sadece DynMm gibi market making stratejileri için direction filter uygulanır
+            if !state.strategy.applies_own_direction_filter() {
+                // DynMm gibi stratejiler için: main.rs'de direction filter uygula
+                let min_signal_strength = cfg.strategy.direction_min_signal_strength.unwrap_or(0.3);
+                let strong_imbalance_long = imbalance_long_threshold + 0.3; // Default: 1.5
+                let strong_imbalance_short = imbalance_short_threshold - 0.16; // Default: 0.67
+                
+                if let Some(current_dir) = state.current_direction {
+                    match current_dir {
+                        Side::Buy => {
+                            // Long seçildi → sadece bid (buy) emirleri
+                            quotes.ask = None;
+                            if quotes.bid.is_none() && long_signal_strength < min_signal_strength {
+                                // Sinyal çok zayıf, emir yerleştirme
+                                debug!(%symbol, "long signal too weak, skipping bid orders");
+                            }
+                        }
+                        Side::Sell => {
+                            // Short seçildi → sadece ask (sell) emirleri
+                            quotes.bid = None;
+                            if quotes.ask.is_none() && short_signal_strength < min_signal_strength {
+                                // Sinyal çok zayıf, emir yerleştirme
+                                debug!(%symbol, "short signal too weak, skipping ask orders");
+                            }
                         }
                     }
-                    Side::Sell => {
-                        // Short seçildi → sadece ask (sell) emirleri
-                        quotes.bid = None;
-                        if quotes.ask.is_none() && short_signal_strength < min_signal_strength {
-                            // Sinyal çok zayıf, emir yerleştirme
-                            debug!(%symbol, "short signal too weak, skipping ask orders");
-                        }
+                } else {
+                    // İlk seferde, her iki yönde de emir yerleştir (başlangıç)
+                    // Ancak imbalance çok güçlüyse tek yöne odaklan
+                    if imbalance_ratio_f64 > strong_imbalance_long {
+                        quotes.ask = None; // Sadece long
+                        state.current_direction = Some(Side::Buy);
+                    } else if imbalance_ratio_f64 < strong_imbalance_short {
+                        quotes.bid = None; // Sadece short
+                        state.current_direction = Some(Side::Sell);
                     }
                 }
             } else {
-                // İlk seferde, her iki yönde de emir yerleştir (başlangıç)
-                // Ancak imbalance çok güçlüyse tek yöne odaklan
-                if imbalance_ratio_f64 > strong_imbalance_long {
-                    quotes.ask = None; // Sadece long
-                    state.current_direction = Some(Side::Buy);
-                } else if imbalance_ratio_f64 < strong_imbalance_short {
-                    quotes.bid = None; // Sadece short
-                    state.current_direction = Some(Side::Sell);
-                }
+                // QMelStrategy gibi stratejiler: Kendi kararını veriyor, filter uygulama
+                // Strateji zaten should_trade_long ve should_trade_short kararlarını vermiş
+                // ve quotes.bid/ask'i buna göre ayarlamış
+                debug!(%symbol, "strategy applies own direction filter, skipping main.rs filter");
             }
             
             // KRİTİK: Opportunity mode soft-limit kontrolü - yeni emirleri durdur

@@ -344,6 +344,63 @@ impl FeatureExtractor {
 // Edge Estimation (Alpha Gate)
 // ============================================================================
 
+/// Adam Optimizer: Adaptive Moment Estimation
+/// Her parameter için adaptive learning rate sağlar
+#[derive(Clone, Debug)]
+struct AdamOptimizer {
+    m: Vec<f64>,  // Momentum (first moment estimate)
+    v: Vec<f64>,  // Variance (second moment estimate)
+    t: u64,       // Timestep (bias correction için)
+}
+
+impl AdamOptimizer {
+    fn new(dim: usize) -> Self {
+        Self {
+            m: vec![0.0; dim],
+            v: vec![0.0; dim],
+            t: 0,
+        }
+    }
+    
+    /// Adam update: Adaptive learning rate per parameter
+    /// alpha: learning rate (default: 0.001)
+    /// beta1: momentum decay (default: 0.9)
+    /// beta2: variance decay (default: 0.999)
+    fn update(&mut self, gradients: &[f64], weights: &mut [f64], bias: &mut f64, bias_gradient: f64) {
+        let alpha: f64 = 0.001; // Base learning rate
+        let beta1: f64 = 0.9;   // Momentum decay
+        let beta2: f64 = 0.999; // Variance decay
+        let epsilon: f64 = 1e-8; // Numerical stability
+        
+        self.t += 1;
+        
+        // Bias correction coefficients
+        let beta1_t: f64 = beta1.powi(self.t as i32);
+        let beta2_t: f64 = beta2.powi(self.t as i32);
+        let m_bias_correction = 1.0 - beta1_t;
+        let v_bias_correction = 1.0 - beta2_t;
+        
+        // Update weights with Adam
+        for i in 0..gradients.len() {
+            // Update momentum and variance
+            self.m[i] = beta1 * self.m[i] + (1.0 - beta1) * gradients[i];
+            self.v[i] = beta2 * self.v[i] + (1.0 - beta2) * gradients[i].powi(2);
+            
+            // Bias-corrected estimates
+            let m_hat = self.m[i] / m_bias_correction;
+            let v_hat = self.v[i] / v_bias_correction;
+            
+            // Update weight: w = w - alpha * m_hat / (sqrt(v_hat) + epsilon)
+            weights[i] -= alpha * m_hat / (v_hat.sqrt() + epsilon);
+        }
+        
+        // Update bias with Adam (simplified - single parameter)
+        // Bias için ayrı optimizer kullanabiliriz ama basit tutuyoruz
+        let bias_alpha = alpha * 0.1; // Bias için daha küçük learning rate
+        *bias -= bias_alpha * bias_gradient;
+    }
+}
+
 /// Direction probability model
 #[derive(Clone, Debug)]
 pub struct DirectionModel {
@@ -353,6 +410,7 @@ pub struct DirectionModel {
     feature_names: Vec<String>, // Feature isimleri (importance tracking için)
     feature_importance: Vec<f64>, // Her feature'ın importance skoru
     feature_update_count: Vec<u64>, // Her feature'ın kaç kez güncellendiği
+    adam: AdamOptimizer, // Adam optimizer (adaptive learning rate)
 }
 
 impl DirectionModel {
@@ -395,6 +453,7 @@ impl DirectionModel {
             feature_names,
             feature_importance: vec![0.0; feature_dim],
             feature_update_count: vec![0; feature_dim],
+            adam: AdamOptimizer::new(feature_dim),
         }
     }
     
@@ -533,40 +592,50 @@ impl DirectionModel {
         // L2 regularization (overfitting önleme)
         let l2_reg = 0.0001;
         
-        // Gradient descent step with regularization + feature importance tracking
-        // Önce gradient'leri hesapla, sonra importance'ı güncelle
-        let mut gradients: Vec<(usize, f64, f64)> = Vec::new();
-        for (idx, (w, x)) in self.weights.iter_mut().zip(normalized_features.iter()).enumerate() {
-            let gradient = clipped_error * x;
+        // KRİTİK İYİLEŞTİRME: Adam Optimizer kullan
+        // Gradient'leri hesapla (L2 regularization dahil)
+        let mut gradients: Vec<f64> = Vec::with_capacity(normalized_features.len());
+        let mut gradient_magnitudes: Vec<(usize, f64)> = Vec::new();
+        
+        for (idx, (w, x)) in self.weights.iter().zip(normalized_features.iter()).enumerate() {
+            // Gradient: error * feature + L2 regularization term
+            let gradient = clipped_error * x + l2_reg * w;
             
             // BEST PRACTICE: Gradient clipping (exploding gradient önleme)
             let clipped_gradient = gradient.max(-10.0).min(10.0);
             let gradient_magnitude = clipped_gradient.abs();
             
-            gradients.push((idx, clipped_gradient, gradient_magnitude));
-            
-            // Weight decay: w = w * (1 - l2_reg) + lr * gradient
-            let new_weight = *w * (1.0 - l2_reg) + adaptive_lr * clipped_gradient;
-            
-            // BEST PRACTICE: Weight validation (NaN/Inf kontrolü)
-            let weight_f64: f64 = new_weight;
-            if weight_f64.is_finite() {
-                *w = new_weight;
-            } else {
-                warn!("Invalid weight update for feature {}, skipping", idx);
+            gradients.push(clipped_gradient);
+            gradient_magnitudes.push((idx, gradient_magnitude));
+        }
+        
+        // Bias gradient
+        let bias_gradient = clipped_error;
+        
+        // Adam optimizer ile weight update
+        // NOT: learning_rate parametresi artık kullanılmıyor (Adam kendi learning rate'ini yönetiyor)
+        // Ama feature importance'a göre alpha'yı scale edebiliriz
+        self.adam.update(&gradients, &mut self.weights, &mut self.bias, bias_gradient);
+        
+        // BEST PRACTICE: Weight validation (NaN/Inf kontrolü)
+        for (idx, w) in self.weights.iter_mut().enumerate() {
+            let weight_f64: f64 = *w;
+            if !weight_f64.is_finite() {
+                warn!("Invalid weight after Adam update for feature {}, resetting", idx);
+                *w = 0.0; // Reset to zero if invalid
             }
         }
         
-        // Feature importance tracking: gradient magnitude'yi kaydet
-        for (idx, _, gradient_magnitude) in gradients {
-            self.update_feature_importance(idx, gradient_magnitude);
+        // Bias validation
+        let bias_f64: f64 = self.bias;
+        if !bias_f64.is_finite() {
+            warn!("Invalid bias after Adam update, resetting");
+            self.bias = 0.0;
         }
         
-        // Bias update
-        let new_bias = self.bias + adaptive_lr * clipped_error;
-        let bias_f64: f64 = new_bias;
-        if bias_f64.is_finite() {
-            self.bias = new_bias;
+        // Feature importance tracking: gradient magnitude'yi kaydet
+        for (idx, gradient_magnitude) in gradient_magnitudes {
+            self.update_feature_importance(idx, gradient_magnitude);
         }
     }
 }
@@ -1126,7 +1195,7 @@ impl ThompsonSamplingBandit {
 // Q-MEL Strategy (Main Integration)
 // ============================================================================
 
-use crate::strategy::{Context, Strategy};
+use crate::strategy::{Context, Strategy, DirectionalStrategy};
 use crate::core::types::Quotes;
 
 /// Q-MEL Trading Strategy
@@ -1377,9 +1446,45 @@ impl Strategy for QMelStrategy {
         let should_trade_long = ev_long > adaptive_threshold;
         let should_trade_short = ev_short > adaptive_threshold;
         
-        // AKILLI: Probability threshold - win rate'e göre ayarla
+        // YAPAY ZEKA ENTEGRASYONU: Feature importance'a göre trade kararlarını optimize et
+        let top_features = self.direction_model.get_top_features(3); // En önemli 3 feature
+        let max_importance = top_features.first().map(|(_, score)| *score).unwrap_or(0.0);
+        
+        // Feature importance'a göre spread multiplier
+        // Yüksek importance = model güvenli = daha dar spread (daha agresif)
+        // Düşük importance = model belirsiz = daha geniş spread (daha konservatif)
+        let spread_multiplier = if max_importance > 0.8 {
+            0.8 // Yüksek önem -> daha dar spread (daha agresif)
+        } else if max_importance > 0.5 {
+            1.0 // Orta önem -> normal spread
+        } else {
+            1.2 // Düşük önem -> daha geniş spread (daha konservatif)
+        };
+        
+        // Feature importance'a göre position size adjustment
+        // Yüksek importance = daha fazla güven = daha büyük pozisyon
+        let position_size_multiplier = if max_importance > 0.8 {
+            1.1 // Yüksek önem -> %10 daha büyük pozisyon
+        } else if max_importance > 0.5 {
+            1.0 // Orta önem -> normal pozisyon
+        } else {
+            0.9 // Düşük önem -> %10 daha küçük pozisyon (risk azaltma)
+        };
+        
+        // Feature importance'a göre probability threshold adjustment
+        // Yüksek importance = model güvenli = daha düşük threshold (daha fazla trade)
+        // Düşük importance = model belirsiz = daha yüksek threshold (daha seçici)
+        let probability_adjustment = if max_importance > 0.8 {
+            -0.02 // Yüksek önem -> threshold'u düşür (daha fazla trade)
+        } else if max_importance > 0.5 {
+            0.0 // Orta önem -> threshold değişmez
+        } else {
+            0.03 // Düşük önem -> threshold'u yükselt (daha seçici)
+        };
+        
+        // AKILLI: Probability threshold - win rate'e göre ayarla + feature importance adjustment
         // Düşük win rate = daha yüksek threshold (daha seçici)
-        let min_probability = if win_rate < 0.45 {
+        let base_min_probability: f64 = if win_rate < 0.45 {
             0.55 // Düşük win rate: daha seçici
         } else if win_rate > 0.60 {
             0.50 // Yüksek win rate: daha fazla trade
@@ -1387,28 +1492,55 @@ impl Strategy for QMelStrategy {
             0.52 // Normal
         };
         
+        let min_probability: f64 = (base_min_probability + probability_adjustment).max(0.45_f64).min(0.60_f64);
+        
+        // Adjusted position size
+        let adjusted_position_size_usd = estimated_position_size_usd * position_size_multiplier;
+        
         // Generate quotes based on regime and EV
         let mut quotes = Quotes::default();
         
         if should_trade_long && p_up > min_probability {
-            // Long signal: bid at microprice or slightly below
+            // Long signal: bid at microprice or slightly below (spread multiplier ile)
             if let Some(microprice) = self.feature_extractor.calculate_microprice(&ctx.ob) {
-                let bid_px = Decimal::from_f64_retain(microprice * 0.9995).unwrap_or(Decimal::ZERO);
-                let bid_qty = Decimal::from_f64_retain(estimated_position_size_usd / microprice).unwrap_or(Decimal::ZERO);
+                // Spread multiplier: yüksek importance = daha dar spread (daha agresif fiyat)
+                let price_offset = 0.0005 * spread_multiplier; // Base offset * multiplier
+                let bid_px = Decimal::from_f64_retain(microprice * (1.0 - price_offset)).unwrap_or(Decimal::ZERO);
+                let bid_qty = Decimal::from_f64_retain(adjusted_position_size_usd / microprice).unwrap_or(Decimal::ZERO);
                 quotes.bid = Some((Px(bid_px), Qty(bid_qty)));
                 // KRİTİK: Trade yönünü kaydet (öğrenme için)
                 self.last_trade_direction = Some(true); // true = long
+                
+                // Debug log: Feature importance kullanımı
+                debug!(
+                    max_importance = max_importance,
+                    spread_multiplier = spread_multiplier,
+                    position_multiplier = position_size_multiplier,
+                    probability_adjustment = probability_adjustment,
+                    "AI: Feature importance-based trade optimization (LONG)"
+                );
             }
         }
         
         if should_trade_short && p_down > min_probability {
-            // Short signal: ask at microprice or slightly above
+            // Short signal: ask at microprice or slightly above (spread multiplier ile)
             if let Some(microprice) = self.feature_extractor.calculate_microprice(&ctx.ob) {
-                let ask_px = Decimal::from_f64_retain(microprice * 1.0005).unwrap_or(Decimal::ZERO);
-                let ask_qty = Decimal::from_f64_retain(estimated_position_size_usd / microprice).unwrap_or(Decimal::ZERO);
+                // Spread multiplier: yüksek importance = daha dar spread (daha agresif fiyat)
+                let price_offset = 0.0005 * spread_multiplier; // Base offset * multiplier
+                let ask_px = Decimal::from_f64_retain(microprice * (1.0 + price_offset)).unwrap_or(Decimal::ZERO);
+                let ask_qty = Decimal::from_f64_retain(adjusted_position_size_usd / microprice).unwrap_or(Decimal::ZERO);
                 quotes.ask = Some((Px(ask_px), Qty(ask_qty)));
                 // KRİTİK: Trade yönünü kaydet (öğrenme için)
                 self.last_trade_direction = Some(false); // false = short
+                
+                // Debug log: Feature importance kullanımı
+                debug!(
+                    max_importance = max_importance,
+                    spread_multiplier = spread_multiplier,
+                    position_multiplier = position_size_multiplier,
+                    probability_adjustment = probability_adjustment,
+                    "AI: Feature importance-based trade optimization (SHORT)"
+                );
             }
         }
         
@@ -1489,6 +1621,25 @@ impl Strategy for QMelStrategy {
                 }
             };
             
+            // YAPAY ZEKA ENTEGRASYONU: Feature importance'a göre learning rate ayarla
+            // Önemli feature'lar daha hızlı öğrenmeli (daha yüksek learning rate)
+            let top_features = self.direction_model.get_top_features(3);
+            let avg_importance = if !top_features.is_empty() {
+                top_features.iter().map(|(_, score)| score).sum::<f64>() / top_features.len() as f64
+            } else {
+                0.5 // Default: orta importance
+            };
+            
+            // Feature importance'a göre learning rate multiplier
+            // Yüksek importance = önemli feature'lar = daha hızlı öğren
+            let importance_lr_multiplier = if avg_importance > 0.7 {
+                1.5 // Yüksek önem -> %50 daha hızlı öğren
+            } else if avg_importance > 0.4 {
+                1.0 // Orta önem -> normal hız
+            } else {
+                0.7 // Düşük önem -> %30 daha yavaş öğren (noise'u önlemek için)
+            };
+            
             // BEST PRACTICE: Learning rate decay (zamanla yavaş öğren)
             // İlk trade'lerde daha hızlı öğren, sonra yavaşla
             let base_lr: f64 = if self.recent_returns.len() < 10 {
@@ -1500,11 +1651,14 @@ impl Strategy for QMelStrategy {
             };
             
             // PnL magnitude'ye göre scale et
-            let learning_rate: f64 = if net_pnl_usd.abs() > 0.5 {
-                base_lr * 2.0 // Büyük kazanç/zarar: daha hızlı öğren
+            let pnl_lr_multiplier = if net_pnl_usd.abs() > 0.5 {
+                2.0 // Büyük kazanç/zarar: daha hızlı öğren
             } else {
-                base_lr // Küçük kazanç/zarar: normal hız
+                1.0 // Küçük kazanç/zarar: normal hız
             };
+            
+            // Combined learning rate: base * importance * PnL
+            let learning_rate: f64 = base_lr * importance_lr_multiplier * pnl_lr_multiplier;
             
             // BEST PRACTICE: Learning rate validation
             if learning_rate.is_finite() && learning_rate > 0.0 && learning_rate < 1.0 {
@@ -1543,6 +1697,106 @@ impl Strategy for QMelStrategy {
     fn get_feature_importance(&self) -> Option<Vec<(String, f64)>> {
         Some(self.direction_model.calculate_feature_importance())
     }
+    
+    /// Q-MEL kendi long/short kararını veriyor (EV ve probability bazlı)
+    /// Bu yüzden main.rs'de current_direction filtresi uygulanmamalı
+    fn applies_own_direction_filter(&self) -> bool {
+        true // Q-MEL kendi kararını veriyor
+    }
 }
 
+impl DirectionalStrategy for QMelStrategy {
+    /// Direction prediction: Hangi yönde trade yapılmalı?
+    /// Q-MEL: EV ve probability bazlı direction prediction
+    fn predict_direction(&self, ctx: &Context) -> Option<Side> {
+        // NOT: extract_state &mut self gerektirir, bu yüzden kullanılamaz
+        // Basit bir state oluştur (sadece direction prediction için gerekli alanlar)
+        // Bu metod sadece direction prediction için, tam state extraction gerekmez
+        let microprice = self.feature_extractor.calculate_microprice(&ctx.ob).unwrap_or(0.0);
+        let volatility_1s = self.feature_extractor.get_volatility_1s();
+        
+        // Basit state (sadece direction prediction için gerekli alanlar)
+        let state = MarketState {
+            ofi: 0.0, // OFI hesaplaması prev_orderbook gerektirir, skip
+            microprice,
+            spread_velocity: 0.0,
+            liquidity_pressure: 0.0,
+            volatility_1s,
+            volatility_5s: volatility_1s,
+            cancel_trade_ratio: 0.0,
+            oi_delta_30s: 0.0,
+            funding_rate: ctx.funding_rate,
+            timestamp: std::time::Instant::now(),
+        };
+        
+        // Predict direction probabilities
+        let p_up = self.direction_model.predict_up_probability(&state, self.target_tick_usd);
+        let p_down = 1.0 - p_up;
+        
+        // Calculate EV for both directions
+        let max_margin_usdc = 100.0;
+        let estimated_leverage = self.risk_governor.calculate_leverage(
+            0.01,
+            0.004,
+            self.target_tick_usd,
+            state.volatility_1s,
+            self.daily_drawdown_pct,
+        );
+        let estimated_position_size_usd = max_margin_usdc * estimated_leverage;
+        let estimated_slippage = self.execution_optimizer.estimate_slippage(
+            estimated_position_size_usd,
+            estimated_position_size_usd * 2.0,
+            50.0,
+        );
+        
+        let ev_long = self.ev_calculator.calculate_ev_long(
+            p_up,
+            self.target_tick_usd,
+            self.stop_tick_usd,
+            estimated_position_size_usd,
+            estimated_slippage,
+            true,
+        );
+        
+        let ev_short = self.ev_calculator.calculate_ev_short(
+            p_down,
+            self.target_tick_usd,
+            self.stop_tick_usd,
+            estimated_position_size_usd,
+            estimated_slippage,
+            true,
+        );
+        
+        // Win rate'e göre adaptive threshold
+        let win_rate = if self.recent_returns.len() > 0 {
+            let wins = self.recent_returns.iter().filter(|&&r| r > 0.0).count();
+            wins as f64 / self.recent_returns.len() as f64
+        } else {
+            0.5
+        };
+        
+        let base_min_probability: f64 = if win_rate < 0.45 {
+            0.55
+        } else if win_rate > 0.60 {
+            0.50
+        } else {
+            0.52
+        };
+        
+        let min_probability = base_min_probability.max(0.45_f64).min(0.60_f64);
+        let adaptive_threshold = self.ev_calculator.get_adaptive_threshold(win_rate);
+        
+        // Direction decision: EV ve probability bazlı
+        let should_trade_long = ev_long > adaptive_threshold && p_up > min_probability;
+        let should_trade_short = ev_short > adaptive_threshold && p_down > min_probability;
+        
+        if should_trade_long && ev_long > ev_short {
+            Some(Side::Buy)
+        } else if should_trade_short && ev_short > ev_long {
+            Some(Side::Sell)
+        } else {
+            None
+        }
+    }
+}
 

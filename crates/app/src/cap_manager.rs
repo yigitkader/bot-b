@@ -76,8 +76,14 @@ pub fn calculate_caps(
     // ✅ KRİTİK: per_order_notional zaten opportunity mode leverage reduction içeriyor
     // main.rs'de caps.buy_notional/caps.sell_notional kullanılırken leverage ile çarpılmaz
     // Çünkü bu değerler zaten doğru notional değerlerini içeriyor
-    let per_order_cap_margin = cfg.max_usd_per_order; // Margin limit (USD)
-    let per_order_notional = per_order_cap_margin * effective_leverage_for_caps; // Notional limit (USD) - opportunity mode reduction dahil
+    // 
+    // ✅ ÇİFT SAYMA ÖNLEME: Leverage SADECE burada uygulanıyor (notional limit için)
+    // calc_qty_from_margin() içinde de leverage uygulanıyor ama FARKLI amaç için (gerçek order quantity)
+    // Bu doğru: Her ikisi de aynı formülü kullanır ama farklı amaçlar için
+    // - cap_manager: notional LIMIT hesaplama (max notional per order)
+    // - calc_qty_from_margin: gerçek order NOTIONAL hesaplama (gerçek order quantity)
+    let per_order_cap_margin = cfg.max_usd_per_order; // Margin limit (USD) - leverage uygulanmamış
+    let per_order_notional = per_order_cap_margin * effective_leverage_for_caps; // Notional limit (USD) - leverage burada uygulanıyor
 
     info!(
         quote_asset = %quote_asset,
