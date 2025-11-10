@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .compact()
+        .with_ansi(true) // ✅ Renk desteği aktif
         .init();
 
     let cfg = load_config()?;
@@ -843,9 +844,9 @@ async fn main() -> Result<()> {
     }
 
     struct Caps {
-        buy_notional: f64,      // tek emir için USD üst sınır (örn 100)
-        sell_notional: f64,     // tek emir için USD üst sınır
-        buy_total: f64,         // toplam kullanılabilir quote USD (örn 140)
+        buy_notional: f64,      // Notional (leverage dahil) - pozisyon boyutu (örn 2000 USD = 100 USD margin * 20x)
+        sell_notional: f64,    // Notional (leverage dahil) - pozisyon boyutu (örn 2000 USD = 100 USD margin * 20x)
+        buy_total: f64,         // Margin (leverage yok) - hesaptan çıkan para (örn 100 USD)
     }
 
     let tick_ms = max(cfg.internal.min_tick_interval_ms, cfg.exec.cancel_replace_interval_ms);
@@ -2544,6 +2545,7 @@ async fn main() -> Result<()> {
                             %symbol,
                             reason,
                             net_pnl,
+                            action = "🟡 CLOSE",
                             "position closed successfully (TP/time-box rule)"
                         );
                     } else {
@@ -2592,6 +2594,7 @@ async fn main() -> Result<()> {
                         peak_pnl = peak_pnl_f64,
                         position_hold_duration_ms = state.position_hold_duration_ms,
                         pnl_trend,
+                        action = "🟡 CLOSE",
                         "intelligent position management: closing position"
                     );
                     
@@ -3210,10 +3213,12 @@ async fn main() -> Result<()> {
             }
 
             // --- bakiye/min_emir hızlı kontrolü: gürültüyü kes ---
+            // ✅ KRİTİK FIX: buy_notional/sell_notional notional (leverage dahil), ama min_usd_per_order margin için
+            // Bu yüzden buy_total (margin) kullanılmalı
             let _px_bid_f = bid.0.to_f64().unwrap_or(0.0); // ✅ FIX: Kullanılmıyor, prefix eklendi
             let _px_ask_f = ask.0.to_f64().unwrap_or(0.0); // ✅ FIX: Kullanılmıyor, prefix eklendi
-            let buy_cap_ok = caps.buy_notional >= min_usd_per_order;
-            let sell_cap_ok = caps.sell_notional >= min_usd_per_order; // ✅ FIX: mut kaldırıldı (kullanılmıyor)
+            let buy_cap_ok = caps.buy_total >= min_usd_per_order; // ✅ FIX: buy_total (margin) kullanılmalı, buy_notional (notional) değil
+            let sell_cap_ok = caps.buy_total >= min_usd_per_order; // ✅ FIX: buy_total (margin) kullanılmalı, sell_notional (notional) değil
             // Futures only - no base balance check needed
             if !buy_cap_ok && !sell_cap_ok {
                 info!(
@@ -3311,13 +3316,22 @@ async fn main() -> Result<()> {
                     warn!(%symbol, ?px, "dropping bid quote with non-positive price");
                     quotes.bid = None;
                 } else {
-                    // 1. USD clamp
-                    // KRİTİK DÜZELTME: Margin chunking kullanıldığı için leverage uygulama burada yapılmamalı
-                    // caps.buy_total zaten margin (hesaptan çıkan para)
-                    // calc_qty_from_margin içinde leverage uygulanıyor: notional = margin * leverage
-                    // Bu yüzden burada sadece margin'i kullan (caps.buy_total)
-                    // NOT: Bu kod artık kullanılmıyor çünkü margin chunking sistemi var, ama yine de düzeltelim
-                    let effective_buy_notional = caps.buy_total; // Margin (leverage uygulanmadan)
+                    // ✅ KRİTİK FIX: Margin chunking kullanıldığı için bu kod bloğu gereksiz
+                    // Margin chunking sistemi (satır 3397+) zaten calc_qty_from_margin kullanıyor
+                    // Bu kod bloğu sadece quote hazırlama için kullanılıyor, margin chunking ile override ediliyor
+                    // Bu yüzden burada sadece basit bir kontrol yapıyoruz (leverage uygulamadan)
+                    // NOT: Bu kod artık kullanılmıyor çünkü margin chunking sistemi var
+                    // Ama yine de quote hazırlama için basit bir kontrol yapıyoruz
+                    // Leverage uygulaması margin chunking'de calc_qty_from_margin ile yapılıyor
+                    // ✅ KRİTİK FIX: clamp_qty_by_usd max_usd'yi notional (pozisyon boyutu) olarak kullanıyor
+                    // caps.buy_total margin (leverage yok), bu yüzden leverage ile çarpmalıyız (notional'a çevirmek için)
+                    let is_opportunity_mode = state.strategy.is_opportunity_mode();
+                    let effective_leverage_for_clamp = if is_opportunity_mode {
+                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
+                    } else {
+                        effective_leverage
+                    };
+                    let effective_buy_notional = caps.buy_total * effective_leverage_for_clamp; // Margin → Notional (leverage ile çarpıldı)
                     let nq = clamp_qty_by_usd(q, px, effective_buy_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
@@ -3337,12 +3351,12 @@ async fn main() -> Result<()> {
                             quantized_to_zero,
                             notional,
                             min_usd_per_order,
-                            "skipping quote: qty too small after caps/quantization"
+                            "skipping quote: qty too small after caps/quantization (NOTE: margin chunking will override this)"
                         );
                         quotes.bid = None;
                     } else {
                         quotes.bid = Some((px, nq));
-                        info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared bid quote");
+                        info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared bid quote (NOTE: margin chunking will override with calc_qty_from_margin)");
                     }
                 }
             } else {
@@ -3354,12 +3368,22 @@ async fn main() -> Result<()> {
                     warn!(%symbol, ?px, "dropping ask quote with non-positive price");
                     quotes.ask = None;
                 } else {
-                    // QTY CLAMP SIRASI GARANTİSİ: 1) USD clamp, 2) Quantize, 3) Min notional check
-                    // 1. USD clamp
-                    // KRİTİK DÜZELTME: Margin chunking kullanıldığı için leverage uygulama burada yapılmamalı
-                    // caps.buy_total zaten margin (hesaptan çıkan para)
-                    // calc_qty_from_margin içinde leverage uygulanıyor
-                    let effective_sell_notional = caps.buy_total; // Margin (leverage uygulanmadan)
+                    // ✅ KRİTİK FIX: Margin chunking kullanıldığı için bu kod bloğu gereksiz
+                    // Margin chunking sistemi (satır 3897+) zaten calc_qty_from_margin kullanıyor
+                    // Bu kod bloğu sadece quote hazırlama için kullanılıyor, margin chunking ile override ediliyor
+                    // Bu yüzden burada sadece basit bir kontrol yapıyoruz (leverage uygulamadan)
+                    // NOT: Bu kod artık kullanılmıyor çünkü margin chunking sistemi var
+                    // Ama yine de quote hazırlama için basit bir kontrol yapıyoruz
+                    // Leverage uygulaması margin chunking'de calc_qty_from_margin ile yapılıyor
+                    // ✅ KRİTİK FIX: clamp_qty_by_usd max_usd'yi notional (pozisyon boyutu) olarak kullanıyor
+                    // caps.buy_total margin (leverage yok), bu yüzden leverage ile çarpmalıyız (notional'a çevirmek için)
+                    let is_opportunity_mode = state.strategy.is_opportunity_mode();
+                    let effective_leverage_for_clamp = if is_opportunity_mode {
+                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
+                    } else {
+                        effective_leverage
+                    };
+                    let effective_sell_notional = caps.buy_total * effective_leverage_for_clamp; // Margin → Notional (leverage ile çarpıldı)
                     let nq = clamp_qty_by_usd(q, px, effective_sell_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
@@ -3379,12 +3403,12 @@ async fn main() -> Result<()> {
                             quantized_to_zero,
                             notional,
                             min_usd_per_order,
-                            "skipping quote: qty too small after caps/quantization"
+                            "skipping quote: qty too small after caps/quantization (NOTE: margin chunking will override this)"
                         );
                         quotes.ask = None;
                     } else {
                         quotes.ask = Some((px, nq));
-                        info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared ask quote");
+                        info!(%symbol, ?px, original_qty = ?q, clamped_qty = ?nq, "prepared ask quote (NOTE: margin chunking will override with calc_qty_from_margin)");
                     }
                 }
             } else {
@@ -3876,6 +3900,7 @@ async fn main() -> Result<()> {
                                         min_spread_bps_used,
                                         total_spent_so_far = total_spent_on_bids,  // Şu ana kadar kullanılan toplam margin
                                         remaining_balance = caps.buy_total - total_spent_on_bids,  // Kalan bakiye
+                                        action = "🟢 BUY",
                                         "bid order created successfully (chunk)"
                                     );
                             }
@@ -4379,6 +4404,7 @@ async fn main() -> Result<()> {
                                         min_spread_bps_used,
                                         total_spent_so_far = total_spent_on_bids + total_spent_on_asks,  // Şu ana kadar kullanılan toplam margin (bid + ask)
                                         remaining_balance = caps.buy_total - total_spent_on_bids - total_spent_on_asks,  // Kalan bakiye
+                                        action = "🔴 SELL",
                                         "ask order created successfully (chunk)"
                                     );
                                 }
