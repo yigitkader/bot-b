@@ -8,8 +8,8 @@ use crate::exec::Venue;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
-use std::time::Instant;
-use tracing::{info, warn};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 use crate::config::AppCfg;
 use crate::types::SymbolState;
 use crate::utils::{calc_net_pnl_usd, estimate_close_fee_bps, rate_limit_guard, record_pnl_snapshot};
@@ -208,6 +208,18 @@ pub fn should_close_position_smart(
         return (true, format!("take_profit_{:.2}_usd", net_pnl));
     }
 
+    // KRİTİK DÜZELTME: Stop loss sıkılaştırıldı (-0.10 USDC'de kapat)
+    // Küçük zararlarda hemen kapat, büyük zararlara izin verme
+    if net_pnl <= -0.10 {
+        return (true, format!("stop_loss_{:.2}_usd", net_pnl));
+    }
+
+    // KRİTİK: Inventory threshold kontrolü - pozisyon birikirse zorla kapat
+    // Basit threshold: pozisyon çok büyükse kapat (0.5'ten fazla)
+    if position_qty_f64.abs() > 0.5 {
+        return (true, format!("inventory_threshold_exceeded_{:.2}", position_qty_f64));
+    }
+
     // Rule 2: Smart position management
     let entry_time = match state.position_entry_time {
         Some(t) => t,
@@ -310,7 +322,7 @@ pub fn should_close_position_smart(
     }
 }
 
-/// Close position
+/// Close position with retry mechanism
 pub async fn close_position(
     venue: &BinanceFutures,
     symbol: &str,
@@ -319,20 +331,41 @@ pub async fn close_position(
     state.position_closing = true;
     state.last_close_attempt = Some(Instant::now());
 
+    // KRİTİK: Önce tüm açık emirleri iptal et (pozisyon kapatmadan önce)
     rate_limit_guard(1).await;
-    let result = venue.close_position(symbol).await;
+    if let Err(e) = venue.cancel_all(symbol).await {
+        warn!(symbol = %symbol, error = %e, "failed to cancel orders before close, continuing anyway");
+    }
+
+    // Pozisyonu kapat (retry mekanizması ile)
+    let max_retries = 3;
+    let mut last_error = None;
+    
+    for attempt in 1..=max_retries {
+        rate_limit_guard(1).await;
+        match venue.close_position(symbol).await {
+            Ok(_) => {
+                info!(symbol = %symbol, attempt, "position closed successfully");
+                state.position_closing = false;
+                return Ok(());
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < max_retries {
+                    warn!(symbol = %symbol, attempt, max_retries, "failed to close position, retrying...");
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+    }
 
     state.position_closing = false;
-
-    match result {
-        Ok(_) => {
-            info!(symbol = %symbol, "position closed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            warn!(symbol = %symbol, error = %e, "failed to close position");
-            Err(e)
-        }
+    
+    if let Some(e) = last_error {
+        error!(symbol = %symbol, error = %e, "failed to close position after {} attempts", max_retries);
+        Err(e)
+    } else {
+        Ok(())
     }
 }
 

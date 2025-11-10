@@ -35,13 +35,13 @@ pub const MIN_SPREAD_SAFETY_MARGIN_BPS: f64 = 5.0;
 
 /// Maximum position hold duration in loss (seconds)
 /// If position is in loss for longer than this, force close
-/// Market making için: 5 dakika zararda kalırsa kapat
-pub const MAX_LOSS_DURATION_SEC: f64 = 300.0; // 5 dakika
+/// KRİTİK DÜZELTME: 5 dakika çok uzun, 2 saniye yeterli (zarar eden pozisyonlar hızlı kapanmalı)
+pub const MAX_LOSS_DURATION_SEC: f64 = 2.0; // 2 saniye (ACİL DÜZELTME)
 
 /// Maximum position hold duration overall (seconds)
 /// Absolute timeout - pozisyon ne durumda olursa olsun bu süre sonra kapat
-/// Market making için: 10 dakika maksimum pozisyon süresi
-pub const MAX_POSITION_DURATION_SEC: f64 = 600.0; // 10 dakika
+/// KRİTİK DÜZELTME: 10 dakika çok uzun, 5 saniye yeterli (pozisyonlar hızlı kapanmalı)
+pub const MAX_POSITION_DURATION_SEC: f64 = 5.0; // 5 saniye (ACİL DÜZELTME)
 
 // ============================================================================
 // Decimal Constants

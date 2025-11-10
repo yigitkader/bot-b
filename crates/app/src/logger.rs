@@ -112,6 +112,23 @@ pub enum LogEvent {
         position_size_usd: f64,
         min_spread_bps: f64,
     },
+    #[serde(rename = "pnl_summary")]
+    PnLSummary {
+        timestamp: u64,
+        period: String, // "daily", "hourly", etc.
+        total_trades: u64,
+        profitable_trades: u64,
+        losing_trades: u64,
+        total_profit: f64,
+        total_loss: f64,
+        net_pnl: f64,
+        win_rate: f64,
+        avg_profit_per_trade: f64,
+        avg_loss_per_trade: f64,
+        largest_win: f64,
+        largest_loss: f64,
+        total_fees: f64,
+    },
 }
 
 // ============================================================================
@@ -449,6 +466,60 @@ impl JsonLogger {
             eprintln!("Failed to log trade_rejected: {}", e);
         }
     }
+    
+    /// Log PnL summary (daily/hourly)
+    pub fn log_pnl_summary(
+        &self,
+        period: &str,
+        total_trades: u64,
+        profitable_trades: u64,
+        losing_trades: u64,
+        total_profit: f64,
+        total_loss: f64,
+        net_pnl: f64,
+        largest_win: f64,
+        largest_loss: f64,
+        total_fees: f64,
+    ) {
+        let win_rate = if total_trades > 0 {
+            profitable_trades as f64 / total_trades as f64
+        } else {
+            0.0
+        };
+        
+        let avg_profit_per_trade = if profitable_trades > 0 {
+            total_profit / profitable_trades as f64
+        } else {
+            0.0
+        };
+        
+        let avg_loss_per_trade = if losing_trades > 0 {
+            total_loss / losing_trades as f64
+        } else {
+            0.0
+        };
+        
+        let event = LogEvent::PnLSummary {
+            timestamp: Self::timestamp_ms(),
+            period: period.to_string(),
+            total_trades,
+            profitable_trades,
+            losing_trades,
+            total_profit,
+            total_loss,
+            net_pnl,
+            win_rate,
+            avg_profit_per_trade,
+            avg_loss_per_trade,
+            largest_win,
+            largest_loss,
+            total_fees,
+        };
+        
+        if let Err(e) = self.write_event(&event) {
+            eprintln!("Failed to log pnl_summary: {}", e);
+        }
+    }
 }
 
 // Thread-safe logger wrapper
@@ -712,6 +783,57 @@ impl AsyncJsonLogger {
             spread_bps,
             position_size_usd,
             min_spread_bps,
+        };
+        self.log_event(event);
+    }
+    
+    /// Log PnL summary (daily/hourly)
+    pub fn log_pnl_summary(
+        &self,
+        period: &str,
+        total_trades: u64,
+        profitable_trades: u64,
+        losing_trades: u64,
+        total_profit: f64,
+        total_loss: f64,
+        net_pnl: f64,
+        largest_win: f64,
+        largest_loss: f64,
+        total_fees: f64,
+    ) {
+        let win_rate = if total_trades > 0 {
+            profitable_trades as f64 / total_trades as f64
+        } else {
+            0.0
+        };
+        
+        let avg_profit_per_trade = if profitable_trades > 0 {
+            total_profit / profitable_trades as f64
+        } else {
+            0.0
+        };
+        
+        let avg_loss_per_trade = if losing_trades > 0 {
+            total_loss / losing_trades as f64
+        } else {
+            0.0
+        };
+        
+        let event = LogEvent::PnLSummary {
+            timestamp: JsonLogger::timestamp_ms(),
+            period: period.to_string(),
+            total_trades,
+            profitable_trades,
+            losing_trades,
+            total_profit,
+            total_loss,
+            net_pnl,
+            win_rate,
+            avg_profit_per_trade,
+            avg_loss_per_trade,
+            largest_win,
+            largest_loss,
+            total_fees,
         };
         self.log_event(event);
     }

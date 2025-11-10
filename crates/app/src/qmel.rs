@@ -411,6 +411,8 @@ pub struct ExpectedValueCalculator {
     maker_fee_rate: f64,
     taker_fee_rate: f64,
     ev_threshold: f64, // Minimum EV to trade (e.g., $0.10)
+    base_ev_threshold: f64, // Base threshold (adaptif olarak değişir)
+    recent_ev_performance: VecDeque<f64>, // Son EV tahminlerinin performansı
 }
 
 impl ExpectedValueCalculator {
@@ -419,7 +421,53 @@ impl ExpectedValueCalculator {
             maker_fee_rate,
             taker_fee_rate,
             ev_threshold,
+            base_ev_threshold: ev_threshold,
+            recent_ev_performance: VecDeque::new(),
         }
+    }
+    
+    /// Adaptif EV threshold: Performansa göre dinamik ayarla
+    /// Win rate düşükse threshold'u yükselt (daha seçici ol)
+    /// Win rate yüksekse threshold'u düşür (daha fazla trade yap)
+    pub fn get_adaptive_threshold(&self, win_rate: f64) -> f64 {
+        if win_rate < 0.45 {
+            // Win rate düşük: daha seçici ol (threshold'u yükselt)
+            self.base_ev_threshold * 1.5
+        } else if win_rate > 0.60 {
+            // Win rate yüksek: daha fazla trade yap (threshold'u düşür)
+            self.base_ev_threshold * 0.7
+        } else {
+            // Normal: base threshold kullan
+            self.base_ev_threshold
+        }
+    }
+    
+    /// EV tahmininin performansını kaydet (edge validation için)
+    pub fn record_ev_performance(&mut self, predicted_ev: f64, actual_pnl: f64) {
+        // EV tahmini vs gerçek PnL karşılaştırması
+        let ev_accuracy = if predicted_ev > 0.0 && actual_pnl > 0.0 {
+            1.0 // Doğru tahmin
+        } else if predicted_ev <= 0.0 && actual_pnl <= 0.0 {
+            1.0 // Doğru tahmin (trade yapmadık veya zarar bekliyorduk)
+        } else {
+            0.0 // Yanlış tahmin
+        };
+        
+        self.recent_ev_performance.push_back(ev_accuracy);
+        if self.recent_ev_performance.len() > 50 {
+            self.recent_ev_performance.pop_front();
+        }
+    }
+    
+    /// Edge validation: Gerçekten edge var mı kontrol et
+    /// Son 50 trade'de EV tahminlerinin doğruluğunu kontrol et
+    pub fn has_edge(&self) -> bool {
+        if self.recent_ev_performance.len() < 10 {
+            return true; // Henüz yeterli veri yok, edge olduğunu varsay
+        }
+        
+        let avg_accuracy: f64 = self.recent_ev_performance.iter().sum::<f64>() / self.recent_ev_performance.len() as f64;
+        avg_accuracy > 0.55 // %55'ten fazla doğru tahmin = edge var
     }
 
     /// Calculate expected value for LONG position
@@ -643,45 +691,41 @@ impl AutoRiskGovernor {
         volatility_1s: f64,        // 1-second volatility
         daily_drawdown_pct: f64,   // Current daily drawdown percentage
     ) -> f64 {
-        // AGGRESSIVE: For $0.50 target, we want to maximize leverage
-        // Use higher alpha (closer to 0.6) and beta (closer to 1.5) for aggressive mode
+        // KRİTİK DÜZELTME: Leverage'ı güvenli seviyede tut (125x çok tehlikeli!)
+        // Konservatif alpha ve beta kullan
         
-        // Liquidation safety constraint - AGGRESSIVE: use max alpha
+        // Liquidation safety constraint - KONSERVATİF: use safe alpha
         let leverage_by_stop = if mmr > 0.0 {
-            // Use 0.6 (max safe alpha) for aggressive leverage
-            let aggressive_alpha = 0.6;
-            (aggressive_alpha * stop_distance_pct) / mmr
+            // Use 0.4 (safe alpha) instead of 0.6
+            let safe_alpha = 0.4;
+            (safe_alpha * stop_distance_pct) / mmr
         } else {
-            self.max_leverage
+            self.max_leverage.min(20.0) // Max 20x even if no MMR
         };
         
-        // Volatility constraint - AGGRESSIVE: use max beta
+        // Volatility constraint - KONSERVATİF: use safe beta
         let leverage_by_vol = if volatility_1s > 1e-8 {
-            // Use 1.5 (max beta) for aggressive leverage
-            let aggressive_beta = 1.5;
-            (aggressive_beta * target_tick_usd) / volatility_1s
+            // Use 1.0 (safe beta) instead of 1.5
+            let safe_beta = 1.0;
+            (safe_beta * target_tick_usd) / volatility_1s
         } else {
-            self.max_leverage
+            self.max_leverage.min(20.0) // Max 20x even if no volatility
         };
         
-        // AGGRESSIVE: Only reduce leverage if drawdown is significant (>2%)
-        // For small drawdowns, keep leverage high to maximize $0.50 targets
-        let drawdown_factor = if daily_drawdown_pct > 0.02 {
-            // Only reduce if drawdown > 2%
-            // Reduce by 20% per 1% drawdown (less aggressive than before)
-            (1.0 - (daily_drawdown_pct - 0.02) * 0.2).max(0.5)
+        // KONSERVATİF: Reduce leverage if any drawdown exists
+        let drawdown_factor = if daily_drawdown_pct > 0.0 {
+            // Reduce by 30% per 1% drawdown (more conservative)
+            (1.0 - daily_drawdown_pct * 0.3).max(0.3)
         } else {
-            1.0 // No reduction for small drawdowns
+            1.0
         };
         
-        // AGGRESSIVE: Take maximum of constraints (not minimum) to maximize leverage
-        // But still respect safety limits
-        let base_leverage = leverage_by_stop.max(leverage_by_vol).min(self.max_leverage);
+        // KONSERVATİF: Take minimum of constraints (not maximum) for safety
+        let base_leverage = leverage_by_stop.min(leverage_by_vol).min(self.max_leverage).min(20.0);
         let final_leverage = base_leverage * drawdown_factor;
         
-        // AGGRESSIVE: For $0.50 target, prefer higher leverage
-        // Minimum leverage: 10x (unless safety requires lower)
-        final_leverage.max(10.0).min(self.max_leverage)
+        // KONSERVATİF: Maximum leverage 20x (güvenlik için)
+        final_leverage.max(1.0).min(20.0).min(self.max_leverage)
     }
 }
 
@@ -932,6 +976,7 @@ pub struct QMelStrategy {
     daily_drawdown_pct: f64,
     last_trade_time: Option<Instant>,
     last_state: Option<MarketState>, // Store last state for OFI signal
+    last_trade_direction: Option<bool>, // true = long, false = short (entry'de kaydedilir)
 }
 
 impl QMelStrategy {
@@ -946,10 +991,11 @@ impl QMelStrategy {
         let feature_extractor = FeatureExtractor::new();
         let direction_model = DirectionModel::new(9); // 9 features
         let ev_calculator = ExpectedValueCalculator::new(maker_fee_rate, taker_fee_rate, ev_threshold);
-        // AGGRESSIVE: For $0.50 target, use higher risk fractions (f_min=0.05, f_max=0.20)
-        let margin_allocator = DynamicMarginAllocator::new(min_margin_usdc, max_margin_usdc, 0.05, 0.20);
-        // AGGRESSIVE: Use max alpha (0.6) and beta (1.5) for maximum leverage
-        let risk_governor = AutoRiskGovernor::new(0.6, 1.5, max_leverage);
+        // KONSERVATİF: Risk fractions düşürüldü (güvenlik için)
+        let margin_allocator = DynamicMarginAllocator::new(min_margin_usdc, max_margin_usdc, 0.02, 0.10);
+        // KONSERVATİF: Safe alpha (0.4) and beta (1.0) - max leverage 20x
+        let safe_max_leverage = max_leverage.min(20.0);
+        let risk_governor = AutoRiskGovernor::new(0.4, 1.0, safe_max_leverage);
         let execution_optimizer = ExecutionOptimizer::new(maker_fee_rate, taker_fee_rate, 500.0);
         let regime_classifier = RegimeClassifier::new();
         let bandit = ThompsonSamplingBandit::new(0.1);
@@ -976,6 +1022,7 @@ impl QMelStrategy {
             daily_drawdown_pct: 0.0,
             last_trade_time: None,
             last_state: None,
+            last_trade_direction: None,
         }
     }
 
@@ -1137,6 +1184,8 @@ impl Strategy for QMelStrategy {
                 let bid_px = Decimal::from_f64_retain(microprice * 0.9995).unwrap_or(Decimal::ZERO);
                 let bid_qty = Decimal::from_f64_retain(estimated_position_size_usd / microprice).unwrap_or(Decimal::ZERO);
                 quotes.bid = Some((Px(bid_px), Qty(bid_qty)));
+                // KRİTİK: Trade yönünü kaydet (öğrenme için)
+                self.last_trade_direction = Some(true); // true = long
             }
         }
         
@@ -1146,14 +1195,92 @@ impl Strategy for QMelStrategy {
                 let ask_px = Decimal::from_f64_retain(microprice * 1.0005).unwrap_or(Decimal::ZERO);
                 let ask_qty = Decimal::from_f64_retain(estimated_position_size_usd / microprice).unwrap_or(Decimal::ZERO);
                 quotes.ask = Some((Px(ask_px), Qty(ask_qty)));
+                // KRİTİK: Trade yönünü kaydet (öğrenme için)
+                self.last_trade_direction = Some(false); // false = short
             }
         }
         
-        // Update previous orderbook and state
+        // KRİTİK: Entry state'i kaydet (öğrenme için)
+        // Trade açıldığında bu state kullanılacak
+        if quotes.bid.is_some() || quotes.ask.is_some() {
+            self.last_state = Some(state);
+            self.last_trade_time = Some(now);
+        }
+        
+        // Update previous orderbook
         self.prev_orderbook = Some(ctx.ob.clone());
-        self.last_state = Some(state);
         
         quotes
+    }
+
+    /// Learn from trade result (online learning)
+    /// Bu metod botu gerçekten "akıllı" yapar
+    fn learn_from_trade(&mut self, net_pnl_usd: f64, _entry_state: Option<&dyn std::any::Any>, _actual_direction: Option<f64>) {
+        // 1. Bandit parametrelerini güncelle (Thompson Sampling)
+        self.update_with_trade_result(net_pnl_usd);
+        
+        // 2. EV calculator'a performansı kaydet (edge validation için)
+        // Entry'deki EV tahminini ve gerçek PnL'i karşılaştır
+        if let Some(entry_state) = &self.last_state {
+            // Entry'deki EV'yi tahmin et (basitleştirilmiş)
+            let predicted_ev = if self.last_trade_direction.unwrap_or(false) {
+                // Long trade için EV
+                self.ev_calculator.calculate_ev_long(
+                    self.direction_model.predict_up_probability(entry_state, self.target_tick_usd),
+                    self.target_tick_usd,
+                    self.stop_tick_usd,
+                    100.0, // Estimated position size
+                    0.0, // Estimated slippage
+                    true,
+                )
+            } else {
+                // Short trade için EV
+                self.ev_calculator.calculate_ev_short(
+                    1.0 - self.direction_model.predict_up_probability(entry_state, self.target_tick_usd),
+                    self.target_tick_usd,
+                    self.stop_tick_usd,
+                    100.0,
+                    0.0,
+                    true,
+                )
+            };
+            
+            self.ev_calculator.record_ev_performance(predicted_ev, net_pnl_usd);
+        }
+        
+        // 3. Direction model'i güncelle (gerçek sonuçları öğret)
+        if let Some(entry_state) = &self.last_state {
+            // Gerçek yön: pozitif PnL = doğru yön tahmini, negatif = yanlış
+            // Entry'deki tahmin edilen probability'yi kullan
+            let predicted_p_up = self.direction_model.predict_up_probability(entry_state, self.target_tick_usd);
+            let predicted_p_down = 1.0 - predicted_p_up;
+            
+            let actual_direction = if net_pnl_usd > 0.0 {
+                // Kazançlı trade: tahmin doğruydu
+                if self.last_trade_direction.unwrap_or(false) {
+                    predicted_p_up // Long tahmini doğruydu
+                } else {
+                    predicted_p_down // Short tahmini doğruydu
+                }
+            } else {
+                // Zararlı trade: tahmin yanlıştı, tersini öğret
+                if self.last_trade_direction.unwrap_or(false) {
+                    predicted_p_down // Long tahmini yanlıştı, short öğret
+                } else {
+                    predicted_p_up // Short tahmini yanlıştı, long öğret
+                }
+            };
+            
+            // Learning rate: performansa göre adaptif
+            // Büyük kazanç/zarar = daha hızlı öğren, küçük = yavaş öğren
+            let learning_rate = if net_pnl_usd.abs() > 0.5 {
+                0.01 // Büyük kazanç/zarar: daha hızlı öğren
+            } else {
+                0.001 // Küçük kazanç/zarar: yavaş öğren
+            };
+            
+            self.direction_model.update(entry_state, actual_direction, learning_rate);
+        }
     }
 
     fn get_trend_bps(&self) -> f64 {
@@ -1180,4 +1307,5 @@ impl Strategy for QMelStrategy {
         }
     }
 }
+
 

@@ -48,6 +48,11 @@ pub trait Strategy: Send + Sync {
     fn get_trend_bps(&self) -> f64 {
         0.0 // Default: trend bilgisi yok
     }
+    /// Trade sonucunu öğren (online learning için)
+    /// Bu metod botu "akıllı" yapar - geçmiş trade'lerden öğrenir
+    fn learn_from_trade(&mut self, _net_pnl_usd: f64, _entry_state: Option<&dyn std::any::Any>, _actual_direction: Option<f64>) {
+        // Default: öğrenme yok (override edilebilir)
+    }
     /// Volatilite bilgisini döndür (EWMA volatilite)
     /// Yüksek volatilite = daha riskli = küçük chunk boyutu
     fn get_volatility(&self) -> f64 {

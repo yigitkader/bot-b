@@ -80,6 +80,17 @@ pub struct SymbolState {
     // Position closing control
     pub position_closing: bool, // Pozisyon kapatma süreci başlamış mı (spam önleme)
     pub last_close_attempt: Option<Instant>, // Son kapatma denemesi zamanı (cooldown için)
+    
+    // PnL tracking for summary
+    pub trade_count: u64, // Toplam işlem sayısı
+    pub profitable_trade_count: u64, // Kazançlı işlem sayısı
+    pub losing_trade_count: u64, // Zararlı işlem sayısı
+    pub total_profit: Decimal, // Toplam kazanç
+    pub total_loss: Decimal, // Toplam zarar
+    pub largest_win: Decimal, // En büyük kazanç
+    pub largest_loss: Decimal, // En büyük zarar
+    pub total_fees_paid: Decimal, // Toplam ödenen fees
+    pub last_pnl_summary_time: Option<Instant>, // Son PnL özeti zamanı
 }
 
 // ============================================================================

@@ -42,7 +42,7 @@ risk:
   inv_cap: "0.50"
   min_liq_gap_bps: 300
   dd_limit_bps: 2000
-  max_leverage: 100  # 20x-50x desteklenecek
+  max_leverage: 50  # KRİTİK DÜZELTME: 100x çok tehlikeli, 50x ile sınırla
   slippage_bps_reserve: 2.0  # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
   use_isolated_margin: true  # Isolated margin kullan (20x-50x için kritik)
   max_open_chunks_per_symbol_per_side: 5  # Sembol başına yönde maksimum açık chunk sayısı

@@ -1236,12 +1236,34 @@ async fn main() -> Result<()> {
             
             // KRİTİK DÜZELTME: Pozisyon varsa (qty != 0) veya açık emir varsa, bakiye kontrolünü atla
             let has_position = !pos.qty.0.is_zero();
-            if has_position && !has_balance {
-                info!(
-                    %symbol,
-                    position_qty = %pos.qty.0,
-                    "has open position but no balance, continuing to manage position"
-                );
+            
+            // KRİTİK: Pozisyon varsa MUTLAKA kapatılmalı - otomatik kapatma mekanizması
+            if has_position {
+                // Pozisyon timeout kontrolü - çok uzun süre açık kalmışsa zorla kapat
+                if let Some(entry_time) = state.position_entry_time {
+                    let age_secs = entry_time.elapsed().as_secs() as f64;
+                    if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
+                        warn!(
+                            %symbol,
+                            position_qty = %pos.qty.0,
+                            age_secs,
+                            "FORCE CLOSE: Position exceeded max duration, closing automatically"
+                        );
+                        // Zorla kapat
+                        if !state.position_closing {
+                            let _ = position_manager::close_position(&venue, &symbol, state).await;
+                        }
+                        continue;
+                    }
+                }
+                
+                if has_position && !has_balance {
+                    info!(
+                        %symbol,
+                        position_qty = %pos.qty.0,
+                        "has open position but no balance, continuing to manage position"
+                    );
+                }
             }
             
             // Mark price ve funding rate'i al (bir kere, tüm analizler için kullanılacak)
@@ -1445,8 +1467,162 @@ async fn main() -> Result<()> {
                     "closing position based on smart position management"
                 );
                 
+                // KRİTİK: Pozisyon kapatmadan önce entry price ve quantity'yi kaydet (log için)
+                let entry_price_before_close = pos.entry;
+                let qty_before_close = pos.qty;
+                let leverage_before_close = pos.leverage;
+                let side_str = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+                
                 // Close position using position_manager
-                position_manager::close_position(&venue, &symbol, state).await?;
+                if position_manager::close_position(&venue, &symbol, state).await.is_ok() {
+                    // KRİTİK: Pozisyon kapandıktan sonra exit price'ı al ve logla
+                    // Exit price için bid/ask kullan (long için bid, short için ask)
+                    let exit_price = match side_str {
+                        "long" => bid,
+                        _ => ask,
+                    };
+                    
+                    // PnL hesapla
+                    let qty_abs = qty_before_close.0.abs();
+                    let entry_f = entry_price_before_close.0.to_f64().unwrap_or(0.0);
+                    let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
+                    let realized_pnl = if qty_before_close.0.is_sign_positive() {
+                        (exit_f - entry_f) * qty_abs.to_f64().unwrap_or(0.0)
+                    } else {
+                        (entry_f - exit_f) * qty_abs.to_f64().unwrap_or(0.0)
+                    };
+                    
+                    // Fees hesapla (entry + exit)
+                    let notional = entry_f * qty_abs.to_f64().unwrap_or(0.0);
+                    let entry_fee = notional * maker_fee_rate;
+                    let exit_fee = notional * maker_fee_rate; // Maker olarak kapatmaya çalışıyoruz
+                    let total_fees = entry_fee + exit_fee;
+                    let net_profit = realized_pnl - total_fees;
+                    
+                    // KRİTİK: Detaylı trade loglama
+                    if let Ok(logger) = json_logger.lock() {
+                        logger.log_position_closed(
+                            &symbol,
+                            side_str,
+                            entry_price_before_close,
+                            exit_price,
+                            qty_before_close,
+                            leverage_before_close,
+                            &reason,
+                        );
+                        
+                        logger.log_trade_completed(
+                            &symbol,
+                            side_str,
+                            entry_price_before_close,
+                            exit_price,
+                            qty_before_close,
+                            total_fees,
+                            leverage_before_close,
+                        );
+                    }
+                    
+                    // KRİTİK: PnL tracking güncelle
+                    state.trade_count += 1;
+                    let net_profit_decimal = Decimal::from_f64_retain(net_profit).unwrap_or(Decimal::ZERO);
+                    let total_fees_decimal = Decimal::from_f64_retain(total_fees).unwrap_or(Decimal::ZERO);
+                    
+                    if net_profit > 0.0 {
+                        state.profitable_trade_count += 1;
+                        state.total_profit += net_profit_decimal;
+                        if net_profit_decimal > state.largest_win {
+                            state.largest_win = net_profit_decimal;
+                        }
+                        info!(
+                            %symbol,
+                            entry_price = %entry_price_before_close.0,
+                            exit_price = %exit_price.0,
+                            quantity = %qty_abs,
+                            realized_pnl = realized_pnl,
+                            fees = total_fees,
+                            net_profit = net_profit,
+                            total_trades = state.trade_count,
+                            profitable_trades = state.profitable_trade_count,
+                            "✅ TRADE PROFIT - Position closed with profit"
+                        );
+                    } else {
+                        state.losing_trade_count += 1;
+                        state.total_loss += net_profit_decimal.abs(); // Loss is negative, store as positive
+                        if net_profit_decimal < state.largest_loss {
+                            state.largest_loss = net_profit_decimal.abs(); // Store as positive
+                        }
+                        warn!(
+                            %symbol,
+                            entry_price = %entry_price_before_close.0,
+                            exit_price = %exit_price.0,
+                            quantity = %qty_abs,
+                            realized_pnl = realized_pnl,
+                            fees = total_fees,
+                            net_profit = net_profit,
+                            total_trades = state.trade_count,
+                            losing_trades = state.losing_trade_count,
+                            "❌ TRADE LOSS - Position closed with loss"
+                        );
+                    }
+                    
+                    state.total_fees_paid += total_fees_decimal;
+                    
+                    // KRİTİK: Stratejisine trade sonucunu öğret (online learning)
+                    // Bu botu gerçekten "akıllı" yapan kısım - geçmiş trade'lerden öğreniyor
+                    state.strategy.learn_from_trade(net_profit, None, None);
+                    
+                    debug!(
+                        %symbol,
+                        net_profit,
+                        "Strategy learned from trade result"
+                    );
+                    
+                    // PnL summary log (her 10 işlemde bir veya 1 saatte bir)
+                    let should_log_summary = state.last_pnl_summary_time
+                        .map(|last| {
+                            last.elapsed().as_secs() >= 3600 || // 1 saat
+                            state.trade_count % 10 == 0 // Her 10 işlemde
+                        })
+                        .unwrap_or(false);
+                    
+                    if should_log_summary && state.trade_count > 0 {
+                        let total_profit_f = state.total_profit.to_f64().unwrap_or(0.0);
+                        let total_loss_f = state.total_loss.to_f64().unwrap_or(0.0);
+                        let net_pnl_f = total_profit_f - total_loss_f;
+                        let largest_win_f = state.largest_win.to_f64().unwrap_or(0.0);
+                        let largest_loss_f = state.largest_loss.to_f64().unwrap_or(0.0);
+                        let total_fees_f = state.total_fees_paid.to_f64().unwrap_or(0.0);
+                        
+                        if let Ok(logger) = json_logger.lock() {
+                            logger.log_pnl_summary(
+                                "hourly",
+                                state.trade_count,
+                                state.profitable_trade_count,
+                                state.losing_trade_count,
+                                total_profit_f,
+                                total_loss_f,
+                                net_pnl_f,
+                                largest_win_f,
+                                largest_loss_f,
+                                total_fees_f,
+                            );
+                        }
+                        
+                        info!(
+                            %symbol,
+                            total_trades = state.trade_count,
+                            profitable = state.profitable_trade_count,
+                            losing = state.losing_trade_count,
+                            total_profit = total_profit_f,
+                            total_loss = total_loss_f,
+                            net_pnl = net_pnl_f,
+                            win_rate = if state.trade_count > 0 { state.profitable_trade_count as f64 / state.trade_count as f64 } else { 0.0 },
+                            "📊 PnL SUMMARY - Trade statistics"
+                        );
+                        
+                        state.last_pnl_summary_time = Some(Instant::now());
+                    }
+                }
                 
                 // Reset position tracking after close
                         state.position_entry_time = None;
