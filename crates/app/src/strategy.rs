@@ -53,6 +53,11 @@ pub trait Strategy: Send + Sync {
     fn learn_from_trade(&mut self, _net_pnl_usd: f64, _entry_state: Option<&dyn std::any::Any>, _actual_direction: Option<f64>) {
         // Default: öğrenme yok (override edilebilir)
     }
+    /// Feature importance bilgisini döndür (analiz için)
+    /// Hangi feature'ların daha önemli olduğunu gösterir
+    fn get_feature_importance(&self) -> Option<Vec<(String, f64)>> {
+        None // Default: feature importance yok
+    }
     /// Volatilite bilgisini döndür (EWMA volatilite)
     /// Yüksek volatilite = daha riskli = küçük chunk boyutu
     fn get_volatility(&self) -> f64 {

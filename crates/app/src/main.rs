@@ -16,6 +16,8 @@ mod order_placement;
 mod position_manager;
 mod quote_generator;
 mod qmel;
+#[cfg(test)]
+mod qmel_tests;
 mod risk;
 mod risk_manager;
 mod strategy;
@@ -1257,12 +1259,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 
-                if has_position && !has_balance {
-                    info!(
-                        %symbol,
-                        position_qty = %pos.qty.0,
-                        "has open position but no balance, continuing to manage position"
-                    );
+            if has_position && !has_balance {
+                info!(
+                    %symbol,
+                    position_qty = %pos.qty.0,
+                    "has open position but no balance, continuing to manage position"
+                );
                 }
             }
             
@@ -1570,6 +1572,19 @@ async fn main() -> Result<()> {
                     // KRİTİK: Stratejisine trade sonucunu öğret (online learning)
                     // Bu botu gerçekten "akıllı" yapan kısım - geçmiş trade'lerden öğreniyor
                     state.strategy.learn_from_trade(net_profit, None, None);
+                    
+                    // Feature importance tracking: Her 20 trade'de bir özet logla
+                    // Hangi feature'ların daha önemli olduğunu öğren ve logla
+                    if state.trade_count > 0 && state.trade_count % 20 == 0 {
+                        if let Some(top_features) = state.strategy.get_feature_importance() {
+                            info!(
+                                %symbol,
+                                total_trades = state.trade_count,
+                                top_5_features = ?top_features.iter().take(5).map(|(name, score)| format!("{}: {:.4}", name, score)).collect::<Vec<_>>(),
+                                "📊 Feature Importance Analysis - Learning which features matter most"
+                            );
+                        }
+                    }
                     
                     debug!(
                         %symbol,
