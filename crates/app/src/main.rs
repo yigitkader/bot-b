@@ -1856,8 +1856,10 @@ async fn main() -> Result<()> {
                 
                 // KRİTİK DÜZELTME: Dinamik min_spread_bps hesapla (ProfitGuarantee ile)
                 // Sabit 60 bps yerine, pozisyon boyutuna göre dinamik hesapla
-                // Formül: min_spread = calculate_min_spread_bps(position_size_usd) - slippage_reserve
-                let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd) - cfg.risk.slippage_bps_reserve;
+                // ✅ calculate_min_spread_bps() artık safety margin içeriyor (slippage, partial fill, volatility)
+                // Not: slippage_bps_reserve hala config'de var ama calculate_min_spread_bps içinde safety margin zaten var
+                // İsteğe bağlı olarak ek bir reserve çıkarılabilir (daha konservatif için)
+                let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd);
                 // Config'deki min_spread_bps minimum eşik olarak kullan (fallback, dinamik'ten küçükse)
                 let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(60.0);
                 let min_spread_bps = dyn_min_spread_bps.max(min_spread_bps_config);
@@ -1932,16 +1934,13 @@ async fn main() -> Result<()> {
                     // NOT: Bu kod artık kullanılmıyor çünkü margin chunking sistemi var
                     // Ama yine de quote hazırlama için basit bir kontrol yapıyoruz
                     // Leverage uygulaması margin chunking'de calc_qty_from_margin ile yapılıyor
-                    // ✅ KRİTİK FIX: clamp_qty_by_usd max_usd'yi notional (pozisyon boyutu) olarak kullanıyor
-                    // caps.buy_total margin (leverage yok), bu yüzden leverage ile çarpmalıyız (notional'a çevirmek için)
-                    let is_opportunity_mode = state.strategy.is_opportunity_mode();
-                    let effective_leverage_for_clamp = if is_opportunity_mode {
-                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
-                    } else {
-                        effective_leverage
-                    };
-                    let effective_buy_notional = caps.buy_total * effective_leverage_for_clamp; // Margin → Notional (leverage ile çarpıldı)
-                    let nq = clamp_qty_by_usd(q, px, effective_buy_notional, qty_step_f64);
+                    // ✅ KRİTİK FIX: clamp_qty_by_usd max_usd parametresi notional (pozisyon boyutu) bekliyor
+                    // caps.buy_notional zaten notional içeriyor (cap_manager'da leverage uygulanmış)
+                    // caps.buy_notional opportunity mode leverage reduction'ı zaten içeriyor (cap_manager'da uygulandı)
+                    // caps.buy_total margin'dir, leverage ile çarpmaya gerek yok - caps.buy_notional kullanılmalı
+                    // ❌ YANLIŞ: caps.buy_total * effective_leverage_for_clamp → Çift sayma (leverage 2 kere uygulanır)
+                    // ✅ DOĞRU: caps.buy_notional → Tek sayma (leverage zaten cap_manager'da uygulandı)
+                    let nq = clamp_qty_by_usd(q, px, caps.buy_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec
@@ -1984,16 +1983,13 @@ async fn main() -> Result<()> {
                     // NOT: Bu kod artık kullanılmıyor çünkü margin chunking sistemi var
                     // Ama yine de quote hazırlama için basit bir kontrol yapıyoruz
                     // Leverage uygulaması margin chunking'de calc_qty_from_margin ile yapılıyor
-                    // ✅ KRİTİK FIX: clamp_qty_by_usd max_usd'yi notional (pozisyon boyutu) olarak kullanıyor
-                    // caps.buy_total margin (leverage yok), bu yüzden leverage ile çarpmalıyız (notional'a çevirmek için)
-                    let is_opportunity_mode = state.strategy.is_opportunity_mode();
-                    let effective_leverage_for_clamp = if is_opportunity_mode {
-                        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
-                    } else {
-                        effective_leverage
-                    };
-                    let effective_sell_notional = caps.buy_total * effective_leverage_for_clamp; // Margin → Notional (leverage ile çarpıldı)
-                    let nq = clamp_qty_by_usd(q, px, effective_sell_notional, qty_step_f64);
+                    // ✅ KRİTİK FIX: clamp_qty_by_usd max_usd parametresi notional (pozisyon boyutu) bekliyor
+                    // caps.sell_notional zaten notional içeriyor (cap_manager'da leverage uygulanmış)
+                    // caps.sell_notional opportunity mode leverage reduction'ı zaten içeriyor (cap_manager'da uygulandı)
+                    // caps.buy_total margin'dir, leverage ile çarpmaya gerek yok - caps.sell_notional kullanılmalı
+                    // ❌ YANLIŞ: caps.buy_total * effective_leverage_for_clamp → Çift sayma (leverage 2 kere uygulanır)
+                    // ✅ DOĞRU: caps.sell_notional → Tek sayma (leverage zaten cap_manager'da uygulandı)
+                    let nq = clamp_qty_by_usd(q, px, caps.sell_notional, qty_step_f64);
                     // 2. Quantize kontrolü
                     let quantized_to_zero = qty_step_dec > Decimal::ZERO
                         && nq.0 < qty_step_dec

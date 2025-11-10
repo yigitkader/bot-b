@@ -80,8 +80,9 @@ pub fn check_profit_guarantee(
     let spread_bps = calculate_spread_bps(bid_px.0, ask_px.0);
 
     // Calculate dynamic min spread
-    let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd)
-        - cfg.risk.slippage_bps_reserve;
+    // ✅ calculate_min_spread_bps() artık safety margin içeriyor (slippage, partial fill, volatility)
+    // Not: slippage_bps_reserve hala config'de var ama calculate_min_spread_bps içinde safety margin zaten var
+    let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd);
     let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(60.0);
     let min_spread_bps = dyn_min_spread_bps.max(min_spread_bps_config);
 

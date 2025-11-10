@@ -53,7 +53,10 @@ pub fn calculate_caps(
 
     let available_after_position = (avail - existing_position_margin).max(0.0);
 
-    // Calculate effective leverage (opportunity mode reduces leverage)
+    // ✅ KRİTİK: Opportunity Mode Leverage Reduction
+    // Opportunity mode'da leverage reduction uygulanır (örn: 0.5 → leverage yarıya düşer)
+    // Bu reduction SADECE burada (cap_manager) uygulanır, main.rs'de tekrar uygulanmaz
+    // Çünkü caps.buy_notional ve caps.sell_notional zaten bu reduction ile hesaplanmıştır
     let is_opportunity_mode = state.strategy.is_opportunity_mode();
     let effective_leverage_for_caps = if is_opportunity_mode {
         effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
@@ -61,11 +64,20 @@ pub fn calculate_caps(
         effective_leverage
     };
 
+    // ✅ KRİTİK: Margin vs Notional ayrımı
+    // - margin: Hesaptan çıkan para (USD)
+    // - notional: Pozisyon büyüklüğü (margin * leverage)
+    // Örnek: 100 USD margin, 20x leverage → 2000 USD notional
+    // Örnek (opportunity mode): 100 USD margin, 20x leverage * 0.5 reduction → 10x → 1000 USD notional
+    
     let max_usable_from_account = available_after_position.min(cfg.max_usd_per_order);
-    let position_size_with_leverage = max_usable_from_account * effective_leverage_for_caps;
-
-    let per_order_cap_margin = cfg.max_usd_per_order;
-    let per_order_notional = per_order_cap_margin * effective_leverage_for_caps;
+    
+    // Per-order limits (margin ve notional)
+    // ✅ KRİTİK: per_order_notional zaten opportunity mode leverage reduction içeriyor
+    // main.rs'de caps.buy_notional/caps.sell_notional kullanılırken leverage ile çarpılmaz
+    // Çünkü bu değerler zaten doğru notional değerlerini içeriyor
+    let per_order_cap_margin = cfg.max_usd_per_order; // Margin limit (USD)
+    let per_order_notional = per_order_cap_margin * effective_leverage_for_caps; // Notional limit (USD) - opportunity mode reduction dahil
 
     info!(
         quote_asset = %quote_asset,
@@ -76,7 +88,6 @@ pub fn calculate_caps(
         effective_leverage_for_caps,
         is_opportunity_mode,
         max_usable_from_account,
-        position_size_with_leverage,
         per_order_limit_margin_usd = per_order_cap_margin,
         per_order_limit_notional_usd = per_order_notional,
         "calculated futures caps"

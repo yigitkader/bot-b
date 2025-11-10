@@ -29,6 +29,10 @@ pub const DEFAULT_MIN_PROFIT_USD: f64 = 0.50;
 /// Depth analysis volume multiplier (50% of notional)
 pub const DEPTH_VOLUME_MULTIPLIER: f64 = 0.5;
 
+/// Safety margin for min spread calculation (bps)
+/// Covers: slippage (~1-5 bps), partial fill risks, market volatility
+pub const MIN_SPREAD_SAFETY_MARGIN_BPS: f64 = 5.0;
+
 // ============================================================================
 // Decimal Constants
 // ============================================================================

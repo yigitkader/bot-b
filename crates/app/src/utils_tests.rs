@@ -185,21 +185,21 @@ mod tests {
     #[test]
     fn test_calculate_min_spread_bps_small_position() {
         let pg = ProfitGuarantee::default();
-        // Position: 20 USD, min profit: 0.005 USD, fees: 0.0006 (6 bps)
-        // min_spread = (0.005 / 20) * 10000 + 6 = 2.5 + 6 = 8.5 bps
+        // Position: 20 USD, min profit: 0.50 USD, fees: 0.0004 (4 bps), safety margin: 5 bps
+        // min_spread = (0.50 / 20) * 10000 + 4 + 5 = 250 + 4 + 5 = 259 bps
         let min_spread = pg.calculate_min_spread_bps(20.0);
-        assert!(min_spread > 8.0);
-        assert!(min_spread < 9.0);
+        assert!(min_spread > 258.0);
+        assert!(min_spread < 260.0);
     }
 
     #[test]
     fn test_calculate_min_spread_bps_large_position() {
         let pg = ProfitGuarantee::default();
-        // Position: 1000 USD, min profit: 0.005 USD, fees: 0.0006 (6 bps)
-        // min_spread = (0.005 / 1000) * 10000 + 6 = 0.05 + 6 = 6.05 bps
+        // Position: 1000 USD, min profit: 0.50 USD, fees: 0.0004 (4 bps), safety margin: 5 bps
+        // min_spread = (0.50 / 1000) * 10000 + 4 + 5 = 5 + 4 + 5 = 14 bps
         let min_spread = pg.calculate_min_spread_bps(1000.0);
-        assert!(min_spread > 6.0);
-        assert!(min_spread < 7.0);
+        assert!(min_spread > 13.0);
+        assert!(min_spread < 15.0);
     }
 
     #[test]
@@ -495,22 +495,23 @@ mod tests {
 
     #[test]
     fn test_split_margin_into_chunks_exact_multiple() {
-        // 300 USD, min 10, max 100 → [100, 100, 100]
+        // 300 USD, min 10, max 100 → [100, 100, 50, 50] (split last 100 into 2x50)
         let chunks = split_margin_into_chunks(300.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0], 100.0);
         assert_eq!(chunks[1], 100.0);
-        assert_eq!(chunks[2], 100.0);
+        assert!((chunks[2] - 50.0).abs() < 0.01);
+        assert!((chunks[3] - 50.0).abs() < 0.01);
     }
 
     #[test]
     fn test_split_margin_into_chunks_with_remainder() {
-        // 250 USD, min 10, max 100 → [100, 100, 50]
+        // 250 USD, min 10, max 100 → [100, 75, 75] (split last 150 into 2x75)
         let chunks = split_margin_into_chunks(250.0, 10.0, 100.0);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], 100.0);
-        assert_eq!(chunks[1], 100.0);
-        assert_eq!(chunks[2], 50.0);
+        assert!((chunks[1] - 75.0).abs() < 0.01);
+        assert!((chunks[2] - 75.0).abs() < 0.01);
     }
 
     #[test]
@@ -546,20 +547,24 @@ mod tests {
 
     #[test]
     fn test_split_margin_into_chunks_exact_maximum() {
-        // 100 USD, min 10, max 100 → [100]
+        // 100 USD, min 10, max 100 → [50, 50] (split to maximize trades)
         let chunks = split_margin_into_chunks(100.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], 100.0);
+        assert_eq!(chunks.len(), 2);
+        assert!((chunks[0] - 50.0).abs() < 0.01);
+        assert!((chunks[1] - 50.0).abs() < 0.01);
     }
 
     #[test]
     fn test_split_margin_into_chunks_large_amount() {
-        // 1000 USD, min 10, max 100 → [100, 100, ..., 100] (10 chunks)
+        // 1000 USD, min 10, max 100 → [100, 100, ..., 100, 50, 50] (10 chunks of 100, then split last 100 into 2x50)
         let chunks = split_margin_into_chunks(1000.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 10);
-        for chunk in &chunks {
-            assert_eq!(*chunk, 100.0);
+        // 1000 = 9×100 + 100, last 100 split into 2x50 = 9 + 2 = 11 chunks
+        assert_eq!(chunks.len(), 11);
+        for i in 0..9 {
+            assert_eq!(chunks[i], 100.0);
         }
+        assert!((chunks[9] - 50.0).abs() < 0.01);
+        assert!((chunks[10] - 50.0).abs() < 0.01);
     }
 
     #[test]
@@ -578,12 +583,13 @@ mod tests {
 
     #[test]
     fn test_split_margin_into_chunks_custom_min_max() {
-        // 150 USD, min 20, max 50 → [50, 50, 50]
+        // 150 USD, min 20, max 50 → [50, 50, 25, 25] (split last 50 into 2x25)
         let chunks = split_margin_into_chunks(150.0, 20.0, 50.0);
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0], 50.0);
         assert_eq!(chunks[1], 50.0);
-        assert_eq!(chunks[2], 50.0);
+        assert!((chunks[2] - 25.0).abs() < 0.01);
+        assert!((chunks[3] - 25.0).abs() < 0.01);
     }
 
     // ============================================================================
@@ -592,18 +598,18 @@ mod tests {
 
     #[test]
     fn test_margin_chunking_respects_limits() {
-        // 140 USD available → [100, 40] chunks
+        // 140 USD available → [70, 70] chunks (split to maximize trades)
         let chunks = split_margin_into_chunks(140.0, 10.0, 100.0);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], 100.0);
-        assert_eq!(chunks[1], 40.0);
+        assert!((chunks[0] - 70.0).abs() < 0.01);
+        assert!((chunks[1] - 70.0).abs() < 0.01);
         
         // Total spent tracking
         let mut total_spent = 0.0;
         for chunk in &chunks {
             total_spent += chunk;
         }
-        assert_eq!(total_spent, 140.0); // Hepsi kullanıldı
+        assert!((total_spent - 140.0).abs() < 0.01); // Hepsi kullanıldı
     }
 
     #[test]
@@ -629,12 +635,14 @@ mod tests {
 
     #[test]
     fn test_margin_chunking_large_balance() {
-        // 500 USD available → [100, 100, 100, 100, 100] chunks
+        // 500 USD available → [100, 100, 100, 100, 50, 50] chunks (split last 100 into 2x50)
         let chunks = split_margin_into_chunks(500.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 5);
-        for chunk in &chunks {
-            assert_eq!(*chunk, 100.0);
+        assert_eq!(chunks.len(), 6);
+        for i in 0..4 {
+            assert_eq!(chunks[i], 100.0);
         }
+        assert!((chunks[4] - 50.0).abs() < 0.01);
+        assert!((chunks[5] - 50.0).abs() < 0.01);
     }
 
     // ============================================================================

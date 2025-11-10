@@ -18,6 +18,9 @@ use crate::types::{OrderInfo, SymbolState};
 
 /// Place orders for a side with profit guarantee check
 /// This function unifies bid/ask order placement logic to eliminate duplication
+/// 
+/// IMPORTANT: Opening LIMIT orders always use GTX (post-only) to guarantee maker fee
+/// This prevents accidental taker execution which could eliminate the $0.50 profit margin
 pub async fn place_orders_with_profit_guarantee(
     venue: &BinanceFutures,
     symbol: &str,
@@ -35,13 +38,17 @@ pub async fn place_orders_with_profit_guarantee(
     quote_balances: &mut HashMap<String, f64>,
     total_spent: &mut f64,
     cfg: &AppCfg,
-    tif: Tif,
+    _tif: Tif, // Parameter kept for compatibility but not used - opening orders always use GTX
     json_logger: &std::sync::Arc<std::sync::Mutex<logger::JsonLogger>>,
     ob: &OrderBook,
     _maker_fee_rate: f64, // Available but not used (using taker for safety in TP calculation)
     taker_fee_rate: f64,
     min_margin: f64,
 ) -> Result<()> {
+    // KRİTİK: Açılış LIMIT emirleri için her zaman GTX (post-only) kullan
+    // Bu, yanlışlıkla taker olma riskini önler ve maker fee garantisi sağlar
+    // $0.50 profit margin'ı korumak için zorunlu
+    const OPENING_ORDER_TIF: Tif = Tif::PostOnly; // GTX on Binance Futures
     let (px_raw, _qty) = match quote {
         Some(q) => q,
         None => return Ok(()),
@@ -141,7 +148,10 @@ pub async fn place_orders_with_profit_guarantee(
             effective_leverage
         };
 
-        // Depth analysis
+        // ✅ Depth analysis için notional hesaplama (çift sayma yok, sadece depth için)
+        // margin_chunk: USD (hesaptan çıkan para)
+        // chunk_notional_estimate: USD (pozisyon büyüklüğü = margin * leverage)
+        // Bu sadece depth analysis için kullanılıyor, gerçek order placement calc_qty_from_margin kullanıyor
         let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
         let min_required_volume_usd = chunk_notional_estimate * DEPTH_VOLUME_MULTIPLIER;
         let optimal_price_from_depth = crate::utils::find_optimal_price_from_depth(
@@ -306,7 +316,7 @@ pub async fn place_orders_with_profit_guarantee(
         // Test order for first chunk
         if chunk_idx == 0 && !state.test_order_passed {
             crate::utils::rate_limit_guard(1).await;
-            match venue.test_order(symbol, side, chunk_price, chunk_qty, tif).await {
+            match venue.test_order(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF).await {
                 Ok(_) => {
                     state.test_order_passed = true;
                     info!(
@@ -337,7 +347,7 @@ pub async fn place_orders_with_profit_guarantee(
                                 info!(%symbol, side = ?side, "rules refreshed, retrying test order");
 
                                 crate::utils::rate_limit_guard(1).await;
-                                match venue.test_order(symbol, side, chunk_price, chunk_qty, tif).await {
+                                match venue.test_order(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF).await {
                                     Ok(_) => {
                                         state.test_order_passed = true;
                                         info!(%symbol, side = ?side, "test order passed after rules refresh");
@@ -397,7 +407,7 @@ pub async fn place_orders_with_profit_guarantee(
         };
 
         match venue
-            .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, tif, &client_order_id)
+            .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF, &client_order_id)
             .await
         {
             Ok((order_id, returned_client_id)) => {

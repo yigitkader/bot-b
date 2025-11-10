@@ -173,11 +173,18 @@ pub fn is_usd_stable(asset: &str) -> bool {
 /// # Returns
 /// Vector of margin chunks, each between min and max
 /// 
+/// # Strategy
+/// Maximizes number of trades by splitting margin into smaller chunks when possible:
+/// - If remaining == max: split into 2 equal chunks (max/2, max/2)
+/// - If remaining > max: take max, then process remainder
+/// - If remaining >= min: add as single chunk
+/// 
 /// # Examples
 /// - 0-9 USD: empty vector (ignored)
-/// - 10-100 USD: single chunk
-/// - 101-200 USD: 1×100 + 1×(remainder)
-/// - 201-300 USD: 2×100 + 1×(remainder)
+/// - 10-100 USD: single chunk (or 2×50 if exactly 100)
+/// - 100 USD: [50, 50] (2 chunks for more trades)
+/// - 140 USD: [100, 40] (2 chunks)
+/// - 200 USD: [100, 50, 50] (3 chunks)
 pub fn split_margin_into_chunks(
     available_margin: f64,
     min_margin_per_trade: f64,
@@ -186,16 +193,31 @@ pub fn split_margin_into_chunks(
     let mut chunks = Vec::new();
     let mut remaining = available_margin;
     
-    // While we have enough for a full chunk (max_margin_per_trade)
-    while remaining >= max_margin_per_trade {
+    // While we have enough for at least 2 full chunks (max_margin_per_trade * 2)
+    // This ensures we can split the last max chunk if needed
+    while remaining >= max_margin_per_trade * 2.0 {
         chunks.push(max_margin_per_trade);
         remaining -= max_margin_per_trade;
     }
     
-    // If remainder is >= min_margin_per_trade, add it as a separate chunk
-    if remaining >= min_margin_per_trade {
+    // Handle remaining margin
+    if remaining >= max_margin_per_trade {
+        // Remaining is >= max but < max*2
+        // Split into 2 equal chunks to maximize number of trades
+        let half = remaining / 2.0;
+        // Ensure both halves are >= min_margin_per_trade
+        if half >= min_margin_per_trade {
+            chunks.push(half);
+            chunks.push(remaining - half); // Second half (may be slightly different due to rounding)
+        } else {
+            // Can't split, add as single chunk
+            chunks.push(remaining);
+        }
+    } else if remaining >= min_margin_per_trade {
+        // Remaining is < max but >= min, add as single chunk
         chunks.push(remaining);
     }
+    // If remaining < min, ignore it
     
     chunks
 }
@@ -203,7 +225,7 @@ pub fn split_margin_into_chunks(
 /// Calculate quantity and price from margin, leverage, and exchange rules
 /// 
 /// # Arguments
-/// * `margin_chunk` - Margin chunk in USD (10-100)
+/// * `margin_chunk` - Margin chunk in USD (10-100) - hesaptan çıkan para
 /// * `leverage` - Leverage (20-50x)
 /// * `price` - Current price
 /// * `rules` - Exchange rules (stepSize, tickSize, minQty, minNotional, precisions)
@@ -211,6 +233,17 @@ pub fn split_margin_into_chunks(
 /// 
 /// # Returns
 /// Option<(qty_string, price_string)> if valid, None if cannot satisfy rules
+/// 
+/// # Formula
+/// 1. notional = margin * leverage (pozisyon büyüklüğü)
+/// 2. qty = notional / price
+/// 3. Quantize qty and price according to exchange rules
+/// 
+/// # Consistency
+/// Bu fonksiyon cap_manager'daki hesaplamalarla uyumludur:
+/// - cap_manager: per_order_notional = per_order_cap_margin * effective_leverage
+/// - calc_qty_from_margin: notional = margin_chunk * leverage
+/// Her ikisi de aynı formülü kullanır: margin * leverage = notional
 pub fn calc_qty_from_margin(
     margin_chunk: f64,
     leverage: f64,
@@ -218,8 +251,10 @@ pub fn calc_qty_from_margin(
     rules: &SymbolRules,
     side: crate::core::types::Side,
 ) -> Option<(String, String)> {
-    // KRİTİK DÜZELTME: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
+    // ✅ KRİTİK: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
     // Calculate notional = margin * leverage (Decimal olarak)
+    // margin: hesaptan çıkan para (USD)
+    // notional: pozisyon büyüklüğü (USD) = margin * leverage
     let margin_dec = Decimal::try_from(margin_chunk).unwrap_or(Decimal::ZERO);
     let leverage_dec = Decimal::try_from(leverage).unwrap_or(Decimal::ZERO);
     let notional = margin_dec * leverage_dec;
@@ -1140,7 +1175,8 @@ impl ProfitGuarantee {
     /// Maker → maker (giriş+çıkış) için ücret toplamı: fees_bps_total = 2 * maker_fee_bps
     /// İstenen net kâr: $0.50
     /// Gerekli brüt bps: target_bps = 10000 * 0.50 / notional
-    /// min_spread_bps_needed = fees_bps_total + target_bps
+    /// Safety margin: slippage (~1-5 bps) + partial fill risks + market volatility
+    /// min_spread_bps_needed = fees_bps_total + target_bps + safety_margin_bps
     pub fn calculate_min_spread_bps(&self, position_size_usd: f64) -> f64 {
         if position_size_usd <= 0.0 {
             return 0.0;
@@ -1153,8 +1189,14 @@ impl ProfitGuarantee {
         // İstenen net kâr için gerekli brüt bps
         let target_bps = 10000.0 * self.min_profit_usd / position_size_usd;
         
-        // Minimum spread = fees + target profit
-        fees_bps_total + target_bps
+        // ✅ Safety margin: slippage, partial fill risks, market volatility
+        // Slippage: ~1-5 bps (fiyat kayması)
+        // Partial fill risks: emirlerin tam doldurulmaması riski
+        // Market volatility: volatilite anında spread genişlemesi
+        let safety_margin_bps = crate::constants::MIN_SPREAD_SAFETY_MARGIN_BPS;
+        
+        // Minimum spread = fees + target profit + safety margin
+        fees_bps_total + target_bps + safety_margin_bps
     }
 
     /// Check if a trade is profitable given spread and position size
@@ -1382,8 +1424,8 @@ pub fn calculate_spread_bps(bid: Decimal, ask: Decimal) -> f64 {
 /// 
 /// Market Making için özel mantık:
 /// - Spread'den kazanç garantili (maker olarak)
-/// - Risk/reward kontrolü daha esnek (market making için 1.0-1.5 yeterli)
-/// - Büyük pozisyonlar için daha sıkı risk/reward kontrolü
+/// - Risk/reward kontrolü sabit threshold kullanır (pozisyon boyutuna göre değişmez)
+/// - Her işlemde $0.50 kar hedefi olduğu için threshold sabit olmalı
 /// 
 /// # Arguments
 /// * `spread_bps` - Current spread in basis points
@@ -1413,8 +1455,11 @@ pub fn should_place_trade(
         return (false, "not_profitable_after_fees");
     }
     
-    // 3. Risk/Reward oranı kontrolü (Market Making için esnek)
-    // Market making'de spread'den kazanç garantili, bu yüzden risk/reward daha esnek olabilir
+    // 3. Risk/Reward oranı kontrolü
+    // ✅ KRİTİK FIX: $0.50 kar hedefi her işlemde aynı olduğu için risk/reward oranı sabit olmalı
+    // Pozisyon boyutuna göre threshold değiştirmek mantıksız çünkü:
+    // - Küçük pozisyonlarda bile kar garantisi korunmalı
+    // - Her işlemde aynı $0.50 hedefi varsa threshold sabit olmalı
     let max_loss_pct = stop_loss_threshold.abs();
     let risk_reward_ratio = profit_guarantee.calculate_risk_reward_ratio(
         spread_bps,
@@ -1422,19 +1467,8 @@ pub fn should_place_trade(
         max_loss_pct,
     );
     
-    // Market making için dinamik risk/reward threshold:
-    // - Küçük pozisyonlar (< 50 USD): Risk/reward kontrolü daha esnek (0.8x threshold)
-    // - Orta pozisyonlar (50-200 USD): Normal threshold
-    // - Büyük pozisyonlar (> 200 USD): Daha sıkı kontrol (1.2x threshold)
-    let adjusted_threshold = if position_size_usd < 50.0 {
-        min_risk_reward_ratio * 0.8  // Küçük pozisyonlar için daha esnek
-    } else if position_size_usd > 200.0 {
-        min_risk_reward_ratio * 1.2  // Büyük pozisyonlar için daha sıkı
-    } else {
-        min_risk_reward_ratio  // Normal
-    };
-    
-    if risk_reward_ratio < adjusted_threshold {
+    // Risk/reward oranı kontrolü - sabit threshold (pozisyon boyutuna göre değişmez)
+    if risk_reward_ratio < min_risk_reward_ratio {
         return (false, "risk_reward_too_low");
     }
     
