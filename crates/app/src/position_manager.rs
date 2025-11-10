@@ -215,6 +215,18 @@ pub fn should_close_position_smart(
     };
 
     let age_secs = entry_time.elapsed().as_secs() as f64;
+    
+    // ✅ KRİTİK: Zarar durumunda timeout kontrolü
+    // Eğer pozisyon zararda ve belirli bir süre geçtiyse, zorla kapat
+    if net_pnl < 0.0 && age_secs >= crate::constants::MAX_LOSS_DURATION_SEC {
+        return (true, format!("loss_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
+    }
+    
+    // ✅ KRİTİK: Mutlak timeout - pozisyon ne durumda olursa olsun maksimum süre
+    // Market making için pozisyonlar çok uzun süre açık kalmamalı
+    if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
+        return (true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
+    }
 
     // Time-weighted profit thresholds
     let time_weighted_threshold = if age_secs <= 10.0 {

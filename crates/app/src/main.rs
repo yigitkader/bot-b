@@ -15,6 +15,7 @@ mod order_manager;
 mod order_placement;
 mod position_manager;
 mod quote_generator;
+mod qmel;
 mod risk;
 mod risk_manager;
 mod strategy;
@@ -370,8 +371,25 @@ async fn main() -> Result<()> {
         "main trading loop starting"
     );
     
+    // ✅ KRİTİK FIX: Graceful shutdown için signal handler'ı bir kez spawn et
+    // Signal handler bir kez kurulmalı, her tick'te yeni handler kurmak yanlış ve çalışmıyor
+    // Cross-platform çözüm: tokio::signal::ctrl_c() kullan ama bir kez spawn et
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let shutdown_tx_clone = shutdown_tx.clone();
+    
+    // Signal handler task'ı spawn et (bir kez)
+    tokio::spawn(async move {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!(error = %e, "failed to wait for ctrl_c signal");
+            return;
+        }
+        info!("Ctrl+C signal received, sending shutdown signal");
+        let _ = shutdown_tx_clone.send(());
+    });
+    
     // WebSocket reconnect sonrası missed events sync flag'i (loop dışında)
     let mut force_sync_all = false;
+    let mut shutdown_requested = false;
     
     // BEST PRACTICE: Bot sürekli çalışır, ancak Ctrl+C ile graceful shutdown yapılabilir
     // Shutdown mekanizması sadece manuel durdurma için - bot normalde sürekli çalışır
@@ -380,18 +398,11 @@ async fn main() -> Result<()> {
             _ = interval.tick() => {
                 // Normal trading tick - bot sürekli çalışır
             }
-            result = tokio::signal::ctrl_c() => {
-                match result {
-                    Ok(_) => {
-                        info!("shutdown signal received (Ctrl+C), initiating graceful shutdown");
-                        break;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "failed to wait for ctrl_c signal, continuing");
-                        // Signal handler kurulamadı ama bot çalışmaya devam eder
-                        continue;
-                    }
-                }
+            _ = shutdown_rx.recv() => {
+                // ✅ Signal handler bir kez kuruldu, shutdown channel'dan mesaj geldi
+                info!("shutdown signal received (Ctrl+C), initiating graceful shutdown");
+                shutdown_requested = true;
+                break;
             }
         }
         
@@ -2114,18 +2125,35 @@ async fn main() -> Result<()> {
         }
     }
     
-    // BEST PRACTICE: Graceful shutdown - tüm kaynakları temizle
+    // ✅ BEST PRACTICE: Graceful shutdown - tüm kaynakları temizle
     info!("main loop ended, performing graceful shutdown");
     
-    // Async logger'ın channel'ını kapat (writer task'ın son event'leri yazması için)
-    // Logger Arc ile shared olduğu için drop edildiğinde sender drop olur ve receiver None alır
-    drop(json_logger);
+    // 1. Açık pozisyonları kontrol et (log için)
+    if shutdown_requested {
+        info!("checking for open positions...");
+        for state in states.iter() {
+            let symbol = &state.meta.symbol;
+            if !state.inv.0.is_zero() {
+                warn!(%symbol, inventory = %state.inv.0, "position still open during shutdown");
+            }
+        }
+    }
     
-    // Event channel'ı kapat (WebSocket task'ı bunu algılayacak ve duracak)
+    // 2. Event channel'ı kapat (WebSocket task'ları bunu algılayacak ve duracak)
+    info!("closing event channels...");
     drop(event_tx);
     
-    // Kısa bir süre bekle ki pending işlemler (logger flush, WebSocket cleanup) tamamlansın
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 3. Async logger'ın channel'ını kapat (writer task'ın son event'leri yazması için)
+    // Logger Arc ile shared olduğu için drop edildiğinde sender drop olur ve receiver None alır
+    info!("closing logger...");
+    drop(json_logger);
+    
+    // 4. Shutdown channel'ı kapat
+    drop(shutdown_tx);
+    
+    // 5. Kısa bir süre bekle ki pending işlemler (logger flush, WebSocket cleanup) tamamlansın
+    info!("waiting for background tasks to complete...");
+    tokio::time::sleep(Duration::from_millis(1000)).await; // 500ms → 1000ms (daha güvenli)
     
     info!("graceful shutdown completed");
     Ok(())

@@ -33,6 +33,8 @@ binance:
   spot_base: "https://api.binance.com"
   # USDⓈ-M Futures (USDC teminat)
   futures_base: "https://fapi.binance.com"
+  api_key: ""
+  secret_key: ""
   recv_window_ms: 5000
   hedge_mode: false  # Hedge mode (dual-side position) açık mı? Default: false (one-way mode)
 
@@ -46,11 +48,23 @@ risk:
   max_open_chunks_per_symbol_per_side: 5  # Sembol başına yönde maksimum açık chunk sayısı
 
 strategy:
-  type: "dyn_mm"
+  type: "dyn_mm"  # "dyn_mm" | "qmel" - Q-MEL algoritması için "qmel" kullan
   # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
   a: 60.0   # 100.0 → 60.0: spread'i daralt (daha agresif, daha fazla işlem)
   b: 20.0    # 35.0 → 20.0: spread'i daralt (daha agresif, daha fazla işlem)
   base_size: "20.0"  # 20 → 50 (daha fazla kazanç/işlem)
+  
+  # --- Q-MEL Algoritma Parametreleri (type: "qmel" için) ---
+  # Q-MEL: Micro-Edge Trading Algorithm
+  qmel_ev_threshold: 0.10  # Minimum EV to trade (USD) - default: $0.10
+  qmel_min_margin_usdc: 10.0  # Minimum margin per trade (USDC) - zorunlu kural
+  qmel_max_margin_usdc: 100.0  # Maximum margin per trade (USDC) - zorunlu kural
+  qmel_f_min: 0.02  # Minimum risk fraction (2%)
+  qmel_f_max: 0.15  # Maximum risk fraction (15%)
+  qmel_alpha: 0.5  # ARG safety coefficient [0.3, 0.6]
+  qmel_beta: 1.0  # ARG volatility coefficient [0.5, 1.5]
+  qmel_edge_decay_half_life_ms: 500.0  # Edge decay half-life (ms)
+  qmel_exploration_rate: 0.1  # Bandit exploration rate
   
   # --- Spread ve Fiyatlama Eşikleri ---
   # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
