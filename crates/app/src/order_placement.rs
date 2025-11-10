@@ -93,19 +93,23 @@ pub async fn place_orders_with_profit_guarantee(
         }
     };
 
-    // Volatility-based chunk sizing
+    // ✅ Volatility-based chunk sizing - optimized for 100+ trades per day
+    // Hedef: 100 USDC'yi 4-5 chunk'a bölmek (her biri 20-25 USDC)
+    // base_chunk_size: 20.0 → max_margin_adaptive = 40.0 → 100 USDC → [40, 20, 20, 20] (4 chunks)
     let volatility = state.strategy.get_volatility();
-    let base_chunk_size: f64 = 50.0;
+    let base_chunk_size: f64 = 20.0; // ✅ Düşürüldü: 50.0 → 20.0 (daha fazla chunk için)
     let volatility_factor: f64 = if volatility > 0.05 {
-        0.6
+        0.6  // Yüksek volatilite: daha küçük chunk'lar
     } else if volatility < 0.01 {
-        1.2
+        1.2  // Düşük volatilite: daha büyük chunk'lar
     } else {
-        1.0
+        1.0  // Normal volatilite
     };
 
     let adaptive_chunk_size = base_chunk_size * volatility_factor;
     let min_margin_adaptive = (adaptive_chunk_size * 0.2).max(min_margin).min(100.0);
+    // ✅ max_margin_adaptive: adaptive_chunk_size * 2.0 (örn: 20 * 2 = 40)
+    // Bu sayede 100 USDC → [40, 20, 20, 20] (4 chunks) veya [40, 30, 30] (3 chunks) olabilir
     let max_margin_adaptive = (adaptive_chunk_size * 2.0).min(cfg.max_usd_per_order).max(10.0);
 
     let margin_chunks = crate::utils::split_margin_into_chunks(
