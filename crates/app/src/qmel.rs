@@ -632,6 +632,7 @@ impl AutoRiskGovernor {
     }
 
     /// Calculate safe leverage based on stop distance, MMR, and volatility
+    /// AGGRESSIVE MODE: For $0.50 target, maximize leverage while staying safe
     /// L ≤ (α · d_stop) / MMR
     /// L ← min(L, β · T / σ_1s)
     pub fn calculate_leverage(
@@ -642,31 +643,45 @@ impl AutoRiskGovernor {
         volatility_1s: f64,        // 1-second volatility
         daily_drawdown_pct: f64,   // Current daily drawdown percentage
     ) -> f64 {
-        // Liquidation safety constraint
+        // AGGRESSIVE: For $0.50 target, we want to maximize leverage
+        // Use higher alpha (closer to 0.6) and beta (closer to 1.5) for aggressive mode
+        
+        // Liquidation safety constraint - AGGRESSIVE: use max alpha
         let leverage_by_stop = if mmr > 0.0 {
-            (self.alpha * stop_distance_pct) / mmr
+            // Use 0.6 (max safe alpha) for aggressive leverage
+            let aggressive_alpha = 0.6;
+            (aggressive_alpha * stop_distance_pct) / mmr
         } else {
             self.max_leverage
         };
         
-        // Volatility constraint
+        // Volatility constraint - AGGRESSIVE: use max beta
         let leverage_by_vol = if volatility_1s > 1e-8 {
-            (self.beta * target_tick_usd) / volatility_1s
+            // Use 1.5 (max beta) for aggressive leverage
+            let aggressive_beta = 1.5;
+            (aggressive_beta * target_tick_usd) / volatility_1s
         } else {
             self.max_leverage
         };
         
-        // Daily drawdown protection: reduce leverage as drawdown increases
-        let drawdown_factor = if daily_drawdown_pct > 0.0 {
-            // Reduce leverage by 30% for each 1% drawdown
-            (1.0 - daily_drawdown_pct * 0.3).max(0.3)
+        // AGGRESSIVE: Only reduce leverage if drawdown is significant (>2%)
+        // For small drawdowns, keep leverage high to maximize $0.50 targets
+        let drawdown_factor = if daily_drawdown_pct > 0.02 {
+            // Only reduce if drawdown > 2%
+            // Reduce by 20% per 1% drawdown (less aggressive than before)
+            (1.0 - (daily_drawdown_pct - 0.02) * 0.2).max(0.5)
         } else {
-            1.0
+            1.0 // No reduction for small drawdowns
         };
         
-        // Take minimum of all constraints
-        let base_leverage = leverage_by_stop.min(leverage_by_vol).min(self.max_leverage);
-        (base_leverage * drawdown_factor).max(1.0).min(self.max_leverage)
+        // AGGRESSIVE: Take maximum of constraints (not minimum) to maximize leverage
+        // But still respect safety limits
+        let base_leverage = leverage_by_stop.max(leverage_by_vol).min(self.max_leverage);
+        let final_leverage = base_leverage * drawdown_factor;
+        
+        // AGGRESSIVE: For $0.50 target, prefer higher leverage
+        // Minimum leverage: 10x (unless safety requires lower)
+        final_leverage.max(10.0).min(self.max_leverage)
     }
 }
 
@@ -931,8 +946,10 @@ impl QMelStrategy {
         let feature_extractor = FeatureExtractor::new();
         let direction_model = DirectionModel::new(9); // 9 features
         let ev_calculator = ExpectedValueCalculator::new(maker_fee_rate, taker_fee_rate, ev_threshold);
-        let margin_allocator = DynamicMarginAllocator::new(min_margin_usdc, max_margin_usdc, 0.02, 0.15);
-        let risk_governor = AutoRiskGovernor::new(0.5, 1.0, max_leverage);
+        // AGGRESSIVE: For $0.50 target, use higher risk fractions (f_min=0.05, f_max=0.20)
+        let margin_allocator = DynamicMarginAllocator::new(min_margin_usdc, max_margin_usdc, 0.05, 0.20);
+        // AGGRESSIVE: Use max alpha (0.6) and beta (1.5) for maximum leverage
+        let risk_governor = AutoRiskGovernor::new(0.6, 1.5, max_leverage);
         let execution_optimizer = ExecutionOptimizer::new(maker_fee_rate, taker_fee_rate, 500.0);
         let regime_classifier = RegimeClassifier::new();
         let bandit = ThompsonSamplingBandit::new(0.1);
@@ -1066,9 +1083,18 @@ impl Strategy for QMelStrategy {
         let p_up = self.direction_model.predict_up_probability(&state, self.target_tick_usd);
         let p_down = 1.0 - p_up;
         
-        // Calculate expected values
-        // Note: We need position size estimate - using a default for now
-        let estimated_position_size_usd = 50.0; // Will be calculated by DMA in actual implementation
+        // AGGRESSIVE: For $0.50 target, use max margin (100 USDC) to maximize profit per trade
+        // Calculate position size using max margin with aggressive leverage
+        let max_margin_usdc = 100.0; // Use max margin for $0.50 target
+        let estimated_leverage = self.risk_governor.calculate_leverage(
+            0.01, // 1% stop distance (conservative estimate)
+            0.004, // 0.4% MMR (typical for futures)
+            self.target_tick_usd,
+            state.volatility_1s,
+            self.daily_drawdown_pct,
+        );
+        let estimated_position_size_usd = max_margin_usdc * estimated_leverage;
+        
         let estimated_slippage = self.execution_optimizer.estimate_slippage(
             estimated_position_size_usd,
             estimated_position_size_usd * 2.0, // Assume 2x depth
@@ -1093,14 +1119,19 @@ impl Strategy for QMelStrategy {
             true,
         );
         
-        // Alpha gate: only trade if EV > threshold
-        let should_trade_long = self.ev_calculator.passes_alpha_gate(ev_long);
-        let should_trade_short = self.ev_calculator.passes_alpha_gate(ev_short);
+        // AGGRESSIVE: Lower threshold for $0.50 target (more trades = more opportunities)
+        // Use 80% of normal threshold to allow more trades
+        let aggressive_threshold = self.ev_threshold * 0.8;
+        let should_trade_long = ev_long > aggressive_threshold;
+        let should_trade_short = ev_short > aggressive_threshold;
+        
+        // AGGRESSIVE: Lower probability threshold (0.52 instead of 0.55) for more trades
+        let min_probability = 0.52;
         
         // Generate quotes based on regime and EV
         let mut quotes = Quotes::default();
         
-        if should_trade_long && p_up > 0.55 {
+        if should_trade_long && p_up > min_probability {
             // Long signal: bid at microprice or slightly below
             if let Some(microprice) = self.feature_extractor.calculate_microprice(&ctx.ob) {
                 let bid_px = Decimal::from_f64_retain(microprice * 0.9995).unwrap_or(Decimal::ZERO);
@@ -1109,7 +1140,7 @@ impl Strategy for QMelStrategy {
             }
         }
         
-        if should_trade_short && p_down > 0.55 {
+        if should_trade_short && p_down > min_probability {
             // Short signal: ask at microprice or slightly above
             if let Some(microprice) = self.feature_extractor.calculate_microprice(&ctx.ob) {
                 let ask_px = Decimal::from_f64_retain(microprice * 1.0005).unwrap_or(Decimal::ZERO);
