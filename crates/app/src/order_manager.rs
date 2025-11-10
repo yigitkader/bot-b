@@ -239,9 +239,12 @@ pub async fn place_side_orders(
         };
 
         // Calculate quantity and price
+        // ✅ KRİTİK: margin_chunk leverage uygulanmamış margin (USD)
+        // Leverage'i burada uygulayıp leveraged notional'ı calc_qty_from_margin'a geçiriyoruz
+        // calc_qty_from_margin içinde leverage UYGULANMAZ (zaten leveraged geliyor)
+        let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
         let qty_price_result = calc_qty_from_margin(
-            *margin_chunk,
-            effective_leverage_for_chunk,
+            margin_chunk_leveraged, // ZATEN leverage uygulanmış notional (USD)
             px_with_depth,
             &rules,
             side,

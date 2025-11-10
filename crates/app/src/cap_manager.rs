@@ -77,11 +77,11 @@ pub fn calculate_caps(
     // main.rs'de caps.buy_notional/caps.sell_notional kullanılırken leverage ile çarpılmaz
     // Çünkü bu değerler zaten doğru notional değerlerini içeriyor
     // 
-    // ✅ ÇİFT SAYMA ÖNLEME: Leverage SADECE burada uygulanıyor (notional limit için)
-    // calc_qty_from_margin() içinde de leverage uygulanıyor ama FARKLI amaç için (gerçek order quantity)
-    // Bu doğru: Her ikisi de aynı formülü kullanır ama farklı amaçlar için
-    // - cap_manager: notional LIMIT hesaplama (max notional per order)
-    // - calc_qty_from_margin: gerçek order NOTIONAL hesaplama (gerçek order quantity)
+    // ✅ ÇİFT SAYMA ÖNLEME: Leverage uygulaması
+    // - cap_manager: per_order_notional = margin_limit * leverage (NOTIONAL LIMIT hesaplama)
+    // - order_placement/order_manager: margin_chunk_leveraged = margin_chunk * leverage (caller'da hesaplanır)
+    // - calc_qty_from_margin: notional = margin_chunk_leveraged (leverage UYGULANMAZ, zaten leveraged geliyor)
+    // Bu sayede leverage SADECE BİR KEZ uygulanıyor (caller'da), leverage^2 etkisi önleniyor
     let per_order_cap_margin = cfg.max_usd_per_order; // Margin limit (USD) - leverage uygulanmamış
     let per_order_notional = per_order_cap_margin * effective_leverage_for_caps; // Notional limit (USD) - leverage burada uygulanıyor
 

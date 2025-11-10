@@ -159,10 +159,11 @@ internal:
   strategy_sigma: 0.5  # Volatility coefficient for strategy (default: 0.5)
   
   # Emir fiyat mesafesi eşikleri (decimal)
-  # KRİTİK: Küçük kar hedefi ($0.50) için çok agresif - market'e çok yakın emirler
-  # Tek amaç: artacak mı azalacak mı - hızlı fill için çok yakın fiyat
-  order_price_distance_with_position: 0.005  # %0.5 (pozisyon varsa) - çok agresif, market'e çok yakın
-  order_price_distance_no_position: 0.003     # %0.3 (pozisyon yoksa) - çok agresif, market'e çok yakın
+  # KRİTİK DÜZELTME: $0.50 kar hedefi için %0.3-0.5 spread çok dar
+  # Maker fee (2 bps) + slippage + kar = minimum %0.6-1% spread gerekli
+  # %1.0 ve %0.8 değerleri daha makul - spread'den yeterli kar garantisi
+  order_price_distance_with_position: 0.01   # %1.0 (pozisyon varsa) - maker fee + slippage + kar için yeterli
+  order_price_distance_no_position: 0.008    # %0.8 (pozisyon yoksa) - maker fee + slippage + kar için yeterli
   order_price_change_threshold: 0.001         # %0.1 fiyat değişimi eşiği (0.0001 → 0.001: gereksiz güncellemeleri azalt)
   min_quote_life_ms: 1500                    # Minimum quote ömrü (ms) - rate limit koruması için
   

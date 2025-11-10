@@ -48,6 +48,8 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
+use futures_util::stream::{self, StreamExt};
+use std::sync::Arc;
 
 // ============================================================================
 // Constants
@@ -238,12 +240,44 @@ async fn main() -> Result<()> {
     // Initialize symbol states
     let mut states = symbol_discovery::initialize_symbol_states(selected, &dyn_cfg, &strategy_name, &cfg);
     
-    // Fetch per-symbol metadata and update states
-    info!("fetching per-symbol metadata for quantization...");
+    // Fetch per-symbol metadata and update states - OPTIMIZED: Parallel processing
+    info!(
+        total_symbols = states.len(),
+        "fetching per-symbol metadata for quantization (parallel processing)..."
+    );
     let mut symbol_index: HashMap<String, usize> = HashMap::new();
-    for (idx, state) in states.iter_mut().enumerate() {
-        let symbol = &state.meta.symbol;
-        symbol_index.insert(symbol.clone(), idx);
+    
+    // Build symbol index first
+    for (idx, state) in states.iter().enumerate() {
+        symbol_index.insert(state.meta.symbol.clone(), idx);
+    }
+    
+    // Parallel fetch rules for all symbols
+    const CONCURRENT_LIMIT: usize = 10;
+    let venue_arc = Arc::new(venue.clone());
+    let symbols: Vec<(String, usize)> = states.iter()
+        .enumerate()
+        .map(|(idx, state)| (state.meta.symbol.clone(), idx))
+        .collect();
+    
+    let rules_results: Vec<_> = stream::iter(symbols.iter())
+        .map(|(symbol, idx)| {
+            let venue = venue_arc.clone();
+            let symbol = symbol.clone();
+            let idx = *idx;
+            async move {
+                let rules = venue.rules_for(&symbol).await.ok();
+                (idx, symbol, rules)
+            }
+        })
+        .buffer_unordered(CONCURRENT_LIMIT)
+        .collect()
+        .await;
+    
+    // Update states with fetched rules
+    for (idx, symbol, symbol_rules) in rules_results {
+        let state = &mut states[idx];
+        let rules_fetch_failed = symbol_rules.is_none();
         
         info!(
             symbol = %symbol,
@@ -253,9 +287,6 @@ async fn main() -> Result<()> {
             "bot initialized assets"
         );
         
-        // Fetch exchange rules
-        let symbol_rules = venue.rules_for(symbol).await.ok();
-        let rules_fetch_failed = symbol_rules.is_none();
         if let Some(ref rules) = symbol_rules {
             info!(
                 symbol = %symbol,
@@ -469,20 +500,9 @@ async fn main() -> Result<()> {
                                             
                                             // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu)
                                             
-                                            // ✅ KRİTİK FIX: Reconnect sonrası pozisyon varsa entry_time set et (FALLBACK)
-                                            // WebSocket event EN GÜVENİLİR kaynak, ama reconnect sonrası gelmeyebilir
-                                            // Pozisyon açıldıysa (old_inv.is_zero() && !pos.qty.0.is_zero()) entry_time set et
-                                            if old_inv.is_zero() && !pos.qty.0.is_zero() {
-                                                if state.position_entry_time.is_none() {
-                                                    state.position_entry_time = Some(std::time::Instant::now());
-                                                    warn!(
-                                                        symbol = %state.meta.symbol,
-                                                        entry_time_set = "from_reconnect_sync_fallback",
-                                                        inv_change = %(pos.qty.0 - old_inv),
-                                                        "position entry time set from reconnect sync (FALLBACK - WebSocket event preferred)"
-                                                    );
-                                                }
-                                            }
+                                            // KRİTİK DÜZELTME: Position entry time SADECE WebSocket fill event'te set edilir
+                                            // Reconnect sync fallback kaldırıldı - WebSocket event bekleniyor
+                                            // Bu, PnL hesaplamalarının doğruluğunu garanti eder (yanlış zaman set etmek yerine bekler)
                                             
                                             info!(
                                                 symbol = %state.meta.symbol,
@@ -655,9 +675,10 @@ async fn main() -> Result<()> {
                                 state.avg_entry_price = Some(price.0);
                             }
                             
-                            // ✅ KRİTİK FIX: Position entry time - WebSocket fill event EN GÜVENİLİR kaynak
+                            // KRİTİK DÜZELTME: Position entry time SADECE WebSocket fill event'te set edilir
+                            // Bu, gerçek fill zamanını verir ve PnL hesaplamalarının doğruluğunu garanti eder
+                            // Fallback'ler kaldırıldı - position check ve reconnect sync artık entry_time set etmiyor
                             // Pozisyon ilk kez açılıyorsa entry time set et (gerçek fill zamanı)
-                            // Bu, position check'ten ÖNCE gelebilir, bu yüzden burada set edilirse position check dokunmamalı
                             if old_inv.is_zero() && !inv.is_zero() {
                                 if state.position_entry_time.is_none() {
                                     state.position_entry_time = Some(std::time::Instant::now());
@@ -666,11 +687,10 @@ async fn main() -> Result<()> {
                                         entry_time_set = "from_websocket_fill",
                                         fill_price = %price.0,
                                         fill_qty = %fill_increment,
-                                        "position entry time set from WebSocket fill event (PRIMARY SOURCE)"
+                                        "position entry time set from WebSocket fill event (ONLY SOURCE)"
                                     );
                                 } else {
-                                    // Entry time zaten set edilmiş (position check önce çalışmış olabilir)
-                                    // WebSocket event daha güvenilir, ama değiştirmeyelim (ilk set edilen zamanı koru)
+                                    // Entry time zaten set edilmiş (normal durum değil, ama koruyalım)
                                     debug!(
                                         %symbol,
                                         existing_entry_time = ?state.position_entry_time,
@@ -1682,14 +1702,36 @@ async fn main() -> Result<()> {
                         state.avg_entry_price = None;
                             state.peak_pnl = Decimal::ZERO;
                             state.position_hold_duration_ms = 0;
+                        // Loglanan değerleri de sıfırla (pozisyon kapandı)
+                        state.last_logged_position_qty = None;
+                        state.last_logged_pnl = None;
             }
             
             // Pozisyon durumu logla (sadece önemli değişikliklerde)
-            // ÖNEMLİ: Pozisyon analizi her tick'te yapılıyor, sadece log sıklığını azalt
-            // Log spam'ini önlemek için 30 saniyede bir log (ama analiz her tick'te)
-            let should_log_position = state.last_position_check
-                .map(|last| last.elapsed().as_secs() >= 30) // Her 30 saniyede bir log (log spam'ini önle)
-                .unwrap_or(true);
+            // KRİTİK DÜZELTME: Her tick'te loglama disk I/O bottleneck yaratır
+            // Sadece değişiklik olduğunda logla: qty değişti, PnL önemli ölçüde değişti, veya ilk pozisyon
+            let should_log_position = if has_position {
+                let qty_changed = state.last_logged_position_qty
+                    .map(|last_qty| (last_qty - pos.qty.0).abs() > Decimal::new(1, 8))
+                    .unwrap_or(true); // İlk pozisyon → logla
+                
+                let pnl_changed_significantly = state.last_logged_pnl
+                    .map(|last_pnl| {
+                        let pnl_diff = (current_pnl - last_pnl).abs();
+                        // PnL %5'ten fazla değiştiyse veya işaret değiştiyse logla
+                        let pnl_diff_pct = if last_pnl.abs() > Decimal::ZERO {
+                            (pnl_diff / last_pnl.abs()).to_f64().unwrap_or(0.0)
+                        } else {
+                            1.0 // last_pnl sıfırsa her zaman logla
+                        };
+                        pnl_diff_pct > 0.05 || (current_pnl.is_sign_positive() != last_pnl.is_sign_positive())
+                    })
+                    .unwrap_or(true); // İlk pozisyon → logla
+                
+                qty_changed || pnl_changed_significantly
+            } else {
+                false
+            };
             
             if should_log_position && has_position {
                 // JSON log: Position updated
@@ -1729,6 +1771,9 @@ async fn main() -> Result<()> {
                     consecutive_no_fills = state.consecutive_no_fills,
                     "position status: monitoring for intelligent decisions"
                 );
+                // Son loglanan değerleri kaydet (değişiklik bazlı loglama için)
+                state.last_logged_position_qty = Some(pos.qty.0);
+                state.last_logged_pnl = Some(current_pnl);
                 state.last_position_check = Some(Instant::now());
             }
 

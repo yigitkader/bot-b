@@ -35,6 +35,8 @@ pub struct SymbolState {
     
     // Position and order tracking
     pub last_position_check: Option<Instant>,
+    pub last_logged_position_qty: Option<Decimal>, // Son loglanan pozisyon qty (değişiklik bazlı loglama için)
+    pub last_logged_pnl: Option<Decimal>, // Son loglanan PnL (değişiklik bazlı loglama için)
     pub last_order_sync: Option<Instant>,
     pub order_fill_rate: f64,
     pub consecutive_no_fills: u32,

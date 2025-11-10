@@ -8,6 +8,7 @@ mod tests {
     use std::str::FromStr;
     use rust_decimal_macros::dec;
     use crate::exec::binance::SymbolRules;
+    use crate::core::types::Side;
 
     // ============================================================================
     // is_usd_stable Tests
@@ -177,7 +178,7 @@ mod tests {
     #[test]
     fn test_profit_guarantee_default() {
         let pg = ProfitGuarantee::default();
-        assert_eq!(pg.min_profit_usd, 0.005);
+        assert_eq!(pg.min_profit_usd, 0.50); // Updated: 0.005 → 0.50 USD
         assert_eq!(pg.maker_fee_rate, 0.0002);
         assert_eq!(pg.taker_fee_rate, 0.0004);
     }
@@ -185,21 +186,25 @@ mod tests {
     #[test]
     fn test_calculate_min_spread_bps_small_position() {
         let pg = ProfitGuarantee::default();
-        // Position: 20 USD, min profit: 0.50 USD, fees: 0.0004 (4 bps), safety margin: 5 bps
-        // min_spread = (0.50 / 20) * 10000 + 4 + 5 = 250 + 4 + 5 = 259 bps
+        // Position: 20 USD, min profit: 0.50 USD
+        // Fees: maker (2 bps) + taker (4 bps) = 6 bps (worst case: maker entry + taker exit)
+        // Safety margin: 5 bps
+        // min_spread = (0.50 / 20) * 10000 + 6 + 5 = 250 + 6 + 5 = 261 bps
         let min_spread = pg.calculate_min_spread_bps(20.0);
-        assert!(min_spread > 258.0);
-        assert!(min_spread < 260.0);
+        assert!(min_spread > 260.0);
+        assert!(min_spread < 262.0);
     }
 
     #[test]
     fn test_calculate_min_spread_bps_large_position() {
         let pg = ProfitGuarantee::default();
-        // Position: 1000 USD, min profit: 0.50 USD, fees: 0.0004 (4 bps), safety margin: 5 bps
-        // min_spread = (0.50 / 1000) * 10000 + 4 + 5 = 5 + 4 + 5 = 14 bps
+        // Position: 1000 USD, min profit: 0.50 USD
+        // Fees: maker (2 bps) + taker (4 bps) = 6 bps (worst case: maker entry + taker exit)
+        // Safety margin: 5 bps
+        // min_spread = (0.50 / 1000) * 10000 + 6 + 5 = 5 + 6 + 5 = 16 bps
         let min_spread = pg.calculate_min_spread_bps(1000.0);
-        assert!(min_spread > 13.0);
-        assert!(min_spread < 15.0);
+        assert!(min_spread > 15.0);
+        assert!(min_spread < 17.0);
     }
 
     #[test]
@@ -495,31 +500,49 @@ mod tests {
 
     #[test]
     fn test_split_margin_into_chunks_exact_multiple() {
-        // 300 USD, min 10, max 100 → [100, 100, 50, 50] (split last 100 into 2x50)
+        // 300 USD, min 10, max 100 → [100, 100, 100]
+        // Loop: 300 >= 200? YES → push 100, remaining = 200
+        // Loop: 200 >= 200? YES → push 100, remaining = 100
+        // Loop: 100 >= 200? NO → exit
+        // remaining >= max? 100 >= 100? YES → push 100, remaining = 0
         let chunks = split_margin_into_chunks(300.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], 100.0);
         assert_eq!(chunks[1], 100.0);
-        assert!((chunks[2] - 50.0).abs() < 0.01);
-        assert!((chunks[3] - 50.0).abs() < 0.01);
+        assert_eq!(chunks[2], 100.0);
     }
 
     #[test]
     fn test_split_margin_into_chunks_with_remainder() {
-        // 250 USD, min 10, max 100 → [100, 75, 75] (split last 150 into 2x75)
+        // 250 USD, min 10, max 100 → [100, 100, 50]
+        // Loop: 250 >= 200? YES → push 100, remaining = 150
+        // Loop: 150 >= 200? NO → exit
+        // remaining >= max? 150 >= 100? YES → push 100, remaining = 50
+        // remaining >= min? 50 >= 10? YES → push 50
         let chunks = split_margin_into_chunks(250.0, 10.0, 100.0);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], 100.0);
-        assert!((chunks[1] - 75.0).abs() < 0.01);
-        assert!((chunks[2] - 75.0).abs() < 0.01);
+        assert_eq!(chunks[1], 100.0);
+        assert!((chunks[2] - 50.0).abs() < 0.01);
     }
 
     #[test]
     fn test_split_margin_into_chunks_small_remainder() {
-        // 105 USD, min 10, max 100 → [100, 5] (5 < 10, so only [100])
+        // 105 USD, min 10, max 100 → [100] (5 < 10, so remainder ignored)
+        // KRİTİK EDGE CASE: Önce max (100) alınır, kalan (5) min'den küçük olduğu için ignore edilir
         let chunks = split_margin_into_chunks(105.0, 10.0, 100.0);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], 100.0);
+    }
+
+    #[test]
+    fn test_split_margin_into_chunks_small_remainder_with_low_min() {
+        // 105 USD, min 5, max 100 → [100, 5] (5 >= 5, so both chunks added)
+        // Edge case: Kalan min'den büyükse eklenir
+        let chunks = split_margin_into_chunks(105.0, 5.0, 100.0);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], 100.0);
+        assert!((chunks[1] - 5.0).abs() < 0.01);
     }
 
     #[test]
@@ -547,24 +570,29 @@ mod tests {
 
     #[test]
     fn test_split_margin_into_chunks_exact_maximum() {
-        // 100 USD, min 10, max 100 → [50, 50] (split to maximize trades)
+        // 100 USD, min 10, max 100 → [100]
+        // Loop: 100 >= 200? NO → exit
+        // remaining >= max? 100 >= 100? YES → push 100, remaining = 0
+        // remaining >= min? 0 >= 10? NO
         let chunks = split_margin_into_chunks(100.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 2);
-        assert!((chunks[0] - 50.0).abs() < 0.01);
-        assert!((chunks[1] - 50.0).abs() < 0.01);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], 100.0);
     }
 
     #[test]
     fn test_split_margin_into_chunks_large_amount() {
-        // 1000 USD, min 10, max 100 → [100, 100, ..., 100, 50, 50] (10 chunks of 100, then split last 100 into 2x50)
+        // 1000 USD, min 10, max 100 → [100, 100, ..., 100] (10 chunks of 100)
+        // Loop: 1000 >= 200? YES → push 100, remaining = 900
+        // Loop: 900 >= 200? YES → push 100, remaining = 800
+        // ... (9 kez daha, toplam 9 kez)
+        // Loop: 100 >= 200? NO → exit
+        // remaining >= max? 100 >= 100? YES → push 100, remaining = 0
+        // Result: 10 chunks of 100
         let chunks = split_margin_into_chunks(1000.0, 10.0, 100.0);
-        // 1000 = 9×100 + 100, last 100 split into 2x50 = 9 + 2 = 11 chunks
-        assert_eq!(chunks.len(), 11);
-        for i in 0..9 {
+        assert_eq!(chunks.len(), 10);
+        for i in 0..10 {
             assert_eq!(chunks[i], 100.0);
         }
-        assert!((chunks[9] - 50.0).abs() < 0.01);
-        assert!((chunks[10] - 50.0).abs() < 0.01);
     }
 
     #[test]
@@ -583,13 +611,17 @@ mod tests {
 
     #[test]
     fn test_split_margin_into_chunks_custom_min_max() {
-        // 150 USD, min 20, max 50 → [50, 50, 25, 25] (split last 50 into 2x25)
+        // 150 USD, min 20, max 50 → [50, 50, 50]
+        // Loop: 150 >= 100? YES → push 50, remaining = 100
+        // Loop: 100 >= 100? YES → push 50, remaining = 50
+        // Loop: 50 >= 100? NO → exit
+        // remaining >= max? 50 >= 50? YES → push 50, remaining = 0
+        // remaining >= min? 0 >= 20? NO
         let chunks = split_margin_into_chunks(150.0, 20.0, 50.0);
-        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], 50.0);
         assert_eq!(chunks[1], 50.0);
-        assert!((chunks[2] - 25.0).abs() < 0.01);
-        assert!((chunks[3] - 25.0).abs() < 0.01);
+        assert_eq!(chunks[2], 50.0);
     }
 
     // ============================================================================
@@ -598,11 +630,14 @@ mod tests {
 
     #[test]
     fn test_margin_chunking_respects_limits() {
-        // 140 USD available → [70, 70] chunks (split to maximize trades)
+        // 140 USD available → [100, 40] chunks
+        // Loop: 140 >= 200? NO → exit
+        // remaining >= max? 140 >= 100? YES → push 100, remaining = 40
+        // remaining >= min? 40 >= 10? YES → push 40
         let chunks = split_margin_into_chunks(140.0, 10.0, 100.0);
         assert_eq!(chunks.len(), 2);
-        assert!((chunks[0] - 70.0).abs() < 0.01);
-        assert!((chunks[1] - 70.0).abs() < 0.01);
+        assert_eq!(chunks[0], 100.0);
+        assert!((chunks[1] - 40.0).abs() < 0.01);
         
         // Total spent tracking
         let mut total_spent = 0.0;
@@ -635,14 +670,18 @@ mod tests {
 
     #[test]
     fn test_margin_chunking_large_balance() {
-        // 500 USD available → [100, 100, 100, 100, 50, 50] chunks (split last 100 into 2x50)
+        // 500 USD available → [100, 100, 100, 100, 100] chunks (5 chunks of 100)
+        // Loop: 500 >= 200? YES → push 100, remaining = 400
+        // Loop: 400 >= 200? YES → push 100, remaining = 300
+        // Loop: 300 >= 200? YES → push 100, remaining = 200
+        // Loop: 200 >= 200? YES → push 100, remaining = 100
+        // Loop: 100 >= 200? NO → exit
+        // remaining >= max? 100 >= 100? YES → push 100, remaining = 0
         let chunks = split_margin_into_chunks(500.0, 10.0, 100.0);
-        assert_eq!(chunks.len(), 6);
-        for i in 0..4 {
+        assert_eq!(chunks.len(), 5);
+        for i in 0..5 {
             assert_eq!(chunks[i], 100.0);
         }
-        assert!((chunks[4] - 50.0).abs() < 0.01);
-        assert!((chunks[5] - 50.0).abs() < 0.01);
     }
 
     // ============================================================================
@@ -663,12 +702,13 @@ mod tests {
     #[test]
     fn test_calc_qty_from_margin_basic() {
         // Margin: 10 USD, Leverage: 20x, Price: 50000
-        // Notional: 10 * 20 = 200 USD
+        // Notional: 10 * 20 = 200 USD (already leveraged)
         // Qty: 200 / 50000 = 0.004
         // Floor to step: 0.004 (step = 0.001)
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, price_str) = result.unwrap();
@@ -685,11 +725,12 @@ mod tests {
     #[test]
     fn test_calc_qty_from_margin_small_margin() {
         // Margin: 5 USD, Leverage: 20x, Price: 50000
-        // Notional: 5 * 20 = 100 USD
+        // Notional: 5 * 20 = 100 USD (already leveraged)
         // Qty: 100 / 50000 = 0.002
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(5.0, 20.0, price, &rules);
+        let margin_leveraged = 5.0 * 20.0; // 100 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, _) = result.unwrap();
@@ -703,11 +744,12 @@ mod tests {
     #[test]
     fn test_calc_qty_from_margin_large_margin() {
         // Margin: 100 USD, Leverage: 20x, Price: 50000
-        // Notional: 100 * 20 = 2000 USD
+        // Notional: 100 * 20 = 2000 USD (already leveraged)
         // Qty: 2000 / 50000 = 0.04
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(100.0, 20.0, price, &rules);
+        let margin_leveraged = 100.0 * 20.0; // 2000 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, _) = result.unwrap();
@@ -721,11 +763,12 @@ mod tests {
     #[test]
     fn test_calc_qty_from_margin_high_leverage() {
         // Margin: 10 USD, Leverage: 50x, Price: 50000
-        // Notional: 10 * 50 = 500 USD
+        // Notional: 10 * 50 = 500 USD (already leveraged)
         // Qty: 500 / 50000 = 0.01
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(10.0, 50.0, price, &rules);
+        let margin_leveraged = 10.0 * 50.0; // 500 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, _) = result.unwrap();
@@ -741,7 +784,8 @@ mod tests {
         // Zero price should return None
         let rules = create_test_rules();
         let price = dec!(0);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         assert!(result.is_none());
     }
 
@@ -750,17 +794,19 @@ mod tests {
         // Negative price should return None
         let rules = create_test_rules();
         let price = dec!(-100);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_calc_qty_from_margin_min_notional_satisfied() {
         // Margin: 1 USD, Leverage: 20x, Price: 50000
-        // Notional: 1 * 20 = 20 USD (should satisfy min_notional = 5.0)
+        // Notional: 1 * 20 = 20 USD (already leveraged, should satisfy min_notional = 5.0)
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(1.0, 20.0, price, &rules);
+        let margin_leveraged = 1.0 * 20.0; // 20 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, price_str) = result.unwrap();
@@ -775,11 +821,12 @@ mod tests {
     #[test]
     fn test_calc_qty_from_margin_min_notional_not_satisfied() {
         // Margin: 0.1 USD, Leverage: 20x, Price: 50000
-        // Notional: 0.1 * 20 = 2 USD (should NOT satisfy min_notional = 5.0)
+        // Notional: 0.1 * 20 = 2 USD (already leveraged, should NOT satisfy min_notional = 5.0)
         // Should try to increase qty to satisfy min_notional
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(0.1, 20.0, price, &rules);
+        let margin_leveraged = 0.1 * 20.0; // 2 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         // Should still return Some (tries to increase qty to satisfy min_notional)
         if let Some((qty_str, price_str)) = result {
@@ -802,7 +849,8 @@ mod tests {
         // Should floor to 50000.12
         let rules = create_test_rules();
         let price = dec!(50000.123);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (_, price_str) = result.unwrap();
@@ -819,7 +867,8 @@ mod tests {
         // Should floor to 0.004
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(11.4175, 20.0, price, &rules); // 11.4175 * 20 / 50000 = 0.004567
+        let margin_leveraged = 11.4175 * 20.0; // 228.35 USD (already leveraged) → 228.35 / 50000 = 0.004567
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, _) = result.unwrap();
@@ -835,7 +884,8 @@ mod tests {
         // Test that qty and price are formatted with correct precision
         let rules = create_test_rules();
         let price = dec!(50000);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, price_str) = result.unwrap();
@@ -861,7 +911,8 @@ mod tests {
         rules.qty_precision = 2;
         
         let price = dec!(50000);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (qty_str, _) = result.unwrap();
@@ -882,7 +933,8 @@ mod tests {
         rules.price_precision = 1;
         
         let price = dec!(50000.123);
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         assert!(result.is_some());
         let (_, price_str) = result.unwrap();
@@ -898,7 +950,8 @@ mod tests {
         // Test with very small price (e.g., altcoin)
         let rules = create_test_rules();
         let price = dec!(0.001); // Very small price
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         // Should still work
         assert!(result.is_some());
@@ -914,7 +967,8 @@ mod tests {
         // Test with very large price
         let rules = create_test_rules();
         let price = dec!(1000000); // Very large price
-        let result = calc_qty_from_margin(10.0, 20.0, price, &rules);
+        let margin_leveraged = 10.0 * 20.0; // 200 USD (already leveraged)
+        let result = calc_qty_from_margin(margin_leveraged, price, &rules, Side::Buy);
         
         // Should still work
         assert!(result.is_some());

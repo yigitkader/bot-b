@@ -389,8 +389,8 @@ fn default_fill_rate_increase_bonus() -> f64 { 0.05 }
 fn default_fill_rate_decrease_factor() -> f64 { 0.98 }
 fn default_fill_rate_slow_decrease_factor() -> f64 { 0.995 }
 fn default_fill_rate_slow_decrease_bonus() -> f64 { 0.005 }
-fn default_order_price_distance_with_position() -> f64 { 0.005 } // %0.5 (çok agresif - market'e çok yakın)
-fn default_order_price_distance_no_position() -> f64 { 0.003 } // %0.3 (çok agresif - market'e çok yakın)
+fn default_order_price_distance_with_position() -> f64 { 0.01 } // %1.0 (maker fee + slippage + kar için yeterli)
+fn default_order_price_distance_no_position() -> f64 { 0.008 } // %0.8 (maker fee + slippage + kar için yeterli)
 fn default_order_price_change_threshold() -> f64 { 0.001 }
 fn default_min_quote_life_ms() -> u64 { 1500 }
 fn default_inventory_reconcile_threshold() -> String { "0.00000001".to_string() }

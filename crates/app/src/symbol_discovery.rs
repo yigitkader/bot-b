@@ -14,6 +14,8 @@ use crate::core::types::Qty;
 use std::collections::{HashMap, HashSet};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use futures_util::stream::{self, StreamExt};
+use std::sync::Arc;
 
 /// Discover and filter symbols based on configuration
 pub async fn discover_symbols(
@@ -273,6 +275,8 @@ pub fn initialize_symbol_states(
             last_rules_retry: None,
             test_order_passed: false,
             last_position_check: None,
+            last_logged_position_qty: None,
+            last_logged_pnl: None,
             last_order_sync: None,
             order_fill_rate: cfg.internal.initial_fill_rate,
             consecutive_no_fills: 0,
@@ -321,6 +325,7 @@ pub fn initialize_symbol_states(
 }
 
 /// Setup margin type and leverage for all symbols
+/// OPTIMIZED: Uses parallel processing with controlled concurrency for faster setup
 pub async fn setup_margin_and_leverage(
     venue: &BinanceFutures,
     states: &mut [SymbolState],
@@ -335,22 +340,33 @@ pub async fn setup_margin_and_leverage(
         .or(cfg.leverage)
         .unwrap_or(1);
 
+    // Parallel processing configuration
+    // Binance rate limit: 1200 requests per minute = 20 req/sec
+    // Using 10 concurrent requests to stay safe
+    const CONCURRENT_LIMIT: usize = 10;
+    
+    let venue = Arc::new(venue.clone());
+    let total_symbols = states.len();
+
     if use_isolated {
-        let mut isolated_set_count = 0;
-        let mut isolated_skip_count = 0;
-        let mut isolated_fail_count = 0;
+        info!(
+            total_symbols = total_symbols,
+            "setting isolated margin for all symbols (parallel processing)"
+        );
         
-        info!("checking and setting isolated margin for all symbols");
-        for state in states.iter() {
-            let symbol = &state.meta.symbol;
-            
+        let symbols: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
+        let venue_clone = venue.clone();
+        
+        let results: Vec<_> = stream::iter(symbols.iter())
+            .map(|symbol| {
+                let venue = venue_clone.clone();
+                let symbol = symbol.clone();
+                async move {
             rate_limit_guard(1).await;
-            match venue.get_margin_type(symbol).await {
+                    match venue.get_margin_type(&symbol).await {
                 Ok(current_is_isolated) => {
                     if current_is_isolated == use_isolated {
-                        isolated_skip_count += 1;
-                        debug!(%symbol, "margin type already set to isolated, skipping");
-                        continue;
+                                return (symbol, Ok(true), true); // Already set
                     }
                 }
                 Err(e) => {
@@ -359,27 +375,49 @@ pub async fn setup_margin_and_leverage(
             }
             
             rate_limit_guard(1).await;
-            match venue.set_margin_type(symbol, true).await {
-                Ok(_) => {
-                    isolated_set_count += 1;
-                    info!(%symbol, "isolated margin set successfully");
-                }
+                    match venue.set_margin_type(&symbol, true).await {
+                        Ok(_) => (symbol, Ok(true), false),
                 Err(err) => {
                     let error_str = err.to_string();
                     let error_lower = error_str.to_lowercase();
                     
                     if error_lower.contains("-4046") || error_lower.contains("no need to change") {
-                        isolated_skip_count += 1;
-                        debug!(%symbol, "margin type already isolated, no change needed");
-                    } else {
-                        isolated_fail_count += 1;
-                        warn!(%symbol, error = %err, "failed to set isolated margin");
+                                (symbol, Ok(true), true) // Already set
+                            } else {
+                                (symbol, Err(err), false)
+                            }
+                        }
                     }
+                }
+            })
+            .buffer_unordered(CONCURRENT_LIMIT)
+            .collect()
+            .await;
+        
+        let mut isolated_set_count = 0;
+        let mut isolated_skip_count = 0;
+        let mut isolated_fail_count = 0;
+        
+        for (symbol, result, was_skip) in results {
+            match result {
+                Ok(_) => {
+                    if was_skip {
+                        isolated_skip_count += 1;
+                        debug!(%symbol, "margin type already set to isolated");
+                    } else {
+                        isolated_set_count += 1;
+                        debug!(%symbol, "isolated margin set successfully");
+                    }
+                }
+                Err(err) => {
+                    isolated_fail_count += 1;
+                    warn!(%symbol, error = %err, "failed to set isolated margin");
                 }
             }
         }
         
         info!(
+            total = total_symbols,
             isolated_set = isolated_set_count,
             isolated_skip = isolated_skip_count,
             isolated_fail = isolated_fail_count,
@@ -387,51 +425,71 @@ pub async fn setup_margin_and_leverage(
         );
     }
     
-    // Set leverage
+    // Set leverage - OPTIMIZED: Skip get_leverage check, just try to set
+    // Binance API will return error if already set, which we handle gracefully
+    info!(
+        total_symbols = total_symbols,
+        leverage = leverage_to_set,
+        "setting leverage for all symbols (parallel processing, skipping pre-check)"
+    );
+    
+    let symbols: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
+    let venue_clone = venue.clone();
+    
+    let results: Vec<_> = stream::iter(symbols.iter())
+        .map(|symbol| {
+            let venue = venue_clone.clone();
+            let symbol = symbol.clone();
+            async move {
+                // Skip get_leverage check - just try to set directly
+                // This saves 500 API calls and significant time
+                rate_limit_guard(1).await;
+                match venue.set_leverage(&symbol, leverage_to_set).await {
+                    Ok(_) => (symbol, Ok(true), false),
+                    Err(err) => {
+                        let error_str = err.to_string();
+                        let error_lower = error_str.to_lowercase();
+                        
+                        // Handle "already set" errors gracefully
+                        if error_lower.contains("-4059") || 
+                           error_lower.contains("no need to change") ||
+                           error_lower.contains("leverage not modified") {
+                            (symbol, Ok(true), true) // Already set
+                        } else {
+                            (symbol, Err(err), false)
+                        }
+                    }
+                }
+            }
+        })
+        .buffer_unordered(CONCURRENT_LIMIT)
+        .collect()
+        .await;
+    
     let mut leverage_set_count = 0;
     let mut leverage_skip_count = 0;
     let mut leverage_fail_count = 0;
     
-    info!(leverage = leverage_to_set, "checking and setting leverage for all symbols");
-    for state in states.iter() {
-        let symbol = &state.meta.symbol;
-        
-        rate_limit_guard(5).await;
-        match venue.get_leverage(symbol).await {
-            Ok(current_leverage) => {
-                if current_leverage == leverage_to_set {
-                    leverage_skip_count += 1;
-                    debug!(%symbol, leverage = current_leverage, "leverage already set, skipping");
-                    continue;
-                }
-            }
-            Err(e) => {
-                warn!(%symbol, error = %e, "failed to get leverage, will attempt to set anyway");
-            }
-        }
-        
-        rate_limit_guard(1).await;
-        match venue.set_leverage(symbol, leverage_to_set).await {
+    for (symbol, result, was_skip) in results {
+        match result {
             Ok(_) => {
+                if was_skip {
+                    leverage_skip_count += 1;
+                    debug!(%symbol, leverage = leverage_to_set, "leverage already set");
+                } else {
                 leverage_set_count += 1;
-                info!(%symbol, leverage = leverage_to_set, "leverage set successfully");
+                    debug!(%symbol, leverage = leverage_to_set, "leverage set successfully");
+                }
             }
             Err(err) => {
-                let error_str = err.to_string();
-                let error_lower = error_str.to_lowercase();
-                
-                if error_lower.contains("-4059") || error_lower.contains("no need to change") {
-                    leverage_skip_count += 1;
-                    debug!(%symbol, leverage = leverage_to_set, "leverage already set, no change needed");
-                } else {
                     leverage_fail_count += 1;
                     warn!(%symbol, leverage = leverage_to_set, error = %err, "failed to set leverage");
-                }
             }
         }
     }
     
     info!(
+        total = total_symbols,
         leverage_set = leverage_set_count,
         leverage_skip = leverage_skip_count,
         leverage_fail = leverage_fail_count,

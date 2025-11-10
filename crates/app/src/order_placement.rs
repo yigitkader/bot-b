@@ -174,11 +174,11 @@ pub async fn place_orders_with_profit_guarantee(
 
         // Calculate quantity and price
         // ✅ KRİTİK: margin_chunk leverage uygulanmamış margin (USD)
-        // calc_qty_from_margin içinde leverage uygulanacak: notional = margin * leverage
-        // Bu doğru: margin_chunk leverage uygulanmamış, leverage parametre olarak veriliyor
+        // Leverage'i burada uygulayıp leveraged notional'ı calc_qty_from_margin'a geçiriyoruz
+        // calc_qty_from_margin içinde leverage UYGULANMAZ (zaten leveraged geliyor)
+        let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
         let qty_price_result = crate::utils::calc_qty_from_margin(
-            *margin_chunk, // Leverage uygulanmamış margin (USD)
-            effective_leverage_for_chunk, // Leverage değeri (burada uygulanacak)
+            margin_chunk_leveraged, // ZATEN leverage uygulanmış notional (USD)
             px_with_depth,
             rules,
             side,

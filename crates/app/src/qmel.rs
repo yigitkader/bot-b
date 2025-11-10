@@ -485,6 +485,10 @@ impl DirectionModel {
     }
     
     /// En önemli N feature'ı döndür
+    /// 
+    /// # Race Condition Note
+    /// Bu fonksiyon `&self` alır (immutable reference), bu yüzden Rust'ın borrow checker'ı
+    /// aynı anda `&mut self` ile update yapılmasını önler. Ancak çağıran kod empty check yapmalı.
     pub fn get_top_features(&self, n: usize) -> Vec<(String, f64)> {
         let importance = self.calculate_feature_importance();
         importance.into_iter().take(n).collect()
@@ -1623,11 +1627,14 @@ impl Strategy for QMelStrategy {
             
             // YAPAY ZEKA ENTEGRASYONU: Feature importance'a göre learning rate ayarla
             // Önemli feature'lar daha hızlı öğrenmeli (daha yüksek learning rate)
+            // KRİTİK DÜZELTME: Division by zero ve race condition önleme
+            // get_top_features() hesaplama yaparken weight'ler değişebilir (race condition risk)
+            // top_features.len() sıfır olabilir (division by zero risk)
             let top_features = self.direction_model.get_top_features(3);
             let avg_importance = if !top_features.is_empty() {
                 top_features.iter().map(|(_, score)| score).sum::<f64>() / top_features.len() as f64
             } else {
-                0.5 // Default: orta importance
+                0.5 // Default: orta importance (empty check - division by zero önleme)
             };
             
             // Feature importance'a göre learning rate multiplier

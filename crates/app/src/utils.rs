@@ -203,16 +203,16 @@ pub fn split_margin_into_chunks(
     // Handle remaining margin
     if remaining >= max_margin_per_trade {
         // Remaining is >= max but < max*2
-        // Split into 2 equal chunks to maximize number of trades
-        let half = remaining / 2.0;
-        // Ensure both halves are >= min_margin_per_trade
-        if half >= min_margin_per_trade {
-            chunks.push(half);
-            chunks.push(remaining - half); // Second half (may be slightly different due to rounding)
-        } else {
-            // Can't split, add as single chunk
+        // KRİTİK DÜZELTME: Önce max'ı al, sonra kalanı kontrol et
+        // Edge case: 105 USDC, max 100 → [100, 5] olmalı, [52.5, 52.5] değil
+        chunks.push(max_margin_per_trade);
+        remaining -= max_margin_per_trade;
+        
+        // Kalanı kontrol et
+        if remaining >= min_margin_per_trade {
             chunks.push(remaining);
         }
+        // Eğer kalan < min ise, sadece max'ı ekledik (kalanı ignore ediyoruz)
     } else if remaining >= min_margin_per_trade {
         // Remaining is < max but >= min, add as single chunk
         chunks.push(remaining);
@@ -222,11 +222,10 @@ pub fn split_margin_into_chunks(
     chunks
 }
 
-/// Calculate quantity and price from margin, leverage, and exchange rules
+/// Calculate quantity and price from already-leveraged margin and exchange rules
 /// 
 /// # Arguments
-/// * `margin_chunk` - Margin chunk in USD (10-100) - hesaptan çıkan para
-/// * `leverage` - Leverage (20-50x)
+/// * `margin_chunk_leveraged` - Margin chunk in USD (10-100) - ZATEN LEVERAGE UYGULANMIŞ (notional)
 /// * `price` - Current price
 /// * `rules` - Exchange rules (stepSize, tickSize, minQty, minNotional, precisions)
 /// * `side` - Order side (Buy = floor price, Sell = ceil price for side-aware rounding)
@@ -235,7 +234,7 @@ pub fn split_margin_into_chunks(
 /// Option<(qty_string, price_string)> if valid, None if cannot satisfy rules
 /// 
 /// # Formula
-/// 1. notional = margin * leverage (pozisyon büyüklüğü)
+/// 1. notional = margin_chunk_leveraged (zaten leveraged, leverage uygulanmaz!)
 /// 2. qty = notional / price
 /// 3. Quantize qty and price according to exchange rules
 /// 
@@ -243,38 +242,28 @@ pub fn split_margin_into_chunks(
 /// 
 /// PROBLEM: Eğer hem burada hem cap_manager'da leverage uygulanırsa leverage^2 etkisi oluşur!
 /// 
-/// ÇÖZÜM: Leverage SADECE BİR YER'de uygulanmalı
+/// ÇÖZÜM: Leverage SADECE BİR YER'de uygulanmalı (caller'da, bu fonksiyon çağrılmadan önce)
 /// - cap_manager: per_order_notional = per_order_cap_margin * effective_leverage (NOTIONAL LIMIT)
-/// - calc_qty_from_margin: notional = margin_chunk * leverage (GERÇEK ORDER NOTIONAL)
-/// 
-/// Bu iki değer FARKLI amaçlar için:
-/// - cap_manager: Limit kontrolü (max notional per order)
-/// - calc_qty_from_margin: Gerçek order quantity hesaplama
+/// - Caller: margin_chunk_leveraged = margin_chunk * leverage (GERÇEK ORDER NOTIONAL)
+/// - calc_qty_from_margin: notional = margin_chunk_leveraged (leverage UYGULANMAZ!)
 /// 
 /// ✅ DOĞRU KULLANIM:
-/// - margin_chunk: leverage uygulanmamış margin (USD)
-/// - leverage: leverage değeri
-/// - Bu fonksiyon: notional = margin * leverage hesaplar
-/// - cap_manager: per_order_notional = margin_limit * leverage hesaplar (limit için)
+/// - Caller'da: margin_chunk_leveraged = margin_chunk * leverage hesaplanır
+/// - Bu fonksiyon: notional = margin_chunk_leveraged (direkt kullanılır, leverage uygulanmaz)
 /// 
 /// ❌ YANLIŞ KULLANIM:
-/// - margin_chunk zaten leverage uygulanmış ise → leverage^2 etkisi!
+/// - margin_chunk_leveraged zaten leverage uygulanmış ise ve burada tekrar leverage uygulanırsa → leverage^2 etkisi!
 pub fn calc_qty_from_margin(
-    margin_chunk: f64,
-    leverage: f64,
+    margin_chunk_leveraged: f64,
     price: Decimal,
     rules: &SymbolRules,
     side: crate::core::types::Side,
 ) -> Option<(String, String)> {
     // ✅ KRİTİK: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
-    // Calculate notional = margin * leverage (Decimal olarak)
-    // margin_chunk: hesaptan çıkan para (USD) - leverage uygulanmamış olmalı
-    // notional: pozisyon büyüklüğü (USD) = margin * leverage
-    // KRİTİK: margin_chunk zaten leverage uygulanmamış olmalı (split_margin_into_chunks'dan geliyor)
-    // Eğer margin_chunk zaten leverage uygulanmış ise, burada tekrar leverage uygulanmamalı!
-    let margin_dec = Decimal::try_from(margin_chunk).unwrap_or(Decimal::ZERO);
-    let leverage_dec = Decimal::try_from(leverage).unwrap_or(Decimal::ZERO);
-    let notional = margin_dec * leverage_dec;
+    // margin_chunk_leveraged: ZATEN leverage uygulanmış notional (USD)
+    // notional: pozisyon büyüklüğü (USD) = margin_chunk_leveraged (leverage UYGULANMAZ!)
+    // KRİTİK: margin_chunk_leveraged zaten leveraged olarak gelmeli (caller'da hesaplanmış)
+    let notional = Decimal::try_from(margin_chunk_leveraged).unwrap_or(Decimal::ZERO);
     
     if price <= Decimal::ZERO || notional <= Decimal::ZERO {
         return None;
@@ -913,6 +902,9 @@ pub struct RateLimiter {
     requests: Mutex<VecDeque<Instant>>,
     /// Per-minute weight tracking (for weight-based limits)
     weights: Mutex<VecDeque<(Instant, u32)>>,
+    /// Atomik counter: Sleep sırasında reserve edilen weight (race condition fix)
+    /// Bu, sleep sırasında başka thread'lerin weight eklemesini önler
+    reserved_weight: std::sync::atomic::AtomicU32,
     /// Maximum requests per second (with safety margin)
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) max_requests_per_sec: u32,
@@ -942,6 +934,7 @@ impl RateLimiter {
         Self {
             requests: Mutex::new(VecDeque::new()),
             weights: Mutex::new(VecDeque::new()),
+            reserved_weight: std::sync::atomic::AtomicU32::new(0),
             max_requests_per_sec: safe_req_limit,
             max_weight_per_minute: safe_weight_limit,
             min_interval_ms,
@@ -956,7 +949,8 @@ impl RateLimiter {
     /// 
     /// # Race Condition Fix
     /// Sleep sırasında lock yokken başka thread'ler weight ekleyebilir.
-    /// Bu yüzden sleep'i küçük parçalara bölüp her parçada kontrol yapıyoruz.
+    /// Çözüm: Atomik counter ile weight'i reserve et, sleep sırasında da reserve korunur.
+    /// Sleep bitince weight'i ekle ve reserve'i serbest bırak.
     pub async fn wait_if_needed(&self, weight: u32) {
         loop {
             let now = Instant::now();
@@ -1012,17 +1006,25 @@ impl RateLimiter {
                 weights.pop_front();
             }
             
-            // Toplam weight'i hesapla
+            // Toplam weight'i hesapla (reserved weight dahil - race condition fix)
             let total_weight: u32 = weights.iter().map(|(_, w)| w).sum();
+            let reserved = self.reserved_weight.load(std::sync::atomic::Ordering::Acquire);
+            let total_with_reserved = total_weight + reserved;
             
             // Eğer weight limit aşıldıysa bekle
-            if total_weight + weight > self.max_weight_per_minute {
+            if total_with_reserved + weight > self.max_weight_per_minute {
                 if let Some((oldest_time, _)) = weights.front().copied() {
                     let wait_time = oldest_time + Duration::from_secs(60);
                     if wait_time > now {
                         let sleep_duration = wait_time.duration_since(now);
+                        
+                        // KRİTİK RACE CONDITION FIX: Weight'i atomik olarak reserve et
+                        // Sleep sırasında başka thread'ler bu weight'i görecek ve limit aşmayacak
+                        self.reserved_weight.fetch_add(weight, std::sync::atomic::Ordering::AcqRel);
+                        
                         drop(requests);
                         drop(weights);
+                        
                         // KRİTİK İYİLEŞTİRME: Adaptive polling interval - Binance 1 dakikalık pencere kullanıyor
                         // Uzun bekleme (> 10 saniye): 2-5 saniye polling (overhead azaltma)
                         // Orta bekleme (1-10 saniye): 1 saniye polling
@@ -1035,6 +1037,9 @@ impl RateLimiter {
                             100 // 100ms - kısa bekleme için (per-second limit)
                         };
                         self.sleep_with_polling(sleep_duration, poll_interval_ms).await;
+                        
+                        // Sleep bitince reserve'i serbest bırak
+                        self.reserved_weight.fetch_sub(weight, std::sync::atomic::Ordering::AcqRel);
                         continue;
                     }
                 }
@@ -1047,8 +1052,10 @@ impl RateLimiter {
         }
     }
     
-    /// Sleep with polling: Sleep'i küçük parçalara böl ve her parçada kontrol yap
-    /// Bu, sleep sırasında başka thread'lerin weight eklemesini önler (race condition fix)
+    /// Sleep with polling: Sleep'i küçük parçalara böl (overhead azaltma için)
+    /// 
+    /// NOT: Race condition fix artık atomik counter ile yapılıyor (reserved_weight).
+    /// Bu polling sadece overhead azaltma için - sleep sırasında weight reserve edilmiş durumda.
     /// 
     /// KRİTİK İYİLEŞTİRME: Adaptive polling interval
     /// - Binance 1 dakikalık pencere kullanıyor, bu yüzden uzun bekleme için 1-5 saniye polling yeterli
@@ -1189,7 +1196,9 @@ impl ProfitGuarantee {
     /// Minimum spread in bps (basis points) required for profit
     /// 
     /// # Formula
-    /// Maker → maker (giriş+çıkış) için ücret toplamı: fees_bps_total = 2 * maker_fee_bps
+    /// KRİTİK DÜZELTME: Worst case senaryosu için maker entry + taker exit varsay
+    /// Exit fee'si her zaman maker olmayabilir (taker olabilir) - pozisyon kapanırken taker fee ödersen kar garantisi bozulur
+    /// Ücret toplamı: fees_bps_total = maker_fee_bps + taker_fee_bps
     /// İstenen net kâr: $0.50
     /// Gerekli brüt bps: target_bps = 10000 * 0.50 / notional
     /// Safety margin: slippage (~1-5 bps) + partial fill risks + market volatility
@@ -1199,9 +1208,12 @@ impl ProfitGuarantee {
             return 0.0;
         }
 
-        // Maker → maker (giriş+çıkış) için ücret toplamı: 2 * maker_fee_bps
+        // KRİTİK DÜZELTME: Worst case senaryosu - maker entry + taker exit
+        // Exit fee'si her zaman maker olmayabilir (taker olabilir)
+        // Pozisyon kapanırken taker fee ödersen kar garantisi bozulur
         let maker_fee_bps = self.maker_fee_rate * 10000.0;
-        let fees_bps_total = 2.0 * maker_fee_bps;
+        let taker_fee_bps = self.taker_fee_rate * 10000.0;
+        let fees_bps_total = maker_fee_bps + taker_fee_bps;
         
         // İstenen net kâr için gerekli brüt bps
         let target_bps = 10000.0 * self.min_profit_usd / position_size_usd;

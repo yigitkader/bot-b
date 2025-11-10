@@ -139,21 +139,20 @@ pub fn update_position_tracking(
         state.position_size_notional_history.remove(0);
     }
 
-    // Update position entry time if needed
+    // Update position hold duration (entry_time sadece WebSocket event'te set edilir)
+    // KRİTİK DÜZELTME: Position entry time SADECE WebSocket fill event'te set edilir
+    // Fallback kaldırıldı - WebSocket geç gelirse bile yanlış zaman set etmek yerine bekler
+    // Bu, PnL hesaplamalarının doğruluğunu garanti eder
     let position_qty_threshold = Decimal::from_str_radix(&cfg.internal.position_qty_threshold, 10)
         .unwrap_or(Decimal::new(1, 8));
     if position.qty.0.abs() > position_qty_threshold {
-        if state.position_entry_time.is_none() {
-            state.position_entry_time = Some(Instant::now());
-            warn!(
-                entry_time_set = "from_position_check_fallback",
-                "position entry time set from position check (FALLBACK)"
-            );
-        }
+        // Entry time varsa hold duration'ı güncelle
         if let Some(entry_time) = state.position_entry_time {
             state.position_hold_duration_ms = entry_time.elapsed().as_millis() as u64;
         }
+        // Entry time yoksa set etme - WebSocket event bekleniyor
     } else {
+        // Pozisyon kapalı - entry_time ve hold_duration sıfırla
         state.position_entry_time = None;
         state.peak_pnl = Decimal::ZERO;
         state.position_hold_duration_ms = 0;
