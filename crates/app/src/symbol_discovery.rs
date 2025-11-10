@@ -9,6 +9,7 @@ use crate::utils::{is_usd_stable, rate_limit_guard};
 use crate::config::AppCfg;
 use crate::types::SymbolState;
 use crate::strategy::{DynMm, DynMmCfg, Strategy};
+use crate::qmel::QMelStrategy;
 use crate::core::types::Qty;
 use std::collections::HashMap;
 use rust_decimal::Decimal;
@@ -232,6 +233,22 @@ pub fn initialize_symbol_states(
         let dyn_cfg_clone = dyn_cfg.clone();
         match strategy_name {
             "dyn_mm" => Box::new(DynMm::from(dyn_cfg_clone)),
+            "qmel" => {
+                let maker_fee = cfg.strategy.maker_fee_rate.unwrap_or(0.0001);
+                let taker_fee = cfg.strategy.taker_fee_rate.unwrap_or(0.0004);
+                let ev_threshold = cfg.strategy.qmel_ev_threshold.unwrap_or(0.10);
+                let min_margin = cfg.strategy.qmel_min_margin_usdc.unwrap_or(10.0);
+                let max_margin = cfg.strategy.qmel_max_margin_usdc.unwrap_or(100.0);
+                let max_leverage = cfg.risk.max_leverage as f64;
+                Box::new(QMelStrategy::new(
+                    maker_fee,
+                    taker_fee,
+                    ev_threshold,
+                    min_margin,
+                    max_margin,
+                    max_leverage,
+                ))
+            },
             other => {
                 warn!(symbol = %symbol, strategy = %other, "unknown strategy type, defaulting dyn_mm");
                 Box::new(DynMm::from(dyn_cfg_clone))

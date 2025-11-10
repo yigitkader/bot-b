@@ -916,6 +916,7 @@ pub struct QMelStrategy {
     daily_pnl: f64,
     daily_drawdown_pct: f64,
     last_trade_time: Option<Instant>,
+    last_state: Option<MarketState>, // Store last state for OFI signal
 }
 
 impl QMelStrategy {
@@ -957,7 +958,33 @@ impl QMelStrategy {
             daily_pnl: 0.0,
             daily_drawdown_pct: 0.0,
             last_trade_time: None,
+            last_state: None,
         }
+    }
+
+    /// Calculate margin chunks using DMA
+    pub fn calculate_margin_chunks(&self, available_equity_usdc: f64, ev: f64) -> Vec<f64> {
+        let variance = DynamicMarginAllocator::estimate_variance(
+            &self.recent_returns.iter().copied().collect::<Vec<_>>()
+        );
+        self.margin_allocator.allocate_margin(available_equity_usdc, ev, variance)
+    }
+
+    /// Calculate leverage using ARG
+    pub fn calculate_leverage(
+        &self,
+        stop_distance_pct: f64,
+        mmr: f64,
+        target_tick_usd: f64,
+        volatility_1s: f64,
+    ) -> f64 {
+        self.risk_governor.calculate_leverage(
+            stop_distance_pct,
+            mmr,
+            target_tick_usd,
+            volatility_1s,
+            self.daily_drawdown_pct,
+        )
     }
 
     /// Update strategy with trade result (for online learning)
@@ -1091,27 +1118,35 @@ impl Strategy for QMelStrategy {
             }
         }
         
-        // Update previous orderbook
+        // Update previous orderbook and state
         self.prev_orderbook = Some(ctx.ob.clone());
+        self.last_state = Some(state);
         
         quotes
     }
 
     fn get_trend_bps(&self) -> f64 {
-        // Return OFI as trend signal
-        // This is a simplified implementation - can be enhanced
-        0.0
+        // Return OFI as trend signal (OFI is already normalized [-1, 1])
+        // Convert to bps: multiply by 10000 for strong signals
+        if let Some(ref state) = self.last_state {
+            state.ofi * 100.0 // Scale OFI to bps (OFI is typically [-1, 1])
+        } else {
+            0.0
+        }
     }
 
     fn get_volatility(&self) -> f64 {
-        // Return 5s volatility
+        // Return 5s volatility (already in log-return space)
         self.feature_extractor.get_volatility_5s()
     }
 
     fn get_ofi_signal(&self) -> f64 {
         // Return last OFI value
-        // Note: This requires storing last state or extracting on demand
-        0.0 // Simplified - should be stored in state
+        if let Some(ref state) = self.last_state {
+            state.ofi
+        } else {
+            0.0
+        }
     }
 }
 

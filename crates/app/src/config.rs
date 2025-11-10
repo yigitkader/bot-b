@@ -109,6 +109,25 @@ pub struct StratCfg {
     pub orderbook_imbalance_long_threshold: Option<f64>, // Long için imbalance threshold (bid_vol/ask_vol) - default: 1.2
     #[serde(default)]
     pub orderbook_imbalance_short_threshold: Option<f64>, // Short için imbalance threshold (bid_vol/ask_vol) - default: 0.83
+    // Q-MEL parameters
+    #[serde(default)]
+    pub qmel_ev_threshold: Option<f64>, // Minimum EV to trade (USD) - default: 0.10
+    #[serde(default)]
+    pub qmel_min_margin_usdc: Option<f64>, // Minimum margin per trade (USDC) - default: 10.0
+    #[serde(default)]
+    pub qmel_max_margin_usdc: Option<f64>, // Maximum margin per trade (USDC) - default: 100.0
+    #[serde(default)]
+    pub qmel_f_min: Option<f64>, // Minimum risk fraction - default: 0.02
+    #[serde(default)]
+    pub qmel_f_max: Option<f64>, // Maximum risk fraction - default: 0.15
+    #[serde(default)]
+    pub qmel_alpha: Option<f64>, // ARG safety coefficient - default: 0.5
+    #[serde(default)]
+    pub qmel_beta: Option<f64>, // ARG volatility coefficient - default: 1.0
+    #[serde(default)]
+    pub qmel_edge_decay_half_life_ms: Option<f64>, // Edge decay half-life (ms) - default: 500.0
+    #[serde(default)]
+    pub qmel_exploration_rate: Option<f64>, // Bandit exploration rate - default: 0.1
 }
 
 #[derive(Debug, Deserialize)]
