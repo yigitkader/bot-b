@@ -2,16 +2,16 @@
 // All utility functions and helpers
 
 use crate::types::*;
-use crate::exec::binance::SymbolRules;
-use crate::binance_exec::BinanceFutures;
-use crate::exec::Venue;
-use crate::cap_manager::Caps;
-use crate::risk::RiskAction;
-use crate::order::place_orders_with_profit_guarantee;
+use crate::connection::{SymbolRules, BinanceFutures, Venue};
 use crate::logger::{self, SharedLogger};
 use crate::config::AppCfg;
-use crate::event_handler::handle_order_fill;
-use crate::constants::*;
+
+// Constants (moved from constants.rs)
+const MIN_SPREAD_SAFETY_MARGIN_BPS: f64 = 5.0;
+const FILL_RATE_DECAY_THRESHOLD_SEC: u64 = 30;
+const FILL_RATE_DECAY_CHECK_INTERVAL_SEC: u64 = 5;
+const FILL_RATE_DECAY_INTERVAL_SEC: u64 = 30;
+const FILL_RATE_DECAY_MULTIPLIER: f64 = 0.9;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
 use rust_decimal::RoundingStrategy;
@@ -42,43 +42,6 @@ pub fn quant_utils_ceil_to_step(val: Decimal, step: Decimal) -> Decimal {
     (val / step).ceil() * step
 }
 
-/// Snap price to tick (is_buy=true -> floor, is_buy=false -> ceil)
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn quant_utils_snap_price(raw: Decimal, tick: Decimal, is_buy: bool) -> Decimal {
-    if is_buy {
-        quant_utils_floor_to_step(raw, tick)
-    } else {
-        quant_utils_ceil_to_step(raw, tick)
-    }
-}
-
-/// Calculate quantity from quote amount, floor to lot step
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn quant_utils_qty_from_quote(quote: Decimal, price: Decimal, lot_step: Decimal) -> Decimal {
-    if price.is_zero() {
-        return Decimal::ZERO;
-    }
-    quant_utils_floor_to_step(quote / price, lot_step)
-}
-
-/// Calculate basis points difference: (|new-old|/old)*1e4
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn quant_utils_bps_diff(old_px: Decimal, new_px: Decimal) -> f64 {
-    if old_px.is_zero() {
-        return f64::INFINITY;
-    }
-    let num = (new_px - old_px).abs();
-    (num / old_px).to_f64().unwrap_or(0.0) * 10_000.0
-}
-
-/// Quantize decimal value to step (alias for floor_to_step for consistency)
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() || step.is_sign_negative() {
-        return value;
-    }
-    quant_utils_floor_to_step(value, step)
-}
 
 // ============================================================================
 // Quantity and Price Helpers
@@ -104,48 +67,6 @@ pub fn get_price_tick(
         .unwrap_or(fallback)
 }
 
-/// KRİTİK DÜZELTME: Tick/step kuantizasyon standardizasyonu - tek util fonksiyon
-/// Fiyatı tick'e, miktarı step'e çevirir ve string format üretir
-/// 
-/// # Arguments
-/// * `price` - Raw price (Decimal)
-/// * `qty` - Raw quantity (Decimal)
-/// * `rules` - Symbol rules (tick_size, step_size, precisions)
-/// 
-/// # Returns
-/// (price_str, qty_str, price_quantized, qty_quantized)
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn quantize_order(
-    price: Decimal,
-    qty: Decimal,
-    rules: &SymbolRules,
-) -> (String, String, Decimal, Decimal) {
-    // 1. Quantize: price to tick, qty to step
-    let price_quantized = quant_utils_floor_to_step(price, rules.tick_size);
-    let qty_quantized = quant_utils_floor_to_step(qty.abs(), rules.step_size);
-    
-    // 2. Format: precision'a göre string'e çevir
-    let price_str = format_decimal_fixed(price_quantized, rules.price_precision);
-    let qty_str = format_decimal_fixed(qty_quantized, rules.qty_precision);
-    
-    (price_str, qty_str, price_quantized, qty_quantized)
-}
-
-// format_decimal_fixed moved here to avoid duplication
-
-/// Helper trait for floor division by step
-pub trait FloorStep {
-    fn floor_div_step(self, step: f64) -> f64;
-}
-
-impl FloorStep for f64 {
-    fn floor_div_step(self, step: f64) -> f64 {
-        if step <= 0.0 {
-            return self;
-        }
-        (self / step).floor() * step
-    }
-}
 
 /// Clamp quantity by USD value
 pub fn clamp_qty_by_usd(qty: Qty, px: Px, max_usd: f64, qty_step: f64) -> Qty {
@@ -153,23 +74,19 @@ pub fn clamp_qty_by_usd(qty: Qty, px: Px, max_usd: f64, qty_step: f64) -> Qty {
     if p <= 0.0 || max_usd <= 0.0 {
         return Qty(Decimal::ZERO);
     }
-    let max_qty = (max_usd / p).floor_div_step(qty_step);
+    // Floor to step size
+    let max_qty_raw = max_usd / p;
+    let step = qty_step;
+    let max_qty = if step > 0.0 {
+        (max_qty_raw / step).floor() * step
+    } else {
+        max_qty_raw
+    };
     let wanted = qty.0.to_f64().unwrap_or(0.0);
     let q = wanted.min(max_qty);
     Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
 }
 
-/// Clamp quantity by base asset amount
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn clamp_qty_by_base(qty: Qty, max_base: f64, qty_step: f64) -> Qty {
-    if max_base <= 0.0 {
-        return Qty(Decimal::ZERO);
-    }
-    let max_qty = max_base.floor_div_step(qty_step);
-    let wanted = qty.0.to_f64().unwrap_or(0.0);
-    let q = wanted.min(max_qty);
-    Qty(Decimal::from_f64_retain(q).unwrap_or(Decimal::ZERO))
-}
 
 /// Check if asset is a USD stablecoin (only USDC and USDT allowed)
 pub fn is_usd_stable(asset: &str) -> bool {
@@ -412,87 +329,6 @@ pub fn calc_qty_from_margin(
     Some((qty_str, price_str))
 }
 
-/// KRİTİK DÜZELTME: ProfitGuarantee wrapper - maker→taker fallback zinciri standardize
-/// Tek wrapper fonksiyon: required_take_profit_price_with_fallback
-/// 
-/// # Arguments
-/// * `side` - Position side (Buy=Long, Sell=Short)
-/// * `entry_price` - Entry price
-/// * `qty` - Quantity
-/// * `maker_fee_rate` - Maker fee rate (e.g., 0.0001)
-/// * `taker_fee_rate` - Taker fee rate (e.g., 0.0004)
-/// * `min_profit_usd` - Minimum profit in USD
-/// * `tick_size` - Tick size for quantization
-/// * `best_bid` - Best bid price (for maker check)
-/// * `best_ask` - Best ask price (for maker check)
-/// 
-/// # Returns
-/// (tp_price_quantized, is_taker_fallback, reason_code)
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn required_take_profit_price_with_fallback(
-    side: crate::types::Side,
-    entry_price: Decimal,
-    qty: Decimal,
-    maker_fee_rate: f64,
-    taker_fee_rate: f64,
-    min_profit_usd: f64,
-    tick_size: Decimal,
-    best_bid: Decimal,
-    best_ask: Decimal,
-) -> Option<(Decimal, bool, &'static str)> {
-    let maker_fee_bps = maker_fee_rate * 10000.0;
-    let taker_fee_bps = taker_fee_rate * 10000.0;
-    
-    // Önce maker→maker senaryosu
-    let tp_maker = required_take_profit_price(
-        side,
-        entry_price,
-        qty,
-        maker_fee_bps,
-        maker_fee_bps,
-        min_profit_usd,
-    )?;
-    
-    // Quantize et
-    let tp_quantized = match side {
-        crate::types::Side::Buy => quant_utils_ceil_to_step(tp_maker, tick_size),
-        crate::types::Side::Sell => quant_utils_floor_to_step(tp_maker, tick_size),
-    };
-    
-    // Maker kontrolü
-    let is_maker = match side {
-        crate::types::Side::Buy => {
-            // Long: TP = sell exit, best_ask'ten en az 1 tick yüksek olmalı
-            tp_quantized >= best_ask + tick_size
-        }
-        crate::types::Side::Sell => {
-            // Short: TP = buy exit, best_bid'ten en az 1 tick düşük olmalı
-            tp_quantized <= best_bid - tick_size
-        }
-    };
-    
-    if is_maker {
-        return Some((tp_quantized, false, "TP_MAKER"));
-    }
-    
-    // Maker olamıyorsa taker fallback
-    let tp_taker = required_take_profit_price(
-        side,
-        entry_price,
-        qty,
-        taker_fee_bps,
-        taker_fee_bps,
-        min_profit_usd,
-    )?;
-    
-    let tp_taker_quantized = match side {
-        crate::types::Side::Buy => quant_utils_ceil_to_step(tp_taker, tick_size),
-        crate::types::Side::Sell => quant_utils_floor_to_step(tp_taker, tick_size),
-    };
-    
-    Some((tp_taker_quantized, true, "TP_TAKER_FALLBACK"))
-}
-
 /// Calculate required take profit price to guarantee net profit ≥ min_profit_usd
 /// 
 /// # Arguments
@@ -559,17 +395,15 @@ pub fn required_take_profit_price(
     }
 }
 
-/// Calculate side multiplier for PnL calculation
-/// Long: +1.0, Short: -1.0
-pub fn side_mult(side: &crate::types::Side) -> f64 {
+/// Calculate side multiplier for PnL calculation (internal helper)
+fn side_mult(side: &crate::types::Side) -> f64 {
     match side {
-        crate::types::Side::Buy => 1.0,  // Long
-        crate::types::Side::Sell => -1.0, // Short
+        crate::types::Side::Buy => 1.0,
+        crate::types::Side::Sell => -1.0,
     }
 }
 
 /// Estimate exit fee BPS based on exit type
-/// Market exit uses taker fee, limit exit uses maker fee
 pub fn estimate_close_fee_bps(is_market_exit: bool, maker_bps: f64, taker_bps: f64) -> f64 {
     if is_market_exit {
         taker_bps
@@ -579,17 +413,6 @@ pub fn estimate_close_fee_bps(is_market_exit: bool, maker_bps: f64, taker_bps: f
 }
 
 /// Calculate net PnL in USD (fees included)
-/// 
-/// # Arguments
-/// * `entry_price` - Entry price (Decimal)
-/// * `exit_price` - Current/exit price (Decimal)
-/// * `qty` - Position quantity (Decimal, absolute value)
-/// * `side` - Position side (Buy=Long, Sell=Short)
-/// * `entry_fee_bps` - Entry fee in basis points
-/// * `exit_fee_bps` - Exit fee in basis points
-/// 
-/// # Returns
-/// Net PnL in USD (fees deducted)
 pub fn calc_net_pnl_usd(
     entry_price: Decimal,
     exit_price: Decimal,
@@ -599,222 +422,22 @@ pub fn calc_net_pnl_usd(
     exit_fee_bps: f64,
 ) -> f64 {
     let mult = side_mult(side);
-    
-    // Gross PnL = (exit_price - entry_price) * qty * mult
     let price_diff = exit_price - entry_price;
     let gross_pnl = price_diff * qty * Decimal::try_from(mult).unwrap_or(Decimal::ONE);
     
-    // Notionals for fee calculation
     let notional_entry = entry_price * qty;
     let notional_exit = exit_price * qty;
     
-    // Fees
     let entry_fee_bps_dec = Decimal::try_from(entry_fee_bps / 10_000.0).unwrap_or(Decimal::ZERO);
     let exit_fee_bps_dec = Decimal::try_from(exit_fee_bps / 10_000.0).unwrap_or(Decimal::ZERO);
     
     let fees_open = notional_entry * entry_fee_bps_dec;
     let fees_close = notional_exit * exit_fee_bps_dec;
     
-    // Net PnL = gross - fees
     let net_pnl = gross_pnl - fees_open - fees_close;
-    
     net_pnl.to_f64().unwrap_or(0.0)
 }
 
-/// Clamp price to market distance (mid ± max_distance_pct)
-/// 
-/// # Arguments
-/// * `price` - Raw price from strategy
-/// * `mid` - Mid price (best_bid + best_ask) / 2
-/// * `max_distance_pct` - Maximum distance from mid (e.g., 0.01 = 1%)
-/// 
-/// # Returns
-/// Clamped price within mid ± max_distance_pct
-#[allow(dead_code)] // Gelecekte kullanılacak
-pub fn clamp_price_to_market_distance(
-    price: Decimal,
-    mid: Decimal,
-    max_distance_pct: f64,
-) -> Decimal {
-    // KRİTİK: Division by zero ve invalid input kontrolleri
-    if mid <= Decimal::ZERO || max_distance_pct <= 0.0 || price <= Decimal::ZERO {
-        return price;
-    }
-    
-    let max_distance_pct_dec = match Decimal::try_from(max_distance_pct) {
-        Ok(d) => d,
-        Err(_) => return price, // Invalid conversion
-    };
-    
-    let max_distance = mid * max_distance_pct_dec;
-    let min_price = mid - max_distance;
-    let max_price = mid + max_distance;
-    
-    // Clamp to valid range
-    price.max(min_price).min(max_price)
-}
-
-/// Analyze order book depth to find optimal price level
-/// 
-/// # Arguments
-/// * `order_book` - Order book with top bids/asks
-/// * `side` - Order side (Buy or Sell)
-/// * `min_required_volume_usd` - Minimum required volume in USD for a level to be considered
-/// * `best_bid` - Best bid price (fallback)
-/// * `best_ask` - Best ask price (fallback)
-/// 
-/// # Returns
-/// Optimal price based on depth analysis, or best_bid/best_ask if no suitable level found
-pub fn find_optimal_price_from_depth(
-    order_book: &crate::types::OrderBook,
-    side: crate::types::Side,
-    min_required_volume_usd: f64,
-    best_bid: Decimal,
-    best_ask: Decimal,
-) -> Decimal {
-    match side {
-        crate::types::Side::Buy => {
-            // BID: En yüksek volume'lu level'ı bul (best_bid'e yakın)
-            if let Some(top_bids) = &order_book.top_bids {
-                for level in top_bids.iter() {
-                    let level_volume_usd = (level.px.0 * level.qty.0).to_f64().unwrap_or(0.0);
-                    // Yeterli volume varsa ve best_bid'e yakınsa kullan
-                    if level_volume_usd >= min_required_volume_usd && level.px.0 <= best_bid {
-                        return level.px.0;
-                    }
-                }
-            }
-            // Fallback: best_bid
-            best_bid
-        }
-        crate::types::Side::Sell => {
-            // ASK: En yüksek volume'lu level'ı bul (best_ask'e yakın)
-            if let Some(top_asks) = &order_book.top_asks {
-                for level in top_asks.iter() {
-                    let level_volume_usd = (level.px.0 * level.qty.0).to_f64().unwrap_or(0.0);
-                    // Yeterli volume varsa ve best_ask'e yakınsa kullan
-                    if level_volume_usd >= min_required_volume_usd && level.px.0 >= best_ask {
-                        return level.px.0;
-                    }
-                }
-            }
-            // Fallback: best_ask
-            best_ask
-        }
-    }
-}
-
-/// Adjust price for aggressiveness based on trend and manipulation
-/// 
-/// # Arguments
-/// * `price` - Raw price from strategy
-/// * `best_bid` - Best bid price
-/// * `best_ask` - Best ask price
-/// * `side` - Order side (Buy or Sell)
-/// * `is_opportunity_mode` - Is manipulation opportunity active?
-/// * `trend_bps` - Trend in basis points (positive = uptrend, negative = downtrend)
-/// * `max_distance_pct` - Maximum distance from best bid/ask
-/// 
-/// # Returns
-/// Adjusted price that is closer to market when trend/opportunity is strong
-pub fn adjust_price_for_aggressiveness(
-    price: Decimal,
-    best_bid: Decimal,
-    best_ask: Decimal,
-    side: crate::types::Side,
-    is_opportunity_mode: bool,
-    trend_bps: f64,
-    max_distance_pct: f64,
-) -> Decimal {
-    if best_bid <= Decimal::ZERO || best_ask <= Decimal::ZERO || price <= Decimal::ZERO {
-        return price;
-    }
-    
-    let max_distance_pct_dec = match Decimal::try_from(max_distance_pct) {
-        Ok(d) => d,
-        Err(_) => return price,
-    };
-    
-    match side {
-        crate::types::Side::Buy => {
-            // BID: best_bid'e yakın olmalı
-            let max_distance = best_bid * max_distance_pct_dec;
-            
-            // Trend-aware adjustment: Uptrend varsa bid'i yukarı çek
-            let trend_factor = if trend_bps > 50.0 {
-                // Güçlü uptrend: bid'i %50 daha yakın yap
-                0.5
-            } else if trend_bps > 0.0 {
-                // Zayıf uptrend: bid'i %25 daha yakın yap
-                0.75
-            } else {
-                1.0 // Downtrend: normal mesafe
-            };
-            
-            // Opportunity mode: Manipülasyon varsa daha agresif
-            let opportunity_factor = if is_opportunity_mode {
-                0.2 // %80 daha yakın (çok agresif - küçük kar hedefi için)
-            } else {
-                0.5 // Normal modda bile %50 daha yakın (küçük kar hedefi için agresif)
-            };
-            
-            // Kombine faktör (en agresif olanı seç)
-            let adjustment_factor = if trend_factor < opportunity_factor { trend_factor } else { opportunity_factor };
-            let adjustment_factor_dec = Decimal::try_from(adjustment_factor).unwrap_or(Decimal::ONE);
-            let adjusted_min = best_bid - (max_distance * adjustment_factor_dec);
-            
-            // Clamp: strategy price ile adjusted min arasında en yakın olanı seç
-            // Küçük kar hedefi için best_bid'e mümkün olduğunca yakın
-            price.max(adjusted_min).min(best_bid)
-        }
-        crate::types::Side::Sell => {
-            // ASK: best_ask'e yakın olmalı
-            let max_distance = best_ask * max_distance_pct_dec;
-            
-            // Trend-aware adjustment: Downtrend varsa ask'i aşağı çek
-            let trend_factor = if trend_bps < -50.0 {
-                // Güçlü downtrend: ask'i %50 daha yakın yap
-                0.5
-            } else if trend_bps < 0.0 {
-                // Zayıf downtrend: ask'i %25 daha yakın yap
-                0.75
-            } else {
-                1.0 // Uptrend: normal mesafe
-            };
-            
-            // Opportunity mode: Manipülasyon varsa daha agresif
-            let opportunity_factor = if is_opportunity_mode {
-                0.2 // %80 daha yakın (çok agresif - küçük kar hedefi için)
-            } else {
-                0.5 // Normal modda bile %50 daha yakın (küçük kar hedefi için agresif)
-            };
-            
-            // Kombine faktör (en agresif olanı seç)
-            let adjustment_factor = if trend_factor < opportunity_factor { trend_factor } else { opportunity_factor };
-            let adjustment_factor_dec = Decimal::try_from(adjustment_factor).unwrap_or(Decimal::ONE);
-            let adjusted_max = best_ask + (max_distance * adjustment_factor_dec);
-            
-            // Clamp: strategy price ile adjusted max arasında en yakın olanı seç
-            // Küçük kar hedefi için best_ask'e mümkün olduğunca yakın
-            price.max(best_ask).min(adjusted_max)
-        }
-    }
-}
-
-/// Helper trait for ceiling division by step
-#[allow(dead_code)] // Gelecekte kullanılacak
-trait CeilStep {
-    fn ceil_div_step(self, step: f64) -> f64;
-}
-
-impl CeilStep for f64 {
-    fn ceil_div_step(self, step: f64) -> f64 {
-        if step <= 0.0 {
-            return self;
-        }
-        (self / step).ceil() * step
-    }
-}
 
 /// Format decimal with fixed precision (truncate, don't round)
 /// KRİTİK: Decimal kullanarak precision kaybını önle
@@ -1152,26 +775,15 @@ pub fn init_rate_limiter() {
     )).ok();
 }
 
-/// Get or initialize the global rate limiter (default: Futures limits)
-pub fn get_rate_limiter() -> &'static RateLimiter {
-    RATE_LIMITER.get_or_init(|| {
-        // Default: Futures limits with 70% safety factor
-        RateLimiter::new(40, 2400, 0.7)
-    })
-}
-
 /// Guard function for rate limiting (async)
 /// 
 /// # Arguments
 /// * `weight` - API endpoint weight (default: 1)
 pub async fn rate_limit_guard(weight: u32) {
-    get_rate_limiter().wait_if_needed(weight).await;
-}
-
-/// Convenience function for rate limiting with default weight (1)
-#[allow(dead_code)]
-pub async fn rate_limit_guard_default() {
-    rate_limit_guard(1).await;
+    RATE_LIMITER.get_or_init(|| {
+        // Default: Futures limits with 70% safety factor
+        RateLimiter::new(40, 2400, 0.7)
+    }).wait_if_needed(weight).await;
 }
 
 // ============================================================================
@@ -1260,7 +872,7 @@ impl ProfitGuarantee {
         // Slippage: ~1-5 bps (fiyat kayması)
         // Partial fill risks: emirlerin tam doldurulmaması riski
         // Market volatility: volatilite anında spread genişlemesi
-        let safety_margin_bps = crate::constants::MIN_SPREAD_SAFETY_MARGIN_BPS;
+        let safety_margin_bps = MIN_SPREAD_SAFETY_MARGIN_BPS;
         
         // Minimum spread = fees + target profit + safety margin
         fees_bps_total + target_bps + safety_margin_bps
@@ -1369,90 +981,6 @@ impl ProfitGuarantee {
     }
 }
 
-/// Profit tracker for monitoring trading performance
-pub struct ProfitTracker {
-    total_trades: u32,
-    winning_trades: u32,
-    total_profit: f64,
-    total_fees: f64,
-    total_loss: f64,
-}
-
-impl ProfitTracker {
-    pub fn new() -> Self {
-        Self {
-            total_trades: 0,
-            winning_trades: 0,
-            total_profit: 0.0,
-            total_fees: 0.0,
-            total_loss: 0.0,
-        }
-    }
-
-    /// Record a completed trade
-    /// 
-    /// # Arguments
-    /// * `profit` - Net profit in USD (can be negative)
-    /// * `fees` - Total fees paid in USD
-    pub fn record_trade(&mut self, profit: f64, fees: f64) {
-        self.total_trades += 1;
-        self.total_fees += fees;
-
-        if profit > 0.0 {
-            self.winning_trades += 1;
-            self.total_profit += profit;
-        } else {
-            self.total_loss += profit.abs();
-        }
-    }
-
-    /// Get win rate as percentage
-    pub fn win_rate(&self) -> f64 {
-        if self.total_trades == 0 {
-            return 0.0;
-        }
-        (self.winning_trades as f64 / self.total_trades as f64) * 100.0
-    }
-
-    /// Get net profit (profit - fees - losses)
-    pub fn net_profit(&self) -> f64 {
-        self.total_profit - self.total_fees - self.total_loss
-    }
-
-    /// Get statistics as formatted string
-    pub fn get_stats(&self) -> String {
-        let win_rate = self.win_rate();
-        let net_profit = self.net_profit();
-        let avg_profit_per_trade = if self.total_trades > 0 {
-            net_profit / self.total_trades as f64
-        } else {
-            0.0
-        };
-
-        format!(
-            "Trades: {}, Win Rate: {:.1}%, Net Profit: ${:.2}, Fees: ${:.2}, Avg Profit/Trade: ${:.4}",
-            self.total_trades, win_rate, net_profit, self.total_fees, avg_profit_per_trade
-        )
-    }
-
-    /// Reset all statistics
-    pub fn reset(&mut self) {
-        self.total_trades = 0;
-        self.winning_trades = 0;
-        self.total_profit = 0.0;
-        self.total_fees = 0.0;
-        self.total_loss = 0.0;
-    }
-}
-
-impl Default for ProfitTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Thread-safe profit tracker wrapper
-pub type SharedProfitTracker = Mutex<ProfitTracker>;
 
 /// Calculate spread in basis points from bid and ask prices
 /// KRİTİK DÜZELTME: Mid price bazlı tutarlı hesaplama (volatilite anında sapma önleme)
@@ -1558,53 +1086,19 @@ pub fn tif_from_cfg(s: &str) -> Tif {
     }
 }
 
-/// Fetch balance for a quote asset from venue (futures only)
-pub async fn fetch_quote_balance(venue: &BinanceFutures, quote_asset: &str) -> f64 {
-    match venue.available_balance(quote_asset).await {
-        Ok(balance) => balance.to_f64().unwrap_or(0.0),
-        Err(_) => 0.0,
-    }
-}
-
 /// Fetch balances for all unique quote assets
 pub async fn fetch_all_quote_balances(venue: &BinanceFutures, quote_assets: &[String]) -> HashMap<String, f64> {
     let mut balances = HashMap::new();
     for quote_asset in quote_assets {
-        let balance = fetch_quote_balance(venue, quote_asset).await;
+        let balance = match venue.available_balance(quote_asset).await {
+            Ok(balance) => balance.to_f64().unwrap_or(0.0),
+            Err(_) => 0.0,
+        };
         balances.insert(quote_asset.clone(), balance);
     }
     balances
 }
 
-/// Check if symbol should be processed based on balance
-#[allow(dead_code)]
-pub fn should_process_symbol(
-    state: &SymbolState,
-    quote_balance: f64,
-    min_balance: f64,
-    min_order_size: f64,
-    effective_leverage: f64,
-    mode: &str,
-) -> bool {
-    let has_open_orders = !state.active_orders.is_empty();
-    let has_position = !state.inv.0.is_zero();
-    
-    if has_open_orders || has_position {
-        return true;
-    }
-    
-    if quote_balance < min_balance {
-        return false;
-    }
-    
-    match mode {
-        "futures" => {
-            let total_with_leverage = quote_balance * effective_leverage;
-            total_with_leverage >= min_order_size
-        }
-        _ => quote_balance >= min_order_size,
-    }
-}
 
 /// Calculate effective leverage
 pub fn calculate_effective_leverage(config_leverage: Option<u32>, max_leverage: u32) -> f64 {
@@ -1680,259 +1174,6 @@ pub fn apply_fill_rate_decay(state: &mut SymbolState, cfg: &crate::config::AppCf
     }
 }
 
-// ============================================================================
-// Quote Validation (moved from quote_validator.rs)
-// ============================================================================
-
-/// Validate and clamp quote quantities
-pub fn validate_quotes(
-    quotes: &mut Quotes,
-    caps: &Caps,
-    qty_step_f64: f64,
-    qty_step_dec: Decimal,
-    min_usd_per_order: f64,
-) {
-    if let Some((px, q)) = quotes.bid {
-        if px.0 <= Decimal::ZERO {
-            quotes.bid = None;
-        } else {
-            let nq = clamp_qty_by_usd(q, px, caps.buy_notional, qty_step_f64);
-            let quantized_to_zero = qty_step_dec > Decimal::ZERO && nq.0 < qty_step_dec && nq.0 != Decimal::ZERO;
-            let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
-            if nq.0 == Decimal::ZERO || quantized_to_zero || (min_usd_per_order > 0.0 && notional < min_usd_per_order) {
-                quotes.bid = None;
-            } else {
-                quotes.bid = Some((px, nq));
-            }
-        }
-    }
-
-    if let Some((px, q)) = quotes.ask {
-        if px.0 <= Decimal::ZERO {
-            quotes.ask = None;
-        } else {
-            let nq = clamp_qty_by_usd(q, px, caps.sell_notional, qty_step_f64);
-            let quantized_to_zero = qty_step_dec > Decimal::ZERO && nq.0 < qty_step_dec && nq.0 != Decimal::ZERO;
-            let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
-            if nq.0 == Decimal::ZERO || quantized_to_zero || (min_usd_per_order > 0.0 && notional < min_usd_per_order) {
-                quotes.ask = None;
-            } else {
-                quotes.ask = Some((px, nq));
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Risk Adjustment (moved from risk_adjuster.rs)
-// ============================================================================
-
-/// Adjust quotes based on risk action
-pub fn adjust_quotes_for_risk(
-    quotes: &mut Quotes,
-    risk_action: RiskAction,
-    order_price_distance_no_position: f64,
-    spread_widen_factor: f64,
-) {
-    match risk_action {
-        RiskAction::Reduce => {
-            let widen = Decimal::from_f64_retain(order_price_distance_no_position).unwrap_or(Decimal::ZERO);
-            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
-            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
-        }
-        RiskAction::Widen => {
-            let widen = Decimal::from_f64_retain(spread_widen_factor).unwrap_or(Decimal::ZERO);
-            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
-            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
-        }
-        RiskAction::Ok | RiskAction::Halt => {}
-    }
-}
-
-// ============================================================================
-// Market Data Fetching (moved from market_data.rs)
-// ============================================================================
-
-/// Fetch market data for a symbol (position, mark price)
-pub async fn fetch_market_data(
-    venue: &BinanceFutures,
-    symbol: &str,
-    bid: Px,
-    ask: Px,
-    has_balance: bool,
-    has_open_orders: bool,
-) -> anyhow::Result<(Position, Px, Option<f64>, Option<u64>)> {
-    rate_limit_guard(5).await;
-    let pos = match <BinanceFutures as Venue>::get_position(venue, symbol).await {
-        Ok(pos) => pos,
-        Err(err) => {
-            if !has_open_orders && !has_balance {
-                return Err(anyhow!("failed to fetch position: {}", err));
-            }
-            warn!(%symbol, ?err, "failed to fetch position, using default");
-            Position {
-                symbol: symbol.to_string(),
-                qty: Qty(Decimal::ZERO),
-                entry: Px(Decimal::ZERO),
-                leverage: 1,
-                liq_px: None,
-            }
-        }
-    };
-    
-    rate_limit_guard(1).await;
-    let (mark_px, funding_rate, next_funding_time) = match venue.fetch_premium_index(symbol).await {
-        Ok((mark, funding, next_time)) => (mark, funding, next_time),
-        Err(_) => {
-            let mid = (bid.0 + ask.0) / Decimal::from(2u32);
-            (Px(mid), None, None)
-        }
-    };
-    
-    Ok((pos, mark_px, funding_rate, next_funding_time))
-}
-
-// ============================================================================
-// Position Close (moved from position_close.rs)
-// ============================================================================
-
-/// Calculate PnL and fees for position close
-pub fn calculate_close_pnl(entry_price: Px, exit_price: Px, qty: Qty, maker_fee_rate: f64) -> (f64, f64, f64) {
-    let qty_abs = qty.0.abs();
-    let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
-    let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-    let realized_pnl = if qty.0.is_sign_positive() {
-        (exit_f - entry_f) * qty_abs.to_f64().unwrap_or(0.0)
-    } else {
-        (entry_f - exit_f) * qty_abs.to_f64().unwrap_or(0.0)
-    };
-    
-    let notional = entry_f * qty_abs.to_f64().unwrap_or(0.0);
-    let entry_fee = notional * maker_fee_rate;
-    let exit_fee = notional * maker_fee_rate;
-    let total_fees = entry_fee + exit_fee;
-    let net_profit = realized_pnl - total_fees;
-    
-    (realized_pnl, total_fees, net_profit)
-}
-
-/// Update trade statistics after position close
-pub fn update_trade_stats(
-    state: &mut SymbolState,
-    net_profit: f64,
-    realized_pnl: f64,
-    total_fees: f64,
-    entry_price: Px,
-    exit_price: Px,
-    qty: Qty,
-    symbol: &str,
-) {
-    state.trade_count += 1;
-    let net_profit_decimal = Decimal::from_f64_retain(net_profit).unwrap_or(Decimal::ZERO);
-    let total_fees_decimal = Decimal::from_f64_retain(total_fees).unwrap_or(Decimal::ZERO);
-    let qty_abs = qty.0.abs();
-    
-    if net_profit > 0.0 {
-        state.profitable_trade_count += 1;
-        state.total_profit += net_profit_decimal;
-        if net_profit_decimal > state.largest_win {
-            state.largest_win = net_profit_decimal;
-        }
-        info!(
-            %symbol,
-            entry_price = %entry_price.0,
-            exit_price = %exit_price.0,
-            quantity = %qty_abs,
-            realized_pnl,
-            fees = total_fees,
-            net_profit,
-            total_trades = state.trade_count,
-            profitable_trades = state.profitable_trade_count,
-            "TRADE PROFIT - Position closed with profit"
-        );
-    } else {
-        state.losing_trade_count += 1;
-        state.total_loss += net_profit_decimal.abs();
-        if net_profit_decimal < state.largest_loss {
-            state.largest_loss = net_profit_decimal.abs();
-        }
-        warn!(
-            %symbol,
-            entry_price = %entry_price.0,
-            exit_price = %exit_price.0,
-            quantity = %qty_abs,
-            realized_pnl,
-            fees = total_fees,
-            net_profit,
-            total_trades = state.trade_count,
-            losing_trades = state.losing_trade_count,
-            "TRADE LOSS - Position closed with loss"
-        );
-    }
-    
-    state.total_fees_paid += total_fees_decimal;
-}
-
-// ============================================================================
-// Order Placement (moved from order_placer.rs)
-// ============================================================================
-
-/// Place orders for a side (bid or ask)
-pub async fn place_side_orders(
-    venue: &BinanceFutures,
-    symbol: &str,
-    side: Side,
-    quote: Option<(Px, Qty)>,
-    state: &mut SymbolState,
-    bid: Px,
-    ask: Px,
-    position_size_notional: f64,
-    caps: &Caps,
-    total_spent_on_side: &mut f64,
-    total_spent_on_other: f64,
-    effective_leverage: f64,
-    quote_asset: &str,
-    quote_balances: &mut HashMap<String, f64>,
-    cfg: &AppCfg,
-    tif: Tif,
-    json_logger: &Arc<Mutex<logger::JsonLogger>>,
-    ob: &OrderBook,
-    profit_guarantee: &ProfitGuarantee,
-) -> anyhow::Result<()> {
-    if let Some(quote) = quote {
-        let open_orders = state.active_orders.values()
-            .filter(|o| o.side == side)
-            .count();
-        let available_margin = (caps.buy_total - *total_spent_on_side - total_spent_on_other).max(0.0);
-        let min_margin: f64 = (50.0f64 * 0.2f64).max(cfg.min_usd_per_order.unwrap_or(10.0)).min(100.0f64);
-        
-        place_orders_with_profit_guarantee(
-            venue,
-            symbol,
-            side,
-            Some(quote),
-            state,
-            bid,
-            ask,
-            position_size_notional,
-            available_margin,
-            effective_leverage,
-            open_orders,
-            cfg.risk.max_open_chunks_per_symbol_per_side,
-            quote_asset,
-            quote_balances,
-            total_spent_on_side,
-            cfg,
-            tif,
-            json_logger,
-            ob,
-            profit_guarantee.maker_fee_rate(),
-            profit_guarantee.taker_fee_rate(),
-            min_margin,
-        ).await?;
-    }
-    Ok(())
-}
 
 // ============================================================================
 // Fill Processing (moved from fill_processor.rs)
@@ -2107,7 +1348,11 @@ pub fn process_order_fill_with_logging(
     cfg: &AppCfg,
     json_logger: &SharedLogger,
 ) -> bool {
-    if !handle_order_fill(state, symbol, order_id, cumulative_filled_qty, order_status) {
+    // Update order state
+    if let Some(order_info) = state.active_orders.get_mut(order_id) {
+        order_info.filled_qty = cumulative_filled_qty;
+        order_info.remaining_qty = Qty(order_info.qty.0 - cumulative_filled_qty.0);
+    } else {
         return false;
     }
     

@@ -3,12 +3,11 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use crate::exec::binance::SymbolMeta;
+use crate::connection::SymbolMeta;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use crate::strategy::Strategy;
 
 // ============================================================================
 // Core Domain Types (moved from core.rs)
@@ -87,7 +86,6 @@ pub struct Quotes {
 pub struct SymbolState {
     pub meta: SymbolMeta,
     pub inv: Qty,
-    pub strategy: Box<dyn Strategy>,
     pub active_orders: HashMap<String, OrderInfo>,
     pub pnl_history: Vec<Decimal>,
     
@@ -96,7 +94,7 @@ pub struct SymbolState {
     pub disabled: bool,
     
     // Per-symbol metadata
-    pub symbol_rules: Option<std::sync::Arc<crate::exec::binance::SymbolRules>>,
+    pub symbol_rules: Option<std::sync::Arc<crate::connection::SymbolRules>>,
     // KRİTİK: ExchangeInfo fetch durumu - başarısızsa trade etme
     pub rules_fetch_failed: bool, // ExchangeInfo çekilemediyse true (trade etme)
     pub last_rules_retry: Option<Instant>, // Son retry zamanı (periyodik retry için)

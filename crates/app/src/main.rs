@@ -1,394 +1,300 @@
 //location: /crates/app/src/main.rs
-// Main application entry point and trading loop
+// Simplified Main - Parallel architecture: Trend analysis and Order execution
 
-mod app_init;
-mod binance_exec;
-mod binance_rest;
-mod binance_ws;
-mod cap_manager;
-mod config;
-mod constants;
-mod exec;
-mod event_handler;
-mod logger;
-mod monitor;
+mod balance;
+mod trend;
+mod connection;
 mod order;
-mod position_manager;
-mod quote_generator;
-mod qmel;
-#[cfg(test)]
-mod qmel_tests;
-mod risk;
-mod strategy;
-mod direction_selector;
-mod symbol_discovery;
-mod symbol_processor;
+
+// Keep essential modules
+mod config;
 mod types;
 mod utils;
+mod logger;
 
 use anyhow::Result;
+use crate::config::load_config;
 use crate::types::*;
-use crate::binance_ws::UserEvent;
-use crate::constants::*;
-use crate::exec::Venue;
-use crate::risk::RiskAction;
-use rust_decimal::prelude::ToPrimitive;
+use crate::connection::UserEvent;
+use crate::balance::{check_balances, get_symbols_matched_with_our_balance, get_current_symbol_prices};
+use crate::trend::{describe_and_analyse_token, TrendLearner, get_best_tokens_to_invest_now_after_analyse, TokenAnalysis};
+use crate::connection::{handle_apis, handle_ws_connection, close_ws_connection, BinanceFutures};
+use crate::order::{create_open_long_order, handle_open_short_order, check_position, close_position, save_profits_and_loses, PnLTracker};
+use crate::logger::create_logger;
 use rust_decimal::Decimal;
-use crate::strategy::Context;
-use tracing::{debug, error, info, warn};
-use utils::{
-    compute_drawdown_bps, get_price_tick, get_qty_step, rate_limit_guard,
-    calculate_effective_leverage, fetch_all_quote_balances,
-    apply_fill_rate_decay, should_sync_orders,
-    process_order_canceled, process_order_fill_with_logging,
-};
-use app_init::{initialize_app, AppInitResult};
-use event_handler::handle_reconnect_sync;
-use symbol_processor::process_symbol;
-
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use futures_util::stream::{self, StreamExt};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+// Trend analysis result for order module
+#[derive(Debug, Clone)]
+pub struct TrendSignal {
+    pub symbol: String,
+    pub recommendation: String, // "LONG", "SHORT", "HOLD"
+    pub trend_score: f64,
+    pub signal_strength: f64,
+    pub bid: Decimal,
+    pub ask: Decimal,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize application (config, venue, symbols, states)
-    let init = initialize_app().await?;
+    // Initialize logging
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .compact()
+        .with_ansi(true)
+        .init();
+
+    // Load config
+    let cfg = load_config()?;
+    info!("configuration loaded");
+
+    // 1. Connection Module: Handle APIs and WebSocket
+    let venue = Arc::new(connection::handle_apis(&cfg).await?);
     
-    let AppInitResult {
-        cfg,
-        venue,
-        mut states,
-        risk_limits,
-        event_tx,
-        mut event_rx,
-        json_logger,
-        profit_guarantee,
-        tick_ms,
-        min_usd_per_order,
-        tif,
-    } = init;
-    
-    let mut interval = tokio::time::interval_at(
-        tokio::time::Instant::now(),
-        Duration::from_millis(tick_ms),
-    );
-    
-    static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
-    
-    info!(
-        symbol_count = states.len(),
-        tick_interval_ms = tick_ms,
-        min_usd_per_order,
-        "main trading loop starting"
-    );
-    
-    let mut symbol_index: HashMap<String, usize> = HashMap::new();
-    for (idx, state) in states.iter().enumerate() {
-        symbol_index.insert(state.meta.symbol.clone(), idx);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    if cfg.websocket.enabled {
+        connection::handle_ws_connection(&cfg, event_tx.clone()).await;
     }
+
+    // 2. Log Module: Initialize logger
+    let _logger = create_logger("logs/trading_events.json")?;
+    info!("logger initialized");
+
+    // 3. Trend Module: Initialize AI learner
+    let learner = Arc::new(Mutex::new(TrendLearner::new()));
+    info!("trend learner initialized");
+
+    // 4. Order Module: Initialize PnL tracker
+    let pnl_tracker = Arc::new(Mutex::new(PnLTracker::new()));
+    info!("PnL tracker initialized");
+
+    // Channel for trend signals -> order module
+    let (trend_tx, mut trend_rx) = mpsc::unbounded_channel::<TrendSignal>();
+
+    // Get symbols from config
+    let symbols = if cfg.symbols.is_empty() {
+        vec!["BTCUSDC".to_string(), "ETHUSDC".to_string()]
+    } else {
+        cfg.symbols.clone()
+    };
+    let quote_assets: Vec<String> = symbols.iter()
+        .map(|s| {
+            if s.ends_with("USDC") { "USDC".to_string() }
+            else if s.ends_with("USDT") { "USDT".to_string() }
+            else { "USDC".to_string() }
+        })
+        .collect();
+
+    // Price history for trend analysis (per symbol) - shared state
+    let price_history: Arc<Mutex<HashMap<String, Vec<(Instant, Decimal)>>>> = 
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // ============================================================================
+    // PARALLEL SERVICES
+    // ============================================================================
+
+    // Service 1: Trend Analysis Service (runs continuously)
+    let venue_trend = venue.clone();
+    let learner_trend = learner.clone();
+    let price_history_trend = price_history.clone();
+    let trend_tx_clone = trend_tx.clone();
+    let symbols_trend = symbols.clone();
+    let quote_assets_trend = quote_assets.clone();
+    let cfg_trend = cfg.clone();
     
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("Ctrl+C signal received, shutting down");
-            let _ = shutdown_tx_clone.send(());
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            
+            // 1. Check balances
+            let balances = check_balances(&venue_trend, &quote_assets_trend).await;
+            let symbols_with_balance = get_symbols_matched_with_our_balance(
+                &symbols_trend,
+                &balances,
+                cfg_trend.min_quote_balance_usd,
+            );
+            
+            if symbols_with_balance.is_empty() {
+                continue;
+            }
+            
+            // 2. Get current prices
+            let prices = get_current_symbol_prices(&venue_trend, &symbols_with_balance).await;
+            
+            // 3. Analyze tokens
+            let mut analyses: Vec<TokenAnalysis> = Vec::new();
+            for symbol in &symbols_with_balance {
+                if let Some((bid, ask)) = prices.get(symbol) {
+                    // Update price history
+                    let mut history_guard = price_history_trend.lock().await;
+                    let history = history_guard.entry(symbol.clone()).or_insert_with(Vec::new);
+                    history.push((Instant::now(), (*bid + *ask) / Decimal::from(2)));
+                    
+                    // Keep only last 100 prices
+                    if history.len() > 100 {
+                        history.remove(0);
+                    }
+                    
+                    let history_snapshot = history.clone();
+                    drop(history_guard);
+                    
+                    // Analyze token
+                    let learner_guard = learner_trend.lock().await;
+                    let analysis = describe_and_analyse_token(
+                        symbol,
+                        *bid,
+                        *ask,
+                        &history_snapshot,
+                        &learner_guard,
+                    );
+                    drop(learner_guard);
+                    analyses.push(analysis);
+                }
+            }
+            
+            // 4. Get best tokens
+            let best_tokens = get_best_tokens_to_invest_now_after_analyse(&analyses, 5);
+            
+            // 5. Send signals to order module
+            for symbol in &best_tokens {
+                if let Some(analysis) = analyses.iter().find(|a| a.symbol == *symbol) {
+                    if let Some((bid, ask)) = prices.get(symbol) {
+                        if analysis.recommendation != "HOLD" {
+                            let signal = TrendSignal {
+                                symbol: symbol.clone(),
+                                recommendation: analysis.recommendation.clone(),
+                                trend_score: analysis.trend_score,
+                                signal_strength: analysis.signal_strength,
+                                bid: *bid,
+                                ask: *ask,
+                            };
+                            if trend_tx_clone.send(signal).is_err() {
+                                warn!("trend signal channel closed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     });
+
+    // Service 2: Order Execution Service (runs continuously, processes trend signals)
+    let venue_order = venue.clone();
+    let pnl_tracker_order = pnl_tracker.clone();
     
-    let mut force_sync_all = false;
-    let mut shutdown_requested = false;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                // Process trend signals
+                signal = trend_rx.recv() => {
+                    if let Some(signal) = signal {
+                        // Check current position
+                        match check_position(&venue_order, &signal.symbol).await {
+                            Ok(position) => {
+                                // If we have a position, check if we should close it
+                                if !position.qty.0.is_zero() {
+                                    let should_close = (signal.recommendation == "LONG" && position.qty.0.is_sign_negative())
+                                        || (signal.recommendation == "SHORT" && position.qty.0.is_sign_positive());
+                                    
+                                    if should_close {
+                                        if let Err(e) = close_position(&venue_order, &signal.symbol, &position).await {
+                                            warn!(symbol = %signal.symbol, error = %e, "failed to close position");
+                                        } else {
+                                            // Save PnL
+                                            let mut tracker = pnl_tracker_order.lock().await;
+                                            save_profits_and_loses(
+                                                &mut tracker,
+                                                &signal.symbol,
+                                                position.entry.0,
+                                                position.entry.0, // TODO: Get actual exit price
+                                                position.qty.0.abs(),
+                                                if position.qty.0.is_sign_positive() { Side::Buy } else { Side::Sell },
+                                                2.0, // entry fee bps
+                                                4.0, // exit fee bps
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    // No position, create new order
+                                    let price = if signal.recommendation == "LONG" {
+                                        signal.bid // Buy at bid
+                                    } else {
+                                        signal.ask // Sell at ask
+                                    };
+                                    
+                                    // Simple quantity calculation (10 USDC per order)
+                                    let qty = Decimal::from(10) / price;
+                                    
+                                    if signal.recommendation == "LONG" {
+                                        if let Err(e) = create_open_long_order(&venue_order, &signal.symbol, price, qty, Tif::PostOnly).await {
+                                            warn!(symbol = %signal.symbol, error = %e, "failed to create long order");
+                                        }
+                                    } else if signal.recommendation == "SHORT" {
+                                        if let Err(e) = handle_open_short_order(&venue_order, &signal.symbol, price, qty, Tif::PostOnly).await {
+                                            warn!(symbol = %signal.symbol, error = %e, "failed to create short order");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(symbol = %signal.symbol, error = %e, "failed to check position");
+                            }
+                        }
+                    } else {
+                        warn!("trend signal channel closed");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Main loop: Handle WebSocket events and periodic tasks
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    info!("main loop starting (orchestration only)");
+
     loop {
         tokio::select! {
-            _ = interval.tick() => {}
-            _ = shutdown_rx.recv() => {
-                info!("shutdown signal received, initiating graceful shutdown");
-                shutdown_requested = true;
-                break;
-            }
-        }
-        
-        let tick_num = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-        if tick_num <= 5 || tick_num % 10 == 0 {
-            info!(tick_num, "=== MAIN LOOP TICK START ===");
-        }
-
-        // WebSocket event'lerini işle
-        while let Ok(event) = event_rx.try_recv() {
-            match event {
-                UserEvent::Heartbeat => {
-                    force_sync_all = true;
-                    info!("websocket reconnect detected, will sync all symbols");
-                    handle_reconnect_sync(&venue, &mut states, &cfg).await;
+            _ = interval.tick() => {
+                // Periodic tasks (e.g., PnL summary)
+                static TICK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let tick = TICK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if tick % 5 == 0 {
+                    let tracker = pnl_tracker.lock().await;
+                    let summary = tracker.get_summary();
+                    info!(
+                        total_trades = summary.total_trades,
+                        profitable = summary.profitable_trades,
+                        losing = summary.losing_trades,
+                        total_pnl = summary.total_pnl,
+                        win_rate = summary.win_rate,
+                        "PnL summary"
+                    );
                 }
-                UserEvent::OrderFill {
-                    symbol,
-                    order_id,
-                    client_order_id: _,
-                    side,
-                    qty,
-                    cumulative_filled_qty,
-                    price,
-                    is_maker,
-                    order_status,
-                    commission,
-                } => {
-                    if let Some(idx) = symbol_index.get(&symbol) {
-                        process_order_fill_with_logging(
-                            &mut states[*idx],
-                            &symbol,
-                            &order_id,
-                            side,
-                            qty,
-                            price,
-                            is_maker,
-                            cumulative_filled_qty,
-                            &order_status,
-                            commission,
-                            &cfg,
-                            &json_logger,
-                        );
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Some(UserEvent::Heartbeat) => {
+                        info!("websocket heartbeat received");
                     }
-                }
-                UserEvent::OrderCanceled { symbol, order_id, client_order_id } => {
-                    if let Some(idx) = symbol_index.get(&symbol) {
-                        process_order_canceled(
-                            &mut states[*idx],
-                            &symbol,
-                            &order_id,
-                            &client_order_id,
-                            &cfg,
-                            &json_logger,
-                        );
+                    Some(_) => {
+                        // Handle other events if needed
                     }
-                }
-            }
-        }
-
-        let effective_leverage = calculate_effective_leverage(cfg.leverage, cfg.risk.max_leverage);
-        
-        let unique_quote_assets: std::collections::HashSet<String> = states
-            .iter()
-            .map(|s| s.meta.quote_asset.clone())
-            .collect();
-        
-        let quote_assets_vec: Vec<String> = unique_quote_assets.iter().cloned().collect();
-        let mut quote_balances = fetch_all_quote_balances(&venue, &quote_assets_vec).await;
-        
-        let mut processed_count = 0;
-        let mut skipped_count = 0;
-        let mut disabled_count = 0;
-        let mut no_balance_count = 0;
-        let total_symbols = states.len();
-        let mut symbol_index = 0;
-        
-        let max_symbols_per_tick = cfg.internal.max_symbols_per_tick;
-        let mut symbols_processed_this_tick = 0;
-        
-        // Prioritize symbols with open orders/positions, then round-robin
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static ROUND_ROBIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
-        let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % states.len().max(1);
-        
-        let prioritized_indices: Vec<usize> = {
-            let mut indices: Vec<(usize, bool)> = states.iter()
-            .enumerate()
-                .map(|(i, s)| (i, !s.active_orders.is_empty() || !s.inv.0.is_zero()))
-            .collect();
-            indices.sort_by_key(|(_, priority)| !*priority); // false (no priority) first, then true
-            indices.into_iter()
-                .map(|(i, _)| i)
-            .cycle()
-            .skip(round_robin_offset)
-            .take(states.len())
-                .collect()
-        };
-        
-        for state_idx in prioritized_indices {
-            let state = &mut states[state_idx];
-            
-            // Rate limit koruması: Her tick'te maksimum sembol sayısı
-            if symbols_processed_this_tick >= max_symbols_per_tick {
-                // Bu tick'te yeterli sembol işlendi, kalan semboller bir sonraki tick'te işlenecek
-                skipped_count += 1;
-                continue;
-            }
-            symbol_index += 1;
-            
-            // Progress log: Her N sembolde bir veya ilk N sembolde
-            if symbol_index <= cfg.internal.progress_log_first_n_symbols || symbol_index % cfg.internal.progress_log_interval == 0 {
-                info!(
-                    progress = format!("{}/{}", symbol_index, total_symbols),
-                    processed_so_far = processed_count,
-                    skipped_so_far = skipped_count,
-                    "processing symbols..."
-                );
-            }
-            if state.disabled {
-                skipped_count += 1;
-                disabled_count += 1;
-                continue;
-            }
-            
-            let symbol = state.meta.symbol.clone();
-            let quote_asset = state.meta.quote_asset.clone();
-
-            // Early balance check: Skip if no balance and no open orders
-            let q_free = quote_balances.get(&quote_asset).copied().unwrap_or(0.0);
-            let has_balance = q_free >= cfg.min_quote_balance_usd && q_free >= min_usd_per_order;
-            let has_open_orders = !state.active_orders.is_empty();
-            
-            if !has_balance && !has_open_orders {
-                skipped_count += 1;
-                no_balance_count += 1;
-                continue;
-            }
-            
-            if !has_balance && has_open_orders {
-                info!(%symbol, active_orders = state.active_orders.len(), "no balance but has open orders, continuing");
-            }
-            
-            processed_count += 1;
-            symbols_processed_this_tick += 1;
-
-            rate_limit_guard(1).await;
-            let (bid, ask) = match venue.best_prices(&symbol).await {
-                Ok(prices) => prices,
-                Err(err) => {
-                    warn!(%symbol, ?err, "failed to fetch best prices, skipping tick");
-                    continue;
-                }
-            };
-            
-            if force_sync_all && symbol_index == total_symbols {
-                force_sync_all = false;
-                info!("WebSocket reconnect sync completed for all symbols");
-            }
-            
-            match process_symbol(
-                &venue,
-                &symbol,
-                &quote_asset,
-                state,
-                bid,
-                ask,
-                &mut quote_balances,
-                &cfg,
-                &risk_limits,
-                &profit_guarantee,
-                effective_leverage,
-                min_usd_per_order,
-                tif,
-                &json_logger,
-                force_sync_all,
-            ).await {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    warn!(%symbol, ?e, "error processing symbol, continuing");
-                    continue;
-                }
-            }
-
-        }
-        
-        let current_tick = TICK_COUNTER.load(Ordering::Relaxed);
-        if current_tick <= 5 || current_tick % 10 == 0 {
-            info!(
-                tick_count = current_tick,
-                processed_symbols = processed_count,
-                skipped_symbols = skipped_count,
-                disabled_symbols = disabled_count,
-                no_balance_symbols = no_balance_count,
-                total_symbols = states.len(),
-                "main loop tick completed"
-            );
-        }
-    }
-    
-    info!("main loop ended, performing graceful shutdown");
-    
-    if shutdown_requested {
-        // ✅ Graceful shutdown: Açık pozisyonları ve emirleri temizle
-        let shutdown_timeout = Duration::from_secs(10); // Maximum 10 saniye cleanup
-        
-        let cleanup_result = tokio::time::timeout(shutdown_timeout, async {
-            let mut positions_to_close = Vec::new();
-            let mut orders_to_cancel = Vec::new();
-            
-            // 1. Açık pozisyonları ve emirleri tespit et
-            for state in states.iter() {
-                let symbol = state.meta.symbol.clone();
-                if !state.inv.0.is_zero() {
-                    positions_to_close.push(symbol.clone());
-                    info!(symbol = %symbol, inventory = %state.inv.0, "position will be closed during shutdown");
-                }
-                if !state.active_orders.is_empty() {
-                    orders_to_cancel.push(symbol.clone());
-                    info!(symbol = %symbol, order_count = state.active_orders.len(), "orders will be canceled during shutdown");
-                }
-            }
-            
-            // 2. Sequential cleanup: Rate limit koruması için sıralı işle
-            // (Paralel işlem rate limit'i aşabilir)
-            
-            // Pozisyonları kapat
-            for symbol in positions_to_close {
-                if let Some(state) = states.iter_mut().find(|s| s.meta.symbol == symbol) {
-                    if let Err(e) = position_manager::close_position(&venue, &symbol, state).await {
-                        error!(symbol = %symbol, error = %e, "failed to close position during shutdown");
-                    } else {
-                        info!(symbol = %symbol, "position closed successfully during shutdown");
-                    }
-                }
-            }
-            
-            // Emirleri iptal et
-            for symbol in orders_to_cancel {
-                rate_limit_guard(1).await;
-                if let Err(e) = venue.cancel_all(&symbol).await {
-                    warn!(symbol = %symbol, error = %e, "failed to cancel orders during shutdown");
-                } else {
-                    info!(symbol = %symbol, "orders canceled successfully during shutdown");
-                }
-            }
-            
-            info!("cleanup completed for all symbols");
-        }).await;
-        
-        match cleanup_result {
-            Ok(_) => info!("graceful shutdown cleanup completed successfully"),
-            Err(_) => {
-                warn!("graceful shutdown cleanup timed out after 10 seconds, forcing exit");
-                // Timeout durumunda açık pozisyonları log'la
-                for state in states.iter() {
-                    if !state.inv.0.is_zero() {
-                        error!(symbol = %state.meta.symbol, inventory = %state.inv.0, "position still open after shutdown timeout");
-                    }
-                    if !state.active_orders.is_empty() {
-                        error!(symbol = %state.meta.symbol, order_count = state.active_orders.len(), "orders still open after shutdown timeout");
+                    None => {
+                        warn!("websocket event channel closed");
+                        break;
                     }
                 }
             }
         }
     }
-    
-    // WebSocket ve diğer kaynakları temizle
-    drop(event_tx);
-    drop(json_logger);
-    drop(shutdown_tx);
-    
-    // Kısa bir bekleme: WebSocket'in kapanması için
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
-    info!("graceful shutdown completed");
-    Ok(())
 }
-
-#[cfg(test)]
-#[path = "position_order_tests.rs"]
-mod position_order_tests;
-

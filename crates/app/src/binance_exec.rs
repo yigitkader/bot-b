@@ -16,7 +16,33 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use urlencoding::encode;
 
-use crate::exec::{Venue, VenueOrder};
+// Venue trait (moved from exec.rs)
+#[async_trait::async_trait]
+pub trait Venue: Send + Sync {
+    async fn place_limit(&self, sym: &str, side: crate::types::Side, px: crate::types::Px, qty: crate::types::Qty, tif: crate::types::Tif) -> anyhow::Result<String>;
+    async fn place_limit_with_client_id(&self, sym: &str, side: crate::types::Side, px: crate::types::Px, qty: crate::types::Qty, tif: crate::types::Tif, client_order_id: &str) -> anyhow::Result<(String, Option<String>)>;
+    async fn cancel(&self, order_id: &str, sym: &str) -> anyhow::Result<()>;
+    async fn best_prices(&self, sym: &str) -> anyhow::Result<(crate::types::Px, crate::types::Px)>;
+    async fn get_open_orders(&self, sym: &str) -> anyhow::Result<Vec<VenueOrder>>;
+    async fn get_position(&self, sym: &str) -> anyhow::Result<crate::types::Position>;
+    async fn mark_price(&self, sym: &str) -> anyhow::Result<crate::types::Px>;
+    async fn close_position(&self, sym: &str) -> anyhow::Result<()>;
+    async fn cancel_all(&self, sym: &str) -> anyhow::Result<()> {
+        let orders = self.get_open_orders(sym).await?;
+        for order in orders {
+            self.cancel(&order.order_id, sym).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VenueOrder {
+    pub order_id: String,
+    pub side: crate::types::Side,
+    pub price: crate::types::Px,
+    pub qty: crate::types::Qty,
+}
 
 #[derive(Clone, Debug)]
 pub struct SymbolRules {
