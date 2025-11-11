@@ -313,6 +313,8 @@ pub fn initialize_symbol_states(
             last_close_attempt: None,
             processed_events: HashSet::new(),
             last_event_cleanup: None,
+            price_history: Vec::with_capacity(10), // Son 10 fiyat noktası
+            price_momentum_bps: 0.0,
         });
     }
     

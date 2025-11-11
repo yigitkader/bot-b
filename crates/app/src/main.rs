@@ -312,17 +312,77 @@ async fn main() -> Result<()> {
     info!("main loop ended, performing graceful shutdown");
     
     if shutdown_requested {
-        for state in states.iter() {
-            if !state.inv.0.is_zero() {
-                warn!(symbol = %state.meta.symbol, inventory = %state.inv.0, "position still open during shutdown");
+        // ✅ Graceful shutdown: Açık pozisyonları ve emirleri temizle
+        let shutdown_timeout = Duration::from_secs(10); // Maximum 10 saniye cleanup
+        
+        let cleanup_result = tokio::time::timeout(shutdown_timeout, async {
+            let mut positions_to_close = Vec::new();
+            let mut orders_to_cancel = Vec::new();
+            
+            // 1. Açık pozisyonları ve emirleri tespit et
+            for state in states.iter() {
+                let symbol = state.meta.symbol.clone();
+                if !state.inv.0.is_zero() {
+                    positions_to_close.push(symbol.clone());
+                    info!(symbol = %symbol, inventory = %state.inv.0, "position will be closed during shutdown");
+                }
+                if !state.active_orders.is_empty() {
+                    orders_to_cancel.push(symbol.clone());
+                    info!(symbol = %symbol, order_count = state.active_orders.len(), "orders will be canceled during shutdown");
+                }
+            }
+            
+            // 2. Sequential cleanup: Rate limit koruması için sıralı işle
+            // (Paralel işlem rate limit'i aşabilir)
+            
+            // Pozisyonları kapat
+            for symbol in positions_to_close {
+                if let Some(state) = states.iter_mut().find(|s| s.meta.symbol == symbol) {
+                    if let Err(e) = position_manager::close_position(&venue, &symbol, state).await {
+                        error!(symbol = %symbol, error = %e, "failed to close position during shutdown");
+                    } else {
+                        info!(symbol = %symbol, "position closed successfully during shutdown");
+                    }
+                }
+            }
+            
+            // Emirleri iptal et
+            for symbol in orders_to_cancel {
+                rate_limit_guard(1).await;
+                if let Err(e) = venue.cancel_all(&symbol).await {
+                    warn!(symbol = %symbol, error = %e, "failed to cancel orders during shutdown");
+                } else {
+                    info!(symbol = %symbol, "orders canceled successfully during shutdown");
+                }
+            }
+            
+            info!("cleanup completed for all symbols");
+        }).await;
+        
+        match cleanup_result {
+            Ok(_) => info!("graceful shutdown cleanup completed successfully"),
+            Err(_) => {
+                warn!("graceful shutdown cleanup timed out after 10 seconds, forcing exit");
+                // Timeout durumunda açık pozisyonları log'la
+                for state in states.iter() {
+                    if !state.inv.0.is_zero() {
+                        error!(symbol = %state.meta.symbol, inventory = %state.inv.0, "position still open after shutdown timeout");
+                    }
+                    if !state.active_orders.is_empty() {
+                        error!(symbol = %state.meta.symbol, order_count = state.active_orders.len(), "orders still open after shutdown timeout");
+                    }
+                }
             }
         }
     }
     
+    // WebSocket ve diğer kaynakları temizle
     drop(event_tx);
     drop(json_logger);
     drop(shutdown_tx);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    
+    // Kısa bir bekleme: WebSocket'in kapanması için
+    tokio::time::sleep(Duration::from_millis(500)).await;
     
     info!("graceful shutdown completed");
     Ok(())

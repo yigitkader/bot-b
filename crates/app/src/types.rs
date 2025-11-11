@@ -143,6 +143,10 @@ pub struct SymbolState {
     pub current_direction: Option<Side>, // Mevcut yön (Long=Buy, Short=Sell)
     pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
     
+    // ✅ KRİTİK İYİLEŞTİRME: Price momentum tracking (trend analizi için)
+    pub price_history: Vec<(Instant, Decimal)>, // (timestamp, price) - son 10 fiyat noktası
+    pub price_momentum_bps: f64, // Son 5 fiyat değişiminin ortalaması (bps)
+    
     // Position closing control
     // ✅ KRİTİK: Thread-safe flag (race condition önleme)
     // WebSocket ve REST API aynı anda close edebilir, AtomicBool ile korunuyor

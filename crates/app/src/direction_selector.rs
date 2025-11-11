@@ -8,13 +8,46 @@ use std::time::Instant;
 use tracing::debug;
 
 /// Calculate orderbook imbalance and select direction (long/short)
+/// ✅ KRİTİK İYİLEŞTİRME: Multiple signal confirmation (orderbook + price momentum + volume)
 /// Returns the selected direction and applies filter to quotes
 pub fn select_direction(
     quotes: &mut Quotes,
     state: &mut SymbolState,
     ob: &crate::types::OrderBook,
     cfg: &crate::config::AppCfg,
+    mark_price: Decimal, // ✅ Fiyat momentum analizi için
 ) {
+    // ✅ 1. PRICE MOMENTUM TRACKING: Son fiyat değişimlerini takip et
+    let now = Instant::now();
+    let cutoff = now.checked_sub(std::time::Duration::from_secs(30)).unwrap_or(now);
+    state.price_history.retain(|(ts, _)| *ts > cutoff);
+    state.price_history.push((now, mark_price));
+    
+    // Son 5 fiyat değişimini hesapla (momentum)
+    let price_momentum_bps = if state.price_history.len() >= 2 {
+        let recent_prices: Vec<Decimal> = state.price_history.iter()
+            .rev()
+            .take(5.min(state.price_history.len()))
+            .map(|(_, px)| *px)
+            .collect();
+        
+        if recent_prices.len() >= 2 {
+            let first_price = recent_prices.last().unwrap();
+            let last_price = recent_prices.first().unwrap();
+            if !first_price.is_zero() {
+                let price_change = (*last_price - *first_price) / *first_price;
+                price_change.to_f64().unwrap_or(0.0) * 10000.0 // bps
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    state.price_momentum_bps = price_momentum_bps;
+    
     // Calculate orderbook volumes
     let (bid_vol, ask_vol) = if let (Some(ref top_bids), Some(ref top_asks)) = (&ob.top_bids, &ob.top_asks) {
         let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
@@ -34,11 +67,12 @@ pub fn select_direction(
     };
     let imbalance_ratio_f64 = imbalance_ratio.to_f64().unwrap_or(1.0);
     
-    // Calculate signal strengths
+    // ✅ 2. MULTIPLE SIGNAL CONFIRMATION: Orderbook + Price Momentum + Volume
     let imbalance_long_threshold = cfg.strategy.orderbook_imbalance_long_threshold.unwrap_or(1.2);
     let imbalance_short_threshold = cfg.strategy.orderbook_imbalance_short_threshold.unwrap_or(0.83);
     
-    let long_signal_strength = if imbalance_ratio_f64 > imbalance_long_threshold {
+    // Orderbook imbalance signal
+    let imbalance_long_signal = if imbalance_ratio_f64 > imbalance_long_threshold {
         let range = imbalance_long_threshold - 1.0;
         if range > 0.0 {
             ((imbalance_ratio_f64 - 1.0) / range).min(1.0)
@@ -49,7 +83,7 @@ pub fn select_direction(
         0.0
     };
     
-    let short_signal_strength = if imbalance_ratio_f64 < imbalance_short_threshold {
+    let imbalance_short_signal = if imbalance_ratio_f64 < imbalance_short_threshold {
         let range = 1.0 - imbalance_short_threshold;
         if range > 0.0 {
             ((1.0 - imbalance_ratio_f64) / range).min(1.0)
@@ -60,11 +94,47 @@ pub fn select_direction(
         0.0
     };
     
+    // ✅ Price momentum signal (trend confirmation)
+    // Pozitif momentum = fiyat yükseliyor = long sinyali
+    // Negatif momentum = fiyat düşüyor = short sinyali
+    let momentum_long_signal = if price_momentum_bps > 10.0 { // En az 10 bps yükseliş
+        (price_momentum_bps / 100.0).min(1.0) // Max 100 bps = 1.0 signal
+    } else {
+        0.0
+    };
+    
+    let momentum_short_signal = if price_momentum_bps < -10.0 { // En az 10 bps düşüş
+        (-price_momentum_bps / 100.0).min(1.0) // Max 100 bps = 1.0 signal
+    } else {
+        0.0
+    };
+    
+    // ✅ Combined signal strength (weighted average)
+    // Orderbook: 40%, Price Momentum: 60% (momentum daha güvenilir)
+    let mut long_signal_strength = (imbalance_long_signal * 0.4 + momentum_long_signal * 0.6).min(1.0);
+    let mut short_signal_strength = (imbalance_short_signal * 0.4 + momentum_short_signal * 0.6).min(1.0);
+    
+    // ✅ KRİTİK: Trend reversal detection - momentum orderbook'a ters ise sinyali zayıflat
+    let momentum_opposite = (price_momentum_bps > 0.0 && imbalance_ratio_f64 < 1.0) || 
+                            (price_momentum_bps < 0.0 && imbalance_ratio_f64 > 1.0);
+    if momentum_opposite {
+        // Momentum ve orderbook ters yönde - sinyali zayıflat (%50 azalt)
+        long_signal_strength *= 0.5;
+        short_signal_strength *= 0.5;
+    }
+    
+    // ✅ 3. MINIMUM SIGNAL STRENGTH: Zayıf sinyalleri filtrele
+    let min_signal_strength = 0.3; // Minimum %30 sinyal gücü gerekli
+    if long_signal_strength < min_signal_strength {
+        long_signal_strength = 0.0;
+    }
+    if short_signal_strength < min_signal_strength {
+        short_signal_strength = 0.0;
+    }
+    
     // Apply direction selection with cooldown
     let cooldown_secs = cfg.strategy.direction_cooldown_secs.unwrap_or(60);
     let signal_strength_threshold = cfg.strategy.direction_signal_strength_threshold.unwrap_or(0.2);
-    
-    let now = Instant::now();
     let can_change_direction = state.last_direction_change
         .map(|last| now.duration_since(last).as_secs() >= cooldown_secs)
         .unwrap_or(true);
@@ -87,7 +157,10 @@ pub fn select_direction(
             new_direction = ?new_direction,
             signal_strength = state.direction_signal_strength,
             imbalance_ratio = imbalance_ratio_f64,
-            "direction changed (long/short selection)"
+            price_momentum_bps = price_momentum_bps,
+            imbalance_signal = imbalance_long_signal.max(imbalance_short_signal),
+            momentum_signal = momentum_long_signal.max(momentum_short_signal),
+            "direction changed (long/short selection with price momentum confirmation)"
         );
     } else if direction_changed && !can_change_direction {
         debug!(

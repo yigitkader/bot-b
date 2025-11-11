@@ -315,7 +315,7 @@ pub async fn process_symbol(
     let mut quotes = state.strategy.on_tick(&ctx);
     
     if cfg.strategy.r#type == "dyn_mm" {
-        select_direction(&mut quotes, state, &ctx.ob, cfg);
+        select_direction(&mut quotes, state, &ctx.ob, cfg, mark_px.0);
     }
     
     if should_block_new_orders {
