@@ -16,6 +16,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Discover and filter symbols based on configuration
 pub async fn discover_symbols(
@@ -308,7 +309,7 @@ pub fn initialize_symbol_states(
             last_direction_change: None,
             current_direction: None,
             direction_signal_strength: 0.0,
-            position_closing: false,
+            position_closing: Arc::new(AtomicBool::new(false)),
             last_close_attempt: None,
             processed_events: HashSet::new(),
             last_event_cleanup: None,

@@ -7,6 +7,7 @@ use crate::config::AppCfg;
 use crate::utils::rate_limit_guard;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
@@ -188,17 +189,21 @@ pub async fn handle_risk_level<V: Venue>(
                 max_allowed,
                 "HARD LIMIT: force closing position"
             );
-            state.position_closing = true;
-            state.last_close_attempt = Some(Instant::now());
-            
-            rate_limit_guard(2).await;
-            let _ = venue.cancel_all(symbol).await;
-            if venue.close_position(symbol).await.is_ok() {
-                info!(%symbol, "closed position due to hard limit");
+            // ✅ Thread-safe: Atomik swap - eğer zaten true ise skip eder
+            if !state.position_closing.swap(true, Ordering::AcqRel) {
+                state.last_close_attempt = Some(Instant::now());
+                
+                rate_limit_guard(2).await;
+                let _ = venue.cancel_all(symbol).await;
+                if venue.close_position(symbol).await.is_ok() {
+                    info!(%symbol, "closed position due to hard limit");
+                } else {
+                    error!(%symbol, "failed to close position due to hard limit");
+                }
+                state.position_closing.store(false, Ordering::Release);
             } else {
-                error!(%symbol, "failed to close position due to hard limit");
+                info!(%symbol, "position close already in progress, skipping duplicate close");
             }
-            state.position_closing = false;
             false
         }
         PositionRiskLevel::Medium => {

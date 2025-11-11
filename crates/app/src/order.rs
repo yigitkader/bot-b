@@ -362,9 +362,13 @@ pub async fn place_orders_with_profit_guarantee(
             Side::Sell => px.0.min(optimal_price_from_depth).max(ask.0),
         };
 
+        // ✅ DOĞRULAMA: Leverage sadece burada uygulanıyor (çift sayma yok)
+        // margin_chunk: USD (leverage uygulanmamış)
+        // margin_chunk_leveraged: USD (leverage uygulanmış notional)
+        // calc_qty_from_margin() içinde leverage UYGULANMAZ, direkt notional kullanılır
         let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
         let qty_price_result = calc_qty_from_margin(
-            margin_chunk_leveraged,
+            margin_chunk_leveraged,  // ✅ Zaten leveraged notional
             px_with_depth,
             rules,
             side,

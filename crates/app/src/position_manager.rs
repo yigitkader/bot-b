@@ -7,6 +7,7 @@ use crate::exec::binance::BinanceFutures;
 use crate::exec::Venue;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use crate::config::AppCfg;
@@ -322,12 +323,19 @@ pub fn should_close_position_smart(
 
 /// Close position with retry mechanism
 /// KRİTİK: Race condition önleme - WebSocket event sync kontrolü
+/// ✅ Thread-safe: AtomicBool kullanarak aynı anda sadece bir close işlemi yapılmasını garanti eder
 pub async fn close_position(
     venue: &BinanceFutures,
     symbol: &str,
     state: &mut SymbolState,
 ) -> Result<()> {
-    state.position_closing = true;
+    // ✅ KRİTİK: Atomik swap - eğer zaten true ise (başka thread close ediyor), false döner ve skip eder
+    if state.position_closing.swap(true, Ordering::AcqRel) {
+        // Zaten başka bir thread/task pozisyonu kapatıyor
+        info!(symbol = %symbol, "position close already in progress, skipping duplicate close");
+        return Ok(());
+    }
+    
     state.last_close_attempt = Some(Instant::now());
 
     // KRİTİK RACE CONDITION FIX: WebSocket event sonrası inventory sync kontrolü
@@ -344,7 +352,7 @@ pub async fn close_position(
                     time_since_update_ms = time_since_update,
                     "position already closed (WebSocket sync detected)"
                 );
-                state.position_closing = false;
+                state.position_closing.store(false, Ordering::Release);
                 return Ok(());
             }
         }
@@ -373,7 +381,7 @@ pub async fn close_position(
                     time_since_update_ms = time_since_update,
                     "position closed during retry (WebSocket sync detected)"
                 );
-                state.position_closing = false;
+                state.position_closing.store(false, Ordering::Release);
                 return Ok(());
             }
         }
@@ -382,7 +390,7 @@ pub async fn close_position(
         match venue.close_position(symbol).await {
             Ok(_) => {
                 info!(symbol = %symbol, attempt, "position closed successfully");
-                state.position_closing = false;
+                state.position_closing.store(false, Ordering::Release);
                 return Ok(());
             }
             Err(e) => {
@@ -395,7 +403,7 @@ pub async fn close_position(
         }
     }
 
-    state.position_closing = false;
+    state.position_closing.store(false, Ordering::Release);
     
     if let Some(e) = last_error {
         error!(symbol = %symbol, error = %e, "failed to close position after {} attempts", max_retries);

@@ -145,7 +145,7 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
             10,
         )
         .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap: {}", e))?,
-        min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(60.0),
+        min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(30.0),
         max_spread_bps: cfg.strategy.max_spread_bps.unwrap_or(100.0),
         spread_arbitrage_min_bps: cfg.strategy.spread_arbitrage_min_bps.unwrap_or(30.0),
         spread_arbitrage_max_bps: cfg.strategy.spread_arbitrage_max_bps.unwrap_or(200.0),

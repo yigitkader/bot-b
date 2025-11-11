@@ -215,7 +215,7 @@ pub struct DynMmCfg {
 
 // Default değerler
 fn default_min_spread_bps() -> f64 {
-    3.0
+    30.0  // ✅ Optimized for $0.50 profit target: Fees (8 bps) + Target (50 bps) = 58 bps needed, 30 bps floor is sufficient with dynamic calculation
 }
 fn default_max_spread_bps() -> f64 {
     100.0
@@ -811,6 +811,11 @@ impl Strategy for DynMm {
                                 let min_price_f = min_price.to_f64().unwrap_or(0.0);
                                 let current_price_f = mid.to_f64().unwrap_or(0.0);
                                 
+                                // Min noktanın timestamp'ini al
+                                let min_timestamp = recent_prices[min_idx].0;
+                                let current_timestamp = recent_prices[recent_prices.len() - 1].0;
+                                let seconds_since_min = (current_timestamp.saturating_sub(min_timestamp)) as f64 / 1000.0;
+                                
                                 // Önceki fiyatı bul (minimum noktadan önce)
                                 let before_min_price = if min_idx > 0 {
                                     recent_prices[min_idx - 1].1.to_f64().unwrap_or(min_price_f)
@@ -823,9 +828,26 @@ impl Strategy for DynMm {
                                     let drop_ratio = (before_min_price - min_price_f) / before_min_price;
                                     let recovery_ratio = (current_price_f - min_price_f) / min_price_f;
                                     
+                                    // ✅ İYİLEŞTİRME: Volume surge kontrolü (bull trap önleme)
+                                    // Min noktadan sonra volume artışı var mı?
+                                    let volume_surge = if self.volume_history.len() >= 10 {
+                                        let recent_volume: f64 = self.volume_history.iter().rev().take(5).sum::<f64>() / 5.0;
+                                        let avg_volume: f64 = self.volume_history.iter().sum::<f64>() / self.volume_history.len() as f64;
+                                        recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                    } else {
+                                        true // Yeterli veri yok, volume kontrolünü skip et
+                                    };
+                                    
+                                    // ✅ İYİLEŞTİRME: Time stability kontrolü (geçici toparlanma önleme)
+                                    // En az 10 saniye stabil mi? (bull trap önleme)
+                                    let time_stable = seconds_since_min >= 10.0;
+                                    
                                     // Minimum drop var mı ve recovery yeterli mi?
-                                    drop_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
-                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio
+                                    let basic_recovery = drop_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
+                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio;
+                                    
+                                    // ✅ GÜÇLENDİRİLMİŞ KONTROL: Recovery + Volume + Time
+                                    basic_recovery && volume_surge && time_stable
                                 } else {
                                     false
                                 }
@@ -847,6 +869,11 @@ impl Strategy for DynMm {
                                 let max_price_f = max_price.to_f64().unwrap_or(0.0);
                                 let current_price_f = mid.to_f64().unwrap_or(0.0);
                                 
+                                // Max noktanın timestamp'ini al
+                                let max_timestamp = recent_prices[max_idx].0;
+                                let current_timestamp = recent_prices[recent_prices.len() - 1].0;
+                                let seconds_since_max = (current_timestamp.saturating_sub(max_timestamp)) as f64 / 1000.0;
+                                
                                 // Önceki fiyatı bul (maksimum noktadan önce)
                                 let before_max_price = if max_idx > 0 {
                                     recent_prices[max_idx - 1].1.to_f64().unwrap_or(max_price_f)
@@ -859,9 +886,26 @@ impl Strategy for DynMm {
                                     let rise_ratio = (max_price_f - before_max_price) / before_max_price;
                                     let recovery_ratio = (max_price_f - current_price_f) / max_price_f;
                                     
+                                    // ✅ İYİLEŞTİRME: Volume surge kontrolü (bear trap önleme)
+                                    // Max noktadan sonra volume artışı var mı?
+                                    let volume_surge = if self.volume_history.len() >= 10 {
+                                        let recent_volume: f64 = self.volume_history.iter().rev().take(5).sum::<f64>() / 5.0;
+                                        let avg_volume: f64 = self.volume_history.iter().sum::<f64>() / self.volume_history.len() as f64;
+                                        recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                    } else {
+                                        true // Yeterli veri yok, volume kontrolünü skip et
+                                    };
+                                    
+                                    // ✅ İYİLEŞTİRME: Time stability kontrolü (geçici düşüş önleme)
+                                    // En az 10 saniye stabil mi? (bear trap önleme)
+                                    let time_stable = seconds_since_max >= 10.0;
+                                    
                                     // Minimum rise var mı ve recovery yeterli mi?
-                                    rise_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
-                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio
+                                    let basic_recovery = rise_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
+                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio;
+                                    
+                                    // ✅ GÜÇLENDİRİLMİŞ KONTROL: Recovery + Volume + Time
+                                    basic_recovery && volume_surge && time_stable
                                 } else {
                                     false
                                 }

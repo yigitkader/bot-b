@@ -283,6 +283,7 @@ pub fn calc_qty_from_margin(
     // margin_chunk_leveraged: ZATEN leverage uygulanmış notional (USD)
     // notional: pozisyon büyüklüğü (USD) = margin_chunk_leveraged (leverage UYGULANMAZ!)
     // KRİTİK: margin_chunk_leveraged zaten leveraged olarak gelmeli (caller'da hesaplanmış)
+    // ✅ DOĞRULAMA: Leverage çift sayma yok - burada leverage uygulanmıyor, direkt notional kullanılıyor
     let notional = Decimal::try_from(margin_chunk_leveraged).unwrap_or(Decimal::ZERO);
     
     if price <= Decimal::ZERO || notional <= Decimal::ZERO {
@@ -1046,14 +1047,13 @@ impl RateLimiter {
                         drop(requests);
                         drop(weights);
                         
-                        // KRİTİK İYİLEŞTİRME: Adaptive polling interval - Binance 1 dakikalık pencere kullanıyor
-                        // Uzun bekleme (> 10 saniye): 2-5 saniye polling (overhead azaltma)
-                        // Orta bekleme (1-10 saniye): 1 saniye polling
-                        // Kısa bekleme (< 1 saniye): 100ms polling
-                        let poll_interval_ms = if sleep_duration.as_secs() > 10 {
-                            3000 // 3 saniye - uzun bekleme için (1 dakikalık limit)
-                        } else if sleep_duration.as_secs() >= 1 {
-                            1000 // 1 saniye - orta bekleme için
+                        // ✅ KRİTİK İYİLEŞTİRME: Adaptive polling interval - Binance 1 dakikalık pencere kullanıyor
+                        // Weight limit aşıldığında 1 dakika boyunca bekleme olur, 5 saniye polling yeterli
+                        // Uzun bekleme (> 10 saniye): 5 saniye polling (12 wake-up, 5x az overhead)
+                        // Orta bekleme (1-10 saniye): 5 saniye polling (overhead azaltma)
+                        // Kısa bekleme (< 1 saniye): 100ms polling (per-second limit için fine-grained)
+                        let poll_interval_ms = if sleep_duration.as_secs() >= 1 {
+                            5000 // 5 saniye - Binance 1 dakikalık window için yeterli (60 wake-up → 12 wake-up)
                         } else {
                             100 // 100ms - kısa bekleme için (per-second limit)
                         };
@@ -1078,8 +1078,9 @@ impl RateLimiter {
     /// NOT: Race condition fix artık atomik counter ile yapılıyor (reserved_weight).
     /// Bu polling sadece overhead azaltma için - sleep sırasında weight reserve edilmiş durumda.
     /// 
-    /// KRİTİK İYİLEŞTİRME: Adaptive polling interval
-    /// - Binance 1 dakikalık pencere kullanıyor, bu yüzden uzun bekleme için 1-5 saniye polling yeterli
+    /// ✅ KRİTİK İYİLEŞTİRME: Adaptive polling interval
+    /// - Binance 1 dakikalık pencere kullanıyor, bu yüzden weight limit için 5 saniye polling yeterli
+    /// - 1 dakika bekleme: 60 wake-up (1s) → 12 wake-up (5s) = 5x az overhead
     /// - Kısa bekleme için 100ms polling (per-second limit için)
     /// - Bu overhead'i önemli ölçüde azaltır
     /// 
@@ -1232,9 +1233,10 @@ impl ProfitGuarantee {
     /// Minimum spread in bps (basis points) required for profit
     /// 
     /// # Formula
-    /// KRİTİK DÜZELTME: Worst case senaryosu için maker entry + taker exit varsay
-    /// Exit fee'si her zaman maker olmayabilir (taker olabilir) - pozisyon kapanırken taker fee ödersen kar garantisi bozulur
-    /// Ücret toplamı: fees_bps_total = maker_fee_bps + taker_fee_bps
+    /// KRİTİK DÜZELTME: Worst case senaryosu için her iki taraf da taker olabilir
+    /// Entry: taker fee (limit order taker olabilir)
+    /// Exit: taker fee (pozisyon kapanırken taker olabilir)
+    /// Ücret toplamı: fees_bps_total = taker_fee_bps * 2.0 (worst case)
     /// İstenen net kâr: $0.50
     /// Gerekli brüt bps: target_bps = 10000 * 0.50 / notional
     /// Safety margin: slippage (~1-5 bps) + partial fill risks + market volatility
@@ -1244,12 +1246,12 @@ impl ProfitGuarantee {
             return 0.0;
         }
 
-        // KRİTİK DÜZELTME: Worst case senaryosu - maker entry + taker exit
-        // Exit fee'si her zaman maker olmayabilir (taker olabilir)
-        // Pozisyon kapanırken taker fee ödersen kar garantisi bozulur
-        let maker_fee_bps = self.maker_fee_rate * 10000.0;
+        // KRİTİK DÜZELTME: Worst case senaryosu - her iki taraf da taker olabilir
+        // Entry: taker fee (limit order taker olabilir)
+        // Exit: taker fee (pozisyon kapanırken taker olabilir)
+        // Toplam: taker_fee_bps * 2.0 (worst case)
         let taker_fee_bps = self.taker_fee_rate * 10000.0;
-        let fees_bps_total = maker_fee_bps + taker_fee_bps;
+        let fees_bps_total = taker_fee_bps * 2.0; // Entry taker + Exit taker
         
         // İstenen net kâr için gerekli brüt bps
         let target_bps = 10000.0 * self.min_profit_usd / position_size_usd;
@@ -1296,7 +1298,8 @@ impl ProfitGuarantee {
 
         let spread_rate = spread_bps / 10000.0;
         let gross_profit = position_size_usd * spread_rate;
-        let total_fees = position_size_usd * (self.maker_fee_rate + self.taker_fee_rate);
+        // Worst case: her iki taraf da taker
+        let total_fees = position_size_usd * (self.taker_fee_rate * 2.0);
         gross_profit - total_fees
     }
 
@@ -1320,7 +1323,8 @@ impl ProfitGuarantee {
         }
 
         let spread_rate = spread_bps / 10000.0;
-        let total_fee_rate = self.maker_fee_rate + self.taker_fee_rate;
+        // Worst case: her iki taraf da taker
+        let total_fee_rate = self.taker_fee_rate * 2.0;
         let net_spread_rate = spread_rate - total_fee_rate;
 
         if net_spread_rate <= 0.0 {

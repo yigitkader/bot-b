@@ -5,6 +5,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use crate::exec::binance::SymbolMeta;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use crate::strategy::Strategy;
 
@@ -142,7 +144,9 @@ pub struct SymbolState {
     pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
     
     // Position closing control
-    pub position_closing: bool, // Pozisyon kapatma süreci başlamış mı (spam önleme)
+    // ✅ KRİTİK: Thread-safe flag (race condition önleme)
+    // WebSocket ve REST API aynı anda close edebilir, AtomicBool ile korunuyor
+    pub position_closing: Arc<AtomicBool>, // Pozisyon kapatma süreci başlamış mı (spam önleme)
     pub last_close_attempt: Option<Instant>, // Son kapatma denemesi zamanı (cooldown için)
     
     // PnL tracking for summary

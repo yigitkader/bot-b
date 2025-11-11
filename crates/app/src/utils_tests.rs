@@ -187,24 +187,24 @@ mod tests {
     fn test_calculate_min_spread_bps_small_position() {
         let pg = ProfitGuarantee::default();
         // Position: 20 USD, min profit: 0.50 USD
-        // Fees: maker (2 bps) + taker (4 bps) = 6 bps (worst case: maker entry + taker exit)
+        // Fees: taker (4 bps) * 2 = 8 bps (worst case: entry taker + exit taker)
         // Safety margin: 5 bps
-        // min_spread = (0.50 / 20) * 10000 + 6 + 5 = 250 + 6 + 5 = 261 bps
+        // min_spread = (0.50 / 20) * 10000 + 8 + 5 = 250 + 8 + 5 = 263 bps
         let min_spread = pg.calculate_min_spread_bps(20.0);
-        assert!(min_spread > 260.0);
-        assert!(min_spread < 262.0);
+        assert!(min_spread > 262.0);
+        assert!(min_spread < 264.0);
     }
 
     #[test]
     fn test_calculate_min_spread_bps_large_position() {
         let pg = ProfitGuarantee::default();
         // Position: 1000 USD, min profit: 0.50 USD
-        // Fees: maker (2 bps) + taker (4 bps) = 6 bps (worst case: maker entry + taker exit)
+        // Fees: taker (4 bps) * 2 = 8 bps (worst case: entry taker + exit taker)
         // Safety margin: 5 bps
-        // min_spread = (0.50 / 1000) * 10000 + 6 + 5 = 5 + 6 + 5 = 16 bps
+        // min_spread = (0.50 / 1000) * 10000 + 8 + 5 = 5 + 8 + 5 = 18 bps
         let min_spread = pg.calculate_min_spread_bps(1000.0);
-        assert!(min_spread > 15.0);
-        assert!(min_spread < 17.0);
+        assert!(min_spread > 17.0);
+        assert!(min_spread < 19.0);
     }
 
     #[test]

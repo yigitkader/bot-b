@@ -20,6 +20,7 @@ use crate::cap_manager;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{info, warn};
 
@@ -59,7 +60,7 @@ pub async fn process_symbol(
             let age_secs = entry_time.elapsed().as_secs() as f64;
             if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
                 warn!(%symbol, position_qty = %pos.qty.0, age_secs, "FORCE CLOSE: Position exceeded max duration");
-                if !state.position_closing {
+                if !state.position_closing.load(Ordering::Acquire) {
                     let _ = position_manager::close_position(venue, symbol, state).await;
                 }
                 return Ok(false);
@@ -124,7 +125,7 @@ pub async fn process_symbol(
         .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
         .unwrap_or(true);
     
-    if should_close && !state.position_closing && can_attempt_close {
+    if should_close && !state.position_closing.load(Ordering::Acquire) && can_attempt_close {
         if position_manager::close_position(venue, symbol, state).await.is_ok() {
             let side_str = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
             let exit_price = if side_str == "long" { bid } else { ask };
@@ -348,7 +349,7 @@ pub async fn process_symbol(
             .max(ask_px.0.to_f64().unwrap_or(0.0) * ask_qty.0.to_f64().unwrap_or(0.0));
         
         let min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd)
-            .max(cfg.strategy.min_spread_bps.unwrap_or(60.0));
+            .max(cfg.strategy.min_spread_bps.unwrap_or(30.0));
         
         if !crate::utils::should_place_trade(
             spread_bps, position_size_usd, min_spread_bps,

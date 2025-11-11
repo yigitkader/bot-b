@@ -67,8 +67,10 @@ strategy:
   qmel_exploration_rate: 0.1  # Bandit exploration rate
   
   # --- Spread ve Fiyatlama Eşikleri ---
-  # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
-  min_spread_bps: 1.0               # Minimum spread floor (bps) - 2.0 → 1.0: daha dar spread (daha agresif)
+  # ✅ KRİTİK DÜZELTME: $0.50 kar hedefi için optimize edilmiş spread
+  # Hesaplama: Fees (8 bps) + Target profit (50 bps) = 58 bps gerekli
+  # 30 bps floor: Dynamic spread hesaplaması ile birlikte yeterli, daha agresif trading için
+  min_spread_bps: 30.0              # Minimum spread floor (bps) - 60.0 → 30.0: daha agresif, daha fazla işlem
   max_spread_bps: 200.0            # Maksimum spread (bps) (150 → 200: daha toleranslı)
   spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
   spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)

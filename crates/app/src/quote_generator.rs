@@ -78,7 +78,7 @@ pub fn check_profit_guarantee(
     // ✅ calculate_min_spread_bps() artık safety margin içeriyor (slippage, partial fill, volatility)
     // Not: slippage_bps_reserve hala config'de var ama calculate_min_spread_bps içinde safety margin zaten var
     let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd);
-    let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(60.0);
+    let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(30.0);
     let min_spread_bps = dyn_min_spread_bps.max(min_spread_bps_config);
 
     let stop_loss_threshold = cfg.internal.stop_loss_threshold;
