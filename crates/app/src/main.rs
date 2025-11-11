@@ -46,7 +46,7 @@ use order_placement::place_orders_with_profit_guarantee;
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use futures_util::stream::{self, StreamExt};
 use std::sync::Arc;

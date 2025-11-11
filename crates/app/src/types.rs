@@ -23,7 +23,6 @@ pub struct SymbolState {
     // Min notional tracking
     pub min_notional_req: Option<f64>,
     pub disabled: bool,
-    pub disabled_until: Option<std::time::Instant>, // Disabled semboller için cooldown (5 dk)
     
     // Per-symbol metadata
     pub symbol_rules: Option<std::sync::Arc<crate::exec::binance::SymbolRules>>,
@@ -48,14 +47,10 @@ pub struct SymbolState {
     // Position management
     pub position_entry_time: Option<Instant>,
     pub peak_pnl: Decimal,
-    pub last_peak_update: Option<Instant>, // Peak PnL güncelleme cooldown için
     pub position_hold_duration_ms: u64,
     pub last_order_price_update: HashMap<String, Px>,
     // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu, sadece overhead yaratıyordu)
     // Eğer gelecekte partial close veya order-to-position mapping gerekirse, o zaman eklenebilir
-    // Cancel-replace debounce ve backoff
-    pub last_cancel_all_time: Option<Instant>, // Son cancel_all zamanı (debounce için)
-    pub cancel_all_attempt_count: u32, // Cancel_all deneme sayısı (backoff için)
     
     // Advanced tracking
     pub daily_pnl: Decimal,
@@ -69,15 +64,13 @@ pub struct SymbolState {
     pub last_applied_funding_time: Option<u64>, // Unix timestamp (ms) - son uygulanan funding time
     
     // PnL tracking
-    pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı (deprecated, use last_daily_reset_date)
-    pub last_daily_reset_date: Option<chrono::NaiveDate>, // UTC tarih - son günlük reset tarihi (drift önleme için)
+    pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı
     pub avg_entry_price: Option<Decimal>, // Ortalama entry price (pozisyon açılırken güncellenir)
     
     // Long/Short seçimi için histerezis ve cooldown
     pub last_direction_change: Option<Instant>, // Son yön değişikliği zamanı
     pub current_direction: Option<crate::core::types::Side>, // Mevcut yön (Long=Buy, Short=Sell)
     pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
-    pub regime: Option<String>, // "trend" veya "sideways"
     
     // Position closing control
     pub position_closing: bool, // Pozisyon kapatma süreci başlamış mı (spam önleme)
@@ -97,19 +90,6 @@ pub struct SymbolState {
     // WebSocket event deduplication
     pub processed_events: HashSet<String>, // İşlenmiş event ID'leri (duplicate önleme için)
     pub last_event_cleanup: Option<Instant>, // Son event cleanup zamanı (memory leak önleme için)
-}
-
-// ============================================================================
-// Risk Action
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RiskAction {
-    Ok,
-    Narrow,
-    Widen,
-    Reduce,
-    Halt,
 }
 
 // ============================================================================

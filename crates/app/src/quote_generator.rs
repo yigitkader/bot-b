@@ -9,6 +9,7 @@ use tracing::info;
 use crate::config::AppCfg;
 use crate::types::SymbolState;
 use crate::utils::calculate_spread_bps;
+use crate::risk::RiskAction;
 
 #[derive(Debug, Clone)]
 pub struct Quotes {
@@ -33,30 +34,24 @@ pub fn generate_quotes(
 /// Apply risk adjustments to quotes
 pub fn apply_risk_adjustments(
     quotes: &mut Quotes,
-    risk_action: &crate::types::RiskAction,
+    risk_action: &RiskAction,
     cfg: &AppCfg,
 ) {
     match risk_action {
-        crate::types::RiskAction::Narrow => {
-            // Narrow is not implemented in config, use a small default
-            let narrow = Decimal::from_f64_retain(0.0005).unwrap_or(Decimal::ZERO);
-            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + narrow)), qty));
-            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - narrow)), qty));
-        }
-        crate::types::RiskAction::Reduce => {
+        RiskAction::Reduce => {
             // Reduce is similar to widen but uses order_price_distance_no_position
             let widen = Decimal::from_f64_retain(cfg.internal.order_price_distance_no_position)
                 .unwrap_or(Decimal::ZERO);
             quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
             quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
         }
-        crate::types::RiskAction::Widen => {
+        RiskAction::Widen => {
             let widen = Decimal::from_f64_retain(cfg.internal.spread_widen_factor)
                 .unwrap_or(Decimal::ZERO);
             quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
             quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
         }
-        crate::types::RiskAction::Ok | crate::types::RiskAction::Halt => {}
+        RiskAction::Ok | RiskAction::Halt => {}
     }
 }
 

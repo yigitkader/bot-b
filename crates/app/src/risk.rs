@@ -14,7 +14,7 @@ pub struct RiskLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskAction {
     Ok,
-    Widen,
+    Widen, // Kullanılıyor (main.rs:2082, quote_generator.rs:53)
     Reduce,
     Halt,
 }

@@ -29,6 +29,7 @@ pub fn quant_utils_ceil_to_step(val: Decimal, step: Decimal) -> Decimal {
 }
 
 /// Snap price to tick (is_buy=true -> floor, is_buy=false -> ceil)
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn quant_utils_snap_price(raw: Decimal, tick: Decimal, is_buy: bool) -> Decimal {
     if is_buy {
         quant_utils_floor_to_step(raw, tick)
@@ -38,6 +39,7 @@ pub fn quant_utils_snap_price(raw: Decimal, tick: Decimal, is_buy: bool) -> Deci
 }
 
 /// Calculate quantity from quote amount, floor to lot step
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn quant_utils_qty_from_quote(quote: Decimal, price: Decimal, lot_step: Decimal) -> Decimal {
     if price.is_zero() {
         return Decimal::ZERO;
@@ -46,6 +48,7 @@ pub fn quant_utils_qty_from_quote(quote: Decimal, price: Decimal, lot_step: Deci
 }
 
 /// Calculate basis points difference: (|new-old|/old)*1e4
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn quant_utils_bps_diff(old_px: Decimal, new_px: Decimal) -> f64 {
     if old_px.is_zero() {
         return f64::INFINITY;
@@ -55,6 +58,7 @@ pub fn quant_utils_bps_diff(old_px: Decimal, new_px: Decimal) -> f64 {
 }
 
 /// Quantize decimal value to step (alias for floor_to_step for consistency)
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     if step.is_zero() || step.is_sign_negative() {
         return value;
@@ -96,6 +100,7 @@ pub fn get_price_tick(
 /// 
 /// # Returns
 /// (price_str, qty_str, price_quantized, qty_quantized)
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn quantize_order(
     price: Decimal,
     qty: Decimal,
@@ -141,6 +146,7 @@ pub fn clamp_qty_by_usd(qty: Qty, px: Px, max_usd: f64, qty_step: f64) -> Qty {
 }
 
 /// Clamp quantity by base asset amount
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn clamp_qty_by_base(qty: Qty, max_base: f64, qty_step: f64) -> Qty {
     if max_base <= 0.0 {
         return Qty(Decimal::ZERO);
@@ -407,6 +413,7 @@ pub fn calc_qty_from_margin(
 /// 
 /// # Returns
 /// (tp_price_quantized, is_taker_fallback, reason_code)
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn required_take_profit_price_with_fallback(
     side: crate::core::types::Side,
     entry_price: Decimal,
@@ -608,6 +615,7 @@ pub fn calc_net_pnl_usd(
 /// 
 /// # Returns
 /// Clamped price within mid ± max_distance_pct
+#[allow(dead_code)] // Gelecekte kullanılacak
 pub fn clamp_price_to_market_distance(
     price: Decimal,
     mid: Decimal,
@@ -779,6 +787,7 @@ pub fn adjust_price_for_aggressiveness(
 }
 
 /// Helper trait for ceiling division by step
+#[allow(dead_code)] // Gelecekte kullanılacak
 trait CeilStep {
     fn ceil_div_step(self, step: f64) -> f64;
 }

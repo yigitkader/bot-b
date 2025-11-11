@@ -32,7 +32,7 @@ pub struct Context {
     pub inv: Qty,
     pub liq_gap_bps: f64,
     pub funding_rate: Option<f64>,
-    pub next_funding_time: Option<u64>,
+    pub next_funding_time: Option<u64>, // Funding time tracking (position_manager'da kullanılıyor)
     pub mark_price: Px,             // Mark price (futures için)
     pub tick_size: Option<Decimal>, // Per-symbol tick_size (crossing guard için)
 }
@@ -302,8 +302,8 @@ pub struct DynMm {
     volatility_coefficient: f64,
     ofi_coefficient: f64,
     min_liquidity_required: f64,
-    min_24h_volume_usd: f64,
-    min_book_depth_usd: f64,
+    min_24h_volume_usd: f64, // Config'den okunuyor, gelecekte kullanılacak
+    min_book_depth_usd: f64, // Config'den okunuyor, gelecekte kullanılacak
     opportunity_size_multiplier: f64,
     strong_trend_multiplier: f64,
     // Strategy internal config
