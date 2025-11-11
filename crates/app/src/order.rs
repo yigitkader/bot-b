@@ -2,13 +2,12 @@
 // Order Module: Create orders, check positions, close positions, save PnL
 
 use crate::types::*;
-use crate::connection::{BinanceFutures, Venue};
+use crate::connection::{BinanceFutures, VenueTrait};
 use crate::utils::{rate_limit_guard, calc_net_pnl_usd};
 use anyhow::Result;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Create open long order (buy)
 pub async fn create_open_long_order(
@@ -20,20 +19,19 @@ pub async fn create_open_long_order(
 ) -> Result<String> {
     rate_limit_guard(1).await;
     
-    let order = venue
-        .place_limit(symbol, Side::Buy, price, qty, tif)
+    let order_id = venue.place_limit(symbol, Side::Buy, Px(price), Qty(qty), tif)
         .await?;
     
             info!(
         symbol = %symbol,
-        order_id = %order.order_id,
+                order_id = %order_id,
         side = "LONG",
         price = %price,
         qty = %qty,
         "long order created"
     );
     
-    Ok(order.order_id)
+    Ok(order_id)
 }
 
 /// Handle open short order (sell)
@@ -46,20 +44,19 @@ pub async fn handle_open_short_order(
 ) -> Result<String> {
     rate_limit_guard(1).await;
     
-    let order = venue
-        .place_limit(symbol, Side::Sell, price, qty, tif)
+    let order_id = venue.place_limit(symbol, Side::Sell, Px(price), Qty(qty), tif)
         .await?;
     
     info!(
         symbol = %symbol,
-        order_id = %order.order_id,
+        order_id = %order_id,
         side = "SHORT",
         price = %price,
         qty = %qty,
         "short order created"
     );
     
-    Ok(order.order_id)
+    Ok(order_id)
 }
 
 /// Check current position for a symbol
@@ -114,8 +111,7 @@ pub async fn close_position(
     };
     
     // Place market order (IOC = Immediate or Cancel)
-    let _order = venue
-        .place_limit(symbol, side, market_price, qty, Tif::Ioc)
+    let _order_id = venue.place_limit(symbol, side, Px(market_price), Qty(qty), Tif::Ioc)
         .await?;
 
     info!(

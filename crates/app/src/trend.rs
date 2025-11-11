@@ -1,19 +1,21 @@
 //location: /crates/app/src/trend.rs
 // Trend Module: Analyze tokens, learn with AI, get best tokens to invest
 
-use crate::types::*;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Token analysis result
 #[derive(Debug, Clone)]
 pub struct TokenAnalysis {
     pub symbol: String,
     pub trend_score: f64,        // -1.0 to 1.0 (negative = downtrend, positive = uptrend)
-    pub momentum_bps: f64,       // Price momentum in basis points
-    pub volatility: f64,         // Volatility measure
+    #[allow(dead_code)]
+    pub momentum_bps: f64,       // Price momentum in basis points (for future analysis)
+    #[allow(dead_code)]
+    pub volatility: f64,         // Volatility measure (for future analysis)
     pub signal_strength: f64,    // 0.0 to 1.0 (how strong the signal is)
     pub recommendation: String,  // "LONG", "SHORT", "HOLD"
 }
@@ -23,8 +25,10 @@ pub struct TrendLearner {
     // Learning weights for different features
     weights: HashMap<String, f64>,
     // Recent trade results for learning
-    recent_results: Vec<(String, f64, f64)>, // (symbol, predicted_score, actual_pnl)
-    learning_rate: f64,
+    #[allow(dead_code)]
+    recent_results: Vec<(String, f64, f64)>, // (symbol, predicted_score, actual_pnl) - for future learning
+    #[allow(dead_code)]
+    learning_rate: f64, // For future adaptive learning
 }
 
 impl TrendLearner {
@@ -44,12 +48,13 @@ impl TrendLearner {
     }
     
     /// Learn from trade result (AI learning)
+    #[allow(dead_code)]
     pub fn learn_with_ai(&mut self, symbol: &str, predicted_score: f64, actual_pnl: f64) {
         // Simple gradient descent: adjust weights based on error
         let error = actual_pnl - predicted_score;
         
         // Update weights (simplified - in real AI this would be more sophisticated)
-        for (key, weight) in self.weights.iter_mut() {
+        for (_key, weight) in self.weights.iter_mut() {
             let adjustment = self.learning_rate * error * 0.1; // Small adjustment
             *weight = (*weight + adjustment).clamp(-1.0, 1.0);
         }
@@ -68,6 +73,7 @@ impl TrendLearner {
     }
     
     /// Get current weights (for analysis)
+    #[allow(dead_code)]
     pub fn get_weights(&self) -> &HashMap<String, f64> {
         &self.weights
     }
@@ -81,11 +87,6 @@ pub fn describe_and_analyse_token(
     price_history: &[(Instant, Decimal)],
     learner: &TrendLearner,
 ) -> TokenAnalysis {
-    let mid_price = (bid + ask) / Decimal::from(2);
-    let spread_bps = ((ask - bid) / mid_price * Decimal::from(10000))
-        .to_f64()
-        .unwrap_or(0.0);
-    
     // Calculate momentum (price change over last 5 prices)
     let momentum_bps = if price_history.len() >= 2 {
         let recent: Vec<Decimal> = price_history

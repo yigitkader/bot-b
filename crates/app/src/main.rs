@@ -18,7 +18,7 @@ use crate::types::*;
 use crate::connection::UserEvent;
 use crate::balance::{check_balances, get_symbols_matched_with_our_balance, get_current_symbol_prices};
 use crate::trend::{describe_and_analyse_token, TrendLearner, get_best_tokens_to_invest_now_after_analyse, TokenAnalysis};
-use crate::connection::{handle_apis, handle_ws_connection, close_ws_connection, BinanceFutures};
+use crate::connection::{handle_apis, handle_ws_connection};
 use crate::order::{create_open_long_order, handle_open_short_order, check_position, close_position, save_profits_and_loses, PnLTracker};
 use crate::logger::create_logger;
 use rust_decimal::Decimal;
@@ -56,15 +56,21 @@ async fn main() -> Result<()> {
     info!("configuration loaded");
 
     // 1. Connection Module: Handle APIs and WebSocket
-    let venue = Arc::new(connection::handle_apis(&cfg).await?);
+    let venue = Arc::new(handle_apis(&cfg).await?);
     
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     if cfg.websocket.enabled {
-        connection::handle_ws_connection(&cfg, event_tx.clone()).await;
+        handle_ws_connection(&cfg, event_tx.clone()).await;
     }
 
     // 2. Log Module: Initialize logger
-    let _logger = create_logger("logs/trading_events.json")?;
+    let _logger = match create_logger("logs/trading_events.json") {
+        Ok(logger) => logger,
+        Err(e) => {
+            warn!(error = %e, "Failed to create logger, continuing without logging");
+            return Err(anyhow::anyhow!("Failed to create logger: {}", e));
+        }
+    };
     info!("logger initialized");
 
     // 3. Trend Module: Initialize AI learner
@@ -90,8 +96,8 @@ async fn main() -> Result<()> {
             else if s.ends_with("USDT") { "USDT".to_string() }
             else { "USDC".to_string() }
         })
-        .collect();
-
+            .collect();
+        
     // Price history for trend analysis (per symbol) - shared state
     let price_history: Arc<Mutex<HashMap<String, Vec<(Instant, Decimal)>>>> = 
         Arc::new(Mutex::new(HashMap::new()));
@@ -223,16 +229,16 @@ async fn main() -> Result<()> {
                                             );
                                         }
                                     }
-                                } else {
-                                    // No position, create new order
-                                    let price = if signal.recommendation == "LONG" {
-                                        signal.bid // Buy at bid
-                                    } else {
-                                        signal.ask // Sell at ask
-                                    };
+                                        } else {
+                                            // No position, create new order
+                                            let price = if signal.recommendation == "LONG" {
+                                                signal.bid // Buy at bid
+                                            } else {
+                                                signal.ask // Sell at ask
+                                            };
                                     
-                                    // Simple quantity calculation (10 USDC per order)
-                                    let qty = Decimal::from(10) / price;
+                                            // Simple quantity calculation (10 USDC per order)
+                                            let qty = Decimal::from(10) / price;
                                     
                                     if signal.recommendation == "LONG" {
                                         if let Err(e) = create_open_long_order(&venue_order, &signal.symbol, price, qty, Tif::PostOnly).await {
@@ -291,7 +297,7 @@ async fn main() -> Result<()> {
                     }
                     None => {
                         warn!("websocket event channel closed");
-                        break;
+                        return Ok(());
                     }
                 }
             }

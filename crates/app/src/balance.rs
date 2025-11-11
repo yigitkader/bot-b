@@ -1,10 +1,10 @@
 //location: /crates/app/src/balance.rs
 // Balance Module: Check balances, get symbols with balance, get current prices
 
-use crate::types::*;
-use crate::connection::{BinanceFutures, Venue};
+use crate::connection::{BinanceFutures, VenueTrait};
 use std::collections::HashMap;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use tracing::{info, warn};
 
 /// Check balances for all quote assets

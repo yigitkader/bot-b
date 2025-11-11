@@ -10,13 +10,12 @@ mod binance_ws;
 
 // Re-export public API
 pub use binance_exec::{
-    BinanceCommon, BinanceFutures, BinanceFutures as Venue, SymbolRules, SymbolMeta, VenueOrder,
+    BinanceCommon, BinanceFutures, SymbolRules, SymbolMeta,
     Venue as VenueTrait,
 };
-pub use binance_ws::{UserDataStream, UserEvent, UserStreamKind, WsStream};
+pub use binance_ws::{UserDataStream, UserEvent, UserStreamKind};
 
 use crate::config::AppCfg;
-use crate::types::*;
 use crate::utils::init_rate_limiter;
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
@@ -136,10 +135,6 @@ pub async fn handle_ws_connection(
     });
 }
 
-/// Close WebSocket connection (graceful shutdown)
-pub async fn close_ws_connection() {
-    info!("closing WebSocket connection");
-    // WebSocket is handled by tokio::spawn, so we just log
-    // In a real implementation, you might want to track the handle and cancel it
-}
+// Note: WebSocket connection is handled by tokio::spawn in handle_ws_connection
+// For graceful shutdown, you would need to track the handle and cancel it
 

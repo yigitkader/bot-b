@@ -4,7 +4,7 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BinanceCfg {
     pub api_key: String,
     pub secret_key: String,
@@ -15,7 +15,7 @@ pub struct BinanceCfg {
     pub hedge_mode: bool,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct WebsocketCfg {
     #[serde(default)]
     pub enabled: bool,
