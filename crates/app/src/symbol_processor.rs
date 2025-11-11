@@ -11,11 +11,9 @@ use crate::utils::{
     adjust_quotes_for_risk, validate_quotes, place_side_orders,
 };
 use crate::logger::SharedLogger;
-use crate::order_sync::sync_orders_from_api;
-use crate::order_manager;
+use crate::order::{sync_orders_from_api, analyze_orders, cancel_orders};
 use crate::position_manager;
-use crate::risk_manager;
-use crate::risk_handler::handle_risk_level;
+use crate::risk::{check_position_size_risk, calculate_total_active_orders_notional, check_pnl_alerts, update_peak_pnl, handle_risk_level};
 use crate::strategy::Context;
 use crate::direction_selector::select_direction;
 use crate::cap_manager;
@@ -76,9 +74,9 @@ pub async fn process_symbol(
     
     // Cancel stale/far orders
     if !state.active_orders.is_empty() {
-        let orders_to_cancel = order_manager::analyze_orders(state, bid, ask, position_size_notional, cfg);
+        let orders_to_cancel = analyze_orders(state, bid, ask, position_size_notional, cfg);
         if !orders_to_cancel.is_empty() {
-            order_manager::cancel_orders(venue, symbol, &orders_to_cancel, state, cfg.internal.cancel_stagger_delay_ms).await?;
+            cancel_orders(venue, symbol, &orders_to_cancel, state, cfg.internal.cancel_stagger_delay_ms).await?;
         }
     }
     
@@ -99,8 +97,8 @@ pub async fn process_symbol(
     position_manager::apply_funding_cost(state, funding_rate, next_funding_time, position_size_notional);
     
     // Risk management
-    let total_active_orders_notional = risk_manager::calculate_total_active_orders_notional(state);
-    let (risk_level, max_position_size_usd, should_block_new_orders) = risk_manager::check_position_size_risk(
+    let total_active_orders_notional = calculate_total_active_orders_notional(state);
+    let (risk_level, max_position_size_usd, should_block_new_orders) = check_position_size_risk(
         state, position_size_notional, total_active_orders_notional, cfg.max_usd_per_order,
         effective_leverage, cfg,
     );
@@ -110,8 +108,8 @@ pub async fn process_symbol(
         return Ok(false);
     }
     
-    risk_manager::check_pnl_alerts(state, pnl_f64, position_size_notional, cfg);
-    risk_manager::update_peak_pnl(state, current_pnl);
+    check_pnl_alerts(state, pnl_f64, position_size_notional, cfg);
+    update_peak_pnl(state, current_pnl);
     
     // Check position close
     let (should_close, reason) = position_manager::should_close_position_smart(

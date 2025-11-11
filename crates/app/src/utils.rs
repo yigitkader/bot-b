@@ -7,7 +7,7 @@ use crate::binance_exec::BinanceFutures;
 use crate::exec::Venue;
 use crate::cap_manager::Caps;
 use crate::risk::RiskAction;
-use crate::order_placement::place_orders_with_profit_guarantee;
+use crate::order::place_orders_with_profit_guarantee;
 use crate::logger::{self, SharedLogger};
 use crate::config::AppCfg;
 use crate::event_handler::handle_order_fill;

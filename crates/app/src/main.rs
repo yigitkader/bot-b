@@ -12,17 +12,13 @@ mod exec;
 mod event_handler;
 mod logger;
 mod monitor;
-mod order_manager;
-mod order_placement;
-mod order_sync;
+mod order;
 mod position_manager;
 mod quote_generator;
 mod qmel;
 #[cfg(test)]
 mod qmel_tests;
 mod risk;
-mod risk_handler;
-mod risk_manager;
 mod strategy;
 mod direction_selector;
 mod symbol_discovery;
