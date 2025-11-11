@@ -2,7 +2,7 @@
 // Q-MEL: Micro-Edge Trading Algorithm
 // Market microstructure + statistical edge + dynamic risk/margin + execution science
 
-use crate::core::types::*;
+use crate::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::VecDeque;
@@ -1200,7 +1200,7 @@ impl ThompsonSamplingBandit {
 // ============================================================================
 
 use crate::strategy::{Context, Strategy, DirectionalStrategy};
-use crate::core::types::Quotes;
+use crate::types::Quotes;
 
 /// Q-MEL Trading Strategy
 pub struct QMelStrategy {

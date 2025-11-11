@@ -1,7 +1,6 @@
 //location: /crates/app/src/risk_manager.rs
 // Risk management and limit checking logic
 
-use crate::core::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tracing::{info, warn};

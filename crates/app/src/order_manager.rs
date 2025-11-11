@@ -2,7 +2,7 @@
 // Order placement, management, and analysis logic
 
 use anyhow::Result;
-use crate::core::types::*;
+use crate::types::*;
 use crate::exec::binance::BinanceFutures;
 use crate::exec::Venue;
 use rust_decimal::prelude::ToPrimitive;

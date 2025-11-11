@@ -1,7 +1,7 @@
 //location: /crates/app/src/risk.rs
 // Core risk checking logic (moved from risk crate)
 
-use crate::core::types::*;
+use crate::types::*;
 
 #[derive(Debug, Clone)]
 pub struct RiskLimits {

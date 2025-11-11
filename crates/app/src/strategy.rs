@@ -1,5 +1,5 @@
 //location: /crates/strategy/src/lib.rs
-use crate::core::types::*;
+use crate::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ pub struct Context {
     pub inv: Qty,
     pub liq_gap_bps: f64,
     pub funding_rate: Option<f64>,
+    #[allow(dead_code)] // Gelecekte funding time tracking için kullanılabilir
     pub next_funding_time: Option<u64>, // Funding time tracking (position_manager'da kullanılıyor)
     pub mark_price: Px,             // Mark price (futures için)
     pub tick_size: Option<Decimal>, // Per-symbol tick_size (crossing guard için)
@@ -65,11 +66,13 @@ pub trait Strategy: Send + Sync {
         0.0 // Default: volatilite bilgisi yok
     }
     /// Volatilite bilgisini bps cinsinden döndür
+    #[allow(dead_code)] // Trait API'sinin parçası, gelecekte kullanılabilir
     fn get_volatility_bps(&self) -> f64 {
         let vol = self.get_volatility();
         (vol.sqrt() * 10000.0).max(0.0) // sqrt(σ²) * 10000 = bps
     }
     /// OFI (Order Flow Imbalance) sinyalini döndür
+    #[allow(dead_code)] // Trait API'sinin parçası, gelecekte kullanılabilir
     fn get_ofi_signal(&self) -> f64 {
         0.0 // Default: OFI bilgisi yok
     }

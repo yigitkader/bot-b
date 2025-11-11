@@ -2,12 +2,11 @@
 // Position management, PnL tracking, and position closing logic
 
 use anyhow::Result;
-use crate::core::types::*;
+use crate::types::*;
 use crate::exec::binance::BinanceFutures;
 use crate::exec::Venue;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use crate::config::AppCfg;

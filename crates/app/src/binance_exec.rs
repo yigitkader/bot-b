@@ -1,7 +1,7 @@
 //location: /crates/exec/src/binance.rs
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use crate::core::types::*;
+use crate::types::*;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
@@ -422,6 +422,7 @@ impl BinanceFutures {
         }
     }
 
+    #[allow(dead_code)] // Gelecekte kullanılabilir
     pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
         let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
         let info: FutExchangeInfo = send_json(self.common.client.get(url)).await?;
@@ -546,6 +547,7 @@ impl BinanceFutures {
     }
     
     /// Get current leverage for a symbol
+    #[allow(dead_code)] // Gelecekte kullanılabilir
     pub async fn get_leverage(&self, sym: &str) -> Result<u32> {
         let pos = self.fetch_position(sym).await?;
         Ok(pos.leverage)
@@ -604,6 +606,7 @@ impl BinanceFutures {
         Ok((Px(mark), funding_rate, next_time))
     }
 
+    #[allow(dead_code)] // fetch_premium_index kullanılıyor, bu wrapper gereksiz
     pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
         let (mark, _, _) = self.fetch_premium_index(sym).await?;
         Ok(mark)
@@ -1239,6 +1242,7 @@ impl Venue for BinanceFutures {
 
 impl BinanceFutures {
     /// Place limit order with client order ID and optional reduceOnly flag (public method for TP orders)
+    #[allow(dead_code)] // Gelecekte take-profit emirleri için kullanılabilir
     pub async fn place_limit_with_reduce_only(
         &self,
         sym: &str,

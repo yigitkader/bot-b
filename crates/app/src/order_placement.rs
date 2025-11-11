@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use crate::binance_exec::BinanceFutures;
-use crate::core::types::{OrderBook, Px, Qty, Side, Tif};
+use crate::types::{OrderBook, Px, Qty, Side, Tif};
 use crate::exec::{Venue, quant_utils_ceil_to_step, quant_utils_floor_to_step};
 use crate::constants::*;
 use rust_decimal::prelude::{ToPrimitive, FromStr};

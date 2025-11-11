@@ -1,0 +1,394 @@
+//location: /crates/app/src/symbol_processor.rs
+// Symbol processing logic extracted from main.rs
+
+use crate::types::*;
+use crate::binance_exec::BinanceFutures;
+use crate::exec::Venue;
+use crate::config::AppCfg;
+use crate::utils::{
+    ProfitGuarantee, get_price_tick, get_qty_step, rate_limit_guard, compute_drawdown_bps,
+    fetch_market_data, apply_fill_rate_decay, should_sync_orders,
+    adjust_quotes_for_risk, validate_quotes, place_side_orders,
+};
+use crate::logger::SharedLogger;
+use crate::order_sync::sync_orders_from_api;
+use crate::order_manager;
+use crate::position_manager;
+use crate::risk_manager;
+use crate::risk_handler::handle_risk_level;
+use crate::strategy::Context;
+use crate::direction_selector::select_direction;
+use crate::cap_manager;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::time::Instant;
+use tracing::{info, warn};
+
+/// Process a single symbol in the trading loop
+pub async fn process_symbol(
+    venue: &BinanceFutures,
+    symbol: &str,
+    quote_asset: &str,
+    state: &mut SymbolState,
+    bid: Px,
+    ask: Px,
+    quote_balances: &mut HashMap<String, f64>,
+    cfg: &AppCfg,
+    risk_limits: &crate::risk::RiskLimits,
+    profit_guarantee: &ProfitGuarantee,
+    effective_leverage: f64,
+    min_usd_per_order: f64,
+    tif: crate::types::Tif,
+    json_logger: &SharedLogger,
+    force_sync_all: bool,
+) -> anyhow::Result<bool> {
+    // Sync orders if needed
+    if should_sync_orders(state, cfg.internal.order_sync_interval_sec * 1000) || force_sync_all {
+        sync_orders_from_api(venue, symbol, state, cfg).await;
+    }
+    
+    // Fetch market data
+    let has_open_orders = !state.active_orders.is_empty();
+    let q_free = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+    let has_balance = q_free >= cfg.min_quote_balance_usd && q_free >= min_usd_per_order;
+    let (pos, mark_px, funding_rate, next_funding_time) = fetch_market_data(venue, symbol, bid, ask, has_balance, has_open_orders).await?;
+    
+    // Force close if position exceeded max duration
+    let has_position = !pos.qty.0.is_zero();
+    if has_position {
+        if let Some(entry_time) = state.position_entry_time {
+            let age_secs = entry_time.elapsed().as_secs() as f64;
+            if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
+                warn!(%symbol, position_qty = %pos.qty.0, age_secs, "FORCE CLOSE: Position exceeded max duration");
+                if !state.position_closing {
+                    let _ = position_manager::close_position(venue, symbol, state).await;
+                }
+                return Ok(false);
+            }
+        }
+    }
+    
+    // Calculate position metrics once (used multiple times)
+    let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
+    let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
+    let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
+    
+    // Cancel stale/far orders
+    if !state.active_orders.is_empty() {
+        let orders_to_cancel = order_manager::analyze_orders(state, bid, ask, position_size_notional, cfg);
+        if !orders_to_cancel.is_empty() {
+            order_manager::cancel_orders(venue, symbol, &orders_to_cancel, state, cfg.internal.cancel_stagger_delay_ms).await?;
+        }
+    }
+    
+    // Build orderbook
+    let ob = OrderBook {
+        best_bid: Some(BookLevel { px: bid, qty: Qty(Decimal::ONE) }),
+        best_ask: Some(BookLevel { px: ask, qty: Qty(Decimal::ONE) }),
+        top_bids: None,
+        top_asks: None,
+    };
+    
+    // Sync inventory and update position tracking
+    let reconcile_threshold = Decimal::from_str_radix(&cfg.internal.inventory_reconcile_threshold, 10)
+        .unwrap_or(Decimal::new(1, 4));
+    position_manager::sync_inventory(state, &pos, force_sync_all, reconcile_threshold, 500);
+    position_manager::update_position_tracking(state, &pos, mark_px, cfg);
+    position_manager::update_daily_pnl_reset(state);
+    position_manager::apply_funding_cost(state, funding_rate, next_funding_time, position_size_notional);
+    
+    // Risk management
+    let total_active_orders_notional = risk_manager::calculate_total_active_orders_notional(state);
+    let (risk_level, max_position_size_usd, should_block_new_orders) = risk_manager::check_position_size_risk(
+        state, position_size_notional, total_active_orders_notional, cfg.max_usd_per_order,
+        effective_leverage, cfg,
+    );
+    
+    if !handle_risk_level(venue, symbol, state, risk_level, position_size_notional,
+        position_size_notional + total_active_orders_notional, max_position_size_usd).await {
+        return Ok(false);
+    }
+    
+    risk_manager::check_pnl_alerts(state, pnl_f64, position_size_notional, cfg);
+    risk_manager::update_peak_pnl(state, current_pnl);
+    
+    // Check position close
+    let (should_close, reason) = position_manager::should_close_position_smart(
+        state, &pos, mark_px, bid, ask,
+        profit_guarantee.min_profit_usd(),
+        profit_guarantee.maker_fee_rate(),
+        profit_guarantee.taker_fee_rate(),
+    );
+    
+    let close_cooldown_ms = cfg.strategy.position_close_cooldown_ms.unwrap_or(500) as u128;
+    let can_attempt_close = state.last_close_attempt
+        .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
+        .unwrap_or(true);
+    
+    if should_close && !state.position_closing && can_attempt_close {
+        if position_manager::close_position(venue, symbol, state).await.is_ok() {
+            let side_str = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+            let exit_price = if side_str == "long" { bid } else { ask };
+            
+            let (realized_pnl, total_fees, net_profit) = crate::utils::calculate_close_pnl(
+                pos.entry, exit_price, pos.qty, profit_guarantee.maker_fee_rate(),
+            );
+            
+            if let Ok(logger) = json_logger.lock() {
+                logger.log_position_closed(symbol, side_str, pos.entry, exit_price, pos.qty, pos.leverage, &reason);
+                logger.log_trade_completed(symbol, side_str, pos.entry, exit_price, pos.qty, total_fees, pos.leverage);
+            }
+            
+            crate::utils::update_trade_stats(
+                state, net_profit, realized_pnl, total_fees, pos.entry, exit_price, pos.qty, symbol,
+            );
+            
+            state.strategy.learn_from_trade(net_profit, None, None);
+            
+            if state.trade_count > 0 && state.trade_count % 20 == 0 {
+                if let Some(top_features) = state.strategy.get_feature_importance() {
+                    info!(
+                        %symbol,
+                        total_trades = state.trade_count,
+                        top_5_features = ?top_features.iter().take(5).map(|(name, score)| format!("{}: {:.4}", name, score)).collect::<Vec<_>>(),
+                        "feature importance analysis"
+                    );
+                }
+            }
+            
+            // PnL summary log (optimized: extract to helper if needed)
+            if state.last_pnl_summary_time
+                .map(|last| last.elapsed().as_secs() >= 3600 || state.trade_count % 10 == 0)
+                .unwrap_or(false) && state.trade_count > 0
+            {
+                let total_profit_f = state.total_profit.to_f64().unwrap_or(0.0);
+                let total_loss_f = state.total_loss.to_f64().unwrap_or(0.0);
+                let net_pnl_f = total_profit_f - total_loss_f;
+                let win_rate = state.profitable_trade_count as f64 / state.trade_count as f64;
+                
+                if let Ok(logger) = json_logger.lock() {
+                    logger.log_pnl_summary("hourly", state.trade_count, state.profitable_trade_count,
+                        state.losing_trade_count, total_profit_f, total_loss_f, net_pnl_f,
+                        state.largest_win.to_f64().unwrap_or(0.0),
+                        state.largest_loss.to_f64().unwrap_or(0.0),
+                        state.total_fees_paid.to_f64().unwrap_or(0.0));
+                }
+                
+                info!(
+                    %symbol,
+                    total_trades = state.trade_count,
+                    profitable = state.profitable_trade_count,
+                    losing = state.losing_trade_count,
+                    total_profit = total_profit_f,
+                    total_loss = total_loss_f,
+                    net_pnl = net_pnl_f,
+                    win_rate,
+                    "PnL summary"
+                );
+                
+                state.last_pnl_summary_time = Some(Instant::now());
+            }
+            
+            state.position_entry_time = None;
+            state.avg_entry_price = None;
+            state.peak_pnl = Decimal::ZERO;
+            state.position_hold_duration_ms = 0;
+            state.last_logged_position_qty = None;
+            state.last_logged_pnl = None;
+        }
+    }
+    
+    // Log position updates
+    if has_position {
+        let should_log = state.last_logged_position_qty
+            .map(|last_qty| (last_qty - pos.qty.0).abs() > Decimal::new(1, 8))
+            .unwrap_or(true)
+            || state.last_logged_pnl
+                .map(|last_pnl| {
+                    let pnl_diff = (current_pnl - last_pnl).abs();
+                    let pnl_diff_pct = if last_pnl.abs() > Decimal::ZERO {
+                        (pnl_diff / last_pnl.abs()).to_f64().unwrap_or(0.0)
+                    } else {
+                        1.0
+                    };
+                    pnl_diff_pct > 0.05 || (current_pnl.is_sign_positive() != last_pnl.is_sign_positive())
+                })
+                .unwrap_or(true);
+        
+        if should_log {
+            if let Ok(logger) = json_logger.lock() {
+                let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+                logger.log_position_updated(symbol, side, pos.entry, pos.qty, mark_px, pos.leverage);
+            }
+            
+            let pnl_trend = state.pnl_history.len()
+                .checked_sub(10)
+                .and_then(|start| {
+                    let recent = &state.pnl_history[start..];
+                    let (first, last) = (recent[0], recent[recent.len() - 1]);
+                    (first > Decimal::ZERO).then(|| ((last - first) / first).to_f64().unwrap_or(0.0))
+                })
+                .unwrap_or(0.0);
+            
+            info!(
+                %symbol,
+                position_qty = %pos.qty.0,
+                entry_price = %pos.entry.0,
+                mark_price = %mark_px.0,
+                current_pnl = pnl_f64,
+                position_size_notional,
+                pnl_trend,
+                active_orders = state.active_orders.len(),
+                order_fill_rate = state.order_fill_rate,
+                "position status"
+            );
+            
+            state.last_logged_position_qty = Some(pos.qty.0);
+            state.last_logged_pnl = Some(current_pnl);
+            state.last_position_check = Some(Instant::now());
+        }
+    }
+    
+    // Calculate risk metrics
+    let liq_gap_bps = if let Some(liq_px) = pos.liq_px {
+        let mark = mark_px.0.to_f64().unwrap_or(0.0);
+        let liq = liq_px.0.to_f64().unwrap_or(0.0);
+        if mark > 0.0 {
+            ((mark - liq).abs() / mark) * 10_000.0
+        } else {
+            crate::constants::DEFAULT_LIQ_GAP_BPS
+        }
+    } else {
+        crate::constants::DEFAULT_LIQ_GAP_BPS
+    };
+    
+    let dd_bps = compute_drawdown_bps(&state.pnl_history);
+    let risk_action = crate::risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, risk_limits);
+    
+    apply_fill_rate_decay(state, cfg);
+    
+    if state.order_fill_rate < crate::constants::LOW_FILL_RATE_THRESHOLD && !state.active_orders.is_empty() {
+        warn!(%symbol, fill_rate = state.order_fill_rate, active_orders = state.active_orders.len(), "low fill rate detected");
+    }
+    
+    if matches!(risk_action, crate::risk::RiskAction::Halt) {
+        warn!(%symbol, "risk halt triggered, cancelling and flattening");
+        rate_limit_guard(2).await;
+        let _ = Venue::cancel_all(venue, symbol).await;
+        let _ = Venue::close_position(venue, symbol).await;
+        return Ok(false);
+    }
+    
+    if state.disabled || state.rules_fetch_failed {
+        let should_retry = state.last_rules_retry
+            .map(|last| last.elapsed().as_secs() >= 45)
+            .unwrap_or(true);
+        
+        if should_retry {
+            state.last_rules_retry = Some(Instant::now());
+            if let Ok(new_rules) = venue.rules_for(symbol).await {
+                state.symbol_rules = Some(new_rules);
+                state.disabled = false;
+                state.rules_fetch_failed = false;
+                info!(%symbol, "symbol re-enabled");
+            }
+        }
+        return Ok(false);
+    }
+    
+    // Generate quotes
+    let tick_size_f64 = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
+    let tick_size_decimal = Decimal::from_f64_retain(tick_size_f64);
+    let ob_for_orders = ob.clone();
+    
+    let ctx = Context {
+        ob,
+        sigma: 0.5,
+        inv: state.inv,
+        liq_gap_bps,
+        funding_rate,
+        next_funding_time,
+        mark_price: mark_px,
+        tick_size: tick_size_decimal,
+    };
+    
+    let mut quotes = state.strategy.on_tick(&ctx);
+    
+    if cfg.strategy.r#type == "dyn_mm" {
+        select_direction(&mut quotes, state, &ctx.ob, cfg);
+    }
+    
+    if should_block_new_orders {
+        quotes.bid = None;
+        quotes.ask = None;
+    }
+    
+    adjust_quotes_for_risk(&mut quotes, risk_action, cfg.internal.order_price_distance_no_position, cfg.internal.spread_widen_factor);
+    
+    // Calculate caps (reuse position_size_notional and current_pnl from above)
+    let caps = cap_manager::calculate_caps(state, &quote_asset, quote_balances, position_size_notional, current_pnl, effective_leverage, cfg);
+    
+    let (buy_cap_ok, sell_cap_ok) = cap_manager::check_caps_sufficient(&caps, min_usd_per_order, state.min_notional_req);
+    
+    if !buy_cap_ok && !sell_cap_ok {
+        info!(%symbol, buy_total = caps.buy_total, min_usd_per_order, "skip tick: insufficient balance");
+        return Ok(true);
+    }
+    
+    if !buy_cap_ok {
+        quotes.bid = None;
+    }
+    if !sell_cap_ok {
+        quotes.ask = None;
+    }
+    
+    // Profit guarantee filter
+    if let (Some((bid_px, bid_qty)), Some((ask_px, ask_qty))) = (quotes.bid, quotes.ask) {
+        let spread_bps = crate::utils::calculate_spread_bps(bid_px.0, ask_px.0);
+        let position_size_usd = bid_px.0.to_f64().unwrap_or(0.0) * bid_qty.0.to_f64().unwrap_or(0.0)
+            .max(ask_px.0.to_f64().unwrap_or(0.0) * ask_qty.0.to_f64().unwrap_or(0.0));
+        
+        let min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd)
+            .max(cfg.strategy.min_spread_bps.unwrap_or(60.0));
+        
+        if !crate::utils::should_place_trade(
+            spread_bps, position_size_usd, min_spread_bps,
+            cfg.internal.stop_loss_threshold, cfg.internal.min_risk_reward_ratio, profit_guarantee,
+        ).0 {
+            if let Ok(logger) = json_logger.lock() {
+                logger.log_trade_rejected(symbol, "not_profitable", spread_bps, position_size_usd, min_spread_bps);
+            }
+            quotes.bid = None;
+            quotes.ask = None;
+        }
+    }
+    
+    let qty_step_f64 = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
+    let qty_step_dec = Decimal::from_f64_retain(qty_step_f64).unwrap_or(Decimal::ZERO);
+    
+    // Early exit: skip order placement if no balance and no active position/orders
+    if !state.active_orders.is_empty() || has_position ||
+       quote_balances.get(quote_asset).copied().unwrap_or(0.0) >= cfg.min_quote_balance_usd {
+        // Continue with order placement
+    } else {
+        quotes.bid = None;
+        quotes.ask = None;
+    }
+    
+    validate_quotes(&mut quotes, &caps, qty_step_f64, qty_step_dec, min_usd_per_order);
+    
+    let mut total_spent_on_bids = 0.0f64;
+    let mut total_spent_on_asks = 0.0f64;
+    
+    place_side_orders(venue, symbol, Side::Buy, quotes.bid, state, bid, ask, position_size_notional,
+        &caps, &mut total_spent_on_bids, 0.0, effective_leverage, quote_asset, quote_balances,
+        cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
+    
+    place_side_orders(venue, symbol, Side::Sell, quotes.ask, state, bid, ask, position_size_notional,
+        &caps, &mut total_spent_on_asks, total_spent_on_bids, effective_leverage, quote_asset,
+        quote_balances, cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
+    
+    Ok(true)
+}
+

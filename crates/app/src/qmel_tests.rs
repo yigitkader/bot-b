@@ -8,7 +8,7 @@ mod tests {
         ThompsonSamplingBandit, QMelStrategy, MarketState
     };
     use crate::strategy::Strategy;
-    use crate::core::types::*;
+    use crate::types::*;
     use rust_decimal::Decimal;
     use std::time::Instant;
 

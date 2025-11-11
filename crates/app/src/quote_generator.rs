@@ -2,7 +2,7 @@
 // Strategy quote generation and profit guarantee logic
 
 use anyhow::Result;
-use crate::core::types::*;
+use crate::types::*;
 use rust_decimal::Decimal;
 use crate::strategy::Context;
 use tracing::info;
@@ -62,12 +62,12 @@ pub fn check_profit_guarantee(
     profit_guarantee: &crate::utils::ProfitGuarantee,
     cfg: &AppCfg,
 ) -> (bool, String) {
-    let (bid_px, bid_qty) = match quotes.bid {
+    let (bid_px, _bid_qty) = match quotes.bid {
         Some((px, qty)) => (px, qty),
         None => return (false, "no_bid_quote".to_string()),
     };
 
-    let (ask_px, ask_qty) = match quotes.ask {
+    let (ask_px, _ask_qty) = match quotes.ask {
         Some((px, qty)) => (px, qty),
         None => return (false, "no_ask_quote".to_string()),
     };

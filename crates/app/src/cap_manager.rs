@@ -1,7 +1,6 @@
 //location: /crates/app/src/cap_manager.rs
 // Cap calculation and balance management logic
 
-use crate::core::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;

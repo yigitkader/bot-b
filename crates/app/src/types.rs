@@ -1,12 +1,81 @@
 //location: /crates/app/src/types.rs
-// Core types and structures for the trading bot
+// All types and structures for the trading bot
 
-use crate::core::types::*;
-use crate::exec::binance::SymbolMeta;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use crate::exec::binance::SymbolMeta;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use crate::strategy::Strategy;
+
+// ============================================================================
+// Core Domain Types (moved from core.rs)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Px(pub Decimal);
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Qty(pub Decimal);
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BookLevel {
+    pub px: Px,
+    pub qty: Qty,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OrderBook {
+    pub best_bid: Option<BookLevel>,
+    pub best_ask: Option<BookLevel>,
+    pub top_bids: Option<Vec<BookLevel>>,
+    pub top_asks: Option<Vec<BookLevel>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum Tif {
+    Gtc,
+    Ioc,
+    PostOnly,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Quote {
+    pub bid: Px,
+    pub ask: Px,
+    pub size: Qty,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Position {
+    pub symbol: String,
+    pub qty: Qty,
+    pub entry: Px,
+    pub leverage: u32,
+    pub liq_px: Option<Px>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Fill {
+    pub id: i64,
+    pub symbol: String,
+    pub side: Side,
+    pub qty: Qty,
+    pub price: Px,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct Quotes {
+    pub bid: Option<(Px, Qty)>,
+    pub ask: Option<(Px, Qty)>,
+}
 
 // ============================================================================
 // Symbol State
@@ -69,7 +138,7 @@ pub struct SymbolState {
     
     // Long/Short seçimi için histerezis ve cooldown
     pub last_direction_change: Option<Instant>, // Son yön değişikliği zamanı
-    pub current_direction: Option<crate::core::types::Side>, // Mevcut yön (Long=Buy, Short=Sell)
+    pub current_direction: Option<Side>, // Mevcut yön (Long=Buy, Short=Sell)
     pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
     
     // Position closing control

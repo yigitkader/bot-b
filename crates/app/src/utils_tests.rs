@@ -8,7 +8,7 @@ mod tests {
     use std::str::FromStr;
     use rust_decimal_macros::dec;
     use crate::exec::binance::SymbolRules;
-    use crate::core::types::Side;
+    use crate::types::Side;
 
     // ============================================================================
     // is_usd_stable Tests

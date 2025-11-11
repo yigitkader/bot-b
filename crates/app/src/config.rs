@@ -16,6 +16,7 @@ pub struct RiskCfg {
     pub dd_limit_bps: i64,
     pub max_leverage: u32,
     #[serde(default = "default_slippage_bps_reserve")]
+    #[allow(dead_code)] // Artık kullanılmıyor, calculate_min_spread_bps içinde safety margin var
     pub slippage_bps_reserve: f64, // Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
     #[serde(default = "default_use_isolated_margin")]
     pub use_isolated_margin: bool, // Isolated margin kullan (default: true)

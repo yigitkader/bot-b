@@ -1,11 +1,25 @@
 //location: /crates/app/src/utils.rs
-// Utility functions and helpers
+// All utility functions and helpers
 
-use crate::core::types::*;
+use crate::types::*;
 use crate::exec::binance::SymbolRules;
+use crate::binance_exec::BinanceFutures;
+use crate::exec::Venue;
+use crate::cap_manager::Caps;
+use crate::risk::RiskAction;
+use crate::order_placement::place_orders_with_profit_guarantee;
+use crate::logger::{self, SharedLogger};
+use crate::config::AppCfg;
+use crate::event_handler::handle_order_fill;
+use crate::constants::*;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
 use rust_decimal::RoundingStrategy;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+use anyhow::anyhow;
 
 
 // ============================================================================
@@ -263,7 +277,7 @@ pub fn calc_qty_from_margin(
     margin_chunk_leveraged: f64,
     price: Decimal,
     rules: &SymbolRules,
-    side: crate::core::types::Side,
+    side: crate::types::Side,
 ) -> Option<(String, String)> {
     // ✅ KRİTİK: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
     // margin_chunk_leveraged: ZATEN leverage uygulanmış notional (USD)
@@ -415,7 +429,7 @@ pub fn calc_qty_from_margin(
 /// (tp_price_quantized, is_taker_fallback, reason_code)
 #[allow(dead_code)] // Gelecekte kullanılacak
 pub fn required_take_profit_price_with_fallback(
-    side: crate::core::types::Side,
+    side: crate::types::Side,
     entry_price: Decimal,
     qty: Decimal,
     maker_fee_rate: f64,
@@ -440,17 +454,17 @@ pub fn required_take_profit_price_with_fallback(
     
     // Quantize et
     let tp_quantized = match side {
-        crate::core::types::Side::Buy => quant_utils_ceil_to_step(tp_maker, tick_size),
-        crate::core::types::Side::Sell => quant_utils_floor_to_step(tp_maker, tick_size),
+        crate::types::Side::Buy => quant_utils_ceil_to_step(tp_maker, tick_size),
+        crate::types::Side::Sell => quant_utils_floor_to_step(tp_maker, tick_size),
     };
     
     // Maker kontrolü
     let is_maker = match side {
-        crate::core::types::Side::Buy => {
+        crate::types::Side::Buy => {
             // Long: TP = sell exit, best_ask'ten en az 1 tick yüksek olmalı
             tp_quantized >= best_ask + tick_size
         }
-        crate::core::types::Side::Sell => {
+        crate::types::Side::Sell => {
             // Short: TP = buy exit, best_bid'ten en az 1 tick düşük olmalı
             tp_quantized <= best_bid - tick_size
         }
@@ -471,8 +485,8 @@ pub fn required_take_profit_price_with_fallback(
     )?;
     
     let tp_taker_quantized = match side {
-        crate::core::types::Side::Buy => quant_utils_ceil_to_step(tp_taker, tick_size),
-        crate::core::types::Side::Sell => quant_utils_floor_to_step(tp_taker, tick_size),
+        crate::types::Side::Buy => quant_utils_ceil_to_step(tp_taker, tick_size),
+        crate::types::Side::Sell => quant_utils_floor_to_step(tp_taker, tick_size),
     };
     
     Some((tp_taker_quantized, true, "TP_TAKER_FALLBACK"))
@@ -495,7 +509,7 @@ pub fn required_take_profit_price_with_fallback(
 /// Long: exit_price >= entry_price + (min_profit + fee_entry + fee_exit) / qty
 /// Short: exit_price <= entry_price - (min_profit + fee_entry + fee_exit) / qty
 pub fn required_take_profit_price(
-    side: crate::core::types::Side,
+    side: crate::types::Side,
     entry_price: Decimal,
     qty: Decimal,
     fee_bps_entry: f64,
@@ -511,7 +525,7 @@ pub fn required_take_profit_price(
     let min_profit_dec = Decimal::try_from(min_profit_usd).unwrap_or(Decimal::ZERO);
     
     match side {
-        crate::core::types::Side::Buy => {
+        crate::types::Side::Buy => {
             // Long position: buy entry, sell exit
             // Net profit = exit_price * qty - fee_exit - (entry_price * qty + fee_entry) >= min_profit
             // => exit_price * qty * (1 - fee_bps_exit/10000) >= entry_price * qty + fee_entry + min_profit
@@ -524,7 +538,7 @@ pub fn required_take_profit_price(
             let numerator = notional_entry + fee_entry + min_profit_dec;
             Some(numerator / denominator)
         }
-        crate::core::types::Side::Sell => {
+        crate::types::Side::Sell => {
             // Short position: sell entry, buy exit
             // Net profit = (entry_price * qty - fee_entry) - (exit_price * qty + fee_exit) >= min_profit
             // => entry_price * qty - fee_entry - exit_price * qty - fee_exit >= min_profit
@@ -546,10 +560,10 @@ pub fn required_take_profit_price(
 
 /// Calculate side multiplier for PnL calculation
 /// Long: +1.0, Short: -1.0
-pub fn side_mult(side: &crate::core::types::Side) -> f64 {
+pub fn side_mult(side: &crate::types::Side) -> f64 {
     match side {
-        crate::core::types::Side::Buy => 1.0,  // Long
-        crate::core::types::Side::Sell => -1.0, // Short
+        crate::types::Side::Buy => 1.0,  // Long
+        crate::types::Side::Sell => -1.0, // Short
     }
 }
 
@@ -579,7 +593,7 @@ pub fn calc_net_pnl_usd(
     entry_price: Decimal,
     exit_price: Decimal,
     qty: Decimal,
-    side: &crate::core::types::Side,
+    side: &crate::types::Side,
     entry_fee_bps: f64,
     exit_fee_bps: f64,
 ) -> f64 {
@@ -651,14 +665,14 @@ pub fn clamp_price_to_market_distance(
 /// # Returns
 /// Optimal price based on depth analysis, or best_bid/best_ask if no suitable level found
 pub fn find_optimal_price_from_depth(
-    order_book: &crate::core::types::OrderBook,
-    side: crate::core::types::Side,
+    order_book: &crate::types::OrderBook,
+    side: crate::types::Side,
     min_required_volume_usd: f64,
     best_bid: Decimal,
     best_ask: Decimal,
 ) -> Decimal {
     match side {
-        crate::core::types::Side::Buy => {
+        crate::types::Side::Buy => {
             // BID: En yüksek volume'lu level'ı bul (best_bid'e yakın)
             if let Some(top_bids) = &order_book.top_bids {
                 for level in top_bids.iter() {
@@ -672,7 +686,7 @@ pub fn find_optimal_price_from_depth(
             // Fallback: best_bid
             best_bid
         }
-        crate::core::types::Side::Sell => {
+        crate::types::Side::Sell => {
             // ASK: En yüksek volume'lu level'ı bul (best_ask'e yakın)
             if let Some(top_asks) = &order_book.top_asks {
                 for level in top_asks.iter() {
@@ -706,7 +720,7 @@ pub fn adjust_price_for_aggressiveness(
     price: Decimal,
     best_bid: Decimal,
     best_ask: Decimal,
-    side: crate::core::types::Side,
+    side: crate::types::Side,
     is_opportunity_mode: bool,
     trend_bps: f64,
     max_distance_pct: f64,
@@ -721,7 +735,7 @@ pub fn adjust_price_for_aggressiveness(
     };
     
     match side {
-        crate::core::types::Side::Buy => {
+        crate::types::Side::Buy => {
             // BID: best_bid'e yakın olmalı
             let max_distance = best_bid * max_distance_pct_dec;
             
@@ -752,7 +766,7 @@ pub fn adjust_price_for_aggressiveness(
             // Küçük kar hedefi için best_bid'e mümkün olduğunca yakın
             price.max(adjusted_min).min(best_bid)
         }
-        crate::core::types::Side::Sell => {
+        crate::types::Side::Sell => {
             // ASK: best_ask'e yakın olmalı
             let max_distance = best_ask * max_distance_pct_dec;
             
@@ -831,7 +845,7 @@ fn format_qty_with_precision(qty: Decimal, precision: usize) -> String {
 }
 
 /// Format price with precision (wrapper for consistency)
-fn format_price_with_precision(price: Decimal, precision: usize, _side: crate::core::types::Side) -> String {
+fn format_price_with_precision(price: Decimal, precision: usize, _side: crate::types::Side) -> String {
     format_decimal_fixed(price, precision)
 }
 
@@ -890,8 +904,6 @@ pub fn record_pnl_snapshot(
 // ============================================================================
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 /// Weight-based rate limiter for Binance Futures API calls
 /// 
@@ -1188,6 +1200,21 @@ impl ProfitGuarantee {
             maker_fee_rate,
             taker_fee_rate,
         }
+    }
+    
+    /// Get minimum profit in USD
+    pub fn min_profit_usd(&self) -> f64 {
+        self.min_profit_usd
+    }
+    
+    /// Get maker fee rate
+    pub fn maker_fee_rate(&self) -> f64 {
+        self.maker_fee_rate
+    }
+    
+    /// Get taker fee rate
+    pub fn taker_fee_rate(&self) -> f64 {
+        self.taker_fee_rate
     }
 
     /// Default constructor with Binance Futures fees
@@ -1511,6 +1538,603 @@ pub fn should_place_trade(
     }
     
     (true, "ok")
+}
+
+// ============================================================================
+// Trading Helpers (moved from trading_helpers.rs)
+// ============================================================================
+
+/// Convert TIF string from config to Tif enum
+pub fn tif_from_cfg(s: &str) -> Tif {
+    match s.to_lowercase().as_str() {
+        "gtc" => Tif::Gtc,
+        "ioc" => Tif::Ioc,
+        "post_only" => Tif::PostOnly,
+        _ => Tif::PostOnly,
+    }
+}
+
+/// Fetch balance for a quote asset from venue (futures only)
+pub async fn fetch_quote_balance(venue: &BinanceFutures, quote_asset: &str) -> f64 {
+    match venue.available_balance(quote_asset).await {
+        Ok(balance) => balance.to_f64().unwrap_or(0.0),
+        Err(_) => 0.0,
+    }
+}
+
+/// Fetch balances for all unique quote assets
+pub async fn fetch_all_quote_balances(venue: &BinanceFutures, quote_assets: &[String]) -> HashMap<String, f64> {
+    let mut balances = HashMap::new();
+    for quote_asset in quote_assets {
+        let balance = fetch_quote_balance(venue, quote_asset).await;
+        balances.insert(quote_asset.clone(), balance);
+    }
+    balances
+}
+
+/// Check if symbol should be processed based on balance
+#[allow(dead_code)]
+pub fn should_process_symbol(
+    state: &SymbolState,
+    quote_balance: f64,
+    min_balance: f64,
+    min_order_size: f64,
+    effective_leverage: f64,
+    mode: &str,
+) -> bool {
+    let has_open_orders = !state.active_orders.is_empty();
+    let has_position = !state.inv.0.is_zero();
+    
+    if has_open_orders || has_position {
+        return true;
+    }
+    
+    if quote_balance < min_balance {
+        return false;
+    }
+    
+    match mode {
+        "futures" => {
+            let total_with_leverage = quote_balance * effective_leverage;
+            total_with_leverage >= min_order_size
+        }
+        _ => quote_balance >= min_order_size,
+    }
+}
+
+/// Calculate effective leverage
+pub fn calculate_effective_leverage(config_leverage: Option<u32>, max_leverage: u32) -> f64 {
+    let requested = config_leverage.unwrap_or(max_leverage).max(1);
+    requested.min(max_leverage).max(1) as f64
+}
+
+// ============================================================================
+// Fill Rate Management (moved from fill_rate.rs)
+// ============================================================================
+
+/// Update fill rate after order fill
+pub fn update_fill_rate_on_fill(state: &mut SymbolState, increase_factor: f64, increase_bonus: f64) {
+    state.consecutive_no_fills = 0;
+    state.last_fill_time = Some(Instant::now());
+    state.last_decay_period = None;
+    state.last_decay_check = None;
+    state.order_fill_rate = (state.order_fill_rate * increase_factor + increase_bonus).min(1.0);
+}
+
+/// Update fill rate on order cancel
+pub fn update_fill_rate_on_cancel(state: &mut SymbolState, decrease_factor: f64) {
+    state.consecutive_no_fills += 1;
+    state.order_fill_rate = (state.order_fill_rate * decrease_factor).max(0.0);
+}
+
+/// Check if orders should be synced
+pub fn should_sync_orders(state: &SymbolState, sync_interval_ms: u64) -> bool {
+    state.last_order_sync
+        .map(|last| last.elapsed().as_millis() as u64 >= sync_interval_ms)
+        .unwrap_or(true)
+}
+
+/// Apply time-based fill rate decay
+pub fn apply_fill_rate_decay(state: &mut SymbolState, cfg: &crate::config::AppCfg) {
+    let should_check_decay = state.last_decay_check
+        .map(|last| last.elapsed().as_secs() >= FILL_RATE_DECAY_CHECK_INTERVAL_SEC)
+        .unwrap_or(true);
+    
+    if should_check_decay {
+        state.last_decay_check = Some(Instant::now());
+        
+        if let Some(last_fill) = state.last_fill_time {
+            let seconds_since_fill = last_fill.elapsed().as_secs();
+            
+            if seconds_since_fill >= FILL_RATE_DECAY_THRESHOLD_SEC {
+                let current_period = seconds_since_fill / FILL_RATE_DECAY_INTERVAL_SEC;
+                
+                if Some(current_period) != state.last_decay_period {
+                    state.order_fill_rate *= FILL_RATE_DECAY_MULTIPLIER;
+                    state.consecutive_no_fills += 1;
+                    state.last_decay_period = Some(current_period);
+                    
+                    debug!(
+                        symbol = %state.meta.symbol,
+                        fill_rate = state.order_fill_rate,
+                        seconds_since_fill,
+                        decay_period = current_period,
+                        consecutive_no_fills = state.consecutive_no_fills,
+                        "time-based fill rate decay"
+                    );
+                }
+            }
+        } else {
+            state.last_decay_period = None;
+        }
+    }
+    
+    if state.active_orders.is_empty() {
+        state.consecutive_no_fills = 0;
+        state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_slow_decrease_factor 
+            + cfg.internal.fill_rate_slow_decrease_bonus).min(1.0);
+    }
+}
+
+// ============================================================================
+// Quote Validation (moved from quote_validator.rs)
+// ============================================================================
+
+/// Validate and clamp quote quantities
+pub fn validate_quotes(
+    quotes: &mut Quotes,
+    caps: &Caps,
+    qty_step_f64: f64,
+    qty_step_dec: Decimal,
+    min_usd_per_order: f64,
+) {
+    if let Some((px, q)) = quotes.bid {
+        if px.0 <= Decimal::ZERO {
+            quotes.bid = None;
+        } else {
+            let nq = clamp_qty_by_usd(q, px, caps.buy_notional, qty_step_f64);
+            let quantized_to_zero = qty_step_dec > Decimal::ZERO && nq.0 < qty_step_dec && nq.0 != Decimal::ZERO;
+            let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
+            if nq.0 == Decimal::ZERO || quantized_to_zero || (min_usd_per_order > 0.0 && notional < min_usd_per_order) {
+                quotes.bid = None;
+            } else {
+                quotes.bid = Some((px, nq));
+            }
+        }
+    }
+
+    if let Some((px, q)) = quotes.ask {
+        if px.0 <= Decimal::ZERO {
+            quotes.ask = None;
+        } else {
+            let nq = clamp_qty_by_usd(q, px, caps.sell_notional, qty_step_f64);
+            let quantized_to_zero = qty_step_dec > Decimal::ZERO && nq.0 < qty_step_dec && nq.0 != Decimal::ZERO;
+            let notional = px.0.to_f64().unwrap_or(0.0) * nq.0.to_f64().unwrap_or(0.0);
+            if nq.0 == Decimal::ZERO || quantized_to_zero || (min_usd_per_order > 0.0 && notional < min_usd_per_order) {
+                quotes.ask = None;
+            } else {
+                quotes.ask = Some((px, nq));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Risk Adjustment (moved from risk_adjuster.rs)
+// ============================================================================
+
+/// Adjust quotes based on risk action
+pub fn adjust_quotes_for_risk(
+    quotes: &mut Quotes,
+    risk_action: RiskAction,
+    order_price_distance_no_position: f64,
+    spread_widen_factor: f64,
+) {
+    match risk_action {
+        RiskAction::Reduce => {
+            let widen = Decimal::from_f64_retain(order_price_distance_no_position).unwrap_or(Decimal::ZERO);
+            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
+            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
+        }
+        RiskAction::Widen => {
+            let widen = Decimal::from_f64_retain(spread_widen_factor).unwrap_or(Decimal::ZERO);
+            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
+            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
+        }
+        RiskAction::Ok | RiskAction::Halt => {}
+    }
+}
+
+// ============================================================================
+// Market Data Fetching (moved from market_data.rs)
+// ============================================================================
+
+/// Fetch market data for a symbol (position, mark price)
+pub async fn fetch_market_data(
+    venue: &BinanceFutures,
+    symbol: &str,
+    bid: Px,
+    ask: Px,
+    has_balance: bool,
+    has_open_orders: bool,
+) -> anyhow::Result<(Position, Px, Option<f64>, Option<u64>)> {
+    rate_limit_guard(5).await;
+    let pos = match <BinanceFutures as Venue>::get_position(venue, symbol).await {
+        Ok(pos) => pos,
+        Err(err) => {
+            if !has_open_orders && !has_balance {
+                return Err(anyhow!("failed to fetch position: {}", err));
+            }
+            warn!(%symbol, ?err, "failed to fetch position, using default");
+            Position {
+                symbol: symbol.to_string(),
+                qty: Qty(Decimal::ZERO),
+                entry: Px(Decimal::ZERO),
+                leverage: 1,
+                liq_px: None,
+            }
+        }
+    };
+    
+    rate_limit_guard(1).await;
+    let (mark_px, funding_rate, next_funding_time) = match venue.fetch_premium_index(symbol).await {
+        Ok((mark, funding, next_time)) => (mark, funding, next_time),
+        Err(_) => {
+            let mid = (bid.0 + ask.0) / Decimal::from(2u32);
+            (Px(mid), None, None)
+        }
+    };
+    
+    Ok((pos, mark_px, funding_rate, next_funding_time))
+}
+
+// ============================================================================
+// Position Close (moved from position_close.rs)
+// ============================================================================
+
+/// Calculate PnL and fees for position close
+pub fn calculate_close_pnl(entry_price: Px, exit_price: Px, qty: Qty, maker_fee_rate: f64) -> (f64, f64, f64) {
+    let qty_abs = qty.0.abs();
+    let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
+    let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
+    let realized_pnl = if qty.0.is_sign_positive() {
+        (exit_f - entry_f) * qty_abs.to_f64().unwrap_or(0.0)
+    } else {
+        (entry_f - exit_f) * qty_abs.to_f64().unwrap_or(0.0)
+    };
+    
+    let notional = entry_f * qty_abs.to_f64().unwrap_or(0.0);
+    let entry_fee = notional * maker_fee_rate;
+    let exit_fee = notional * maker_fee_rate;
+    let total_fees = entry_fee + exit_fee;
+    let net_profit = realized_pnl - total_fees;
+    
+    (realized_pnl, total_fees, net_profit)
+}
+
+/// Update trade statistics after position close
+pub fn update_trade_stats(
+    state: &mut SymbolState,
+    net_profit: f64,
+    realized_pnl: f64,
+    total_fees: f64,
+    entry_price: Px,
+    exit_price: Px,
+    qty: Qty,
+    symbol: &str,
+) {
+    state.trade_count += 1;
+    let net_profit_decimal = Decimal::from_f64_retain(net_profit).unwrap_or(Decimal::ZERO);
+    let total_fees_decimal = Decimal::from_f64_retain(total_fees).unwrap_or(Decimal::ZERO);
+    let qty_abs = qty.0.abs();
+    
+    if net_profit > 0.0 {
+        state.profitable_trade_count += 1;
+        state.total_profit += net_profit_decimal;
+        if net_profit_decimal > state.largest_win {
+            state.largest_win = net_profit_decimal;
+        }
+        info!(
+            %symbol,
+            entry_price = %entry_price.0,
+            exit_price = %exit_price.0,
+            quantity = %qty_abs,
+            realized_pnl,
+            fees = total_fees,
+            net_profit,
+            total_trades = state.trade_count,
+            profitable_trades = state.profitable_trade_count,
+            "TRADE PROFIT - Position closed with profit"
+        );
+    } else {
+        state.losing_trade_count += 1;
+        state.total_loss += net_profit_decimal.abs();
+        if net_profit_decimal < state.largest_loss {
+            state.largest_loss = net_profit_decimal.abs();
+        }
+        warn!(
+            %symbol,
+            entry_price = %entry_price.0,
+            exit_price = %exit_price.0,
+            quantity = %qty_abs,
+            realized_pnl,
+            fees = total_fees,
+            net_profit,
+            total_trades = state.trade_count,
+            losing_trades = state.losing_trade_count,
+            "TRADE LOSS - Position closed with loss"
+        );
+    }
+    
+    state.total_fees_paid += total_fees_decimal;
+}
+
+// ============================================================================
+// Order Placement (moved from order_placer.rs)
+// ============================================================================
+
+/// Place orders for a side (bid or ask)
+pub async fn place_side_orders(
+    venue: &BinanceFutures,
+    symbol: &str,
+    side: Side,
+    quote: Option<(Px, Qty)>,
+    state: &mut SymbolState,
+    bid: Px,
+    ask: Px,
+    position_size_notional: f64,
+    caps: &Caps,
+    total_spent_on_side: &mut f64,
+    total_spent_on_other: f64,
+    effective_leverage: f64,
+    quote_asset: &str,
+    quote_balances: &mut HashMap<String, f64>,
+    cfg: &AppCfg,
+    tif: Tif,
+    json_logger: &Arc<Mutex<logger::JsonLogger>>,
+    ob: &OrderBook,
+    profit_guarantee: &ProfitGuarantee,
+) -> anyhow::Result<()> {
+    if let Some(quote) = quote {
+        let open_orders = state.active_orders.values()
+            .filter(|o| o.side == side)
+            .count();
+        let available_margin = (caps.buy_total - *total_spent_on_side - total_spent_on_other).max(0.0);
+        let min_margin: f64 = (50.0f64 * 0.2f64).max(cfg.min_usd_per_order.unwrap_or(10.0)).min(100.0f64);
+        
+        place_orders_with_profit_guarantee(
+            venue,
+            symbol,
+            side,
+            Some(quote),
+            state,
+            bid,
+            ask,
+            position_size_notional,
+            available_margin,
+            effective_leverage,
+            open_orders,
+            cfg.risk.max_open_chunks_per_symbol_per_side,
+            quote_asset,
+            quote_balances,
+            total_spent_on_side,
+            cfg,
+            tif,
+            json_logger,
+            ob,
+            profit_guarantee.maker_fee_rate(),
+            profit_guarantee.taker_fee_rate(),
+            min_margin,
+        ).await?;
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Fill Processing (moved from fill_processor.rs)
+// ============================================================================
+
+/// Process order fill event and update state
+pub fn process_order_fill(
+    state: &mut SymbolState,
+    order_id: &str,
+    side: Side,
+    fill_increment: Decimal,
+    price: Px,
+    commission: Decimal,
+    cumulative_filled_qty: Qty,
+    order_status: &str,
+    fill_rate_increase_factor: f64,
+    fill_rate_increase_bonus: f64,
+) -> bool {
+    let old_inv = state.inv.0;
+    let mut inv = old_inv;
+    if side == Side::Buy {
+        inv += fill_increment;
+    } else {
+        inv -= fill_increment;
+    }
+    state.inv = Qty(inv);
+    state.last_inventory_update = Some(Instant::now());
+    
+    if (old_inv.is_zero() && !inv.is_zero()) || 
+       (old_inv.is_sign_positive() && side == Side::Buy && inv > old_inv) ||
+       (old_inv.is_sign_negative() && side == Side::Sell && inv < old_inv) {
+        if let Some(ref mut avg_entry) = state.avg_entry_price {
+            let old_qty = old_inv.abs();
+            let new_qty = fill_increment;
+            let total_qty = inv.abs();
+            if total_qty > Decimal::ZERO {
+                *avg_entry = (*avg_entry * old_qty + price.0 * new_qty) / total_qty;
+            }
+        } else {
+            state.avg_entry_price = Some(price.0);
+        }
+        
+        if old_inv.is_zero() && !inv.is_zero() && state.position_entry_time.is_none() {
+            state.position_entry_time = Some(Instant::now());
+        }
+    }
+    
+    if inv.is_zero() && !old_inv.is_zero() {
+        if let Some(avg_entry) = state.avg_entry_price {
+            let closed_qty = old_inv.abs();
+            if closed_qty > Decimal::ZERO {
+                let price_diff = if old_inv.is_sign_positive() {
+                    price.0 - avg_entry
+                } else {
+                    avg_entry - price.0
+                };
+                let gross_pnl = price_diff * closed_qty;
+                let actual_commission = if fill_increment >= closed_qty {
+                    commission
+                } else {
+                    (commission / fill_increment) * closed_qty
+                };
+                let final_net_pnl = gross_pnl - actual_commission;
+                state.daily_pnl += final_net_pnl;
+                state.cumulative_pnl += final_net_pnl;
+                info!(
+                    symbol = %state.meta.symbol,
+                    fill_price = %price.0,
+                    entry_price = %avg_entry,
+                    closed_qty = %closed_qty,
+                    final_net_pnl = %final_net_pnl,
+                    "realized PnL from complete position close"
+                );
+            }
+        }
+        state.avg_entry_price = None;
+    }
+    
+    let should_remove = if let Some(order_info) = state.active_orders.get_mut(order_id) {
+        order_info.filled_qty = cumulative_filled_qty;
+        order_info.remaining_qty = Qty(order_info.qty.0 - cumulative_filled_qty.0);
+        order_info.last_fill_time = Some(Instant::now());
+        let remaining_qty = order_info.remaining_qty.0;
+        info!(
+            symbol = %state.meta.symbol,
+            order_id = %order_id,
+            side = ?side,
+            fill_increment = %fill_increment,
+            cumulative_filled_qty = %cumulative_filled_qty.0,
+            remaining_qty = %remaining_qty,
+            order_status = %order_status,
+            new_inventory = %state.inv.0,
+            "order fill: {}",
+            if order_status == "FILLED" { "fully filled" } else { "partial fill" }
+        );
+        order_status == "FILLED" || remaining_qty.is_zero()
+    } else {
+        false
+    };
+    
+    if should_remove {
+        update_fill_rate_on_fill(state, fill_rate_increase_factor, fill_rate_increase_bonus);
+    } else if fill_increment > Decimal::ZERO {
+        state.order_fill_rate = (state.order_fill_rate * 0.98 + 0.02).min(1.0);
+    }
+    
+    if should_remove {
+        state.active_orders.remove(order_id);
+        state.last_order_price_update.remove(order_id);
+    }
+    
+    should_remove
+}
+
+// ============================================================================
+// Event Processing (moved from event_processor.rs)
+// ============================================================================
+
+/// Process order canceled event
+pub fn process_order_canceled(
+    state: &mut SymbolState,
+    symbol: &str,
+    order_id: &str,
+    client_order_id: &Option<String>,
+    cfg: &AppCfg,
+    json_logger: &SharedLogger,
+) {
+    let should_remove = if let Some(order_info) = state.active_orders.get(order_id) {
+        if let Some(ref client_id) = client_order_id {
+            if let Some(ref order_client_id) = order_info.client_order_id {
+                client_id == order_client_id
+            } else {
+                warn!(%symbol, order_id = %order_id, "event has client_order_id but order doesn't, rejecting");
+                false
+            }
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    
+    if should_remove {
+        state.active_orders.remove(order_id);
+        state.last_order_price_update.remove(order_id);
+        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+        
+        info!(%symbol, order_id = %order_id, client_order_id = ?client_order_id, "order canceled via event");
+        
+        if let Ok(logger) = json_logger.lock() {
+            logger.log_order_canceled(symbol, order_id, "price_update_or_timeout", state.order_fill_rate);
+        }
+        
+        info!(%symbol, order_id = %order_id, fill_rate = state.order_fill_rate, "order canceled: updating fill rate");
+    } else {
+        warn!(%symbol, order_id = %order_id, client_order_id = ?client_order_id, "cancel event for unknown order or client_order_id mismatch");
+    }
+}
+
+/// Process order fill event with logging
+pub fn process_order_fill_with_logging(
+    state: &mut SymbolState,
+    symbol: &str,
+    order_id: &str,
+    side: Side,
+    qty: Qty,
+    price: Px,
+    is_maker: bool,
+    cumulative_filled_qty: Qty,
+    order_status: &str,
+    commission: Decimal,
+    cfg: &AppCfg,
+    json_logger: &SharedLogger,
+) -> bool {
+    if !handle_order_fill(state, symbol, order_id, cumulative_filled_qty, order_status) {
+        return false;
+    }
+    
+    let is_post_only = cfg.exec.tif.to_lowercase() == "post_only";
+    if is_post_only && !is_maker {
+        warn!(
+            %symbol,
+            order_id = %order_id,
+            side = ?side,
+            "POST-ONLY VIOLATION: order filled as taker"
+        );
+    }
+    
+    process_order_fill(
+        state,
+        order_id,
+        side,
+        qty.0,
+        price,
+        commission,
+        cumulative_filled_qty,
+        order_status,
+        cfg.internal.fill_rate_increase_factor,
+        cfg.internal.fill_rate_increase_bonus,
+    );
+    
+    if let Ok(logger) = json_logger.lock() {
+        logger.log_order_filled(symbol, order_id, side, price, qty, is_maker, state.inv, state.order_fill_rate);
+    }
+    
+    true
 }
 
 #[cfg(test)]
