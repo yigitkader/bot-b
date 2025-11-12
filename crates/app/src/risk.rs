@@ -27,8 +27,6 @@ pub struct RiskLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskAction {
     Ok,
-    Narrow,
-    Widen,
     Reduce,
     Halt,
 }
@@ -251,7 +249,6 @@ pub async fn handle_risk_level<V: Venue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal::prelude::ToPrimitive;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 

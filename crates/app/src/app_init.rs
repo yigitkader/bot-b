@@ -91,7 +91,7 @@ pub async fn initialize_app() -> Result<AppInitResult> {
     let venue = initialize_venue(&cfg).await?;
     
     // Discover and initialize symbols
-    let mut states = initialize_symbols(&venue, &cfg, &dyn_cfg, &strategy_name).await?;
+    let states = initialize_symbols(&venue, &cfg, &dyn_cfg, &strategy_name).await?;
 
     // Build risk limits
     let risk_limits = RiskLimits {
@@ -162,13 +162,10 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
         volatility_coefficient: cfg.strategy.volatility_coefficient.unwrap_or(0.5),
         ofi_coefficient: cfg.strategy.ofi_coefficient.unwrap_or(0.5),
         min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
-        min_24h_volume_usd: cfg.strategy.min_24h_volume_usd.unwrap_or(0.0),
-        min_book_depth_usd: cfg.strategy.min_book_depth_usd.unwrap_or(0.0),
         opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(1.05),
         strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.0),
         manipulation_volume_ratio_threshold: Some(cfg.strategy_internal.manipulation_volume_ratio_threshold),
         manipulation_time_threshold_ms: Some(cfg.strategy_internal.manipulation_time_threshold_ms),
-        manipulation_price_history_min_len: Some(cfg.strategy_internal.manipulation_price_history_min_len),
         manipulation_price_history_max_len: Some(cfg.strategy_internal.manipulation_price_history_max_len),
         flash_crash_recovery_window_ms: Some(cfg.strategy_internal.flash_crash_recovery_window_ms),
         flash_crash_recovery_min_points: Some(cfg.strategy_internal.flash_crash_recovery_min_points),

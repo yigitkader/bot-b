@@ -253,6 +253,7 @@ struct FutPlacedOrder {
     #[serde(rename = "orderId")]
     order_id: u64,
     #[serde(rename = "clientOrderId")]
+    #[allow(dead_code)]
     client_order_id: Option<String>,
 }
 
@@ -434,16 +435,6 @@ impl BinanceFutures {
         }
     }
 
-    pub async fn symbol_assets(&self, sym: &str) -> Result<(String, String)> {
-        let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
-        let info: FutExchangeInfo = send_json(self.common.client.get(url)).await?;
-        let sym = info
-            .symbols
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("symbol info missing"))?;
-        Ok((sym.base_asset, sym.quote_asset))
-    }
 
     pub async fn symbol_metadata(&self) -> Result<Vec<SymbolMeta>> {
         let url = format!("{}/fapi/v1/exchangeInfo", self.base);
@@ -557,11 +548,6 @@ impl BinanceFutures {
         Ok(is_isolated)
     }
     
-    /// Get current leverage for a symbol
-    pub async fn get_leverage(&self, sym: &str) -> Result<u32> {
-        let pos = self.fetch_position(sym).await?;
-        Ok(pos.leverage)
-    }
     
     pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
         let qs = format!(
@@ -616,10 +602,6 @@ impl BinanceFutures {
         Ok((Px(mark), funding_rate, next_time))
     }
 
-    pub async fn fetch_mark_price(&self, sym: &str) -> Result<Px> {
-        let (mark, _, _) = self.fetch_premium_index(sym).await?;
-        Ok(mark)
-    }
 
     /// Close position with reduceOnly guarantee and verification
     ///
@@ -941,42 +923,6 @@ impl BinanceFutures {
 
 #[async_trait]
 impl Venue for BinanceFutures {
-    async fn place_limit(
-        &self,
-        sym: &str,
-        side: Side,
-        px: Px,
-        qty: Qty,
-        tif: Tif,
-    ) -> Result<String> {
-        // KRİTİK DÜZELTME: Idempotency için deterministik client_order_id üret
-        // Format: {symbol}_{side}_{price_hash}_{qty_hash}_{timestamp}
-        // Hash kullanarak price ve qty'yi kısalt (deterministic)
-        let price_str = format!("{:.8}", px.0.to_f64().unwrap_or(0.0));
-        let qty_str = format!("{:.8}", qty.0.to_f64().unwrap_or(0.0));
-        // Basit hash: price ve qty'nin son 6 karakterini al
-        let price_hash = price_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
-        let qty_hash = qty_str.chars().rev().take(6).collect::<String>().chars().rev().collect::<String>();
-        let timestamp_ms = BinanceCommon::ts();
-        let side_str = match side {
-            Side::Buy => "B",
-            Side::Sell => "S",
-        };
-        let symbol_clean = sym.replace("-", "_").replace("/", "_");
-        let client_order_id = format!("{}_{}_{}_{}_{}", symbol_clean, side_str, price_hash, qty_hash, timestamp_ms);
-        // 36 karakter limit kontrolü
-        let client_order_id = if client_order_id.len() > 36 {
-            // Kısalt: symbol'ü kısalt
-            let symbol_short = symbol_clean.chars().take(8).collect::<String>();
-            format!("{}_{}_{}_{}_{}", symbol_short, side_str, price_hash, qty_hash, timestamp_ms)
-                .chars().take(36).collect::<String>()
-        } else {
-            client_order_id
-        };
-        
-        self.place_limit_with_client_id(sym, side, px, qty, tif, &client_order_id).await.map(|(order_id, _)| order_id)
-    }
-    
     async fn place_limit_with_client_id(
         &self,
         sym: &str,
@@ -1193,7 +1139,6 @@ impl Venue for BinanceFutures {
             qty_str,
             tif = ?tif,
             order_id = order.order_id,
-            client_order_id = ?order.client_order_id,
             "futures place_limit ok"
         );
         Ok((order.order_id.to_string(), order.client_order_id))
@@ -1240,164 +1185,12 @@ impl Venue for BinanceFutures {
         self.fetch_position(sym).await
     }
 
-    async fn mark_price(&self, sym: &str) -> Result<Px> {
-        self.fetch_mark_price(sym).await
-    }
-
     async fn close_position(&self, sym: &str) -> Result<()> {
         self.flatten_position(sym, self.hedge_mode).await
     }
 }
 
 impl BinanceFutures {
-    /// Place limit order with client order ID and optional reduceOnly flag (public method for TP orders)
-    pub async fn place_limit_with_reduce_only(
-        &self,
-        sym: &str,
-        side: Side,
-        px: Px,
-        qty: Qty,
-        tif: Tif,
-        client_order_id: &str,
-        reduce_only: bool,
-    ) -> Result<(String, Option<String>)> {
-        let s_side = match side {
-            Side::Buy => "BUY",
-            Side::Sell => "SELL",
-        };
-        let tif_str = match tif {
-            Tif::PostOnly => "GTX",
-            Tif::Gtc => "GTC",
-            Tif::Ioc => "IOC",
-        };
-
-        let rules = self.rules_for(sym).await?;
-        let (price_str, qty_str, price_quantized, qty_quantized) = 
-            Self::validate_and_format_order_params(px, qty, &rules, sym)?;
-
-        info!(
-            %sym,
-            side = ?side,
-            price_original = %px.0,
-            price_quantized = %price_quantized,
-            price_str,
-            qty_original = %qty.0,
-            qty_quantized = %qty_quantized,
-            qty_str,
-            price_precision = rules.price_precision,
-            qty_precision = rules.qty_precision,
-            endpoint = "/fapi/v1/order",
-            reduce_only,
-            "order validation guard passed, submitting TP order"
-        );
-
-        let mut params = vec![
-            format!("symbol={}", sym),
-            format!("side={}", s_side),
-            "type=LIMIT".to_string(),
-            format!("timeInForce={}", tif_str),
-            format!("price={}", price_str),
-            format!("quantity={}", qty_str),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-            "newOrderRespType=RESULT".to_string(),
-        ];
-        
-        // ✅ YENİ: reduceOnly desteği (TP emirleri için)
-        if reduce_only {
-            params.push("reduceOnly=true".to_string());
-        }
-        
-        if !client_order_id.is_empty() {
-            if client_order_id.len() <= 36 && client_order_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-                params.push(format!("newClientOrderId={}", client_order_id));
-            }
-        }
-        
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_BACKOFF_MS: u64 = 100;
-        let mut last_error = None;
-        let mut order_result: Option<FutPlacedOrder> = None;
-        
-        for attempt in 0..=MAX_RETRIES {
-            let retry_qs = params.join("&");
-            let retry_sig = self.common.sign(&retry_qs);
-            let retry_url = format!("{}/fapi/v1/order?{}&signature={}", self.base, retry_qs, retry_sig);
-            
-            match self.common
-                .client
-                .post(&retry_url)
-                .header("X-MBX-APIKEY", &self.common.api_key)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
-                        match resp.json::<FutPlacedOrder>().await {
-                            Ok(order) => {
-                                order_result = Some(order);
-                                break;
-                            }
-                            Err(e) => {
-                                if attempt < MAX_RETRIES {
-                                    let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                    last_error = Some(anyhow!("json parse error: {}", e));
-                                    continue;
-                                } else {
-                                    return Err(e.into());
-                                }
-                            }
-                        }
-                    } else {
-                        let body = resp.text().await.unwrap_or_default();
-                        if is_permanent_error(status.as_u16(), &body) {
-                            return Err(anyhow!("binance api error: {} - {} (permanent)", status, body));
-                        }
-                        if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
-                            let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                            last_error = Some(anyhow!("binance api error: {} - {}", status, body));
-                            continue;
-                        } else {
-                            return Err(anyhow!("binance api error: {} - {}", status, body));
-                        }
-                    }
-                }
-                Err(e) => {
-                    if attempt < MAX_RETRIES {
-                        let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        last_error = Some(e.into());
-                        continue;
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            }
-        }
-        
-        let order = order_result.ok_or_else(|| {
-            last_error.unwrap_or_else(|| anyhow!("unknown error after retries"))
-        })?;
-
-        info!(
-            %sym,
-            ?side,
-            price_quantized = %price_quantized,
-            qty_quantized = %qty_quantized,
-            price_str,
-            qty_str,
-            tif = ?tif,
-            order_id = order.order_id,
-            client_order_id = ?order.client_order_id,
-            reduce_only,
-            "futures place_limit_with_reduce_only ok"
-        );
-        Ok((order.order_id.to_string(), order.client_order_id))
-    }
-    
     /// Test order endpoint - İlk emir öncesi doğrulama
     /// /fapi/v1/order/test endpoint'i ile emir parametrelerini test et
     /// -1111 hatası gelirse sembolü disable et ve rules'ı yeniden çek
@@ -1792,7 +1585,6 @@ pub enum UserEvent {
     OrderFill {
         symbol: String,
         order_id: String,
-        client_order_id: Option<String>, // Idempotency için
         side: Side,
         qty: Qty,                   // Last executed qty (incremental)
         cumulative_filled_qty: Qty, // Cumulative filled qty (total filled so far)
@@ -2070,13 +1862,12 @@ impl UserDataStream {
                 // KRİTİK DÜZELTME: Gerçek komisyon (executionReport'tan "n" field'ı)
                 // "n" = commission (last executed qty için komisyon, incremental)
                 let commission = Self::parse_decimal(value, "n");
-                return Ok(Some(UserEvent::OrderFill {
-                    symbol,
-                    order_id,
-                    client_order_id,
-                    side,
-                    qty: Qty(qty),
-                    cumulative_filled_qty: Qty(cumulative_filled_qty),
+                    return Ok(Some(UserEvent::OrderFill {
+                        symbol,
+                        order_id,
+                        side,
+                        qty: Qty(qty),
+                        cumulative_filled_qty: Qty(cumulative_filled_qty),
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),
@@ -2122,13 +1913,12 @@ impl UserDataStream {
                 // KRİTİK DÜZELTME: Gerçek komisyon (ORDER_TRADE_UPDATE'ten "n" field'ı)
                 // "n" = commission (last executed qty için komisyon, incremental)
                 let commission = Self::parse_decimal(data, "n");
-                return Ok(Some(UserEvent::OrderFill {
-                    symbol,
-                    order_id,
-                    client_order_id,
-                    side,
-                    qty: Qty(qty),
-                    cumulative_filled_qty: Qty(cumulative_filled_qty),
+                    return Ok(Some(UserEvent::OrderFill {
+                        symbol,
+                        order_id,
+                        side,
+                        qty: Qty(qty),
+                        cumulative_filled_qty: Qty(cumulative_filled_qty),
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),

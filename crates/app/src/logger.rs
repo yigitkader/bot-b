@@ -54,17 +54,6 @@ pub enum LogEvent {
         reason: String,
         fill_rate: f64,
     },
-    #[serde(rename = "position_opened")]
-    PositionOpened {
-        timestamp: u64,
-        symbol: String,
-        side: String, // "long" or "short"
-        entry_price: f64,
-        quantity: f64,
-        notional_usd: f64,
-        leverage: u32,
-        reason: String,
-    },
     #[serde(rename = "position_updated")]
     PositionUpdated {
         timestamp: u64,
@@ -137,7 +126,6 @@ pub enum LogEvent {
 // ============================================================================
 
 pub struct JsonLogger {
-    file_path: PathBuf,
     file: Arc<Mutex<std::fs::File>>,
     enabled: bool,
 }
@@ -158,20 +146,9 @@ impl JsonLogger {
             .open(&path)?;
         
         Ok(Self {
-            file_path: path,
             file: Arc::new(Mutex::new(file)),
             enabled: true,
         })
-    }
-    
-    /// Disable logging
-    pub fn disable(&mut self) {
-        self.enabled = false;
-    }
-    
-    /// Enable logging
-    pub fn enable(&mut self) {
-        self.enabled = true;
     }
     
     /// Get current timestamp in milliseconds
@@ -286,33 +263,6 @@ impl JsonLogger {
     // ============================================================================
     // Position Event Logging
     // ============================================================================
-    
-    /// Log position opened
-    pub fn log_position_opened(
-        &self,
-        symbol: &str,
-        side: &str, // "long" or "short"
-        entry_price: Px,
-        qty: Qty,
-        leverage: u32,
-        reason: &str,
-    ) {
-        let notional = entry_price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0).abs();
-        let event = LogEvent::PositionOpened {
-            timestamp: Self::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_price.0.to_f64().unwrap_or(0.0),
-            quantity: qty.0.to_f64().unwrap_or(0.0),
-            notional_usd: notional,
-            leverage,
-            reason: reason.to_string(),
-        };
-        
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log position_opened: {}", e);
-        }
-    }
     
     /// Log position update
     pub fn log_position_updated(

@@ -1,18 +1,18 @@
 //location: /crates/app/src/order.rs
 // All order management logic (consolidated from order_manager.rs, order_placement.rs, order_sync.rs)
 
-use anyhow::Result;
-use crate::types::*;
-use crate::exchange::BinanceFutures;
-use crate::exec::{Venue, quant_utils_ceil_to_step, quant_utils_floor_to_step};
 use crate::config::AppCfg;
-use crate::logger;
 use crate::constants::*;
+use crate::exchange::BinanceFutures;
+use crate::exec::{quant_utils_ceil_to_step, quant_utils_floor_to_step, Venue};
+use crate::logger;
+use crate::types::*;
 use crate::utils::{
-    adjust_price_for_aggressiveness, calc_qty_from_margin, find_optimal_price_from_depth,
+    adjust_price_for_aggressiveness, find_optimal_price_from_depth,
     rate_limit_guard, split_margin_into_chunks,
 };
-use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
+use anyhow::Result;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -639,10 +639,10 @@ pub async fn place_orders_with_profit_guarantee(
                 .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF, &client_order_id)
                 .await
             {
-                Ok((order_id, returned_client_id)) => {
+                Ok((order_id, _returned_client_id)) => {
                     let info = OrderInfo {
                         order_id: order_id.clone(),
-                        client_order_id: returned_client_id.or(Some(client_order_id)),
+                        client_order_id: _returned_client_id.or(Some(client_order_id)),
                         side,
                         price: chunk_price,
                         qty: chunk_qty,

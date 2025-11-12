@@ -17,31 +17,22 @@ mod strategy;        // Now includes direction_selector
 mod types;
 mod utils;
 
-use anyhow::Result;
-use crate::types::*;
 use crate::exchange::UserEvent;
-use crate::constants::*;
 use crate::exec::Venue;
-use crate::risk::RiskAction;
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
-use crate::strategy::Context;
-use tracing::{debug, error, info, warn};
-use utils::{
-    compute_drawdown_bps, get_price_tick, get_qty_step, rate_limit_guard,
-    calculate_effective_leverage, fetch_all_quote_balances,
-    apply_fill_rate_decay, should_sync_orders,
-    process_order_canceled, process_order_fill_with_logging,
-};
+use anyhow::Result;
 use app_init::{initialize_app, AppInitResult};
 use logger::handle_reconnect_sync;
 use processor::process_symbol;
+use tracing::{error, info, warn};
+use utils::{
+    calculate_effective_leverage,
+    fetch_all_quote_balances, process_order_canceled,
+    process_order_fill_with_logging, rate_limit_guard,
+};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use futures_util::stream::{self, StreamExt};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -91,13 +82,11 @@ async fn main() -> Result<()> {
     });
     
     let mut force_sync_all = false;
-    let mut shutdown_requested = false;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
             _ = shutdown_rx.recv() => {
                 info!("shutdown signal received, initiating graceful shutdown");
-                shutdown_requested = true;
                 break;
             }
         }
@@ -118,7 +107,6 @@ async fn main() -> Result<()> {
                 UserEvent::OrderFill {
                     symbol,
                     order_id,
-                    client_order_id: _,
                     side,
                     qty,
                     cumulative_filled_qty,
@@ -302,11 +290,10 @@ async fn main() -> Result<()> {
     
     info!("main loop ended, performing graceful shutdown");
     
-    if shutdown_requested {
-        // ✅ Graceful shutdown: Açık pozisyonları ve emirleri temizle
-        let shutdown_timeout = Duration::from_secs(10); // Maximum 10 saniye cleanup
-        
-        let cleanup_result = tokio::time::timeout(shutdown_timeout, async {
+    // ✅ Graceful shutdown: Açık pozisyonları ve emirleri temizle
+    let shutdown_timeout = Duration::from_secs(10); // Maximum 10 saniye cleanup
+    
+    let cleanup_result = tokio::time::timeout(shutdown_timeout, async {
             let mut positions_to_close = Vec::new();
             let mut orders_to_cancel = Vec::new();
             
@@ -347,21 +334,21 @@ async fn main() -> Result<()> {
                 }
             }
             
-            info!("cleanup completed for all symbols");
-        }).await;
-        
-        match cleanup_result {
-            Ok(_) => info!("graceful shutdown cleanup completed successfully"),
-            Err(_) => {
-                warn!("graceful shutdown cleanup timed out after 10 seconds, forcing exit");
-                // Timeout durumunda açık pozisyonları log'la
-                for state in states.iter() {
-                    if !state.inv.0.is_zero() {
-                        error!(symbol = %state.meta.symbol, inventory = %state.inv.0, "position still open after shutdown timeout");
-                    }
-                    if !state.active_orders.is_empty() {
-                        error!(symbol = %state.meta.symbol, order_count = state.active_orders.len(), "orders still open after shutdown timeout");
-                    }
+        info!("cleanup completed for all symbols");
+    })
+    .await;
+    
+    match cleanup_result {
+        Ok(_) => info!("graceful shutdown cleanup completed successfully"),
+        Err(_) => {
+            warn!("graceful shutdown cleanup timed out after 10 seconds, forcing exit");
+            // Timeout durumunda açık pozisyonları log'la
+            for state in states.iter() {
+                if !state.inv.0.is_zero() {
+                    error!(symbol = %state.meta.symbol, inventory = %state.inv.0, "position still open after shutdown timeout");
+                }
+                if !state.active_orders.is_empty() {
+                    error!(symbol = %state.meta.symbol, order_count = state.active_orders.len(), "orders still open after shutdown timeout");
                 }
             }
         }

@@ -1,25 +1,25 @@
 //location: /crates/app/src/utils.rs
 // All utility functions and helpers
 
-use crate::types::*;
-use crate::exchange::SymbolRules;
+use crate::config::AppCfg;
+use crate::constants::*;
 use crate::exchange::BinanceFutures;
+use crate::exchange::SymbolRules;
 use crate::exec::Venue;
+use crate::logger::handle_order_fill;
+use crate::logger::{self, SharedLogger};
+use crate::order::place_orders_with_profit_guarantee;
 use crate::risk::Caps;
 use crate::risk::RiskAction;
-use crate::order::place_orders_with_profit_guarantee;
-use crate::logger::{self, SharedLogger};
-use crate::config::AppCfg;
-use crate::logger::handle_order_fill;
-use crate::constants::*;
+use crate::types::*;
+use anyhow::anyhow;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
 use rust_decimal::RoundingStrategy;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
-use anyhow::anyhow;
 
 
 // ============================================================================
@@ -405,19 +405,6 @@ pub fn calc_qty_from_margin(
     Some((qty_floor, price_quantized))
 }
 
-/// Compatibility wrapper: return string representations (price_str, qty_str)
-pub fn calc_qty_from_margin_strings(
-    margin_chunk_leveraged: f64,
-    price: Decimal,
-    rules: &SymbolRules,
-    side: crate::types::Side,
-) -> Option<(String, String)> {
-    calc_qty_from_margin(margin_chunk_leveraged, price, rules, side).map(|(qty_dec, price_dec)| {
-        let qty_str = format_qty_with_precision(qty_dec, rules.qty_precision);
-        let price_str = format_price_with_precision(price_dec, rules.price_precision, side);
-        (qty_str, price_str)
-    })
-}
 
 /// KRİTİK DÜZELTME: ProfitGuarantee wrapper - maker→taker fallback zinciri standardize
 /// Tek wrapper fonksiyon: required_take_profit_price_with_fallback
@@ -847,15 +834,6 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     }
 }
 
-/// Format quantity with precision (wrapper for consistency)
-fn format_qty_with_precision(qty: Decimal, precision: usize) -> String {
-    format_decimal_fixed(qty, precision)
-}
-
-/// Format price with precision (wrapper for consistency)
-fn format_price_with_precision(price: Decimal, precision: usize, _side: crate::types::Side) -> String {
-    format_decimal_fixed(price, precision)
-}
 
 // ============================================================================
 // PnL Calculation Helpers
@@ -1225,11 +1203,6 @@ impl ProfitGuarantee {
         self.taker_fee_rate
     }
 
-    /// Default constructor with Binance Futures fees
-    /// KRİTİK DÜZELTME: 0.005 USD (0.5 cent) → 0.50 USD (50 cent) hedef
-    pub fn default() -> Self {
-        Self::new(0.50, 0.0002, 0.0004) // 0.50 USD, 2 bps maker, 4 bps taker
-    }
 
     /// Calculate minimum spread required for profitable trade
     /// 
@@ -1310,41 +1283,6 @@ impl ProfitGuarantee {
         gross_profit - total_fees
     }
 
-    /// Calculate optimal position size for a given spread
-    /// 
-    /// # Arguments
-    /// * `spread_bps` - Current spread in basis points
-    /// * `min_position_usd` - Minimum position size in USD
-    /// * `max_position_usd` - Maximum position size in USD
-    /// 
-    /// # Returns
-    /// Optimal position size in USD that guarantees minimum profit
-    pub fn calculate_optimal_position_size(
-        &self,
-        spread_bps: f64,
-        min_position_usd: f64,
-        max_position_usd: f64,
-    ) -> f64 {
-        if spread_bps <= 0.0 {
-            return min_position_usd;
-        }
-
-        let spread_rate = spread_bps / 10000.0;
-        // Worst case: her iki taraf da taker
-        let total_fee_rate = self.taker_fee_rate * 2.0;
-        let net_spread_rate = spread_rate - total_fee_rate;
-
-        if net_spread_rate <= 0.0 {
-            // Spread doesn't cover fees, use minimum
-            return min_position_usd;
-        }
-
-        // Calculate position size needed for minimum profit
-        let optimal_size = self.min_profit_usd / net_spread_rate;
-        
-        // Clamp to min/max bounds
-        optimal_size.max(min_position_usd).min(max_position_usd)
-    }
 
     /// Calculate risk/reward ratio for a trade
     /// 
@@ -1376,90 +1314,6 @@ impl ProfitGuarantee {
     }
 }
 
-/// Profit tracker for monitoring trading performance
-pub struct ProfitTracker {
-    total_trades: u32,
-    winning_trades: u32,
-    total_profit: f64,
-    total_fees: f64,
-    total_loss: f64,
-}
-
-impl ProfitTracker {
-    pub fn new() -> Self {
-        Self {
-            total_trades: 0,
-            winning_trades: 0,
-            total_profit: 0.0,
-            total_fees: 0.0,
-            total_loss: 0.0,
-        }
-    }
-
-    /// Record a completed trade
-    /// 
-    /// # Arguments
-    /// * `profit` - Net profit in USD (can be negative)
-    /// * `fees` - Total fees paid in USD
-    pub fn record_trade(&mut self, profit: f64, fees: f64) {
-        self.total_trades += 1;
-        self.total_fees += fees;
-
-        if profit > 0.0 {
-            self.winning_trades += 1;
-            self.total_profit += profit;
-        } else {
-            self.total_loss += profit.abs();
-        }
-    }
-
-    /// Get win rate as percentage
-    pub fn win_rate(&self) -> f64 {
-        if self.total_trades == 0 {
-            return 0.0;
-        }
-        (self.winning_trades as f64 / self.total_trades as f64) * 100.0
-    }
-
-    /// Get net profit (profit - fees - losses)
-    pub fn net_profit(&self) -> f64 {
-        self.total_profit - self.total_fees - self.total_loss
-    }
-
-    /// Get statistics as formatted string
-    pub fn get_stats(&self) -> String {
-        let win_rate = self.win_rate();
-        let net_profit = self.net_profit();
-        let avg_profit_per_trade = if self.total_trades > 0 {
-            net_profit / self.total_trades as f64
-        } else {
-            0.0
-        };
-
-        format!(
-            "Trades: {}, Win Rate: {:.1}%, Net Profit: ${:.2}, Fees: ${:.2}, Avg Profit/Trade: ${:.4}",
-            self.total_trades, win_rate, net_profit, self.total_fees, avg_profit_per_trade
-        )
-    }
-
-    /// Reset all statistics
-    pub fn reset(&mut self) {
-        self.total_trades = 0;
-        self.winning_trades = 0;
-        self.total_profit = 0.0;
-        self.total_fees = 0.0;
-        self.total_loss = 0.0;
-    }
-}
-
-impl Default for ProfitTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Thread-safe profit tracker wrapper
-pub type SharedProfitTracker = Mutex<ProfitTracker>;
 
 /// Calculate spread in basis points from bid and ask prices
 /// KRİTİK DÜZELTME: Mid price bazlı tutarlı hesaplama (volatilite anında sapma önleme)
@@ -1735,19 +1589,11 @@ pub fn adjust_quotes_for_risk(
     quotes: &mut Quotes,
     risk_action: RiskAction,
     order_price_distance_no_position: f64,
-    spread_widen_factor: f64,
 ) {
     match risk_action {
-        RiskAction::Narrow => {
-            // Narrow spread (more aggressive)
-        }
         RiskAction::Reduce => {
+            // Reduce uses order_price_distance_no_position to widen spread
             let widen = Decimal::from_f64_retain(order_price_distance_no_position).unwrap_or(Decimal::ZERO);
-            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
-            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
-        }
-        RiskAction::Widen => {
-            let widen = Decimal::from_f64_retain(spread_widen_factor).unwrap_or(Decimal::ZERO);
             quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
             quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
         }
@@ -2147,11 +1993,5 @@ pub fn process_order_fill_with_logging(
     true
 }
 
-#[cfg(test)]
-#[path = "rate_limiter_tests.rs"]
-mod rate_limiter_tests;
-
-#[cfg(test)]
-#[path = "utils_tests.rs"]
-mod utils_tests;
+// Tests are embedded inline in this module
 

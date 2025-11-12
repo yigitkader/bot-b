@@ -5,20 +5,21 @@
 use anyhow::Result;
 use crate::types::*;
 use crate::exchange::BinanceFutures;
-use crate::exec::{Venue, binance::SymbolMeta};
+use crate::exec::Venue;
+use crate::exchange::SymbolMeta;
 use crate::config::AppCfg;
 use crate::utils::{
     ProfitGuarantee, get_price_tick, get_qty_step, rate_limit_guard, compute_drawdown_bps,
     fetch_market_data, apply_fill_rate_decay, should_sync_orders,
     adjust_quotes_for_risk, validate_quotes, place_side_orders,
-    is_usd_stable, calculate_spread_bps,
+    is_usd_stable,
 };
 use crate::logger::SharedLogger;
 use crate::order::{sync_orders_from_api, analyze_orders, cancel_orders};
 use crate::position_manager;
 use crate::risk::{
     check_position_size_risk, calculate_total_active_orders_notional, check_pnl_alerts,
-    update_peak_pnl, handle_risk_level, RiskAction, calculate_caps, check_caps_sufficient,
+    update_peak_pnl, handle_risk_level, calculate_caps, check_caps_sufficient,
 };
 use crate::strategy::{Context, DynMm, DynMmCfg, Strategy};
 use crate::qmel::QMelStrategy;
@@ -30,106 +31,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 use futures_util::stream::{self, StreamExt};
-
-// ============================================================================
-// Quote Generation
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct Quotes {
-    pub bid: Option<(Px, Qty)>,
-    pub ask: Option<(Px, Qty)>,
-}
-
-/// Generate quotes from strategy
-pub fn generate_quotes(
-    state: &mut SymbolState,
-    ctx: &Context,
-    _cfg: &AppCfg,
-) -> Result<Quotes> {
-    let quotes = state.strategy.on_tick(ctx);
-    
-    Ok(Quotes {
-        bid: quotes.bid,
-        ask: quotes.ask,
-    })
-}
-
-/// Apply risk adjustments to quotes
-pub fn apply_risk_adjustments(
-    quotes: &mut Quotes,
-    risk_action: &RiskAction,
-    cfg: &AppCfg,
-) {
-    match risk_action {
-        RiskAction::Narrow => {
-            // Narrow spread (more aggressive) - not implemented in config
-        }
-        RiskAction::Reduce => {
-            // Reduce is similar to widen but uses order_price_distance_no_position
-            let widen = Decimal::from_f64_retain(cfg.internal.order_price_distance_no_position)
-                .unwrap_or(Decimal::ZERO);
-            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
-            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
-        }
-        RiskAction::Widen => {
-            let widen = Decimal::from_f64_retain(cfg.internal.spread_widen_factor)
-                .unwrap_or(Decimal::ZERO);
-            quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));
-            quotes.ask = quotes.ask.map(|(px, qty)| (Px(px.0 * (Decimal::ONE + widen)), qty));
-        }
-        RiskAction::Ok | RiskAction::Halt => {}
-    }
-}
-
-/// Check profit guarantee before placing trades
-pub fn check_profit_guarantee(
-    quotes: &Quotes,
-    position_size_usd: f64,
-    profit_guarantee: &ProfitGuarantee,
-    cfg: &AppCfg,
-) -> (bool, String) {
-    let (bid_px, _bid_qty) = match quotes.bid {
-        Some((px, qty)) => (px, qty),
-        None => return (false, "no_bid_quote".to_string()),
-    };
-
-    let (ask_px, _ask_qty) = match quotes.ask {
-        Some((px, qty)) => (px, qty),
-        None => return (false, "no_ask_quote".to_string()),
-    };
-
-    let spread_bps = calculate_spread_bps(bid_px.0, ask_px.0);
-
-    // Calculate dynamic min spread
-    let dyn_min_spread_bps = profit_guarantee.calculate_min_spread_bps(position_size_usd);
-    let min_spread_bps_config = cfg.strategy.min_spread_bps.unwrap_or(30.0);
-    let min_spread_bps = dyn_min_spread_bps.max(min_spread_bps_config);
-
-    let stop_loss_threshold = cfg.internal.stop_loss_threshold;
-    let min_risk_reward_ratio = cfg.internal.min_risk_reward_ratio;
-
-    let (should_place, reason) = crate::utils::should_place_trade(
-        spread_bps,
-        position_size_usd,
-        min_spread_bps,
-        stop_loss_threshold,
-        min_risk_reward_ratio,
-        profit_guarantee,
-    );
-
-    if !should_place {
-        info!(
-            spread_bps,
-            min_spread_bps,
-            position_size_usd,
-            reason = %reason,
-            "profit guarantee filter: trade rejected"
-        );
-    }
-
-    (should_place, reason.to_string())
-}
 
 // ============================================================================
 // Symbol Processing
@@ -430,7 +331,7 @@ pub async fn process_symbol(
         quotes.ask = None;
     }
     
-    adjust_quotes_for_risk(&mut quotes, risk_action, cfg.internal.order_price_distance_no_position, cfg.internal.spread_widen_factor);
+    adjust_quotes_for_risk(&mut quotes, risk_action, cfg.internal.order_price_distance_no_position);
     
     // Calculate caps
     let caps = calculate_caps(state, &quote_asset, quote_balances, position_size_notional, current_pnl, effective_leverage, cfg);
@@ -754,7 +655,6 @@ pub fn initialize_symbol_states(
             pnl_history: Vec::new(),
             min_notional_req: None,
             disabled: false,
-            disabled_until: None,
             symbol_rules: None,
             rules_fetch_failed: false,
             last_rules_retry: None,
@@ -771,11 +671,8 @@ pub fn initialize_symbol_states(
             last_decay_check: None,
             position_entry_time: None,
             peak_pnl: Decimal::ZERO,
-            last_peak_update: None,
             position_hold_duration_ms: 0,
             last_order_price_update: HashMap::new(),
-            last_cancel_all_time: None,
-            cancel_all_attempt_count: 0,
             daily_pnl: Decimal::ZERO,
             total_funding_cost: Decimal::ZERO,
             position_size_notional_history: Vec::with_capacity(cfg.internal.position_size_history_max_len),
@@ -783,7 +680,6 @@ pub fn initialize_symbol_states(
             cumulative_pnl: Decimal::ZERO,
             last_applied_funding_time: None,
             last_daily_reset: None,
-            last_daily_reset_date: None,
             // PnL tracking for summary
             trade_count: 0,
             profitable_trade_count: 0,
@@ -795,16 +691,10 @@ pub fn initialize_symbol_states(
             total_fees_paid: Decimal::ZERO,
             last_pnl_summary_time: None,
             avg_entry_price: None,
-            last_direction_change: None,
-            current_direction: None,
-            direction_signal_strength: 0.0,
             position_closing: Arc::new(AtomicBool::new(false)),
             last_close_attempt: None,
             processed_events: HashSet::new(),
             last_event_cleanup: None,
-            price_history: Vec::with_capacity(10),
-            price_momentum_bps: 0.0,
-            regime: None,
         });
     }
     

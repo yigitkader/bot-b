@@ -17,7 +17,7 @@ pub mod types;
 pub mod utils;
 
 // Additional modules
-pub mod logger;  // TODO: Move to risk.rs in future consolidation
+pub mod logger;
 
 // Backward compatibility - old module names (deprecated, use exchange instead)
 pub use self::exchange as binance_exec;

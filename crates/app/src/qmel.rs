@@ -25,7 +25,6 @@ pub struct MarketState {
     pub cancel_trade_ratio: f64,     // Cancel/Trade ratio (spoof detection)
     pub oi_delta_30s: f64,           // Open Interest delta (30s window)
     pub funding_rate: Option<f64>,    // Current funding rate
-    pub timestamp: Instant,
 }
 
 impl Default for MarketState {
@@ -40,7 +39,6 @@ impl Default for MarketState {
             cancel_trade_ratio: 0.0,
             oi_delta_30s: 0.0,
             funding_rate: None,
-            timestamp: Instant::now(),
         }
     }
 }
@@ -253,14 +251,6 @@ impl FeatureExtractor {
         self.vol_5s_ewma
     }
 
-    /// Update cancel/trade ratio
-    pub fn record_cancel(&mut self) {
-        self.cancel_count += 1;
-    }
-
-    pub fn record_trade(&mut self) {
-        self.trade_count += 1;
-    }
 
     /// Get cancel/trade ratio (reset every 10 seconds)
     pub fn get_cancel_trade_ratio(&mut self) -> f64 {
@@ -280,20 +270,6 @@ impl FeatureExtractor {
         }
     }
 
-    /// Update OI delta tracking
-    pub fn update_oi(&mut self, oi: f64) {
-        let now = Instant::now();
-        self.oi_history.push_back((oi, now));
-        
-        // Keep only last 30 seconds
-        while let Some(&(_, t)) = self.oi_history.front() {
-            if now.duration_since(t) > Duration::from_secs(30) {
-                self.oi_history.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
 
     /// Get OI delta (30s window)
     pub fn get_oi_delta_30s(&self) -> f64 {
@@ -335,7 +311,6 @@ impl FeatureExtractor {
             cancel_trade_ratio,
             oi_delta_30s: oi_delta,
             funding_rate,
-            timestamp: Instant::now(),
         }
     }
 }
@@ -648,7 +623,6 @@ impl DirectionModel {
 pub struct ExpectedValueCalculator {
     maker_fee_rate: f64,
     taker_fee_rate: f64,
-    ev_threshold: f64, // Minimum EV to trade (e.g., $0.10)
     base_ev_threshold: f64, // Base threshold (adaptif olarak değişir)
     recent_ev_performance: VecDeque<f64>, // Son EV tahminlerinin performansı
 }
@@ -658,7 +632,6 @@ impl ExpectedValueCalculator {
         Self {
             maker_fee_rate,
             taker_fee_rate,
-            ev_threshold,
             base_ev_threshold: ev_threshold,
             recent_ev_performance: VecDeque::new(),
         }
@@ -744,10 +717,6 @@ impl ExpectedValueCalculator {
         p_down * target_profit_usd - p_up * stop_loss_usd - fees - estimated_slippage_usd
     }
 
-    /// Check if EV passes the gate
-    pub fn passes_alpha_gate(&self, ev: f64) -> bool {
-        ev > self.ev_threshold
-    }
 }
 
 // ============================================================================
@@ -814,87 +783,12 @@ impl RegimeClassifier {
 
 /// Dynamic margin allocation with min 10, max 100 USDC rule
 pub struct DynamicMarginAllocator {
-    min_margin_usdc: f64,
-    max_margin_usdc: f64,
-    f_min: f64,  // Minimum risk fraction (e.g., 0.02 = 2%)
-    f_max: f64,  // Maximum risk fraction (e.g., 0.15 = 15%)
 }
 
 impl DynamicMarginAllocator {
-    pub fn new(min_margin_usdc: f64, max_margin_usdc: f64, f_min: f64, f_max: f64) -> Self {
+    pub fn new(_min_margin_usdc: f64, _max_margin_usdc: f64, _f_min: f64, _f_max: f64) -> Self {
         Self {
-            min_margin_usdc,
-            max_margin_usdc,
-            f_min,
-            f_max,
         }
-    }
-
-    /// Calculate optimal risk fraction using clipped Kelly
-    /// f* = clip(EV / V, f_min, f_max)
-    fn calculate_optimal_fraction(&self, ev: f64, variance: f64) -> f64 {
-        if variance < 1e-8 {
-            return self.f_min;
-        }
-        let kelly_f = ev / variance;
-        kelly_f.max(self.f_min).min(self.f_max)
-    }
-
-    /// Split equity into margin chunks
-    /// Rule: min 10, max 100 USDC per trade
-    /// If E >= 100, first trade gets 100, remaining (E-100) follows same procedure
-    pub fn allocate_margin(
-        &self,
-        available_equity_usdc: f64,
-        ev: f64,
-        variance: f64,
-    ) -> Vec<f64> {
-        if available_equity_usdc < self.min_margin_usdc {
-            return vec![]; // Not enough for even one trade
-        }
-
-        let mut chunks = Vec::new();
-        let mut remaining = available_equity_usdc;
-        
-        // Calculate optimal fraction
-        let f_star = self.calculate_optimal_fraction(ev, variance);
-        
-        while remaining >= self.min_margin_usdc {
-            // Calculate margin for this chunk
-            let margin = (f_star * remaining).max(self.min_margin_usdc).min(self.max_margin_usdc);
-            
-            // If remaining is less than min, use all remaining (if >= min)
-            if remaining < self.max_margin_usdc {
-                if remaining >= self.min_margin_usdc {
-                    chunks.push(remaining);
-                }
-                break;
-            }
-            
-            chunks.push(margin);
-            remaining -= margin;
-            
-            // Safety: prevent infinite loop
-            if chunks.len() > 100 {
-                break;
-            }
-        }
-        
-        chunks
-    }
-
-    /// Calculate variance from recent returns (simplified)
-    pub fn estimate_variance(returns: &[f64]) -> f64 {
-        if returns.is_empty() {
-            return 0.01; // Default variance
-        }
-        
-        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>() / returns.len() as f64;
-        
-        variance.max(1e-6) // Minimum variance to avoid division by zero
     }
 }
 
@@ -904,16 +798,12 @@ impl DynamicMarginAllocator {
 
 /// Auto-Risk Governor for leverage selection
 pub struct AutoRiskGovernor {
-    alpha: f64,  // Safety coefficient [0.3, 0.6]
-    beta: f64,   // Volatility coefficient [0.5, 1.5]
     max_leverage: f64,
 }
 
 impl AutoRiskGovernor {
-    pub fn new(alpha: f64, beta: f64, max_leverage: f64) -> Self {
+    pub fn new(_alpha: f64, _beta: f64, max_leverage: f64) -> Self {
         Self {
-            alpha: alpha.max(0.3).min(0.6),
-            beta: beta.max(0.5).min(1.5),
             max_leverage,
         }
     }
@@ -974,56 +864,14 @@ impl AutoRiskGovernor {
 
 /// Execution optimizer for maker/taker decision and slippage estimation
 pub struct ExecutionOptimizer {
-    maker_fee_rate: f64,
-    taker_fee_rate: f64,
-    edge_decay_half_life_ms: f64, // Edge decay half-life in milliseconds
 }
 
 impl ExecutionOptimizer {
-    pub fn new(maker_fee_rate: f64, taker_fee_rate: f64, edge_decay_half_life_ms: f64) -> Self {
+    pub fn new(_maker_fee_rate: f64, _taker_fee_rate: f64, _edge_decay_half_life_ms: f64) -> Self {
         Self {
-            maker_fee_rate,
-            taker_fee_rate,
-            edge_decay_half_life_ms,
         }
     }
 
-    /// Estimate fill probability for maker order
-    /// Simplified model based on queue position and cancel rate
-    pub fn estimate_fill_probability(
-        &self,
-        queue_position: usize,
-        cancel_rate: f64,
-    ) -> f64 {
-        // Simple model: fill probability decreases with queue position and cancel rate
-        let base_prob = 1.0 / (1.0 + queue_position as f64 * 0.1);
-        let cancel_penalty = cancel_rate.min(1.0);
-        base_prob * (1.0 - cancel_penalty * 0.5)
-    }
-
-    /// Estimate expected queue wait time
-    pub fn estimate_queue_wait_time(
-        &self,
-        queue_position: usize,
-        avg_fill_rate: f64, // Average fills per second at this level
-    ) -> f64 {
-        if avg_fill_rate < 1e-8 {
-            return 1000.0; // Long wait if no fills
-        }
-        (queue_position as f64 / avg_fill_rate) * 1000.0 // Convert to milliseconds
-    }
-
-    /// Decide maker vs taker
-    /// If edge decay half-life < estimated queue wait time => taker
-    /// Otherwise => maker
-    pub fn decide_maker_taker(
-        &self,
-        edge_decay_half_life_ms: f64,
-        estimated_queue_wait_ms: f64,
-    ) -> bool {
-        // Maker if edge will still be valid when order fills
-        estimated_queue_wait_ms < edge_decay_half_life_ms
-    }
 
     /// Estimate slippage cost
     /// C_slip ≈ g(depth at price, size, latency)
@@ -1043,17 +891,6 @@ impl ExecutionOptimizer {
         (base_slippage + latency_penalty) * order_size_usd
     }
 
-    /// Test if order passes slippage constraint
-    /// EV - C_slip - fees > δ
-    pub fn passes_slippage_test(
-        &self,
-        ev: f64,
-        estimated_slippage: f64,
-        fees: f64,
-        threshold: f64,
-    ) -> bool {
-        (ev - estimated_slippage - fees) > threshold
-    }
 }
 
 // ============================================================================
@@ -1066,18 +903,16 @@ pub struct ParameterArm {
     pub target_tick: f64,
     pub stop_tick: f64,
     pub timeout_secs: f64,
-    pub maker_threshold: f64,
     pub reward_sum: f64,
     pub pull_count: u64,
 }
 
 impl ParameterArm {
-    pub fn new(target_tick: f64, stop_tick: f64, timeout_secs: f64, maker_threshold: f64) -> Self {
+    pub fn new(target_tick: f64, stop_tick: f64, timeout_secs: f64, _maker_threshold: f64) -> Self {
         Self {
             target_tick,
             stop_tick,
             timeout_secs,
-            maker_threshold,
             reward_sum: 0.0,
             pull_count: 0,
         }
@@ -1100,11 +935,10 @@ impl ParameterArm {
 /// Thompson Sampling bandit for parameter optimization
 pub struct ThompsonSamplingBandit {
     pub arms: Vec<ParameterArm>,
-    exploration_rate: f64,
 }
 
 impl ThompsonSamplingBandit {
-    pub fn new(exploration_rate: f64) -> Self {
+    pub fn new(_exploration_rate: f64) -> Self {
         // Initialize with default parameter combinations
         let mut arms = Vec::new();
         
@@ -1126,7 +960,6 @@ impl ThompsonSamplingBandit {
         
         Self {
             arms,
-            exploration_rate,
         }
     }
 
@@ -1188,18 +1021,13 @@ impl ThompsonSamplingBandit {
         }
     }
 
-    /// Get best arm parameters
-    pub fn get_best_arm(&self) -> Option<&ParameterArm> {
-        self.arms.iter()
-            .max_by(|a, b| a.average_reward().partial_cmp(&b.average_reward()).unwrap_or(std::cmp::Ordering::Equal))
-    }
 }
 
 // ============================================================================
 // Q-MEL Strategy (Main Integration)
 // ============================================================================
 
-use crate::strategy::{Context, Strategy, DirectionalStrategy};
+use crate::strategy::{Context, Strategy};
 use crate::types::Quotes;
 
 /// Q-MEL Trading Strategy
@@ -1213,7 +1041,6 @@ pub struct QMelStrategy {
     ev_calculator: ExpectedValueCalculator,
     
     // Risk management
-    margin_allocator: DynamicMarginAllocator,
     risk_governor: AutoRiskGovernor,
     execution_optimizer: ExecutionOptimizer,
     
@@ -1230,7 +1057,6 @@ pub struct QMelStrategy {
     target_tick_usd: f64,
     stop_tick_usd: f64,
     timeout_secs: f64,
-    ev_threshold: f64,
     
     // State tracking
     recent_returns: VecDeque<f64>,
@@ -1254,7 +1080,7 @@ impl QMelStrategy {
         let direction_model = DirectionModel::new(9); // 9 features
         let ev_calculator = ExpectedValueCalculator::new(maker_fee_rate, taker_fee_rate, ev_threshold);
         // KONSERVATİF: Risk fractions düşürüldü (güvenlik için)
-        let margin_allocator = DynamicMarginAllocator::new(min_margin_usdc, max_margin_usdc, 0.02, 0.10);
+        let _margin_allocator = DynamicMarginAllocator::new(min_margin_usdc, max_margin_usdc, 0.02, 0.10);
         // KONSERVATİF: Safe alpha (0.4) and beta (1.0) - max leverage 20x
         let safe_max_leverage = max_leverage.min(20.0);
         let risk_governor = AutoRiskGovernor::new(0.4, 1.0, safe_max_leverage);
@@ -1267,7 +1093,6 @@ impl QMelStrategy {
             prev_orderbook: None,
             direction_model,
             ev_calculator,
-            margin_allocator,
             risk_governor,
             execution_optimizer,
             regime_classifier,
@@ -1278,7 +1103,6 @@ impl QMelStrategy {
             target_tick_usd: 0.5,
             stop_tick_usd: 0.75,
             timeout_secs: 8.0,
-            ev_threshold,
             recent_returns: VecDeque::new(),
             daily_pnl: 0.0,
             daily_drawdown_pct: 0.0,
@@ -1288,30 +1112,6 @@ impl QMelStrategy {
         }
     }
 
-    /// Calculate margin chunks using DMA
-    pub fn calculate_margin_chunks(&self, available_equity_usdc: f64, ev: f64) -> Vec<f64> {
-        let variance = DynamicMarginAllocator::estimate_variance(
-            &self.recent_returns.iter().copied().collect::<Vec<_>>()
-        );
-        self.margin_allocator.allocate_margin(available_equity_usdc, ev, variance)
-    }
-
-    /// Calculate leverage using ARG
-    pub fn calculate_leverage(
-        &self,
-        stop_distance_pct: f64,
-        mmr: f64,
-        target_tick_usd: f64,
-        volatility_1s: f64,
-    ) -> f64 {
-        self.risk_governor.calculate_leverage(
-            stop_distance_pct,
-            mmr,
-            target_tick_usd,
-            volatility_1s,
-            self.daily_drawdown_pct,
-        )
-    }
 
     /// Update strategy with trade result (for online learning)
     pub fn update_with_trade_result(&mut self, net_pnl_usd: f64) {
@@ -1330,12 +1130,6 @@ impl QMelStrategy {
         self.daily_pnl += net_pnl_usd;
     }
 
-    /// Update daily drawdown
-    pub fn update_daily_drawdown(&mut self, current_equity: f64, peak_equity: f64) {
-        if peak_equity > 0.0 {
-            self.daily_drawdown_pct = ((peak_equity - current_equity) / peak_equity).max(0.0);
-        }
-    }
 }
 
 impl Strategy for QMelStrategy {
@@ -1703,107 +1497,6 @@ impl Strategy for QMelStrategy {
     /// Get feature importance (Strategy trait implementation)
     fn get_feature_importance(&self) -> Option<Vec<(String, f64)>> {
         Some(self.direction_model.calculate_feature_importance())
-    }
-    
-    /// Q-MEL kendi long/short kararını veriyor (EV ve probability bazlı)
-    /// Bu yüzden main.rs'de current_direction filtresi uygulanmamalı
-    fn applies_own_direction_filter(&self) -> bool {
-        true // Q-MEL kendi kararını veriyor
-    }
-}
-
-impl DirectionalStrategy for QMelStrategy {
-    /// Direction prediction: Hangi yönde trade yapılmalı?
-    /// Q-MEL: EV ve probability bazlı direction prediction
-    fn predict_direction(&self, ctx: &Context) -> Option<Side> {
-        // NOT: extract_state &mut self gerektirir, bu yüzden kullanılamaz
-        // Basit bir state oluştur (sadece direction prediction için gerekli alanlar)
-        // Bu metod sadece direction prediction için, tam state extraction gerekmez
-        let microprice = self.feature_extractor.calculate_microprice(&ctx.ob).unwrap_or(0.0);
-        let volatility_1s = self.feature_extractor.get_volatility_1s();
-        
-        // Basit state (sadece direction prediction için gerekli alanlar)
-        let state = MarketState {
-            ofi: 0.0, // OFI hesaplaması prev_orderbook gerektirir, skip
-            microprice,
-            spread_velocity: 0.0,
-            liquidity_pressure: 0.0,
-            volatility_1s,
-            volatility_5s: volatility_1s,
-            cancel_trade_ratio: 0.0,
-            oi_delta_30s: 0.0,
-            funding_rate: ctx.funding_rate,
-            timestamp: std::time::Instant::now(),
-        };
-        
-        // Predict direction probabilities
-        let p_up = self.direction_model.predict_up_probability(&state, self.target_tick_usd);
-        let p_down = 1.0 - p_up;
-        
-        // Calculate EV for both directions
-        let max_margin_usdc = 100.0;
-        let estimated_leverage = self.risk_governor.calculate_leverage(
-            0.01,
-            0.004,
-            self.target_tick_usd,
-            state.volatility_1s,
-            self.daily_drawdown_pct,
-        );
-        let estimated_position_size_usd = max_margin_usdc * estimated_leverage;
-        let estimated_slippage = self.execution_optimizer.estimate_slippage(
-            estimated_position_size_usd,
-            estimated_position_size_usd * 2.0,
-            50.0,
-        );
-        
-        let ev_long = self.ev_calculator.calculate_ev_long(
-            p_up,
-            self.target_tick_usd,
-            self.stop_tick_usd,
-            estimated_position_size_usd,
-            estimated_slippage,
-            true,
-        );
-        
-        let ev_short = self.ev_calculator.calculate_ev_short(
-            p_down,
-            self.target_tick_usd,
-            self.stop_tick_usd,
-            estimated_position_size_usd,
-            estimated_slippage,
-            true,
-        );
-        
-        // Win rate'e göre adaptive threshold
-        let win_rate = if self.recent_returns.len() > 0 {
-            let wins = self.recent_returns.iter().filter(|&&r| r > 0.0).count();
-            wins as f64 / self.recent_returns.len() as f64
-        } else {
-            0.5
-        };
-        
-        let base_min_probability: f64 = if win_rate < 0.45 {
-            0.55
-        } else if win_rate > 0.60 {
-            0.50
-        } else {
-            0.52
-        };
-        
-        let min_probability = base_min_probability.max(0.45_f64).min(0.60_f64);
-        let adaptive_threshold = self.ev_calculator.get_adaptive_threshold(win_rate);
-        
-        // Direction decision: EV ve probability bazlı
-        let should_trade_long = ev_long > adaptive_threshold && p_up > min_probability;
-        let should_trade_short = ev_short > adaptive_threshold && p_down > min_probability;
-        
-        if should_trade_long && ev_long > ev_short {
-            Some(Side::Buy)
-        } else if should_trade_short && ev_short > ev_long {
-            Some(Side::Sell)
-        } else {
-            None
-        }
     }
 }
 

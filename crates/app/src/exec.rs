@@ -16,15 +16,6 @@ pub struct VenueOrder {
 
 #[async_trait]
 pub trait Venue: Send + Sync {
-    async fn place_limit(
-        &self,
-        sym: &str,
-        side: Side,
-        px: Px,
-        qty: Qty,
-        tif: Tif,
-    ) -> Result<String>;
-    
     /// Place limit order with client order ID (for futures idempotency)
     async fn place_limit_with_client_id(
         &self,
@@ -39,7 +30,6 @@ pub trait Venue: Send + Sync {
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)>;
     async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>>;
     async fn get_position(&self, sym: &str) -> Result<Position>;
-    async fn mark_price(&self, sym: &str) -> Result<Px>;
     async fn close_position(&self, sym: &str) -> Result<()>;
 
     async fn cancel_all(&self, sym: &str) -> Result<()> {

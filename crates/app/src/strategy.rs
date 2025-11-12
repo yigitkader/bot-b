@@ -77,40 +77,8 @@ pub trait Strategy: Send + Sync {
         0.0 // Default: OFI bilgisi yok
     }
     
-    /// Strateji kendi long/short kararını veriyor mu? (GERİYE DÖNÜK UYUMLULUK)
-    /// true: Strateji zaten bid/ask kararını veriyor, main.rs'de direction filter uygulanmamalı
-    /// false: main.rs'de current_direction filtresi uygulanmalı (DynMm gibi)
-    /// 
-    /// NOT: Bu metod geriye dönük uyumluluk için korunuyor.
-    /// Yeni stratejiler DirectionalStrategy veya MarketMakingStrategy trait'lerini kullanmalı.
-    fn applies_own_direction_filter(&self) -> bool {
-        false // Default: main.rs'de filter uygulanır
-    }
 }
 
-/// Market Making Strategy: Her iki tarafta quote üretir (bid ve ask)
-/// Örnek: DynMm - spread'den kazanç, her iki tarafta likidite sağlar
-/// 
-/// Market making stratejileri her iki tarafta quote üretir.
-/// Bu metod zaten Strategy::on_tick() içinde implement edilmiş olmalı.
-/// Bu trait sadece tip güvenliği ve açıklık için.
-pub trait MarketMakingStrategy: Strategy {
-    // Marker trait: Her iki tarafta quote üretir (bid ve ask)
-}
-
-/// Directional Strategy: Tek taraf için quote üretir (long veya short)
-/// Örnek: QMelStrategy - direction prediction yapar, tek yönde pozisyon alır
-pub trait DirectionalStrategy: Strategy {
-    /// Direction prediction: Hangi yönde trade yapılmalı?
-    /// Returns: Some(Side::Buy) = Long, Some(Side::Sell) = Short, None = No trade
-    fn predict_direction(&self, ctx: &Context) -> Option<Side>;
-    
-    /// Directional stratejiler kendi long/short kararını verir
-    /// main.rs'de direction filter uygulanmamalı
-    fn applies_own_direction_filter(&self) -> bool {
-        true // Default: kendi direction kararını veriyor
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DynMmCfg {
@@ -162,10 +130,6 @@ pub struct DynMmCfg {
     // --- Diğer ---
     #[serde(default = "default_min_liquidity_required")]
     pub min_liquidity_required: f64, // Minimum likidite gereksinimi
-    #[serde(default = "default_min_24h_volume_usd")]
-    pub min_24h_volume_usd: f64, // Minimum 24h volume (USD) - 0.0 = devre dışı
-    #[serde(default = "default_min_book_depth_usd")]
-    pub min_book_depth_usd: f64, // Minimum book depth (USD) - 0.0 = devre dışı
     #[serde(default = "default_opportunity_size_multiplier")]
     pub opportunity_size_multiplier: f64, // Fırsat modu pozisyon çarpanı
     #[serde(default = "default_strong_trend_multiplier")]
@@ -175,8 +139,6 @@ pub struct DynMmCfg {
     pub manipulation_volume_ratio_threshold: Option<f64>,
     #[serde(default)]
     pub manipulation_time_threshold_ms: Option<u64>,
-    #[serde(default)]
-    pub manipulation_price_history_min_len: Option<usize>,
     #[serde(default)]
     pub manipulation_price_history_max_len: Option<usize>,
     #[serde(default)]
@@ -268,12 +230,6 @@ fn default_ofi_coefficient() -> f64 {
 fn default_min_liquidity_required() -> f64 {
     0.01
 }
-fn default_min_24h_volume_usd() -> f64 {
-    0.0
-}
-fn default_min_book_depth_usd() -> f64 {
-    0.0
-}
 fn default_opportunity_size_multiplier() -> f64 {
     1.2
 } // 1.5 → 1.2: daha güvenli, false positive riski azalt
@@ -305,14 +261,11 @@ pub struct DynMm {
     volatility_coefficient: f64,
     ofi_coefficient: f64,
     min_liquidity_required: f64,
-    min_24h_volume_usd: f64, // Config'den okunuyor, gelecekte kullanılacak
-    min_book_depth_usd: f64, // Config'den okunuyor, gelecekte kullanılacak
     opportunity_size_multiplier: f64,
     strong_trend_multiplier: f64,
     // Strategy internal config
     manipulation_volume_ratio_threshold: f64,
     manipulation_time_threshold_ms: u64,
-    manipulation_price_history_min_len: usize,
     manipulation_price_history_max_len: usize,
     flash_crash_recovery_window_ms: u64,
     flash_crash_recovery_min_points: usize,
@@ -396,8 +349,6 @@ impl From<DynMmCfg> for DynMm {
             volatility_coefficient: c.volatility_coefficient,
             ofi_coefficient: c.ofi_coefficient,
             min_liquidity_required: c.min_liquidity_required,
-            min_24h_volume_usd: c.min_24h_volume_usd,
-            min_book_depth_usd: c.min_book_depth_usd,
             opportunity_size_multiplier: c.opportunity_size_multiplier,
             strong_trend_multiplier: c.strong_trend_multiplier,
             // Strategy internal config (default değerler)
@@ -406,7 +357,6 @@ impl From<DynMmCfg> for DynMm {
                 .unwrap_or(5.0),
             // KRİTİK İYİLEŞTİRME: 2000ms → 5000ms (flash crash'ler 5-30 saniye sürebilir)
             manipulation_time_threshold_ms: c.manipulation_time_threshold_ms.unwrap_or(5000),
-            manipulation_price_history_min_len: c.manipulation_price_history_min_len.unwrap_or(3),
             manipulation_price_history_max_len: c.manipulation_price_history_max_len.unwrap_or(200),
             flash_crash_recovery_window_ms: c.flash_crash_recovery_window_ms.unwrap_or(30000),
             flash_crash_recovery_min_points: c.flash_crash_recovery_min_points.unwrap_or(10),
@@ -1784,10 +1734,6 @@ impl Strategy for DynMm {
     }
 }
 
-impl MarketMakingStrategy for DynMm {
-    // Market making stratejisi: Her iki tarafta quote üretir (bid ve ask)
-    // on_tick() zaten hem bid hem ask döndürüyor
-}
 
 #[cfg(test)]
 mod tests {
@@ -1827,15 +1773,12 @@ mod tests {
             min_liquidity_required: default_min_liquidity_required(),
             opportunity_size_multiplier: default_opportunity_size_multiplier(),
             strong_trend_multiplier: default_strong_trend_multiplier(),
-            min_24h_volume_usd: default_min_24h_volume_usd(),
-            min_book_depth_usd: default_min_book_depth_usd(),
             // Strategy internal config (test için default değerler)
             confidence_min_threshold: None,
             default_confidence: None,
             min_confidence_value: None,
             manipulation_volume_ratio_threshold: None,
             manipulation_time_threshold_ms: None,
-            manipulation_price_history_min_len: None,
             manipulation_price_history_max_len: None,
             flash_crash_recovery_window_ms: None,
             flash_crash_recovery_min_points: None,
@@ -1883,11 +1826,6 @@ mod tests {
         }
     }
 
-    /// Test constants
-    const DEFAULT_BID: Decimal = dec!(50000);
-    const DEFAULT_ASK: Decimal = dec!(50010);
-    const DEFAULT_SPREAD_BPS: f64 = 20.0; // 20 bps = 0.2%
-    const DEFAULT_LIQ_GAP_BPS: f64 = 500.0;
 
     #[test]
     fn test_microprice_calculation() {
@@ -2430,7 +2368,7 @@ mod tests {
             (now, dec!(49500)),        // Geri yükseliyor
         ];
 
-        if price_history_recovery.len() >= strategy.manipulation_price_history_min_len {
+        if price_history_recovery.len() >= 3 {
             let last_3: Vec<Decimal> = price_history_recovery
                 .iter()
                 .rev()
@@ -2459,7 +2397,7 @@ mod tests {
             (now, dec!(48500)), // Daha da düşüyor
         ];
 
-        if price_history_no_recovery.len() >= strategy.manipulation_price_history_min_len {
+        if price_history_no_recovery.len() >= 3 {
             let last_3: Vec<Decimal> = price_history_no_recovery
                 .iter()
                 .rev()
@@ -2546,8 +2484,8 @@ mod tests {
         // Limit değerinin mantıklı olduğunu kontrol et
         assert!(max_len > 0, "Price history max length should be positive");
         assert!(
-            max_len >= strategy.manipulation_price_history_min_len,
-            "Max length should be >= min length"
+            max_len >= 3,
+            "Max length should be >= min length (3)"
         );
 
         // Limit kontrolü mantığını test et
