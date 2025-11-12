@@ -203,8 +203,30 @@ async fn main() -> Result<()> {
                 .collect()
         };
         
+        // ✅ KRİTİK: Global tek-pozisyon/tek-order kuralı
+        // Tüm semboller arasında aynı anda sadece bir "exposure" olsun
+        // Bu kontrol WS event'leriyle uyum sağlar - fill geldiğinde diğer semboller skip edilir
+        let any_open = states.iter().any(|s| !s.inv.0.is_zero() || !s.active_orders.is_empty());
+        
         for state_idx in prioritized_indices {
             let state = &mut states[state_idx];
+            
+            // ✅ KRİTİK: Per-symbol rules zorunlu - fetch başarısızsa trade etme
+            // Global tek order modunda "kuralsız" sembolü tamamen skip et
+            if state.disabled || state.rules_fetch_failed || state.symbol_rules.is_none() {
+                skipped_count += 1;
+                continue; // Rules yoksa trade etme - tamamen skip et
+            }
+            
+            // ✅ KRİTİK: Global kontrol - başka bir sembolde exposure varsa, bu sembol beklesin
+            // Bu sayede gereksiz API çağrıları (best_prices, fetch_market_data) azalır
+            if any_open {
+                // Sadece exposure sahibi sembole izin ver
+                if state.inv.0.is_zero() && state.active_orders.is_empty() {
+                    skipped_count += 1;
+                    continue; // Bu sembol bu tick beklesin - API çağrısı yapma
+                }
+            }
             
             // Rate limit protection: Maximum symbols per tick
             if symbols_processed_this_tick >= max_symbols_per_tick {
@@ -214,7 +236,10 @@ async fn main() -> Result<()> {
             symbol_index_counter += 1;
 
             // Progress log: Log first N symbols and then periodically
-            if symbol_index_counter <= cfg.internal.progress_log_first_n_symbols || symbol_index_counter % cfg.internal.progress_log_interval == 0 {
+            // ✅ KRİTİK: İki koşulun "veya" birleşimi - düzgün formatlanmış
+            if symbol_index_counter <= cfg.internal.progress_log_first_n_symbols
+                || symbol_index_counter % cfg.internal.progress_log_interval == 0
+            {
                 info!(
                     progress = format!("{}/{}", symbol_index_counter, total_symbols),
                     processed_so_far = processed_count,

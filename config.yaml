@@ -31,7 +31,8 @@ qty_step: 0.001
 binance:
   # SPOT
   spot_base: "https://api.binance.com"
-  # USDⓈ-M Futures (USDC teminat)
+  # USDⓈ-M Futures (USDT/USDC destekler - fapi.binance.com)
+  # Not: Bu endpoint USDⓈ-M Futures için kullanılır (hem USDT hem USDC quote destekler)
   futures_base: "https://fapi.binance.com"
   api_key: ""
   secret_key: ""
@@ -45,14 +46,14 @@ risk:
   max_leverage: 50  # KRİTİK DÜZELTME: 100x çok tehlikeli, 50x ile sınırla
   slippage_bps_reserve: 2.0  # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
   use_isolated_margin: true  # Isolated margin kullan (20x-50x için kritik)
-  max_open_chunks_per_symbol_per_side: 5  # Sembol başına yönde maksimum açık chunk sayısı
+  max_open_chunks_per_symbol_per_side: 1  # ✅ KRİTİK: Tek chunk kuralı - aynı anda sadece 1 open_order veya 1 position
 
 strategy:
   type: "dyn_mm"  # "dyn_mm" | "qmel" - Q-MEL algoritması için "qmel" kullan
   # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
   a: 60.0   # 100.0 → 60.0: spread'i daralt (daha agresif, daha fazla işlem)
   b: 20.0    # 35.0 → 20.0: spread'i daralt (daha agresif, daha fazla işlem)
-  base_size: "20.0"  # 20 → 50 (daha fazla kazanç/işlem)
+  base_size: "11.0"  # 20 → 50 (daha fazla kazanç/işlem)
   
   # --- Q-MEL Algoritma Parametreleri (type: "qmel" için) ---
   # Q-MEL: Micro-Edge Trading Algorithm
@@ -136,7 +137,7 @@ internal:
   max_symbols_per_tick: 8
   rate_limiter_safety_factor: 0.8
   rate_limiter_min_interval_ms: 1000
-  order_sync_interval_sec: 2
+  order_sync_interval_sec: 8  # ✅ KRİTİK: Daha az request - WS event'leriyle uyum için 8 sn (önceden 2 sn)
   cancel_stagger_delay_ms: 50
   min_tick_interval_ms: 100  # Minimum tick interval (ms) - rate limit koruması için
   symbol_discovery_retry_interval_sec: 30  # Symbol discovery retry interval (seconds)

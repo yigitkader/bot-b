@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use crate::config::AppCfg;
 use crate::types::SymbolState;
-use crate::utils::{calc_net_pnl_usd, estimate_close_fee_bps, rate_limit_guard, record_pnl_snapshot, with_order_lock};
+use crate::utils::{calc_net_pnl_usd, rate_limit_guard, record_pnl_snapshot, with_order_lock};
 
 /// Sync inventory with API position
 pub fn sync_inventory(
@@ -159,7 +159,9 @@ pub fn update_position_tracking(
     }
 }
 
-/// Check if position should be closed based on profit/loss
+/// ✅ KRİTİK: Basit scalping kapatma mantığı - $0.50 net kâr garantisi
+/// Trailing/volatilite/akıllı kurallar kaldırıldı (sadelik, daha az request)
+/// Sadece TP ($0.50) ve opsiyonel SL (-$0.10) kaldı
 pub fn should_close_position_smart(
     state: &SymbolState,
     position: &Position,
@@ -184,15 +186,21 @@ pub fn should_close_position_smart(
         Side::Sell
     };
 
+    // ✅ KRİTİK: Exit price = market price (bid/ask) - market order ile kapatılacak
+    // Taker fee ile hesaplama yapılıyor (market exit garantisi)
     let exit_price = match position_side {
-        Side::Buy => bid.0,
-        Side::Sell => ask.0,
+        Side::Buy => bid.0, // Long pozisyon → Sell (bid'den sat)
+        Side::Sell => ask.0, // Short pozisyon → Buy (ask'ten al)
     };
 
+    // ✅ KRİTİK: Entry fee = maker (limit order ile açıldı)
+    // Exit fee = taker (market order ile kapatılacak - anında kapatma için)
     let entry_fee_bps = maker_fee_rate * 10000.0;
-    let exit_fee_bps = estimate_close_fee_bps(true, maker_fee_rate * 10000.0, taker_fee_rate * 10000.0);
+    let exit_fee_bps = taker_fee_rate * 10000.0; // Market exit = taker fee
 
     let qty_abs = position.qty.0.abs();
+    
+    // ✅ KRİTİK: Net PnL hesaplama - taker fee ile (market exit)
     let net_pnl = calc_net_pnl_usd(
         position.entry.0,
         exit_price,
@@ -202,123 +210,36 @@ pub fn should_close_position_smart(
         exit_fee_bps,
     );
 
-    // Rule 1: Fixed TP ($0.50)
+    // ✅ KRİTİK: Rule 1: Fixed TP ($0.50) - net PnL ≥ min_profit_usd
+    // Net PnL zaten taker fee ile hesaplandı, market ile anında kapatılacak
     if net_pnl >= min_profit_usd {
         return (true, format!("take_profit_{:.2}_usd", net_pnl));
     }
 
-    // KRİTİK DÜZELTME: Stop loss sıkılaştırıldı (-0.10 USDC'de kapat)
-    // Küçük zararlarda hemen kapat, büyük zararlara izin verme
+    // ✅ KRİTİK: Opsiyonel SL (-$0.10) - küçük zararlarda hemen kapat
+    // İstersen bu satırı kaldırarak sadece kârla kapanış yapabilirsin
     if net_pnl <= -0.10 {
         return (true, format!("stop_loss_{:.2}_usd", net_pnl));
     }
 
-    // KRİTİK: Inventory threshold kontrolü - pozisyon birikirse zorla kapat
+    // ✅ KRİTİK: Mutlak timeout - pozisyon ne durumda olursa olsun maksimum süre
+    // Market making için pozisyonlar çok uzun süre açık kalmamalı
+    if let Some(entry_time) = state.position_entry_time {
+        let age_secs = entry_time.elapsed().as_secs() as f64;
+        if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
+            return (true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
+        }
+    }
+
+    // ✅ KRİTİK: Inventory threshold kontrolü - pozisyon birikirse zorla kapat
     // Basit threshold: pozisyon çok büyükse kapat (0.5'ten fazla)
     if position_qty_f64.abs() > 0.5 {
         return (true, format!("inventory_threshold_exceeded_{:.2}", position_qty_f64));
     }
 
-    // Rule 2: Smart position management
-    let entry_time = match state.position_entry_time {
-        Some(t) => t,
-        None => return (false, "no_entry_time".to_string()),
-    };
-
-    let age_secs = entry_time.elapsed().as_secs() as f64;
-    
-    // ✅ KRİTİK: Zarar durumunda timeout kontrolü
-    // Eğer pozisyon zararda ve belirli bir süre geçtiyse, zorla kapat
-    if net_pnl < 0.0 && age_secs >= crate::constants::MAX_LOSS_DURATION_SEC {
-        return (true, format!("loss_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
-    }
-    
-    // ✅ KRİTİK: Mutlak timeout - pozisyon ne durumda olursa olsun maksimum süre
-    // Market making için pozisyonlar çok uzun süre açık kalmamalı
-    if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
-        return (true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
-    }
-
-    // Time-weighted profit thresholds
-    let time_weighted_threshold = if age_secs <= 10.0 {
-        min_profit_usd * 0.6
-    } else if age_secs <= 20.0 {
-        min_profit_usd
-    } else if age_secs <= 60.0 {
-        min_profit_usd * 0.4
-    } else {
-        min_profit_usd * 0.2
-    };
-
-    // Trend alignment
-    let trend_bps = state.strategy.get_trend_bps();
-    let position_side_f64 = if position.qty.0.is_sign_positive() { 1.0 } else { -1.0 };
-    let trend_aligned = (trend_bps > 0.0 && position_side_f64 > 0.0) || (trend_bps < 0.0 && position_side_f64 < 0.0);
-    let trend_factor = if trend_aligned { 1.3 } else { 0.8 };
-
-    // Momentum
-    let pnl_trend = if state.pnl_history.len() >= 10 {
-        let recent = &state.pnl_history[state.pnl_history.len().saturating_sub(10)..];
-        let first = recent[0];
-        let last = recent[recent.len() - 1];
-        if first > Decimal::ZERO {
-            ((last - first) / first).to_f64().unwrap_or(0.0)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-    let momentum_factor = if pnl_trend > 0.1 {
-        1.2
-    } else if pnl_trend < -0.1 {
-        0.7
-    } else {
-        1.0
-    };
-
-    // Volatility
-    let volatility = state.strategy.get_volatility();
-    let volatility_factor = if volatility > 0.05 {
-        0.7
-    } else if volatility < 0.01 {
-        1.2
-    } else {
-        1.0
-    };
-
-    // Peak PnL trailing
-    let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
-    let drawdown_from_peak = peak_pnl_f64 - net_pnl;
-    let trailing_stop_threshold = min_profit_usd * 0.5;
-    let should_close_trailing = peak_pnl_f64 > min_profit_usd && drawdown_from_peak > trailing_stop_threshold;
-
-    // Drawdown
-    let max_loss_threshold = -min_profit_usd * 2.0;
-    let should_close_drawdown = net_pnl < max_loss_threshold;
-
-    // Recovery (from loss to profit)
-    let was_in_loss = state.pnl_history.len() >= 2 && {
-        let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);
-        prev_pnl < 0.0
-    };
-    let should_close_recovery = was_in_loss && net_pnl > 0.0;
-
-    // Combined threshold
-    let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
-    let should_close_by_threshold = net_pnl >= combined_threshold;
-
-    if should_close_by_threshold {
-        (true, format!("smart_threshold_{:.2}_usd", net_pnl))
-    } else if should_close_trailing {
-        (true, format!("trailing_stop_{:.2}_usd", net_pnl))
-    } else if should_close_drawdown {
-        (true, format!("drawdown_{:.2}_usd", net_pnl))
-    } else if should_close_recovery {
-        (true, format!("recovery_{:.2}_usd", net_pnl))
-    } else {
-        (false, "".to_string())
-    }
+    // ✅ KRİTİK: Tüm "smart" kurallar kaldırıldı (trailing, volatilite, momentum, recovery, drawdown)
+    // Sadece basit TP/SL ve timeout kuralları kaldı - scalping için yeterli
+    (false, "".to_string())
 }
 
 /// Close position with retry mechanism

@@ -17,7 +17,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal::RoundingStrategy;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info, warn};
@@ -1780,7 +1780,7 @@ pub async fn place_side_orders(
     quote_balances: &mut HashMap<String, f64>,
     cfg: &AppCfg,
     tif: Tif,
-    json_logger: &Arc<Mutex<logger::JsonLogger>>,
+    json_logger: &logger::SharedLogger,
     ob: &OrderBook,
     profit_guarantee: &ProfitGuarantee,
 ) -> anyhow::Result<()> {
@@ -1790,9 +1790,35 @@ pub async fn place_side_orders(
             let open_orders = state.active_orders.values()
                 .filter(|o| o.side == side)
                 .count();
-            let available_margin = (caps.buy_total - *total_spent_on_side - total_spent_on_other).max(0.0);
-            // Enforce min 10, max 100 USD margin per operation
+            
+            // ✅ KRİTİK: Aktif pozisyonun chunk sayısını hesapla
+            // Pozisyonun yönü: state.inv pozitifse long (Buy), negatifse short (Sell)
+            // Pozisyonun chunk sayısı = position_size_notional / ortalama_chunk_boyutu
+            // Ortalama chunk boyutu: (min_margin + max_margin) / 2 = (10 + 100) / 2 = 55 USD
             let min_margin: f64 = cfg.min_usd_per_order.unwrap_or(10.0).max(10.0).min(100.0);
+            let max_margin: f64 = cfg.max_usd_per_order;
+            let avg_chunk_size = (min_margin + max_margin) / 2.0; // Ortalama chunk boyutu (55 USD)
+            
+            let position_chunks_count = {
+                let current_inv = state.inv.0;
+                let is_position_long = current_inv.is_sign_positive();
+                let is_position_short = current_inv.is_sign_negative();
+                let position_matches_side = (side == Side::Buy && is_position_long) || (side == Side::Sell && is_position_short);
+                
+                if position_matches_side && position_size_notional > 0.0 {
+                    // Pozisyon bu yönde (long için Buy, short için Sell)
+                    // Chunk sayısı = pozisyon notional / ortalama chunk boyutu
+                    let chunks = (position_size_notional / avg_chunk_size).ceil() as usize;
+                    chunks.max(1) // En az 1 chunk (pozisyon varsa)
+                } else {
+                    0 // Pozisyon bu yönde değil veya pozisyon yok
+                }
+            };
+            
+            // ✅ KRİTİK: Toplam açık chunk sayısı = açık emirler + aktif pozisyon
+            let total_open_chunks = open_orders + position_chunks_count;
+            
+            let available_margin = (caps.buy_total - *total_spent_on_side - total_spent_on_other).max(0.0);
             
             place_orders_with_profit_guarantee(
                 venue,
@@ -1806,6 +1832,7 @@ pub async fn place_side_orders(
                 available_margin,
                 effective_leverage,
                 open_orders,
+                total_open_chunks, // ✅ KRİTİK: Toplam açık chunk sayısı (emirler + pozisyon)
                 cfg.risk.max_open_chunks_per_symbol_per_side,
                 quote_asset,
                 quote_balances,
@@ -1971,9 +1998,8 @@ pub fn process_order_canceled(
         
         info!(%symbol, order_id = %order_id, client_order_id = ?client_order_id, "order canceled via event");
         
-        if let Ok(logger) = json_logger.lock() {
-            logger.log_order_canceled(symbol, order_id, "price_update_or_timeout", state.order_fill_rate);
-        }
+        // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+        json_logger.log_order_canceled(symbol, order_id, "price_update_or_timeout", state.order_fill_rate);
         
         info!(%symbol, order_id = %order_id, fill_rate = state.order_fill_rate, "order canceled: updating fill rate");
     } else {
@@ -2006,10 +2032,38 @@ pub fn process_order_fill_with_logging(
             %symbol,
             order_id = %order_id,
             side = ?side,
-            "POST-ONLY VIOLATION: order filled as taker"
+            price = %price.0,
+            qty = %qty.0,
+            "POST-ONLY VIOLATION: order filled as taker - invalidating fill, reducing fill rate, applying cooldown"
         );
+        
+        // ✅ KRİTİK: Post-only violation aksiyonları
+        // 1. Fill'i geçersizle (PnL'e yazma) - process_order_fill'i çağırma
+        // 2. Fill rate'i düşür (taker fill = kötü sinyal)
+        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+        state.order_fill_rate = (state.order_fill_rate * 0.5).max(0.1); // Agresif düşürme
+        
+        // 3. Sembolü cooldown'a al (3-5 sn)
+        const POST_ONLY_VIOLATION_COOLDOWN_SEC: u64 = 4; // 4 saniye cooldown
+        state.post_only_violation_cooldown = Some(Instant::now());
+        
+        // 4. Log violation (fill'i loglama - PnL'e yazılmıyor)
+        // Not: logger.log_order_filled çağrılmıyor çünkü fill geçersiz
+        // Violation zaten yukarıda warn! ile loglandı
+        
+        warn!(
+            %symbol,
+            order_id = %order_id,
+            fill_rate = state.order_fill_rate,
+            cooldown_sec = POST_ONLY_VIOLATION_COOLDOWN_SEC,
+            "POST-ONLY VIOLATION: fill invalidated, fill rate reduced, cooldown applied - spread will widen"
+        );
+        
+        // Fill'i geçersizle - false dön (fill işlenmedi)
+        return false;
     }
     
+    // Normal fill işleme (maker fill veya post-only değil)
     process_order_fill(
         state,
         order_id,
@@ -2023,9 +2077,8 @@ pub fn process_order_fill_with_logging(
         cfg.internal.fill_rate_increase_bonus,
     );
     
-    if let Ok(logger) = json_logger.lock() {
-        logger.log_order_filled(symbol, order_id, side, price, qty, is_maker, state.inv, state.order_fill_rate);
-    }
+    // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+    json_logger.log_order_filled(symbol, order_id, side, price, qty, is_maker, state.inv, state.order_fill_rate);
     
     true
 }

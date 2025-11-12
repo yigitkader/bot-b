@@ -11,8 +11,9 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 // ============================================================================
 // Log Event Types
@@ -122,17 +123,19 @@ pub enum LogEvent {
 }
 
 // ============================================================================
-// Logger Implementation
+// Logger Implementation (Channel-based, non-blocking)
 // ============================================================================
 
+/// ✅ KRİTİK: Async-safe logger - kanal (mpsc) + ayrı task kullanır
+/// std::sync::Mutex yerine tokio::sync::mpsc kullanarak bloklama riskini önler
 pub struct JsonLogger {
-    file: Arc<Mutex<std::fs::File>>,
-    enabled: bool,
+    event_tx: mpsc::UnboundedSender<LogEvent>,
 }
 
 impl JsonLogger {
-    /// Create a new JSON logger
-    pub fn new(log_file: &str) -> Result<Self, std::io::Error> {
+    /// Create a new JSON logger with channel-based async-safe implementation
+    /// Returns (logger, task_handle) - task_handle can be used to wait for logger shutdown
+    pub fn new(log_file: &str) -> Result<(Self, tokio::task::JoinHandle<()>), std::io::Error> {
         let path = PathBuf::from(log_file);
         
         // Create parent directories if they don't exist
@@ -140,15 +143,53 @@ impl JsonLogger {
             std::fs::create_dir_all(parent)?;
         }
         
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        // Open file for writing (will be used by background task)
+        let file_path = path.clone();
         
-        Ok(Self {
-            file: Arc::new(Mutex::new(file)),
-            enabled: true,
-        })
+        // Create channel for async event logging
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LogEvent>();
+        
+        // Spawn background task to write events to file
+        let task_handle = tokio::spawn(async move {
+            let mut file = match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Failed to open log file {}: {}", file_path.display(), e);
+                    return;
+                }
+            };
+            
+            // Process events from channel
+            while let Some(event) = event_rx.recv().await {
+                match serde_json::to_string(&event) {
+                    Ok(json) => {
+                        if let Err(e) = writeln!(file, "{}", json) {
+                            eprintln!("Failed to write log event: {}", e);
+                            // Continue processing other events
+                        } else if let Err(e) = file.flush() {
+                            eprintln!("Failed to flush log file: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to serialize log event: {}", e);
+                    }
+                }
+            }
+            
+            // Channel closed, flush and close file
+            let _ = file.flush();
+        });
+        
+        Ok((
+            Self {
+                event_tx,
+            },
+            task_handle,
+        ))
     }
     
     /// Get current timestamp in milliseconds
@@ -159,20 +200,12 @@ impl JsonLogger {
             .as_millis() as u64
     }
     
-    /// Write event to JSON file
-    fn write_event(&self, event: &LogEvent) -> Result<(), std::io::Error> {
-        if !self.enabled {
-            return Ok(());
+    /// Send event to channel (non-blocking, async-safe)
+    fn send_event(&self, event: LogEvent) {
+        // Unbounded channel - send never blocks
+        if let Err(e) = self.event_tx.send(event) {
+            eprintln!("Failed to send log event to channel: {}", e);
         }
-        
-        let json = serde_json::to_string(event)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        
-        let mut file = self.file.lock().unwrap();
-        writeln!(file, "{}", json)?;
-        file.flush()?;
-        
-        Ok(())
     }
     
     // ============================================================================
@@ -203,9 +236,7 @@ impl JsonLogger {
             tif: tif.to_string(),
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log order_created: {}", e);
-        }
+        self.send_event(event);
     }
     
     /// Log order fill
@@ -234,9 +265,7 @@ impl JsonLogger {
             fill_rate,
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log order_filled: {}", e);
-        }
+        self.send_event(event);
     }
     
     /// Log order cancellation
@@ -255,9 +284,7 @@ impl JsonLogger {
             fill_rate,
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log order_canceled: {}", e);
-        }
+        self.send_event(event);
     }
     
     // ============================================================================
@@ -299,9 +326,7 @@ impl JsonLogger {
             leverage,
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log position_updated: {}", e);
-        }
+        self.send_event(event);
     }
     
     /// Log position closed
@@ -339,9 +364,7 @@ impl JsonLogger {
             reason: reason.to_string(),
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log position_closed: {}", e);
-        }
+        self.send_event(event);
     }
     
     // ============================================================================
@@ -390,9 +413,7 @@ impl JsonLogger {
             leverage,
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log trade_completed: {}", e);
-        }
+        self.send_event(event);
     }
     
     /// Log rejected trade
@@ -413,9 +434,7 @@ impl JsonLogger {
             min_spread_bps,
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log trade_rejected: {}", e);
-        }
+        self.send_event(event);
     }
     
     /// Log PnL summary
@@ -446,19 +465,19 @@ impl JsonLogger {
             total_fees,
         };
         
-        if let Err(e) = self.write_event(&event) {
-            eprintln!("Failed to log pnl_summary: {}", e);
-        }
+        self.send_event(event);
     }
 }
 
-// Thread-safe logger wrapper
-pub type SharedLogger = Arc<Mutex<JsonLogger>>;
+// ✅ KRİTİK: Async-safe logger wrapper - kanal (mpsc) kullanır, bloklama yok
+// std::sync::Mutex yerine tokio::sync::mpsc kullanarak async kod içinde bloklama riskini önler
+pub type SharedLogger = Arc<JsonLogger>;
 
-/// Create a shared logger instance
-pub fn create_logger(log_file: &str) -> Result<SharedLogger, std::io::Error> {
-    let logger = JsonLogger::new(log_file)?;
-    Ok(Arc::new(Mutex::new(logger)))
+/// Create a shared logger instance with background task
+/// Returns (logger, task_handle) - task_handle can be used to wait for logger shutdown
+pub fn create_logger(log_file: &str) -> Result<(SharedLogger, tokio::task::JoinHandle<()>), std::io::Error> {
+    let (logger, task_handle) = JsonLogger::new(log_file)?;
+    Ok((Arc::new(logger), task_handle))
 }
 
 

@@ -16,13 +16,14 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ============================================================================
 // Order Analysis and Cancellation
 // ============================================================================
 
 /// Analyze existing orders and determine which ones should be canceled
+/// ✅ KRİTİK: Symbol başına cancel limiti ile rate limit koruması
 pub fn analyze_orders(
     state: &SymbolState,
     bid: Px,
@@ -30,6 +31,17 @@ pub fn analyze_orders(
     position_size_notional: f64,
     cfg: &AppCfg,
 ) -> Vec<String> {
+    // ✅ KRİTİK: Symbol başına bekleyen cancel sayısı limiti (rate limit koruması)
+    const MAX_PENDING_CANCELS_PER_SYMBOL: u32 = 3; // Symbol başına maksimum bekleyen cancel
+    if state.pending_cancels_count >= MAX_PENDING_CANCELS_PER_SYMBOL {
+        debug!(
+            pending_cancels = state.pending_cancels_count,
+            max_allowed = MAX_PENDING_CANCELS_PER_SYMBOL,
+            "cancel limit reached, skipping cancel analysis"
+        );
+        return Vec::new();
+    }
+    
     let mut orders_to_cancel = Vec::new();
 
     for (order_id, order) in &state.active_orders {
@@ -81,6 +93,11 @@ pub fn analyze_orders(
         let should_cancel_stale = order_age_ms > max_age_for_stale;
 
         if should_cancel_far || should_cancel_stale {
+            // Cancel limiti kontrolü - limit aşılmışsa daha fazla cancel ekleme
+            if orders_to_cancel.len() as u32 + state.pending_cancels_count >= MAX_PENDING_CANCELS_PER_SYMBOL {
+                break; // Limit aşıldı, daha fazla cancel ekleme
+            }
+            
             orders_to_cancel.push(order_id.clone());
             info!(
                 order_id = %order_id,
@@ -97,14 +114,48 @@ pub fn analyze_orders(
     orders_to_cancel
 }
 
-/// Cancel orders with stagger delay
+/// Cancel orders with stagger delay and backoff
+/// ✅ KRİTİK: Backoff mekanizması ile cancel churn azaltma (1.5s → 3s → 6s)
 pub async fn cancel_orders(
     venue: &BinanceFutures,
     symbol: &str,
     order_ids: &[String],
     state: &mut SymbolState,
     stagger_delay_ms: u64,
+    cfg: &AppCfg,
 ) -> Result<()> {
+    if order_ids.is_empty() {
+        return Ok(());
+    }
+    
+    // ✅ KRİTİK: Backoff kontrolü - son cancel'dan bu yana yeterli zaman geçti mi?
+    // Base interval config'ten alınır, backoff multiplier ile çarpılır (1.5s → 3s → 6s)
+    let base_interval_ms = cfg.exec.cancel_replace_interval_ms;
+    let backoff_interval_ms = (base_interval_ms as f64 * state.cancel_backoff_multiplier) as u64;
+    
+    if let Some(last_cancel) = state.last_cancel_time {
+        let elapsed_ms = last_cancel.elapsed().as_millis() as u64;
+        if elapsed_ms < backoff_interval_ms {
+            let remaining_ms = backoff_interval_ms - elapsed_ms;
+            debug!(
+                %symbol,
+                pending_cancels = state.pending_cancels_count,
+                elapsed_ms,
+                backoff_interval_ms,
+                remaining_ms,
+                "cancel backoff active, skipping cancel batch"
+            );
+            return Ok(()); // Backoff aktif, cancel yapma
+        }
+    }
+    
+    // Pending cancels sayısını artır
+    state.pending_cancels_count += order_ids.len() as u32;
+    state.last_cancel_time = Some(Instant::now());
+    
+    // Backoff multiplier'ı artır (1.0 → 2.0 → 4.0, max 4.0)
+    state.cancel_backoff_multiplier = (state.cancel_backoff_multiplier * 2.0).min(4.0);
+    
     for (idx, order_id) in order_ids.iter().enumerate() {
         if idx > 0 {
             tokio::time::sleep(Duration::from_millis(stagger_delay_ms)).await;
@@ -117,6 +168,14 @@ pub async fn cancel_orders(
             state.active_orders.remove(order_id);
             state.last_order_price_update.remove(order_id);
         }
+    }
+    
+    // Cancel işlemi tamamlandı, pending count'u azalt
+    state.pending_cancels_count = state.pending_cancels_count.saturating_sub(order_ids.len() as u32);
+    
+    // Başarılı cancel sonrası backoff'u azalt (yavaşça normale dön)
+    if state.pending_cancels_count == 0 {
+        state.cancel_backoff_multiplier = (state.cancel_backoff_multiplier * 0.9).max(1.0);
     }
 
     Ok(())
@@ -238,13 +297,14 @@ pub async fn place_orders_with_profit_guarantee(
     available_margin: f64,
     effective_leverage: f64,
     open_orders_count: usize,
+    total_open_chunks: usize, // ✅ KRİTİK: Toplam açık chunk sayısı (açık emirler + aktif pozisyon)
     max_chunks: usize,
     quote_asset: &str,
     quote_balances: &mut HashMap<String, f64>,
     total_spent: &mut f64,
     cfg: &AppCfg,
     _tif: Tif,
-    json_logger: &std::sync::Arc<std::sync::Mutex<logger::JsonLogger>>,
+    json_logger: &logger::SharedLogger,
     ob: &OrderBook,
     _maker_fee_rate: f64,
     taker_fee_rate: f64,
@@ -263,6 +323,8 @@ pub async fn place_orders_with_profit_guarantee(
         cfg.internal.order_price_distance_no_position
     };
 
+    // ✅ KRİTİK: No-fill decay ile quote genişletme birleştir
+    // Fill rate düşünce ve consecutive_no_fills artınca spread genişlet
     let fill_rate_factor = if state.order_fill_rate < 0.3 {
         0.5
     } else if state.order_fill_rate < 0.6 {
@@ -270,8 +332,25 @@ pub async fn place_orders_with_profit_guarantee(
     } else {
         1.0
     };
+    
+    // Consecutive no-fills için ek spread genişletme
+    let no_fill_multiplier = if state.consecutive_no_fills >= 5 {
+        1.3 // 5+ consecutive no-fill → %30 daha geniş spread
+    } else if state.consecutive_no_fills >= 3 {
+        1.15 // 3+ consecutive no-fill → %15 daha geniş spread
+    } else {
+        1.0
+    };
 
-    let max_distance_pct = base_distance_pct * fill_rate_factor;
+    // ✅ KRİTİK: Post-only violation sonrası spread widen (ek güvenlik)
+    // Post-only violation sonrası cooldown varsa spread'i daha da genişlet
+    let post_only_violation_multiplier = if state.post_only_violation_cooldown.is_some() {
+        1.5 // %50 daha geniş spread (cooldown sırasında)
+    } else {
+        1.0
+    };
+
+    let max_distance_pct = base_distance_pct * fill_rate_factor * no_fill_multiplier * post_only_violation_multiplier;
     let trend_bps = state.strategy.get_trend_bps();
     let px_clamped = adjust_price_for_aggressiveness(
         px_raw.0,
@@ -284,11 +363,18 @@ pub async fn place_orders_with_profit_guarantee(
     );
     let px = Px(px_clamped);
 
+    // ✅ KRİTİK: Per-symbol rules zorunlu - fetch başarısızsa trade etme
+    // Global tek order modunda "kuralsız" sembolü tamamen skip et
     let rules_opt = state.symbol_rules.clone();
     let rules = match rules_opt.as_ref() {
         Some(r) => r,
         None => {
-            warn!(symbol = %symbol, "no exchange rules available, skipping");
+            warn!(
+                symbol = %symbol,
+                disabled = state.disabled,
+                rules_fetch_failed = state.rules_fetch_failed,
+                "CRITICAL: no exchange rules available, skipping order placement (rules required for trading)"
+            );
             return Ok(());
         }
     };
@@ -323,9 +409,24 @@ pub async fn place_orders_with_profit_guarantee(
         available_margin,
         chunks_count = margin_chunks.len(),
         open_orders = open_orders_count,
+        total_open_chunks,
         max_chunks,
         "margin chunking for orders"
     );
+
+    // ✅ KRİTİK: max_open_chunks_per_symbol_per_side kontrolü
+    // Toplam açık chunk sayısı (açık emirler + aktif pozisyon) max_chunks'ı aşmamalı
+    if total_open_chunks >= max_chunks {
+        warn!(
+            %symbol,
+            side = ?side,
+            total_open_chunks,
+            max_chunks,
+            open_orders = open_orders_count,
+            "max_open_chunks_per_symbol_per_side limit reached, skipping new order placement"
+        );
+        return Ok(());
+    }
 
     // KRİTİK: Bir anda sadece 1 open order veya 1 position olmalı
     // Çok fazla order/position kontrol etmek zor ve çok fazla request gerektirir
@@ -339,6 +440,51 @@ pub async fn place_orders_with_profit_guarantee(
             "skipping chunk processing: already has open order, will process next chunk when current order closes"
         );
         return Ok(());
+    }
+
+    // ✅ KRİTİK: One-way mode'da karşı yöne emir atarken önce reduce-only emir gönder
+    // One-way mode'da (hedge_mode: false) aynı sembolde iki yönlü pozisyon olamaz
+    // Net qty > 0 (long) iken SELL açılışını önce reduce, sonra gerekiyorsa yeni yöne aç
+    // Net qty < 0 (short) iken BUY açılışını önce reduce, sonra gerekiyorsa yeni yöne aç
+    let current_inv = state.inv.0;
+    let is_one_way_mode = !cfg.binance.hedge_mode; // One-way mode kontrolü
+    
+    if is_one_way_mode && !current_inv.is_zero() {
+        let would_flip = (current_inv.is_sign_positive() && side == Side::Sell) ||
+                         (current_inv.is_sign_negative() && side == Side::Buy);
+        
+        if would_flip {
+            // Karşı yöne emir atıyoruz - önce mevcut pozisyonu reduce et
+            info!(
+                %symbol,
+                side = ?side,
+                current_inv = %current_inv,
+                "ONE-WAY MODE: closing existing position before opening opposite side order"
+            );
+            
+            // Market order ile reduce-only emir gönder (pozisyonu kapat)
+            // close_position -> flatten_position zaten reduceOnly=true kullanıyor
+            rate_limit_guard(1).await;
+            match venue.close_position(symbol).await {
+                Ok(_) => {
+                    info!(
+                        %symbol,
+                        "ONE-WAY MODE: position closed, can now place opposite side order"
+                    );
+                    // Pozisyon kapatıldı, state'i güncelle
+                    state.inv = Qty(Decimal::ZERO);
+                    state.last_inventory_update = Some(Instant::now());
+                }
+                Err(e) => {
+                    warn!(
+                        %symbol,
+                        error = %e,
+                        "ONE-WAY MODE: failed to close position, skipping opposite side order"
+                    );
+                    return Ok(()); // Close başarısız, karşı yöne emir atma
+                }
+            }
+        }
     }
 
     // Sadece ilk chunk'ı işle (bir anda sadece 1 order)
@@ -370,6 +516,113 @@ pub async fn place_orders_with_profit_guarantee(
         Side::Sell => px.0.min(optimal_price_from_depth).max(ask.0),
     };
 
+    // ✅ KRİTİK: Post-only emirler için cross kontrolü ve fiyat ayarlaması (yerleştirme öncesi)
+    // Post-only emirler cross ederse taker olur, bu maker fee garantisini bozar
+    // Cross ediyorsa fiyatı bir tick dışarı it, tekrar cross etmiyorsa devam et
+    let px_final = if matches!(OPENING_ORDER_TIF, Tif::PostOnly) {
+        let tick_size = rules.tick_size;
+        
+        // Cross kontrolü
+        let will_cross = match side {
+            Side::Buy => px_with_depth >= ask.0, // Buy order ask'e vuruyor mu?
+            Side::Sell => px_with_depth <= bid.0, // Sell order bid'e vuruyor mu?
+        };
+        
+        if will_cross {
+            // ✅ KRİTİK: Fiyatı bir tick dışarı it
+            let adjust = tick_size;
+            let px_adjusted = match side {
+                Side::Buy => px_with_depth - adjust, // Buy: bir tick aşağı
+                Side::Sell => px_with_depth + adjust, // Sell: bir tick yukarı
+            };
+            
+            // ✅ KRİTİK: Tekrar cross kontrolü - hala cross ediyorsa skip et
+            let still_crosses = match side {
+                Side::Buy => px_adjusted >= ask.0,
+                Side::Sell => px_adjusted <= bid.0,
+            };
+            
+            if still_crosses {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    original_price = %px_with_depth,
+                    adjusted_price = %px_adjusted,
+                    bid = %bid.0,
+                    ask = %ask.0,
+                    tick_size = %tick_size,
+                    "POST-ONLY VIOLATION: order still crosses after adjustment, skipping to prevent taker fill"
+                );
+                return Ok(());
+            }
+            
+            // ✅ KRİTİK: Güvence - en az 1 tick mesafe kontrolü
+            let min_safe_distance = match side {
+                Side::Buy => {
+                    let min_safe_price = ask.0 - tick_size;
+                    px_adjusted <= min_safe_price
+                }
+                Side::Sell => {
+                    let min_safe_price = bid.0 + tick_size;
+                    px_adjusted >= min_safe_price
+                }
+            };
+            
+            if !min_safe_distance {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    adjusted_price = %px_adjusted,
+                    bid = %bid.0,
+                    ask = %ask.0,
+                    tick_size = %tick_size,
+                    "POST-ONLY SAFETY: adjusted price too close to market (less than 1 tick), skipping to prevent cross"
+                );
+                return Ok(());
+            }
+            
+            debug!(
+                %symbol,
+                side = ?side,
+                original_price = %px_with_depth,
+                adjusted_price = %px_adjusted,
+                tick_size = %tick_size,
+                "POST-ONLY: price adjusted to prevent cross"
+            );
+            
+            px_adjusted
+        } else {
+            // Cross etmiyor, ama yine de 1 tick mesafe kontrolü
+            let min_safe_distance = match side {
+                Side::Buy => {
+                    let min_safe_price = ask.0 - tick_size;
+                    px_with_depth <= min_safe_price
+                }
+                Side::Sell => {
+                    let min_safe_price = bid.0 + tick_size;
+                    px_with_depth >= min_safe_price
+                }
+            };
+            
+            if !min_safe_distance {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    price = %px_with_depth,
+                    bid = %bid.0,
+                    ask = %ask.0,
+                    tick_size = %tick_size,
+                    "POST-ONLY SAFETY: order too close to market (less than 1 tick), skipping to prevent cross"
+                );
+                return Ok(());
+            }
+            
+            px_with_depth
+        }
+    } else {
+        px_with_depth
+    };
+
     // ✅ DOĞRULAMA: Leverage sadece burada uygulanıyor (çift sayma yok)
     // margin_chunk: USD (leverage uygulanmamış)
     // margin_chunk_leveraged: USD (leverage uygulanmış notional)
@@ -377,7 +630,7 @@ pub async fn place_orders_with_profit_guarantee(
     let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
     let qty_price_result = crate::utils::calc_qty_from_margin(
         margin_chunk_leveraged,  // ✅ Zaten leveraged notional
-        px_with_depth,
+        px_final, // ✅ Post-only cross kontrolü sonrası final fiyat
         rules,
         side,
     );
@@ -397,22 +650,117 @@ pub async fn place_orders_with_profit_guarantee(
 
     let chunk_qty = Qty(chunk_qty_dec);
     let chunk_price = Px(chunk_price_dec);
+    
+    // ✅ KRİTİK: Quantize sonrası final cross kontrolü
+    // Quantize işlemi fiyatı değiştirebilir, tekrar kontrol et
+    if matches!(OPENING_ORDER_TIF, Tif::PostOnly) {
+        let tick_size = rules.tick_size;
+        let would_cross_after_quantize = match side {
+            Side::Buy => chunk_price.0 >= ask.0,
+            Side::Sell => chunk_price.0 <= bid.0,
+        };
+        
+        if would_cross_after_quantize {
+            warn!(
+                %symbol,
+                side = ?side,
+                chunk_price = %chunk_price.0,
+                bid = %bid.0,
+                ask = %ask.0,
+                "POST-ONLY VIOLATION: quantized price crosses market, skipping to prevent taker fill"
+            );
+            return Ok(());
+        }
+        
+        // Ek güvenlik: En az 1 tick mesafe kontrolü (quantize sonrası)
+        let min_safe_distance = match side {
+            Side::Buy => {
+                let min_safe_price = ask.0 - tick_size;
+                chunk_price.0 <= min_safe_price
+            }
+            Side::Sell => {
+                let min_safe_price = bid.0 + tick_size;
+                chunk_price.0 >= min_safe_price
+            }
+        };
+        
+        if !min_safe_distance {
+            warn!(
+                %symbol,
+                side = ?side,
+                chunk_price = %chunk_price.0,
+                bid = %bid.0,
+                ask = %ask.0,
+                tick_size = %tick_size,
+                "POST-ONLY SAFETY: quantized price too close to market (less than 1 tick), skipping to prevent cross"
+            );
+            return Ok(());
+        }
+    }
 
+    // ✅ KRİTİK: Quantize sonrası notional hesaplama ve 10-100 USD kuralı doğrulama
+    // Quantize işlemi (calc_qty_from_margin) qty ve price'ı yuvarladığı için notional değişebilir
+    // Örnek: 15 USD margin → quantize sonrası 8 USD notional olabilir → < 10 USD → skip edilmeli
     let chunk_notional = chunk_price.0 * chunk_qty.0;
-    let min_req_dec = {
-        let v = state.min_notional_req.unwrap_or(min_margin);
-        Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
-    };
-    if chunk_notional < min_req_dec {
+    
+    // 1. Exchange'in minimum notional gereksinimi (genellikle 5-10 USD)
+    let min_notional_req_dec = state.min_notional_req
+        .map(|v| Decimal::from_f64(v).unwrap_or(Decimal::ZERO))
+        .unwrap_or(Decimal::ZERO);
+    
+    // 2. Risk sınırları: min_margin (10 USD) ve max_usd_per_order (100 USD)
+    let min_margin_dec = Decimal::from_f64(min_margin).unwrap_or(Decimal::ZERO);
+    let max_margin_dec = Decimal::from_f64(cfg.max_usd_per_order).unwrap_or(Decimal::from(100));
+    
+    // 3. Quantize sonrası notional kontrolü
+    // a) Exchange'in minimum notional gereksiniminden küçük olamaz
+    if !min_notional_req_dec.is_zero() && chunk_notional < min_notional_req_dec {
         warn!(
             %symbol,
             side = ?side,
             chunk_notional = %chunk_notional,
-            min_req = %min_req_dec,
-            "chunk notional below min_notional, skipping"
+            min_notional_req = %min_notional_req_dec,
+            "chunk notional below exchange min_notional after quantization, skipping"
         );
         return Ok(());
     }
+    
+    // b) Risk sınırı: 10 USD minimum (quantize sonrası küçüldüyse skip et)
+    if chunk_notional < min_margin_dec {
+        warn!(
+            %symbol,
+            side = ?side,
+            chunk_notional = %chunk_notional,
+            min_margin = %min_margin_dec,
+            margin_chunk = *margin_chunk,
+            "chunk notional below 10 USD minimum after quantization, skipping (quantize reduced size)"
+        );
+        return Ok(());
+    }
+    
+    // c) Risk sınırı: 100 USD maximum (quantize sonrası büyüdüyse skip et)
+    if chunk_notional > max_margin_dec {
+        warn!(
+            %symbol,
+            side = ?side,
+            chunk_notional = %chunk_notional,
+            max_margin = %max_margin_dec,
+            margin_chunk = *margin_chunk,
+            "chunk notional above 100 USD maximum after quantization, skipping (quantize increased size)"
+        );
+        return Ok(());
+    }
+    
+    // ✅ DOĞRULAMA: Quantize sonrası notional 10-100 USD aralığında
+    debug!(
+        %symbol,
+        side = ?side,
+        chunk_notional = %chunk_notional,
+        min_margin = %min_margin_dec,
+        max_margin = %max_margin_dec,
+        margin_chunk = *margin_chunk,
+        "quantize validation passed: notional in 10-100 USD range"
+    );
 
     // Profit guarantee check with TP calculation
     let fee_bps_entry = fee_rate_to_bps(taker_fee_rate);
@@ -592,17 +940,16 @@ pub async fn place_orders_with_profit_guarantee(
             *cached_balance = cached_balance.max(0.0);
         }
 
-        if let Ok(logger) = json_logger.lock() {
-            logger.log_order_created(
-                symbol,
-                &simulated_order_id,
-                side,
-                chunk_price,
-                chunk_qty,
-                "dry_run_simulation",
-                &cfg.exec.tif,
-            );
-        }
+        // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+        json_logger.log_order_created(
+            symbol,
+            &simulated_order_id,
+            side,
+            chunk_price,
+            chunk_qty,
+            "dry_run_simulation",
+            &cfg.exec.tif,
+        );
 
         let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
         info!(
@@ -616,6 +963,67 @@ pub async fn place_orders_with_profit_guarantee(
             action = if matches!(side, Side::Buy) { "SIM BUY" } else { "SIM SELL" },
             "simulated order created (dry_run)"
         );
+        
+        // ✅ KRİTİK: Dry-run'da fill simülasyonu - maker fee ve slippage=0 ile simüle et
+        // Post-only emirler için maker fill simüle et, taker durumunu post-only ihlali olarak test et
+        let _is_post_only = cfg.exec.tif.to_lowercase() == "post_only";
+        
+        // Dry-run'da normal durumda maker fill simüle et (slippage=0)
+        // Taker durumunu test etmek için: %10 ihtimalle taker fill simüle et (post-only ihlali testi)
+        let simulate_as_maker = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            simulated_order_id.hash(&mut hasher);
+            let hash = hasher.finish();
+            (hash % 10) != 0 // %90 maker, %10 taker (test için)
+        };
+        
+        // Simüle edilmiş fill - maker veya taker fee ile (slippage=0)
+        let fee_rate = if simulate_as_maker {
+            _maker_fee_rate
+        } else {
+            taker_fee_rate
+        };
+        let simulated_commission = chunk_notional_log * fee_rate;
+        let simulated_commission_dec = Decimal::from_f64_retain(simulated_commission).unwrap_or(Decimal::ZERO);
+        
+        // Dry-run fill simülasyonu - process_order_fill_with_logging kullan
+        // Taker durumu post-only ihlali olarak simüle edilecek (process_order_fill_with_logging içinde)
+        use crate::utils::process_order_fill_with_logging;
+        let fill_result = process_order_fill_with_logging(
+            state,
+            symbol,
+            &simulated_order_id,
+            side,
+            chunk_qty,
+            chunk_price,
+            simulate_as_maker, // Maker veya taker fill simüle et
+            chunk_qty, // Cumulative filled qty
+            "FILLED", // Order status
+            simulated_commission_dec,
+            cfg,
+            json_logger,
+        );
+        
+        if !fill_result && !simulate_as_maker {
+            // Taker fill post-only ihlali olarak iptal edildi - bu beklenen davranış
+            info!(
+                %symbol,
+                order_id = %simulated_order_id,
+                "dry-run taker fill simulated and rejected (post-only violation test - expected)"
+            );
+        } else {
+            info!(
+                %symbol,
+                order_id = %simulated_order_id,
+                side = ?side,
+                commission = simulated_commission,
+                is_maker = simulate_as_maker,
+                "dry-run fill simulated ({} fee, slippage=0)",
+                if simulate_as_maker { "maker" } else { "taker" }
+            );
+        }
     } else {
         rate_limit_guard(1).await;
 
@@ -670,17 +1078,16 @@ pub async fn place_orders_with_profit_guarantee(
                     *cached_balance = cached_balance.max(0.0);
                 }
 
-                if let Ok(logger) = json_logger.lock() {
-                    logger.log_order_created(
-                        symbol,
-                        &order_id,
-                        side,
-                        chunk_price,
-                        chunk_qty,
-                        "spread_opportunity",
-                        &cfg.exec.tif,
-                    );
-                }
+                // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+                json_logger.log_order_created(
+                    symbol,
+                    &order_id,
+                    side,
+                    chunk_price,
+                    chunk_qty,
+                    "spread_opportunity",
+                    &cfg.exec.tif,
+                );
 
                 let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
                 info!(

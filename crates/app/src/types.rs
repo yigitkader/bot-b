@@ -98,6 +98,14 @@ pub struct SymbolState {
     pub last_decay_period: Option<u64>, // Son fill rate decay period (optimizasyon için)
     pub last_decay_check: Option<Instant>, // Son decay kontrol zamanı (overhead önleme için)
     
+    // Post-only violation cooldown
+    pub post_only_violation_cooldown: Option<Instant>, // Post-only violation sonrası cooldown (3-5 sn)
+    
+    // Cancel/replace churn control
+    pub pending_cancels_count: u32, // Symbol başına bekleyen cancel sayısı (rate limit koruması)
+    pub last_cancel_time: Option<Instant>, // Son cancel zamanı (backoff için)
+    pub cancel_backoff_multiplier: f64, // Cancel backoff çarpanı (1.0 → 2.0 → 4.0)
+    
     // Position management
     pub position_entry_time: Option<Instant>,
     pub peak_pnl: Decimal,

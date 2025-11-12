@@ -404,35 +404,64 @@ impl BinanceFutures {
         }
     }
     
-    /// Per-symbol metadata (tick_size, step_size) alır, fallback olarak global değerleri kullanır
+    /// Per-symbol metadata (tick_size, step_size) alır
+    /// KRİTİK: Global fallback kullanmaz - her sembol için gerçek rules gerekli
+    /// Fallback kullanmak LOT_SIZE ve PRICE_FILTER hatalarına yol açabilir
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }
 
-        let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
-        match send_json::<FutExchangeInfo>(self.common.client.get(url)).await {
-            Ok(info) => {
-                let sym_rec = info
-                    .symbols
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("symbol info missing"))?;
-                let rules = Arc::new(rules_from_fut_symbol(sym_rec));
-                FUT_RULES.insert(sym.to_string(), rules.clone());
-                Ok(rules)
-            }
-            Err(err) => {
-                warn!(error = ?err, %sym, "failed to fetch futures symbol rules, using fallbacks");
-                Ok(Arc::new(SymbolRules {
-                    tick_size: self.price_tick,
-                    step_size: self.qty_step,
-                    price_precision: self.price_precision,
-                    qty_precision: self.qty_precision,
-                    min_notional: Decimal::ZERO,
-                }))
+        // Geçici hata durumunda retry mekanizması (max 2 retry)
+        const MAX_RETRIES: u32 = 2;
+        let mut last_error = None;
+        
+        for attempt in 0..=MAX_RETRIES {
+            let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
+            match send_json::<FutExchangeInfo>(self.common.client.get(url)).await {
+                Ok(info) => {
+                    let sym_rec = info
+                        .symbols
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("symbol info missing"))?;
+                    let rules = Arc::new(rules_from_fut_symbol(sym_rec));
+                    FUT_RULES.insert(sym.to_string(), rules.clone());
+                    return Ok(rules);
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if attempt < MAX_RETRIES {
+                        // Geçici hata olabilir, kısa bir bekleme ile retry
+                        let backoff_ms = 100 * (attempt + 1) as u64;
+                        warn!(
+                            error = ?last_error,
+                            %sym,
+                            attempt = attempt + 1,
+                            max_retries = MAX_RETRIES + 1,
+                            backoff_ms,
+                            "failed to fetch futures symbol rules, retrying..."
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+                }
             }
         }
+        
+        // Tüm retry'ler başarısız oldu - hata dön (fallback kullanma)
+        error!(
+            error = ?last_error,
+            %sym,
+            "CRITICAL: failed to fetch futures symbol rules after {} retries, cannot use global fallback (would cause LOT_SIZE/PRICE_FILTER errors)",
+            MAX_RETRIES + 1
+        );
+        Err(anyhow!(
+            "failed to fetch symbol rules for {} after {} retries: {}",
+            sym,
+            MAX_RETRIES + 1,
+            last_error.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string())
+        ))
     }
 
 
@@ -937,10 +966,15 @@ impl Venue for BinanceFutures {
             Side::Sell => "SELL",
         };
         let tif_str = match tif {
-            Tif::PostOnly => "GTX",
+            Tif::PostOnly => "GTX", // Binance GTX: Post-only, cross ederse otomatik iptal
             Tif::Gtc => "GTC",
             Tif::Ioc => "IOC",
         };
+
+        // ✅ KRİTİK: Post-only (GTX) emirler için not
+        // Not: order.rs'de emir gönderilmeden önce cross kontrolü yapılıyor
+        // Binance GTX kullanıldığında, emir cross ederse otomatik olarak iptal edilir
+        // Ancak emir gönderilmeden önce kontrol etmek daha verimlidir (order.rs'de yapılıyor)
 
         let rules = self.rules_for(sym).await?;
 

@@ -63,9 +63,10 @@ pub async fn initialize_app() -> Result<AppInitResult> {
         crate::monitor::init_prom(port);
     }
 
-    // Initialize JSON logger
-    let json_logger = create_logger("logs/trading_events.json")
+    // Initialize JSON logger (channel-based, async-safe)
+    let (json_logger, _logger_task_handle) = create_logger("logs/trading_events.json")
         .map_err(|e| anyhow!("Failed to initialize JSON logger: {}", e))?;
+    // Note: logger_task_handle is kept alive by the Arc, no need to await it
 
     info!(
         inv_cap = %cfg.risk.inv_cap,

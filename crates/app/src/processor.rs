@@ -57,6 +57,36 @@ pub async fn process_symbol(
     // Sync orders if needed
     if should_sync_orders(state, cfg.internal.order_sync_interval_sec * 1000) || force_sync_all {
         sync_orders_from_api(venue, symbol, state, cfg).await;
+        
+        // ✅ KRİTİK: Sync sonrası çift taraf kontrolü - sembol başına tek taraf açık emir
+        // Eğer hem BUY hem SELL açık emir varsa, birini iptal et (basit tercih: ilk giren kalsın)
+        let buy_exists = state.active_orders.values().any(|o| matches!(o.side, Side::Buy));
+        let sell_exists = state.active_orders.values().any(|o| matches!(o.side, Side::Sell));
+        
+        if buy_exists && sell_exists {
+            // Tercih: SELL'i iptal et, BUY kalsın (basit tercih)
+            warn!(
+                %symbol,
+                "both BUY and SELL orders exist, canceling SELL orders (single side rule)"
+            );
+            // SELL emirlerini iptal et
+            let sell_order_ids: Vec<String> = state.active_orders
+                .iter()
+                .filter(|(_, o)| matches!(o.side, Side::Sell))
+                .map(|(id, _)| id.clone())
+                .collect();
+            
+            for order_id in sell_order_ids {
+                use crate::utils::rate_limit_guard;
+                rate_limit_guard(1).await;
+                if let Err(e) = venue.cancel(&order_id, symbol).await {
+                    warn!(%symbol, order_id = %order_id, error = %e, "failed to cancel SELL order");
+                } else {
+                    state.active_orders.remove(&order_id);
+                    state.last_order_price_update.remove(&order_id);
+                }
+            }
+        }
     }
     
     // Fetch market data
@@ -89,7 +119,7 @@ pub async fn process_symbol(
     if !state.active_orders.is_empty() {
         let orders_to_cancel = analyze_orders(state, bid, ask, position_size_notional, cfg);
         if !orders_to_cancel.is_empty() {
-            cancel_orders(venue, symbol, &orders_to_cancel, state, cfg.internal.cancel_stagger_delay_ms).await?;
+            cancel_orders(venue, symbol, &orders_to_cancel, state, cfg.internal.cancel_stagger_delay_ms, cfg).await?;
         }
     }
     
@@ -146,10 +176,9 @@ pub async fn process_symbol(
                 pos.entry, exit_price, pos.qty, profit_guarantee.maker_fee_rate(),
             );
             
-            if let Ok(logger) = json_logger.lock() {
-                logger.log_position_closed(symbol, side_str, pos.entry, exit_price, pos.qty, pos.leverage, &reason);
-                logger.log_trade_completed(symbol, side_str, pos.entry, exit_price, pos.qty, total_fees, pos.leverage);
-            }
+            // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+            json_logger.log_position_closed(symbol, side_str, pos.entry, exit_price, pos.qty, pos.leverage, &reason);
+            json_logger.log_trade_completed(symbol, side_str, pos.entry, exit_price, pos.qty, total_fees, pos.leverage);
             
             crate::utils::update_trade_stats(
                 state, net_profit, realized_pnl, total_fees, pos.entry, exit_price, pos.qty, symbol,
@@ -177,13 +206,12 @@ pub async fn process_symbol(
                 let total_loss_f = state.total_loss.to_f64().unwrap_or(0.0);
                 let net_pnl_f = total_profit_f - total_loss_f;
                 
-                if let Ok(logger) = json_logger.lock() {
-                    logger.log_pnl_summary("hourly", state.trade_count as u32, state.profitable_trade_count as u32,
-                        state.losing_trade_count as u32, total_profit_f, total_loss_f, net_pnl_f,
-                        state.largest_win.to_f64().unwrap_or(0.0),
-                        state.largest_loss.to_f64().unwrap_or(0.0),
-                        state.total_fees_paid.to_f64().unwrap_or(0.0));
-                }
+                // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+                json_logger.log_pnl_summary("hourly", state.trade_count as u32, state.profitable_trade_count as u32,
+                    state.losing_trade_count as u32, total_profit_f, total_loss_f, net_pnl_f,
+                    state.largest_win.to_f64().unwrap_or(0.0),
+                    state.largest_loss.to_f64().unwrap_or(0.0),
+                    state.total_fees_paid.to_f64().unwrap_or(0.0));
                 
                 info!(
                     %symbol,
@@ -226,10 +254,9 @@ pub async fn process_symbol(
                 .unwrap_or(true);
         
         if should_log {
-            if let Ok(logger) = json_logger.lock() {
-                let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
-                logger.log_position_updated(symbol, side, pos.entry, pos.qty, mark_px, pos.leverage);
-            }
+            // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+            let side = if pos.qty.0.is_sign_positive() { "long" } else { "short" };
+            json_logger.log_position_updated(symbol, side, pos.entry, pos.qty, mark_px, pos.leverage);
             
             let pnl_trend = state.pnl_history.len()
                 .checked_sub(10)
@@ -289,21 +316,65 @@ pub async fn process_symbol(
         return Ok(false);
     }
     
-    if state.disabled || state.rules_fetch_failed {
+    // ✅ KRİTİK: Per-symbol rules zorunlu - fetch başarısızsa trade etme
+    // Global tek order modunda "kuralsız" sembolü tamamen skip et
+    if state.disabled || state.rules_fetch_failed || state.symbol_rules.is_none() {
         let should_retry = state.last_rules_retry
             .map(|last| last.elapsed().as_secs() >= 45)
             .unwrap_or(true);
         
         if should_retry {
             state.last_rules_retry = Some(Instant::now());
-            if let Ok(new_rules) = venue.rules_for(symbol).await {
-                state.symbol_rules = Some(new_rules);
-                state.disabled = false;
-                state.rules_fetch_failed = false;
-                info!(%symbol, "symbol re-enabled");
+            match venue.rules_for(symbol).await {
+                Ok(new_rules) => {
+                    state.symbol_rules = Some(new_rules);
+                    state.disabled = false;
+                    state.rules_fetch_failed = false;
+                    info!(%symbol, "symbol re-enabled after successful rules fetch");
+                }
+                Err(e) => {
+                    warn!(
+                        %symbol,
+                        error = %e,
+                        "failed to fetch rules during retry, symbol remains disabled (will not trade)"
+                    );
+                    state.rules_fetch_failed = true;
+                    state.disabled = true;
+                }
             }
         }
+        // ✅ KRİTİK: Rules yoksa trade etme - global tek order modunda tamamen skip et
+        debug!(
+            %symbol,
+            disabled = state.disabled,
+            rules_fetch_failed = state.rules_fetch_failed,
+            has_rules = state.symbol_rules.is_some(),
+            "skipping symbol: no rules available (required for trading)"
+        );
         return Ok(false);
+    }
+    
+    // ✅ KRİTİK: Post-only violation cooldown kontrolü
+    // Post-only violation sonrası 3-5 saniye cooldown (spread widen için)
+    if let Some(cooldown_start) = state.post_only_violation_cooldown {
+        const POST_ONLY_VIOLATION_COOLDOWN_SEC: u64 = 4; // 4 saniye cooldown
+        let elapsed_sec = cooldown_start.elapsed().as_secs();
+        if elapsed_sec < POST_ONLY_VIOLATION_COOLDOWN_SEC {
+            debug!(
+                %symbol,
+                elapsed_sec,
+                cooldown_sec = POST_ONLY_VIOLATION_COOLDOWN_SEC,
+                "symbol in post-only violation cooldown, skipping (spread will widen)"
+            );
+            return Ok(false);
+        } else {
+            // Cooldown bitti, temizle
+            state.post_only_violation_cooldown = None;
+            info!(
+                %symbol,
+                "post-only violation cooldown expired, resuming trading with widened spread"
+            );
+        }
     }
     
     // KRİTİK: Trend analizi ve order işlemleri birbirini bloklamamalı
@@ -387,9 +458,8 @@ pub async fn process_symbol(
             spread_bps, position_size_usd, min_spread_bps,
             cfg.internal.stop_loss_threshold, cfg.internal.min_risk_reward_ratio, profit_guarantee,
         ).0 {
-            if let Ok(logger) = json_logger.lock() {
-                logger.log_trade_rejected(symbol, "not_profitable", spread_bps, position_size_usd, min_spread_bps);
-            }
+            // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+            json_logger.log_trade_rejected(symbol, "not_profitable", spread_bps, position_size_usd, min_spread_bps);
             quotes.bid = None;
             quotes.ask = None;
         }
@@ -398,29 +468,114 @@ pub async fn process_symbol(
     let qty_step_f64 = get_qty_step(state.symbol_rules.as_ref(), cfg.qty_step);
     let qty_step_dec = Decimal::from_f64_retain(qty_step_f64).unwrap_or(Decimal::ZERO);
     
-    // Early exit: skip order placement if no balance and no active position/orders
-    if !state.active_orders.is_empty() || has_position ||
-       quote_balances.get(quote_asset).copied().unwrap_or(0.0) >= cfg.min_quote_balance_usd {
-        // Continue with order placement
-    } else {
+    // ✅ KRİTİK: Early exit - bakiyesi olmayan quote için emir üretme (churn önleme)
+    // USDC/USDT karışık keşifte hesap bakiyesini doğru quote'a göre filtrele
+    let quote_balance = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+    let has_sufficient_balance = quote_balance >= cfg.min_quote_balance_usd && quote_balance >= min_usd_per_order;
+    
+    if !state.active_orders.is_empty() || has_position {
+        // Açık emir veya pozisyon varsa devam et (bakiye kontrolü yapma - zaten işlem var)
+    } else if !has_sufficient_balance {
+        // Bakiye yok ve açık emir/pozisyon yok - emir üretme (churn önleme)
+        debug!(
+            %symbol,
+            quote_asset = %quote_asset,
+            balance = quote_balance,
+            min_required = cfg.min_quote_balance_usd.max(min_usd_per_order),
+            "skipping order placement: insufficient balance and no active orders/position"
+        );
         quotes.bid = None;
         quotes.ask = None;
     }
     
     validate_quotes(&mut quotes, &caps, qty_step_f64, qty_step_dec, min_usd_per_order);
     
-    let mut total_spent_on_bids = 0.0f64;
-    let mut total_spent_on_asks = 0.0f64;
+    // ✅ KRİTİK: Global tek-işlem kilidi - aynı anda sadece 1 open_order veya 1 position
+    // Global order lock ile tüm semboller arasında aynı anda sadece bir "exposure" garantisi
+    // Bu sayede eşzamanlılık ve churn azalır, request sayısı düşer
+    use crate::utils::with_order_lock;
     
-    place_side_orders(venue, symbol, Side::Buy, quotes.bid, state, bid, ask, position_size_notional,
-        &caps, &mut total_spent_on_bids, 0.0, effective_leverage, quote_asset, quote_balances,
-        cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
-    
-    place_side_orders(venue, symbol, Side::Sell, quotes.ask, state, bid, ask, position_size_notional,
-        &caps, &mut total_spent_on_asks, total_spent_on_bids, effective_leverage, quote_asset,
-        quote_balances, cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
-    
-    Ok(true)
+    with_order_lock(async {
+        // ✅ KRİTİK: Aynı tick'te yalnız bir taraf siparişi
+        // Eğer zaten açık emir veya pozisyon varsa, yeni emir yerleştirme
+        // Bu kontrol gereksiz test_order ve place_limit çağrılarını önler
+        if !state.active_orders.is_empty() || !state.inv.0.is_zero() {
+            debug!(
+                %symbol,
+                open_orders = state.active_orders.len(),
+                inv = %state.inv.0,
+                "skipping order placement: already has open order or position (reducing API calls)"
+            );
+            return Ok(true);
+        }
+        
+        // ✅ KRİTİK: Tek taraf seçimi - trend bazlı
+        // Trend pozitifse Buy, negatifse Sell tercih et
+        let trend_bps = state.strategy.get_trend_bps();
+        let prefer_side = if trend_bps > 0.0 {
+            Side::Buy // Uptrend → Buy tercih et
+        } else if trend_bps < 0.0 {
+            Side::Sell // Downtrend → Sell tercih et
+        } else {
+            // Trend yok, spread'e göre karar ver
+            let spread_bps = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
+                ((ask.0 - bid.0) / bid.0 * Decimal::from(10000)).to_f64().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            // Spread büyükse her iki taraf da riskli, küçükse Buy tercih et
+            if spread_bps > 50.0 {
+                // Spread çok büyük, emir yerleştirme
+                return Ok(true);
+            } else {
+                Side::Buy // Default: Buy tercih et
+            }
+        };
+        
+        let mut total_spent_on_bids = 0.0f64;
+        let mut total_spent_on_asks = 0.0f64;
+        let mut placed = false;
+        
+        // ✅ KRİTİK: Sadece bir taraf yerleştir
+        if quotes.bid.is_some() && quotes.ask.is_some() {
+            // Her iki taraf da mevcut - trend bazlı seç
+            match prefer_side {
+                Side::Buy => {
+                    place_side_orders(venue, symbol, Side::Buy, quotes.bid, state, bid, ask, position_size_notional,
+                        &caps, &mut total_spent_on_bids, 0.0, effective_leverage, quote_asset, quote_balances,
+                        cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
+                    placed = true;
+                }
+                Side::Sell => {
+                    place_side_orders(venue, symbol, Side::Sell, quotes.ask, state, bid, ask, position_size_notional,
+                        &caps, &mut total_spent_on_asks, 0.0, effective_leverage, quote_asset,
+                        quote_balances, cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
+                    placed = true;
+                }
+            }
+        } else if quotes.bid.is_some() {
+            place_side_orders(venue, symbol, Side::Buy, quotes.bid, state, bid, ask, position_size_notional,
+                &caps, &mut total_spent_on_bids, 0.0, effective_leverage, quote_asset, quote_balances,
+                cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
+            placed = true;
+        } else if quotes.ask.is_some() {
+            place_side_orders(venue, symbol, Side::Sell, quotes.ask, state, bid, ask, position_size_notional,
+                &caps, &mut total_spent_on_asks, 0.0, effective_leverage, quote_asset,
+                quote_balances, cfg, tif, json_logger, &ob_for_orders, profit_guarantee).await?;
+            placed = true;
+        }
+        
+        if placed {
+            debug!(
+                %symbol,
+                side = ?prefer_side,
+                trend_bps,
+                "order placed (single side only)"
+            );
+        }
+        
+        Ok(true)
+    }).await
 }
 
 // ============================================================================
@@ -585,9 +740,11 @@ async fn auto_discover_symbols(
             
             let match_quote = match_primary_quote || match_cross_quote;
             
+            // ✅ KRİTİK: Sadece USDⓈ-M Futures (PERPETUAL) seç
+            // fapi.binance.com endpoint'i USDⓈ-M Futures için kullanılır (hem USDT hem USDC destekler)
             match_quote
                 && m.status.as_deref().map(|s| s == "TRADING").unwrap_or(true)
-                && m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false)
+                && m.contract_type.as_deref().map(|ct| ct == "PERPETUAL").unwrap_or(false) // USDⓈ-M Futures only
         })
         .cloned()
         .collect();
@@ -693,6 +850,10 @@ pub fn initialize_symbol_states(
             last_inventory_update: None,
             last_decay_period: None,
             last_decay_check: None,
+            post_only_violation_cooldown: None,
+            pending_cancels_count: 0,
+            last_cancel_time: None,
+            cancel_backoff_multiplier: 1.0,
             position_entry_time: None,
             peak_pnl: Decimal::ZERO,
             position_hold_duration_ms: 0,

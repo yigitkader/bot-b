@@ -229,9 +229,10 @@ pub struct AppCfg {
     pub min_usd_per_order: Option<f64>,
     #[serde(default = "default_min_quote_balance_usd")]
     pub min_quote_balance_usd: f64,
-    pub leverage: Option<u32>,
-    pub price_tick: f64,
-    pub qty_step: f64,
+    #[serde(default)]
+    pub leverage: Option<u32>, // Optional leverage (if not set, uses max_leverage from risk config)
+    pub price_tick: f64, // Required: price tick size
+    pub qty_step: f64, // Required: quantity step size
     #[serde(default)]
     pub dry_run: bool, // When true, the bot will simulate orders and won't send real orders to the exchange
     pub binance: BinanceCfg,
@@ -298,13 +299,13 @@ fn default_ws_reconnect_delay() -> u64 { 5_000 }
 fn default_ws_ping_interval() -> u64 { 30_000 }
 fn default_slippage_bps_reserve() -> f64 { 2.0 } // Default: 2 bps slippage reserve
 fn default_use_isolated_margin() -> bool { true } // Default: isolated margin kullan
-fn default_max_open_chunks_per_symbol_per_side() -> usize { 5 } // Default: sembol başına yönde max 5 chunk
+fn default_max_open_chunks_per_symbol_per_side() -> usize { 1 } // ✅ KRİTİK: Tek chunk kuralı - aynı anda sadece 1 open_order veya 1 position
 fn default_pnl_history_max_len() -> usize { 1024 }
 fn default_position_size_history_max_len() -> usize { 100 }
 fn default_max_symbols_per_tick() -> usize { 8 }
 fn default_rate_limiter_safety_factor() -> f64 { 0.8 }
 fn default_rate_limiter_min_interval_ms() -> u64 { 1000 }
-fn default_order_sync_interval_sec() -> u64 { 2 }
+fn default_order_sync_interval_sec() -> u64 { 8 } // ✅ KRİTİK: Daha az request - WS event'leriyle uyum için 8 sn (önceden 2 sn)
 fn default_cancel_stagger_delay_ms() -> u64 { 50 }
 fn default_fill_rate_increase_factor() -> f64 { 0.95 }
 fn default_fill_rate_increase_bonus() -> f64 { 0.05 }
