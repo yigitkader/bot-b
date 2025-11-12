@@ -31,7 +31,7 @@ use utils::{
 };
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[tokio::main]
@@ -67,11 +67,16 @@ async fn main() -> Result<()> {
         "main trading loop starting"
     );
     
-    let mut symbol_index: HashMap<String, usize> = HashMap::new();
-    for (idx, state) in states.iter().enumerate() {
-        symbol_index.insert(state.meta.symbol.clone(), idx);
-    }
-    
+    // Build symbol index for fast lookup during events
+    let build_symbol_index = || {
+        states.iter()
+            .enumerate()
+            .map(|(idx, state)| (state.meta.symbol.clone(), idx))
+            .collect::<HashMap<String, usize>>()
+    };
+
+    let symbol_index = build_symbol_index();
+
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -96,7 +101,7 @@ async fn main() -> Result<()> {
             info!(tick_num, "=== MAIN LOOP TICK START ===");
         }
 
-        // WebSocket event'lerini işle
+        // ===== Process WebSocket Events =====
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 UserEvent::Heartbeat => {
@@ -149,6 +154,7 @@ async fn main() -> Result<()> {
 
         let effective_leverage = calculate_effective_leverage(cfg.leverage, cfg.risk.max_leverage);
         
+        // ===== Fetch Balances =====
         let unique_quote_assets: std::collections::HashSet<String> = states
             .iter()
             .map(|s| s.meta.quote_asset.clone())
@@ -157,50 +163,53 @@ async fn main() -> Result<()> {
         let quote_assets_vec: Vec<String> = unique_quote_assets.iter().cloned().collect();
         let mut quote_balances = fetch_all_quote_balances(&venue, &quote_assets_vec).await;
         
+        // ===== Symbol Processing Statistics =====
         let mut processed_count = 0;
         let mut skipped_count = 0;
         let mut disabled_count = 0;
         let mut no_balance_count = 0;
         let total_symbols = states.len();
-        let mut symbol_index = 0;
-        
+        let mut symbol_index_counter = 0;
+
         let max_symbols_per_tick = cfg.internal.max_symbols_per_tick;
         let mut symbols_processed_this_tick = 0;
         
-        // Prioritize symbols with open orders/positions, then round-robin
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Calculate prioritized indices: symbols with open orders/positions first, then round-robin
         static ROUND_ROBIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
-        let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % states.len().max(1);
-        
+        let max_states = states.len().max(1);
+        let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % max_states;
+
         let prioritized_indices: Vec<usize> = {
             let mut indices: Vec<(usize, bool)> = states.iter()
-            .enumerate()
+                .enumerate()
                 .map(|(i, s)| (i, !s.active_orders.is_empty() || !s.inv.0.is_zero()))
-            .collect();
-            indices.sort_by_key(|(_, priority)| !*priority); // false (no priority) first, then true
+                .collect();
+
+            // Sort: prioritize symbols with active orders/positions (true first)
+            indices.sort_by_key(|(_, has_priority)| !has_priority);
+
             indices.into_iter()
                 .map(|(i, _)| i)
-            .cycle()
-            .skip(round_robin_offset)
-            .take(states.len())
+                .cycle()
+                .skip(round_robin_offset)
+                .take(states.len())
                 .collect()
         };
         
         for state_idx in prioritized_indices {
             let state = &mut states[state_idx];
             
-            // Rate limit koruması: Her tick'te maksimum sembol sayısı
+            // Rate limit protection: Maximum symbols per tick
             if symbols_processed_this_tick >= max_symbols_per_tick {
-                // Bu tick'te yeterli sembol işlendi, kalan semboller bir sonraki tick'te işlenecek
                 skipped_count += 1;
                 continue;
             }
-            symbol_index += 1;
-            
-            // Progress log: Her N sembolde bir veya ilk N sembolde
-            if symbol_index <= cfg.internal.progress_log_first_n_symbols || symbol_index % cfg.internal.progress_log_interval == 0 {
+            symbol_index_counter += 1;
+
+            // Progress log: Log first N symbols and then periodically
+            if symbol_index_counter <= cfg.internal.progress_log_first_n_symbols || symbol_index_counter % cfg.internal.progress_log_interval == 0 {
                 info!(
-                    progress = format!("{}/{}", symbol_index, total_symbols),
+                    progress = format!("{}/{}", symbol_index_counter, total_symbols),
                     processed_so_far = processed_count,
                     skipped_so_far = skipped_count,
                     "processing symbols..."
@@ -242,7 +251,7 @@ async fn main() -> Result<()> {
                 }
             };
             
-            if force_sync_all && symbol_index == total_symbols {
+            if force_sync_all && symbol_index_counter == total_symbols {
                 force_sync_all = false;
                 info!("WebSocket reconnect sync completed for all symbols");
             }
@@ -290,50 +299,47 @@ async fn main() -> Result<()> {
     
     info!("main loop ended, performing graceful shutdown");
     
-    // ✅ Graceful shutdown: Açık pozisyonları ve emirleri temizle
-    let shutdown_timeout = Duration::from_secs(10); // Maximum 10 saniye cleanup
-    
+    // ===== Graceful Shutdown Sequence =====
+    let shutdown_timeout = Duration::from_secs(10);
+
     let cleanup_result = tokio::time::timeout(shutdown_timeout, async {
-            let mut positions_to_close = Vec::new();
-            let mut orders_to_cancel = Vec::new();
-            
-            // 1. Açık pozisyonları ve emirleri tespit et
-            for state in states.iter() {
-                let symbol = state.meta.symbol.clone();
-                if !state.inv.0.is_zero() {
-                    positions_to_close.push(symbol.clone());
-                    info!(symbol = %symbol, inventory = %state.inv.0, "position will be closed during shutdown");
-                }
-                if !state.active_orders.is_empty() {
-                    orders_to_cancel.push(symbol.clone());
-                    info!(symbol = %symbol, order_count = state.active_orders.len(), "orders will be canceled during shutdown");
-                }
+        // Step 1: Collect positions and orders to close
+        let mut positions_to_close = Vec::new();
+        let mut orders_to_cancel = Vec::new();
+
+        for state in states.iter() {
+            let symbol = state.meta.symbol.clone();
+            if !state.inv.0.is_zero() {
+                positions_to_close.push(symbol.clone());
+                info!(symbol = %symbol, inventory = %state.inv.0, "position will be closed during shutdown");
             }
-            
-            // 2. Sequential cleanup: Rate limit koruması için sıralı işle
-            // (Paralel işlem rate limit'i aşabilir)
-            
-            // Pozisyonları kapat
-            for symbol in positions_to_close {
-                if let Some(state) = states.iter_mut().find(|s| s.meta.symbol == symbol) {
-                    if let Err(e) = position_manager::close_position(&venue, &symbol, state).await {
-                        error!(symbol = %symbol, error = %e, "failed to close position during shutdown");
-                    } else {
-                        info!(symbol = %symbol, "position closed successfully during shutdown");
-                    }
-                }
+            if !state.active_orders.is_empty() {
+                orders_to_cancel.push(symbol.clone());
+                info!(symbol = %symbol, order_count = state.active_orders.len(), "orders will be canceled during shutdown");
             }
-            
-            // Emirleri iptal et
-            for symbol in orders_to_cancel {
-                rate_limit_guard(1).await;
-                if let Err(e) = venue.cancel_all(&symbol).await {
-                    warn!(symbol = %symbol, error = %e, "failed to cancel orders during shutdown");
+        }
+
+        // Step 2: Close positions sequentially (rate limit protection)
+        for symbol in positions_to_close {
+            if let Some(state) = states.iter_mut().find(|s| s.meta.symbol == symbol) {
+                if let Err(e) = position_manager::close_position(&venue, &symbol, state).await {
+                    error!(symbol = %symbol, error = %e, "failed to close position during shutdown");
                 } else {
-                    info!(symbol = %symbol, "orders canceled successfully during shutdown");
+                    info!(symbol = %symbol, "position closed successfully during shutdown");
                 }
             }
-            
+        }
+
+        // Step 3: Cancel orders sequentially (rate limit protection)
+        for symbol in orders_to_cancel {
+            rate_limit_guard(1).await;
+            if let Err(e) = venue.cancel_all(&symbol).await {
+                warn!(symbol = %symbol, error = %e, "failed to cancel orders during shutdown");
+            } else {
+                info!(symbol = %symbol, "orders canceled successfully during shutdown");
+            }
+        }
+
         info!("cleanup completed for all symbols");
     })
     .await;
@@ -341,8 +347,8 @@ async fn main() -> Result<()> {
     match cleanup_result {
         Ok(_) => info!("graceful shutdown cleanup completed successfully"),
         Err(_) => {
-            warn!("graceful shutdown cleanup timed out after 10 seconds, forcing exit");
-            // Timeout durumunda açık pozisyonları log'la
+            warn!("graceful shutdown cleanup timed out after {} seconds, forcing exit", shutdown_timeout.as_secs());
+            // Log remaining open positions and orders
             for state in states.iter() {
                 if !state.inv.0.is_zero() {
                     error!(symbol = %state.meta.symbol, inventory = %state.inv.0, "position still open after shutdown timeout");
@@ -354,12 +360,12 @@ async fn main() -> Result<()> {
         }
     }
     
-    // WebSocket ve diğer kaynakları temizle
+    // Step 4: Release resources
     drop(event_tx);
     drop(json_logger);
     drop(shutdown_tx);
     
-    // Kısa bir bekleme: WebSocket'in kapanması için
+    // Brief wait for WebSocket cleanup
     tokio::time::sleep(Duration::from_millis(500)).await;
     
     info!("graceful shutdown completed");
