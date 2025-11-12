@@ -174,22 +174,29 @@ async fn main() -> Result<()> {
         let max_symbols_per_tick = cfg.internal.max_symbols_per_tick;
         let mut symbols_processed_this_tick = 0;
         
-        // Calculate prioritized indices: symbols with open orders/positions first, then round-robin
+        // Calculate prioritized indices: priority field + open orders/positions
         static ROUND_ROBIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
         let max_states = states.len().max(1);
         let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % max_states;
 
         let prioritized_indices: Vec<usize> = {
-            let mut indices: Vec<(usize, bool)> = states.iter()
+            let mut indices: Vec<(usize, u32, bool)> = states.iter()
                 .enumerate()
-                .map(|(i, s)| (i, !s.active_orders.is_empty() || !s.inv.0.is_zero()))
+                .map(|(i, s)| {
+                    let has_active = !s.active_orders.is_empty() || !s.inv.0.is_zero();
+                    // Priority calculation: priority field (higher = better) + active bonus
+                    // Thread-safe read from AtomicU32
+                    let priority_value = s.priority.load(std::sync::atomic::Ordering::Relaxed);
+                    let priority_score = priority_value + if has_active { 1000 } else { 0 };
+                    (i, priority_score, has_active)
+                })
                 .collect();
 
-            // Sort: prioritize symbols with active orders/positions (true first)
-            indices.sort_by_key(|(_, has_priority)| !has_priority);
+            // Sort: highest priority first, then by active orders/positions
+            indices.sort_by_key(|(_, priority_score, _)| std::cmp::Reverse(*priority_score));
 
             indices.into_iter()
-                .map(|(i, _)| i)
+                .map(|(i, _, _)| i)
                 .cycle()
                 .skip(round_robin_offset)
                 .take(states.len())

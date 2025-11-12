@@ -327,375 +327,383 @@ pub async fn place_orders_with_profit_guarantee(
         "margin chunking for orders"
     );
 
-    for (chunk_idx, margin_chunk) in margin_chunks.iter().enumerate() {
-        if open_orders_count + chunk_idx >= max_chunks {
-            info!(
-                %symbol,
-                side = ?side,
-                open_orders = open_orders_count,
-                chunk_idx,
-                max_chunks,
-                "skipping chunk: max chunks reached"
-            );
-            break;
-        }
-
-        let effective_leverage_for_chunk = if is_opportunity_mode {
-            effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
-        } else {
-            effective_leverage
-        };
-
-        let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
-        let min_required_volume_usd = chunk_notional_estimate * DEPTH_VOLUME_MULTIPLIER;
-        let optimal_price_from_depth = find_optimal_price_from_depth(
-            ob,
-            side,
-            min_required_volume_usd,
-            bid.0,
-            ask.0,
+    // KRİTİK: Bir anda sadece 1 open order veya 1 position olmalı
+    // Çok fazla order/position kontrol etmek zor ve çok fazla request gerektirir
+    // Bu yüzden chunk'lar sırayla işlenir, her chunk tamamlandıktan sonra bir sonraki chunk işlenir
+    // Eğer zaten open order varsa, yeni chunk işleme (bir sonraki tick'te işlenecek)
+    if open_orders_count > 0 {
+        info!(
+            %symbol,
+            side = ?side,
+            open_orders = open_orders_count,
+            "skipping chunk processing: already has open order, will process next chunk when current order closes"
         );
+        return Ok(());
+    }
 
-        let px_with_depth = match side {
-            Side::Buy => px.0.max(optimal_price_from_depth).min(bid.0),
-            Side::Sell => px.0.min(optimal_price_from_depth).max(ask.0),
-        };
+    // Sadece ilk chunk'ı işle (bir anda sadece 1 order)
+    // Diğer chunk'lar bir sonraki tick'lerde, önceki order kapanınca işlenecek
+    let margin_chunk = match margin_chunks.first() {
+        Some(chunk) => chunk,
+        None => return Ok(()),
+    };
+    let chunk_idx = 0;
 
-        // ✅ DOĞRULAMA: Leverage sadece burada uygulanıyor (çift sayma yok)
-        // margin_chunk: USD (leverage uygulanmamış)
-        // margin_chunk_leveraged: USD (leverage uygulanmış notional)
-        // calc_qty_from_margin() içinde leverage UYGULANMAZ, direkt notional kullanılır
-        let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
-        let qty_price_result = crate::utils::calc_qty_from_margin(
-            margin_chunk_leveraged,  // ✅ Zaten leveraged notional
-            px_with_depth,
-            rules,
-            side,
-        );
+    let effective_leverage_for_chunk = if is_opportunity_mode {
+        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
+    } else {
+        effective_leverage
+    };
 
-        let (chunk_qty_dec, chunk_price_dec) = match qty_price_result {
-            Some((q_dec, p_dec)) => (q_dec, p_dec),
-            None => {
-                warn!(
-                    %symbol,
-                    side = ?side,
-                    margin_chunk = *margin_chunk,
-                    "calc_qty_from_margin returned None, skipping chunk"
-                );
-                continue;
-            }
-        };
+    let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
+    let min_required_volume_usd = chunk_notional_estimate * DEPTH_VOLUME_MULTIPLIER;
+    let optimal_price_from_depth = find_optimal_price_from_depth(
+        ob,
+        side,
+        min_required_volume_usd,
+        bid.0,
+        ask.0,
+    );
 
-        let chunk_qty = Qty(chunk_qty_dec);
-        let chunk_price = Px(chunk_price_dec);
+    let px_with_depth = match side {
+        Side::Buy => px.0.max(optimal_price_from_depth).min(bid.0),
+        Side::Sell => px.0.min(optimal_price_from_depth).max(ask.0),
+    };
 
-        let chunk_notional = chunk_price.0 * chunk_qty.0;
-        let min_req_dec = {
-            let v = state.min_notional_req.unwrap_or(min_margin);
-            Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
-        };
-        if chunk_notional < min_req_dec {
+    // ✅ DOĞRULAMA: Leverage sadece burada uygulanıyor (çift sayma yok)
+    // margin_chunk: USD (leverage uygulanmamış)
+    // margin_chunk_leveraged: USD (leverage uygulanmış notional)
+    // calc_qty_from_margin() içinde leverage UYGULANMAZ, direkt notional kullanılır
+    let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
+    let qty_price_result = crate::utils::calc_qty_from_margin(
+        margin_chunk_leveraged,  // ✅ Zaten leveraged notional
+        px_with_depth,
+        rules,
+        side,
+    );
+
+    let (chunk_qty_dec, chunk_price_dec) = match qty_price_result {
+        Some((q_dec, p_dec)) => (q_dec, p_dec),
+        None => {
             warn!(
                 %symbol,
                 side = ?side,
-                chunk_notional = %chunk_notional,
-                min_req = %min_req_dec,
-                "chunk notional below min_notional, skipping"
-            );
-            continue;
-        }
-
-        // Profit guarantee check with TP calculation
-        let fee_bps_entry = fee_rate_to_bps(taker_fee_rate);
-        let fee_bps_exit = fee_rate_to_bps(taker_fee_rate);
-        let min_profit_usd = cfg.strategy.min_profit_usd.unwrap_or(DEFAULT_MIN_PROFIT_USD);
-
-        let tp_price_raw = crate::utils::required_take_profit_price(
-            side,
-            chunk_price.0,
-            chunk_qty.0,
-            fee_bps_entry,
-            fee_bps_exit,
-            min_profit_usd,
-        );
-
-        let tick_size = rules.tick_size;
-        let tp_valid = match tp_price_raw {
-            Some(tp) => {
-                let tp_quantized = match side {
-                    Side::Buy => quant_utils_ceil_to_step(tp, tick_size),
-                    Side::Sell => quant_utils_floor_to_step(tp, tick_size),
-                };
-
-                let (min_tp, max_tp) = match side {
-                    Side::Buy => {
-                        let min_tp_for_maker = ask.0 + tick_size;
-                        let min_tp_for_profit = quant_utils_ceil_to_step(tp, tick_size);
-                        (min_tp_for_maker.max(min_tp_for_profit), Decimal::MAX)
-                    }
-                    Side::Sell => {
-                        let max_tp_for_maker = bid.0 - tick_size;
-                        let max_tp_for_profit = quant_utils_floor_to_step(tp, tick_size);
-                        (Decimal::MIN, max_tp_for_maker.min(max_tp_for_profit))
-                    }
-                };
-
-                let is_valid = match side {
-                    Side::Buy => tp_quantized >= min_tp,
-                    Side::Sell => tp_quantized <= max_tp,
-                };
-
-                if !is_valid {
-                    let tp_with_taker_fee = crate::utils::required_take_profit_price(
-                        side,
-                        chunk_price.0,
-                        chunk_qty.0,
-                        fee_rate_to_bps(taker_fee_rate),
-                        fee_rate_to_bps(taker_fee_rate),
-                        min_profit_usd,
-                    );
-
-                    if tp_with_taker_fee.is_some() {
-                        warn!(
-                            %symbol,
-                            side = ?side,
-                            chunk_idx,
-                            "TP validation failed, using taker fee TP (acceptable)"
-                        );
-                        true
-                    } else {
-                        warn!(
-                            %symbol,
-                            side = ?side,
-                            chunk_idx,
-                            "TP validation failed and taker TP calculation failed, skipping chunk"
-                        );
-                        false
-                    }
-                } else {
-                    true
-                }
-            }
-            None => {
-                warn!(
-                    %symbol,
-                    side = ?side,
-                    chunk_idx,
-                    "required_take_profit_price returned None, skipping chunk"
-                );
-                false
-            }
-        };
-
-        if !tp_valid {
-            continue;
-        }
-
-        // Test order for first chunk
-        if chunk_idx == 0 && !state.test_order_passed {
-            rate_limit_guard(1).await;
-            match venue.test_order(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF).await {
-                Ok(_) => {
-                    state.test_order_passed = true;
-                    info!(
-                        %symbol,
-                        side = ?side,
-                        "test order passed, proceeding with real orders"
-                    );
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    let error_lower = error_str.to_lowercase();
-
-                    error!(
-                        %symbol,
-                        side = ?side,
-                        error = %e,
-                        "test order failed with detailed context"
-                    );
-
-                    if error_lower.contains("precision is over") || error_lower.contains("-1111") {
-                        error!(%symbol, side = ?side, error = %e, "test order failed with -1111, refreshing rules");
-
-                        match venue.rules_for(symbol).await {
-                            Ok(new_rules) => {
-                                state.symbol_rules = Some(new_rules);
-                                state.rules_fetch_failed = false;
-                                state.disabled = false;
-                                info!(%symbol, side = ?side, "rules refreshed, retrying test order");
-
-                                rate_limit_guard(1).await;
-                                match venue.test_order(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF).await {
-                                    Ok(_) => {
-                                        state.test_order_passed = true;
-                                        info!(%symbol, side = ?side, "test order passed after rules refresh");
-                                    }
-                                    Err(e2) => {
-                                        error!(%symbol, side = ?side, error = %e2, "test order still failed, disabling symbol");
-                                        state.disabled = true;
-                                        state.rules_fetch_failed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e2) => {
-                                error!(%symbol, side = ?side, error = %e2, "failed to refresh rules, disabling symbol");
-                                state.disabled = true;
-                                state.rules_fetch_failed = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        warn!(%symbol, side = ?side, error = %e, "test order failed (non-precision), disabling symbol");
-                        state.disabled = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Place order (or simulate in dry-run)
-        if cfg.dry_run {
-            // Simulate order creation without sending to exchange
-            let timestamp_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let simulated_order_id = format!("SIM_{}_{}_{}", symbol, chunk_idx, timestamp_ms);
-
-            let info = OrderInfo {
-                order_id: simulated_order_id.clone(),
-                client_order_id: Some(format!("SIM_C_{}_{}", symbol, chunk_idx)),
-                side,
-                price: chunk_price,
-                qty: chunk_qty,
-                filled_qty: Qty(Decimal::ZERO),
-                remaining_qty: chunk_qty,
-                created_at: Instant::now(),
-                last_fill_time: None,
-            };
-            state.active_orders.insert(simulated_order_id.clone(), info.clone());
-            state.last_order_price_update.insert(simulated_order_id.clone(), info.price);
-
-            *total_spent += *margin_chunk;
-            if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
-                *cached_balance -= *margin_chunk;
-                *cached_balance = cached_balance.max(0.0);
-            }
-
-            if let Ok(logger) = json_logger.lock() {
-                logger.log_order_created(
-                    symbol,
-                    &simulated_order_id,
-                    side,
-                    chunk_price,
-                    chunk_qty,
-                    "dry_run_simulation",
-                    &cfg.exec.tif,
-                );
-            }
-
-            let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
-            info!(
-                %symbol,
-                side = ?side,
-                chunk_idx,
-                order_id = %simulated_order_id,
                 margin_chunk = *margin_chunk,
-                lev = effective_leverage_for_chunk,
-                notional = chunk_notional_log,
-                action = if matches!(side, Side::Buy) { "SIM BUY" } else { "SIM SELL" },
-                "simulated order created (dry_run)"
+                "calc_qty_from_margin returned None, skipping chunk"
             );
-        } else {
-            rate_limit_guard(1).await;
+            return Ok(());
+        }
+    };
 
-            let timestamp_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let random_suffix = (timestamp_ms % 10000) as u64;
-            let side_char = match side {
-                Side::Buy => "B",
-                Side::Sell => "S",
+    let chunk_qty = Qty(chunk_qty_dec);
+    let chunk_price = Px(chunk_price_dec);
+
+    let chunk_notional = chunk_price.0 * chunk_qty.0;
+    let min_req_dec = {
+        let v = state.min_notional_req.unwrap_or(min_margin);
+        Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
+    };
+    if chunk_notional < min_req_dec {
+        warn!(
+            %symbol,
+            side = ?side,
+            chunk_notional = %chunk_notional,
+            min_req = %min_req_dec,
+            "chunk notional below min_notional, skipping"
+        );
+        return Ok(());
+    }
+
+    // Profit guarantee check with TP calculation
+    let fee_bps_entry = fee_rate_to_bps(taker_fee_rate);
+    let fee_bps_exit = fee_rate_to_bps(taker_fee_rate);
+    let min_profit_usd = cfg.strategy.min_profit_usd.unwrap_or(DEFAULT_MIN_PROFIT_USD);
+
+    let tp_price_raw = crate::utils::required_take_profit_price(
+        side,
+        chunk_price.0,
+        chunk_qty.0,
+        fee_bps_entry,
+        fee_bps_exit,
+        min_profit_usd,
+    );
+
+    let tick_size = rules.tick_size;
+    let tp_valid = match tp_price_raw {
+        Some(tp) => {
+            let tp_quantized = match side {
+                Side::Buy => quant_utils_ceil_to_step(tp, tick_size),
+                Side::Sell => quant_utils_floor_to_step(tp, tick_size),
             };
-            let mut client_order_id = format!(
-                "{}_{}_C{}_{}_{}",
-                symbol.replace("-", "_").replace("/", "_"),
-                side_char,
-                chunk_idx,
-                timestamp_ms,
-                random_suffix
-            );
-            if client_order_id.len() > 36 {
-                let symbol_short = symbol.chars().take(8).collect::<String>();
-                client_order_id = format!("{}_{}_C{}_{}", symbol_short, side_char, chunk_idx, timestamp_ms)
-                    .chars()
-                    .take(36)
-                    .collect::<String>();
-            }
 
-            match venue
-                .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF, &client_order_id)
-                .await
-            {
-                Ok((order_id, _returned_client_id)) => {
-                    let info = OrderInfo {
-                        order_id: order_id.clone(),
-                        client_order_id: _returned_client_id.or(Some(client_order_id)),
-                        side,
-                        price: chunk_price,
-                        qty: chunk_qty,
-                        filled_qty: Qty(Decimal::ZERO),
-                        remaining_qty: chunk_qty,
-                        created_at: Instant::now(),
-                        last_fill_time: None,
-                    };
-                    state.active_orders.insert(order_id.clone(), info.clone());
-                    state.last_order_price_update.insert(order_id.clone(), info.price);
-
-                    *total_spent += *margin_chunk;
-
-                    if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
-                        *cached_balance -= *margin_chunk;
-                        *cached_balance = cached_balance.max(0.0);
-                    }
-
-                    if let Ok(logger) = json_logger.lock() {
-                        logger.log_order_created(
-                            symbol,
-                            &order_id,
-                            side,
-                            chunk_price,
-                            chunk_qty,
-                            "spread_opportunity",
-                            &cfg.exec.tif,
-                        );
-                    }
-
-                    let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
-                    info!(
-                        %symbol,
-                        side = ?side,
-                        chunk_idx,
-                        order_id,
-                        margin_chunk = *margin_chunk,
-                        lev = effective_leverage_for_chunk,
-                        notional = chunk_notional_log,
-                        action = if matches!(side, Side::Buy) { "\u{1f7e2} BUY" } else { "\u{1f534} SELL" },
-                        "order created successfully (chunk)"
-                    );
+            let (min_tp, max_tp) = match side {
+                Side::Buy => {
+                    let min_tp_for_maker = ask.0 + tick_size;
+                    let min_tp_for_profit = quant_utils_ceil_to_step(tp, tick_size);
+                    (min_tp_for_maker.max(min_tp_for_profit), Decimal::MAX)
                 }
-                Err(err) => {
+                Side::Sell => {
+                    let max_tp_for_maker = bid.0 - tick_size;
+                    let max_tp_for_profit = quant_utils_floor_to_step(tp, tick_size);
+                    (Decimal::MIN, max_tp_for_maker.min(max_tp_for_profit))
+                }
+            };
+
+            let is_valid = match side {
+                Side::Buy => tp_quantized >= min_tp,
+                Side::Sell => tp_quantized <= max_tp,
+            };
+
+            if !is_valid {
+                let tp_with_taker_fee = crate::utils::required_take_profit_price(
+                    side,
+                    chunk_price.0,
+                    chunk_qty.0,
+                    fee_rate_to_bps(taker_fee_rate),
+                    fee_rate_to_bps(taker_fee_rate),
+                    min_profit_usd,
+                );
+
+                if tp_with_taker_fee.is_some() {
                     warn!(
                         %symbol,
                         side = ?side,
                         chunk_idx,
-                        margin_chunk = *margin_chunk,
-                        error = %err,
-                        "failed to place order (chunk)"
+                        "TP validation failed, using taker fee TP (acceptable)"
+                    );
+                    true
+                } else {
+                    warn!(
+                        %symbol,
+                        side = ?side,
+                        chunk_idx,
+                        "TP validation failed and taker TP calculation failed, skipping chunk"
+                    );
+                    false
+                }
+            } else {
+                true
+            }
+        }
+        None => {
+            warn!(
+                %symbol,
+                side = ?side,
+                chunk_idx,
+                "required_take_profit_price returned None, skipping chunk"
+            );
+            false
+        }
+    };
+
+    if !tp_valid {
+        return Ok(());
+    }
+
+    // Test order for first chunk
+    if chunk_idx == 0 && !state.test_order_passed {
+        rate_limit_guard(1).await;
+        match venue.test_order(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF).await {
+            Ok(_) => {
+                state.test_order_passed = true;
+                info!(
+                    %symbol,
+                    side = ?side,
+                    "test order passed, proceeding with real orders"
+                );
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let error_lower = error_str.to_lowercase();
+
+                error!(
+                    %symbol,
+                    side = ?side,
+                    error = %e,
+                    "test order failed with detailed context"
+                );
+
+                if error_lower.contains("precision is over") || error_lower.contains("-1111") {
+                    error!(%symbol, side = ?side, error = %e, "test order failed with -1111, refreshing rules");
+
+                    match venue.rules_for(symbol).await {
+                        Ok(new_rules) => {
+                            state.symbol_rules = Some(new_rules);
+                            state.rules_fetch_failed = false;
+                            state.disabled = false;
+                            info!(%symbol, side = ?side, "rules refreshed, retrying test order");
+
+                            rate_limit_guard(1).await;
+                            match venue.test_order(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF).await {
+                                Ok(_) => {
+                                    state.test_order_passed = true;
+                                    info!(%symbol, side = ?side, "test order passed after rules refresh");
+                                }
+                                Err(e2) => {
+                                    error!(%symbol, side = ?side, error = %e2, "test order still failed, disabling symbol");
+                                    state.disabled = true;
+                                    state.rules_fetch_failed = true;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(e2) => {
+                            error!(%symbol, side = ?side, error = %e2, "failed to refresh rules, disabling symbol");
+                            state.disabled = true;
+                            state.rules_fetch_failed = true;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    warn!(%symbol, side = ?side, error = %e, "test order failed (non-precision), disabling symbol");
+                    state.disabled = true;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Place order (or simulate in dry-run)
+    if cfg.dry_run {
+        // Simulate order creation without sending to exchange
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let simulated_order_id = format!("SIM_{}_{}_{}", symbol, chunk_idx, timestamp_ms);
+
+        let info = OrderInfo {
+            order_id: simulated_order_id.clone(),
+            client_order_id: Some(format!("SIM_C_{}_{}", symbol, chunk_idx)),
+            side,
+            price: chunk_price,
+            qty: chunk_qty,
+            filled_qty: Qty(Decimal::ZERO),
+            remaining_qty: chunk_qty,
+            created_at: Instant::now(),
+            last_fill_time: None,
+        };
+        state.active_orders.insert(simulated_order_id.clone(), info.clone());
+        state.last_order_price_update.insert(simulated_order_id.clone(), info.price);
+
+        *total_spent += *margin_chunk;
+        if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
+            *cached_balance -= *margin_chunk;
+            *cached_balance = cached_balance.max(0.0);
+        }
+
+        if let Ok(logger) = json_logger.lock() {
+            logger.log_order_created(
+                symbol,
+                &simulated_order_id,
+                side,
+                chunk_price,
+                chunk_qty,
+                "dry_run_simulation",
+                &cfg.exec.tif,
+            );
+        }
+
+        let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
+        info!(
+            %symbol,
+            side = ?side,
+            chunk_idx,
+            order_id = %simulated_order_id,
+            margin_chunk = *margin_chunk,
+            lev = effective_leverage_for_chunk,
+            notional = chunk_notional_log,
+            action = if matches!(side, Side::Buy) { "SIM BUY" } else { "SIM SELL" },
+            "simulated order created (dry_run)"
+        );
+    } else {
+        rate_limit_guard(1).await;
+
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let random_suffix = (timestamp_ms % 10000) as u64;
+        let side_char = match side {
+            Side::Buy => "B",
+            Side::Sell => "S",
+        };
+        let mut client_order_id = format!(
+            "{}_{}_C{}_{}_{}",
+            symbol.replace("-", "_").replace("/", "_"),
+            side_char,
+            chunk_idx,
+            timestamp_ms,
+            random_suffix
+        );
+        if client_order_id.len() > 36 {
+            let symbol_short = symbol.chars().take(8).collect::<String>();
+            client_order_id = format!("{}_{}_C{}_{}", symbol_short, side_char, chunk_idx, timestamp_ms)
+                .chars()
+                .take(36)
+                .collect::<String>();
+        }
+
+        match venue
+            .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF, &client_order_id)
+            .await
+        {
+            Ok((order_id, _returned_client_id)) => {
+                let info = OrderInfo {
+                    order_id: order_id.clone(),
+                    client_order_id: _returned_client_id.or(Some(client_order_id)),
+                    side,
+                    price: chunk_price,
+                    qty: chunk_qty,
+                    filled_qty: Qty(Decimal::ZERO),
+                    remaining_qty: chunk_qty,
+                    created_at: Instant::now(),
+                    last_fill_time: None,
+                };
+                state.active_orders.insert(order_id.clone(), info.clone());
+                state.last_order_price_update.insert(order_id.clone(), info.price);
+
+                *total_spent += *margin_chunk;
+
+                if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
+                    *cached_balance -= *margin_chunk;
+                    *cached_balance = cached_balance.max(0.0);
+                }
+
+                if let Ok(logger) = json_logger.lock() {
+                    logger.log_order_created(
+                        symbol,
+                        &order_id,
+                        side,
+                        chunk_price,
+                        chunk_qty,
+                        "spread_opportunity",
+                        &cfg.exec.tif,
                     );
                 }
+
+                let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
+                info!(
+                    %symbol,
+                    side = ?side,
+                    chunk_idx,
+                    order_id,
+                    margin_chunk = *margin_chunk,
+                    lev = effective_leverage_for_chunk,
+                    notional = chunk_notional_log,
+                    action = if matches!(side, Side::Buy) { "\u{1f7e2} BUY" } else { "\u{1f534} SELL" },
+                    "order created successfully (chunk)"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    chunk_idx,
+                    margin_chunk = *margin_chunk,
+                    error = %err,
+                    "failed to place order (chunk)"
+                );
             }
         }
     }

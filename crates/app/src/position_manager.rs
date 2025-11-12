@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use crate::config::AppCfg;
 use crate::types::SymbolState;
-use crate::utils::{calc_net_pnl_usd, estimate_close_fee_bps, rate_limit_guard, record_pnl_snapshot};
+use crate::utils::{calc_net_pnl_usd, estimate_close_fee_bps, rate_limit_guard, record_pnl_snapshot, with_order_lock};
 
 /// Sync inventory with API position
 pub fn sync_inventory(
@@ -358,58 +358,62 @@ pub async fn close_position(
         }
     }
 
-    // KRİTİK: Önce tüm açık emirleri iptal et (pozisyon kapatmadan önce)
-    rate_limit_guard(1).await;
-    if let Err(e) = venue.cancel_all(symbol).await {
-        warn!(symbol = %symbol, error = %e, "failed to cancel orders before close, continuing anyway");
-    }
-
-    // Pozisyonu kapat (retry mekanizması ile)
-    let max_retries = 3;
-    let mut last_error = None;
-    
-    for attempt in 1..=max_retries {
-        // KRİTİK RACE CONDITION FIX: Her attempt öncesi WebSocket sync kontrolü
-        // Retry sırasında WebSocket event handler pozisyonu kapatmış olabilir
-        if let Some(last_update) = state.last_inventory_update {
-            let time_since_update = last_update.elapsed().as_millis();
-            if time_since_update < 2000 && state.inv.0.is_zero() {
-                // Son 2 saniye içinde güncelleme var ve inventory sıfır
-                info!(
-                    symbol = %symbol,
-                    attempt,
-                    time_since_update_ms = time_since_update,
-                    "position closed during retry (WebSocket sync detected)"
-                );
-                state.position_closing.store(false, Ordering::Release);
-                return Ok(());
-            }
-        }
-        
+    // Use global order lock to ensure only one order/position operation at a time
+    with_order_lock(async {
+        // KRİTİK: Önce tüm açık emirleri iptal et (pozisyon kapatmadan önce)
         rate_limit_guard(1).await;
-        match venue.close_position(symbol).await {
-            Ok(_) => {
-                info!(symbol = %symbol, attempt, "position closed successfully");
-                state.position_closing.store(false, Ordering::Release);
-                return Ok(());
+        if let Err(e) = venue.cancel_all(symbol).await {
+            warn!(symbol = %symbol, error = %e, "failed to cancel orders before close, continuing anyway");
+        }
+
+        // Pozisyonu kapat (retry mekanizması ile)
+        let max_retries = 3;
+        let mut last_error = None;
+        
+        for attempt in 1..=max_retries {
+            // KRİTİK RACE CONDITION FIX: Her attempt öncesi WebSocket sync kontrolü
+            // Retry sırasında WebSocket event handler pozisyonu kapatmış olabilir
+            if let Some(last_update) = state.last_inventory_update {
+                let time_since_update = last_update.elapsed().as_millis();
+                if time_since_update < 2000 && state.inv.0.is_zero() {
+                    // Son 2 saniye içinde güncelleme var ve inventory sıfır
+                    info!(
+                        symbol = %symbol,
+                        attempt,
+                        time_since_update_ms = time_since_update,
+                        "position closed during retry (WebSocket sync detected)"
+                    );
+                    state.position_closing.store(false, Ordering::Release);
+                    return Ok(());
+                }
             }
-            Err(e) => {
-                last_error = Some(e);
-                if attempt < max_retries {
-                    warn!(symbol = %symbol, attempt, max_retries, "failed to close position, retrying...");
-                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            
+            rate_limit_guard(1).await;
+            match venue.close_position(symbol).await {
+                Ok(_) => {
+                    info!(symbol = %symbol, attempt, "position closed successfully");
+                    state.position_closing.store(false, Ordering::Release);
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        warn!(symbol = %symbol, attempt, max_retries, "failed to close position, retrying...");
+                        tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                    }
                 }
             }
         }
-    }
+        
+        state.position_closing.store(false, Ordering::Release);
+        
+        if let Some(e) = last_error {
+            error!(symbol = %symbol, error = %e, "failed to close position after {} attempts", max_retries);
+            Err(e)
+        } else {
+            Ok(())
+        }
+    }).await
 
-    state.position_closing.store(false, Ordering::Release);
-    
-    if let Some(e) = last_error {
-        error!(symbol = %symbol, error = %e, "failed to close position after {} attempts", max_retries);
-        Err(e)
-    } else {
-        Ok(())
-    }
 }
 

@@ -19,7 +19,32 @@ use rust_decimal::RoundingStrategy;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, info, warn};
+
+// ============================================================================
+// Global Order Lock - Ensures only one order/position operation at a time
+// ============================================================================
+
+/// Global mutex to ensure only one order or position operation happens at a time
+/// This prevents concurrent order placement and improves control/tracking
+static GLOBAL_ORDER_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+
+/// Get the global order lock
+pub fn get_order_lock() -> &'static TokioMutex<()> {
+    GLOBAL_ORDER_LOCK.get_or_init(|| TokioMutex::new(()))
+}
+
+/// Execute a function with the global order lock held
+/// This ensures only one order/position operation happens at a time
+pub async fn with_order_lock<F, R>(f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let lock = get_order_lock();
+    let _guard = lock.lock().await;
+    f.await
+}
 
 
 // ============================================================================
@@ -195,46 +220,53 @@ pub fn is_usd_stable(asset: &str) -> bool {
 /// 
 /// # Strategy
 /// Maximizes number of trades by splitting margin into smaller chunks when possible:
-/// - If remaining == max: split into 2 equal chunks (max/2, max/2)
-/// - If remaining > max: take max, then process remainder
-/// - If remaining >= min: add as single chunk
+/// Split available margin into chunks with min 10, max 100 USD per operation
+/// 
+/// # Rules
+/// - Min margin per trade: 10 USD (margin, not leveraged)
+/// - Max margin per trade: 100 USD (margin, not leveraged)
+/// - If available >= 10 and <= 100: use all of it in one operation
+/// - If available > 100: split into chunks of 100, then use remaining if >= 10
 /// 
 /// # Examples
 /// - 0-9 USD: empty vector (ignored)
-/// - 10-100 USD: single chunk (or 2×50 if exactly 100)
-/// - 100 USD: [50, 50] (2 chunks for more trades)
-/// - 140 USD: [100, 40] (2 chunks)
-/// - 200 USD: [100, 50, 50] (3 chunks)
+/// - 10-100 USD: single chunk (use all available)
+/// - 100 USD: [100] (single chunk)
+/// - 140 USD: [100, 40] (2 chunks - use 100, then remaining 40)
+/// - 200 USD: [100, 100] (2 chunks)
+/// - 250 USD: [100, 100, 50] (3 chunks)
 pub fn split_margin_into_chunks(
     available_margin: f64,
     min_margin_per_trade: f64,
     max_margin_per_trade: f64,
 ) -> Vec<f64> {
+    // Enforce min 10, max 100 USD per operation
+    let min_margin = min_margin_per_trade.max(10.0);
+    let max_margin = max_margin_per_trade.min(100.0);
+    
     let mut chunks = Vec::new();
     let mut remaining = available_margin;
     
-    // While we have enough for at least 2 full chunks (max_margin_per_trade * 2)
-    // This ensures we can split the last max chunk if needed
-    while remaining >= max_margin_per_trade * 2.0 {
-        chunks.push(max_margin_per_trade);
-        remaining -= max_margin_per_trade;
+    // While we have enough for at least 2 full chunks (max_margin * 2)
+    while remaining >= max_margin * 2.0 {
+        chunks.push(max_margin);
+        remaining -= max_margin;
     }
     
     // Handle remaining margin
-    if remaining >= max_margin_per_trade {
+    if remaining >= max_margin {
         // Remaining is >= max but < max*2
-        // KRİTİK DÜZELTME: Önce max'ı al, sonra kalanı kontrol et
-        // Edge case: 105 USDC, max 100 → [100, 5] olmalı, [52.5, 52.5] değil
-        chunks.push(max_margin_per_trade);
-        remaining -= max_margin_per_trade;
+        // Use max first, then check if remaining is >= min
+        chunks.push(max_margin);
+        remaining -= max_margin;
         
-        // Kalanı kontrol et
-        if remaining >= min_margin_per_trade {
+        // If remaining is >= min, add it as a chunk
+        if remaining >= min_margin {
             chunks.push(remaining);
         }
-        // Eğer kalan < min ise, sadece max'ı ekledik (kalanı ignore ediyoruz)
-    } else if remaining >= min_margin_per_trade {
-        // Remaining is < max but >= min, add as single chunk
+        // If remaining < min, ignore it (already used max)
+    } else if remaining >= min_margin {
+        // Remaining is < max but >= min, use all of it in one operation
         chunks.push(remaining);
     }
     // If remaining < min, ignore it
@@ -1730,6 +1762,7 @@ pub fn update_trade_stats(
 // ============================================================================
 
 /// Place orders for a side (bid or ask)
+/// Uses global order lock to ensure only one order/position operation at a time
 pub async fn place_side_orders(
     venue: &BinanceFutures,
     symbol: &str,
@@ -1752,36 +1785,40 @@ pub async fn place_side_orders(
     profit_guarantee: &ProfitGuarantee,
 ) -> anyhow::Result<()> {
     if let Some(quote) = quote {
-        let open_orders = state.active_orders.values()
-            .filter(|o| o.side == side)
-            .count();
-        let available_margin = (caps.buy_total - *total_spent_on_side - total_spent_on_other).max(0.0);
-        let min_margin: f64 = (50.0f64 * 0.2f64).max(cfg.min_usd_per_order.unwrap_or(10.0)).min(100.0f64);
-        
-        place_orders_with_profit_guarantee(
-            venue,
-            symbol,
-            side,
-            Some(quote),
-            state,
-            bid,
-            ask,
-            position_size_notional,
-            available_margin,
-            effective_leverage,
-            open_orders,
-            cfg.risk.max_open_chunks_per_symbol_per_side,
-            quote_asset,
-            quote_balances,
-            total_spent_on_side,
-            cfg,
-            tif,
-            json_logger,
-            ob,
-            profit_guarantee.maker_fee_rate(),
-            profit_guarantee.taker_fee_rate(),
-            min_margin,
-        ).await?;
+        // Use global order lock to ensure only one order/position operation at a time
+        with_order_lock(async {
+            let open_orders = state.active_orders.values()
+                .filter(|o| o.side == side)
+                .count();
+            let available_margin = (caps.buy_total - *total_spent_on_side - total_spent_on_other).max(0.0);
+            // Enforce min 10, max 100 USD margin per operation
+            let min_margin: f64 = cfg.min_usd_per_order.unwrap_or(10.0).max(10.0).min(100.0);
+            
+            place_orders_with_profit_guarantee(
+                venue,
+                symbol,
+                side,
+                Some(quote),
+                state,
+                bid,
+                ask,
+                position_size_notional,
+                available_margin,
+                effective_leverage,
+                open_orders,
+                cfg.risk.max_open_chunks_per_symbol_per_side,
+                quote_asset,
+                quote_balances,
+                total_spent_on_side,
+                cfg,
+                tif,
+                json_logger,
+                ob,
+                profit_guarantee.maker_fee_rate(),
+                profit_guarantee.taker_fee_rate(),
+                min_margin,
+            ).await
+        }).await?;
     }
     Ok(())
 }

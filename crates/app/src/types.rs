@@ -141,6 +141,11 @@ pub struct SymbolState {
     // WebSocket event deduplication
     pub processed_events: HashSet<String>, // İşlenmiş event ID'leri (duplicate önleme için)
     pub last_event_cleanup: Option<Instant>, // Son event cleanup zamanı (memory leak önleme için)
+    
+    // Priority for coin selection (higher = more important)
+    // Used to prioritize which coins to trade first
+    // Thread-safe: can be updated by background trend analysis task
+    pub priority: Arc<std::sync::atomic::AtomicU32>, // Default: 0, higher values = higher priority
 }
 
 // ============================================================================

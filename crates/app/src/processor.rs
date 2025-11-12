@@ -306,11 +306,14 @@ pub async fn process_symbol(
         return Ok(false);
     }
     
-    // Generate quotes
+    // KRİTİK: Trend analizi ve order işlemleri birbirini bloklamamalı
+    // strategy.on_tick() hızlı çalışır, trend analizi içinde yapılır ama bloklamaz
+    // Trend analizi sonuçları priority'yi güncellemek için background'da kullanılır
     let tick_size_f64 = get_price_tick(state.symbol_rules.as_ref(), cfg.price_tick);
     let tick_size_decimal = Decimal::from_f64_retain(tick_size_f64);
     let ob_for_orders = ob.clone();
     
+    // Order placement için context oluştur
     let ctx = Context {
         ob,
         sigma: 0.5,
@@ -322,7 +325,28 @@ pub async fn process_symbol(
         tick_size: tick_size_decimal,
     };
     
+    // Generate quotes - strategy.on_tick() çağrısı hızlıdır ve order placement'ı bloklamaz
+    // Trend analizi strategy içinde yapılır ama bu hızlı bir işlemdir
     let mut quotes = state.strategy.on_tick(&ctx);
+    
+    // Trend analizi sonuçlarını background task'a gönder (non-blocking priority update)
+    // Bu sayede order placement trend analizini beklemek zorunda kalmaz
+    let trend_bps = state.strategy.get_trend_bps();
+    let priority_clone = state.priority.clone();
+    
+    // Background task: Priority'yi trend'e göre güncelle (order placement'ı bloklamaz)
+    tokio::spawn(async move {
+        // Trend'e göre priority hesapla (güçlü trend = yüksek priority)
+        let new_priority = if trend_bps.abs() > 50.0 {
+            // Güçlü trend varsa priority'yi artır
+            (trend_bps.abs() / 10.0) as u32
+        } else {
+            0 // Zayıf trend = düşük priority
+        };
+        
+        // Priority'yi thread-safe şekilde güncelle (order placement'ı bloklamaz)
+        priority_clone.store(new_priority, std::sync::atomic::Ordering::Relaxed);
+    });
     
     // Direction selection is now handled in strategy.on_tick()
     
@@ -695,6 +719,7 @@ pub fn initialize_symbol_states(
             last_close_attempt: None,
             processed_events: HashSet::new(),
             last_event_cleanup: None,
+            priority: Arc::new(std::sync::atomic::AtomicU32::new(0)), // Default priority, updated by trend analysis
         });
     }
     
