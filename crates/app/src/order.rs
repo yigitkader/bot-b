@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use crate::types::*;
-use crate::binance_exec::BinanceFutures;
+use crate::exchange::BinanceFutures;
 use crate::exec::{Venue, quant_utils_ceil_to_step, quant_utils_floor_to_step};
 use crate::config::AppCfg;
 use crate::logger;
@@ -12,10 +12,9 @@ use crate::utils::{
     adjust_price_for_aggressiveness, calc_qty_from_margin, find_optimal_price_from_depth,
     rate_limit_guard, split_margin_into_chunks,
 };
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
@@ -367,15 +366,15 @@ pub async fn place_orders_with_profit_guarantee(
         // margin_chunk_leveraged: USD (leverage uygulanmış notional)
         // calc_qty_from_margin() içinde leverage UYGULANMAZ, direkt notional kullanılır
         let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
-        let qty_price_result = calc_qty_from_margin(
+        let qty_price_result = crate::utils::calc_qty_from_margin(
             margin_chunk_leveraged,  // ✅ Zaten leveraged notional
             px_with_depth,
             rules,
             side,
         );
 
-        let (qty_str, price_str) = match qty_price_result {
-            Some((q, p)) => (q, p),
+        let (chunk_qty_dec, chunk_price_dec) = match qty_price_result {
+            Some((q_dec, p_dec)) => (q_dec, p_dec),
             None => {
                 warn!(
                     %symbol,
@@ -387,25 +386,14 @@ pub async fn place_orders_with_profit_guarantee(
             }
         };
 
-        let chunk_qty = match Decimal::from_str(&qty_str) {
-            Ok(d) => Qty(d),
-            Err(e) => {
-                warn!(%symbol, side = ?side, qty_str, error = %e, "failed to parse qty string");
-                continue;
-            }
-        };
-
-        let chunk_price = match Decimal::from_str(&price_str) {
-            Ok(d) => Px(d),
-            Err(e) => {
-                warn!(%symbol, side = ?side, price_str, error = %e, "failed to parse price string");
-                continue;
-            }
-        };
+        let chunk_qty = Qty(chunk_qty_dec);
+        let chunk_price = Px(chunk_price_dec);
 
         let chunk_notional = chunk_price.0 * chunk_qty.0;
-        let min_req_dec = Decimal::try_from(state.min_notional_req.unwrap_or(min_margin))
-            .unwrap_or(Decimal::ZERO);
+        let min_req_dec = {
+            let v = state.min_notional_req.unwrap_or(min_margin);
+            Decimal::from_f64(v).unwrap_or(Decimal::ZERO)
+        };
         if chunk_notional < min_req_dec {
             warn!(
                 %symbol,
@@ -566,100 +554,151 @@ pub async fn place_orders_with_profit_guarantee(
             }
         }
 
-        // Place order
-        rate_limit_guard(1).await;
+        // Place order (or simulate in dry-run)
+        if cfg.dry_run {
+            // Simulate order creation without sending to exchange
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let simulated_order_id = format!("SIM_{}_{}_{}", symbol, chunk_idx, timestamp_ms);
 
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let random_suffix = (timestamp_ms % 10000) as u64;
-        let side_char = match side {
-            Side::Buy => "B",
-            Side::Sell => "S",
-        };
-        let client_order_id = format!(
-            "{}_{}_C{}_{}_{}",
-            symbol.replace("-", "_").replace("/", "_"),
-            side_char,
-            chunk_idx,
-            timestamp_ms,
-            random_suffix
-        );
-        let client_order_id = if client_order_id.len() > 36 {
-            let symbol_short = symbol.chars().take(8).collect::<String>();
-            format!("{}_{}_C{}_{}", symbol_short, side_char, chunk_idx, timestamp_ms)
-                .chars()
-                .take(36)
-                .collect::<String>()
-        } else {
-            client_order_id
-        };
+            let info = OrderInfo {
+                order_id: simulated_order_id.clone(),
+                client_order_id: Some(format!("SIM_C_{}_{}", symbol, chunk_idx)),
+                side,
+                price: chunk_price,
+                qty: chunk_qty,
+                filled_qty: Qty(Decimal::ZERO),
+                remaining_qty: chunk_qty,
+                created_at: Instant::now(),
+                last_fill_time: None,
+            };
+            state.active_orders.insert(simulated_order_id.clone(), info.clone());
+            state.last_order_price_update.insert(simulated_order_id.clone(), info.price);
 
-        match venue
-            .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF, &client_order_id)
-            .await
-        {
-            Ok((order_id, returned_client_id)) => {
-                let info = OrderInfo {
-                    order_id: order_id.clone(),
-                    client_order_id: returned_client_id.or(Some(client_order_id)),
+            *total_spent += *margin_chunk;
+            if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
+                *cached_balance -= *margin_chunk;
+                *cached_balance = cached_balance.max(0.0);
+            }
+
+            if let Ok(logger) = json_logger.lock() {
+                logger.log_order_created(
+                    symbol,
+                    &simulated_order_id,
                     side,
-                    price: chunk_price,
-                    qty: chunk_qty,
-                    filled_qty: Qty(Decimal::ZERO),
-                    remaining_qty: chunk_qty,
-                    created_at: Instant::now(),
-                    last_fill_time: None,
-                };
-                state.active_orders.insert(order_id.clone(), info.clone());
-                state.last_order_price_update.insert(order_id.clone(), info.price);
-
-                *total_spent += *margin_chunk;
-
-                if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
-                    *cached_balance -= *margin_chunk;
-                    *cached_balance = cached_balance.max(0.0);
-                }
-
-                if let Ok(logger) = json_logger.lock() {
-                    logger.log_order_created(
-                        symbol,
-                        &order_id,
-                        side,
-                        chunk_price,
-                        chunk_qty,
-                        "spread_opportunity",
-                        &cfg.exec.tif,
-                    );
-                }
-
-                let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
-                info!(
-                    %symbol,
-                    side = ?side,
-                    chunk_idx,
-                    order_id,
-                    margin_chunk = *margin_chunk,
-                    lev = effective_leverage_for_chunk,
-                    notional = chunk_notional_log,
-                    action = if matches!(side, Side::Buy) { "🟢 BUY" } else { "🔴 SELL" },
-                    "order created successfully (chunk)"
+                    chunk_price,
+                    chunk_qty,
+                    "dry_run_simulation",
+                    &cfg.exec.tif,
                 );
             }
-            Err(err) => {
-                warn!(
-                    %symbol,
-                    side = ?side,
-                    chunk_idx,
-                    margin_chunk = *margin_chunk,
-                    error = %err,
-                    "failed to place order (chunk)"
-                );
+
+            let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
+            info!(
+                %symbol,
+                side = ?side,
+                chunk_idx,
+                order_id = %simulated_order_id,
+                margin_chunk = *margin_chunk,
+                lev = effective_leverage_for_chunk,
+                notional = chunk_notional_log,
+                action = if matches!(side, Side::Buy) { "SIM BUY" } else { "SIM SELL" },
+                "simulated order created (dry_run)"
+            );
+        } else {
+            rate_limit_guard(1).await;
+
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let random_suffix = (timestamp_ms % 10000) as u64;
+            let side_char = match side {
+                Side::Buy => "B",
+                Side::Sell => "S",
+            };
+            let mut client_order_id = format!(
+                "{}_{}_C{}_{}_{}",
+                symbol.replace("-", "_").replace("/", "_"),
+                side_char,
+                chunk_idx,
+                timestamp_ms,
+                random_suffix
+            );
+            if client_order_id.len() > 36 {
+                let symbol_short = symbol.chars().take(8).collect::<String>();
+                client_order_id = format!("{}_{}_C{}_{}", symbol_short, side_char, chunk_idx, timestamp_ms)
+                    .chars()
+                    .take(36)
+                    .collect::<String>();
+            }
+
+            match venue
+                .place_limit_with_client_id(symbol, side, chunk_price, chunk_qty, OPENING_ORDER_TIF, &client_order_id)
+                .await
+            {
+                Ok((order_id, returned_client_id)) => {
+                    let info = OrderInfo {
+                        order_id: order_id.clone(),
+                        client_order_id: returned_client_id.or(Some(client_order_id)),
+                        side,
+                        price: chunk_price,
+                        qty: chunk_qty,
+                        filled_qty: Qty(Decimal::ZERO),
+                        remaining_qty: chunk_qty,
+                        created_at: Instant::now(),
+                        last_fill_time: None,
+                    };
+                    state.active_orders.insert(order_id.clone(), info.clone());
+                    state.last_order_price_update.insert(order_id.clone(), info.price);
+
+                    *total_spent += *margin_chunk;
+
+                    if let Some(cached_balance) = quote_balances.get_mut(quote_asset) {
+                        *cached_balance -= *margin_chunk;
+                        *cached_balance = cached_balance.max(0.0);
+                    }
+
+                    if let Ok(logger) = json_logger.lock() {
+                        logger.log_order_created(
+                            symbol,
+                            &order_id,
+                            side,
+                            chunk_price,
+                            chunk_qty,
+                            "spread_opportunity",
+                            &cfg.exec.tif,
+                        );
+                    }
+
+                    let chunk_notional_log = (chunk_price.0 * chunk_qty.0).to_f64().unwrap_or(0.0);
+                    info!(
+                        %symbol,
+                        side = ?side,
+                        chunk_idx,
+                        order_id,
+                        margin_chunk = *margin_chunk,
+                        lev = effective_leverage_for_chunk,
+                        notional = chunk_notional_log,
+                        action = if matches!(side, Side::Buy) { "\u{1f7e2} BUY" } else { "\u{1f534} SELL" },
+                        "order created successfully (chunk)"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        %symbol,
+                        side = ?side,
+                        chunk_idx,
+                        margin_chunk = *margin_chunk,
+                        error = %err,
+                        "failed to place order (chunk)"
+                    );
+                }
             }
         }
     }
 
     Ok(())
 }
-

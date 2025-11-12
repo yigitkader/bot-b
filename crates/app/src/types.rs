@@ -3,7 +3,7 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use crate::exec::binance::SymbolMeta;
+use crate::exchange::SymbolMeta;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -94,9 +94,10 @@ pub struct SymbolState {
     // Min notional tracking
     pub min_notional_req: Option<f64>,
     pub disabled: bool,
+    pub disabled_until: Option<Instant>,
     
     // Per-symbol metadata
-    pub symbol_rules: Option<std::sync::Arc<crate::exec::binance::SymbolRules>>,
+    pub symbol_rules: Option<std::sync::Arc<crate::exchange::SymbolRules>>,
     // KRİTİK: ExchangeInfo fetch durumu - başarısızsa trade etme
     pub rules_fetch_failed: bool, // ExchangeInfo çekilemediyse true (trade etme)
     pub last_rules_retry: Option<Instant>, // Son retry zamanı (periyodik retry için)
@@ -119,7 +120,10 @@ pub struct SymbolState {
     pub position_entry_time: Option<Instant>,
     pub peak_pnl: Decimal,
     pub position_hold_duration_ms: u64,
+    pub last_peak_update: Option<Instant>,
     pub last_order_price_update: HashMap<String, Px>,
+    pub last_cancel_all_time: Option<Instant>,
+    pub cancel_all_attempt_count: u32,
     // ✅ KRİTİK FIX: position_orders tracking kaldırıldı (kullanılmıyordu, sadece overhead yaratıyordu)
     // Eğer gelecekte partial close veya order-to-position mapping gerekirse, o zaman eklenebilir
     
@@ -136,12 +140,14 @@ pub struct SymbolState {
     
     // PnL tracking
     pub last_daily_reset: Option<u64>, // Unix timestamp (ms) - son günlük reset zamanı
+    pub last_daily_reset_date: Option<u64>, // Unix timestamp (ms) - son günlük reset tarihi
     pub avg_entry_price: Option<Decimal>, // Ortalama entry price (pozisyon açılırken güncellenir)
     
     // Long/Short seçimi için histerezis ve cooldown
     pub last_direction_change: Option<Instant>, // Son yön değişikliği zamanı
     pub current_direction: Option<Side>, // Mevcut yön (Long=Buy, Short=Sell)
     pub direction_signal_strength: f64, // Sinyal gücü (0.0-1.0)
+    pub regime: Option<String>, // Trading regime (e.g., "trend", "range", "volatile")
     
     // ✅ KRİTİK İYİLEŞTİRME: Price momentum tracking (trend analizi için)
     pub price_history: Vec<(Instant, Decimal)>, // (timestamp, price) - son 10 fiyat noktası
@@ -187,4 +193,7 @@ pub struct OrderInfo {
     pub created_at: Instant,
     pub last_fill_time: Option<Instant>, // Son fill zamanı
 }
+
+// Re-export RiskAction from risk module
+pub use crate::risk::RiskAction;
 

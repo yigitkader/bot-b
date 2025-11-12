@@ -2,33 +2,24 @@
 // Main application entry point and trading loop
 
 mod app_init;
-mod binance_exec;
-mod binance_rest;
-mod binance_ws;
-mod cap_manager;
 mod config;
 mod constants;
 mod exec;
-mod event_handler;
+mod exchange;        // NEW: binance consolidation
 mod logger;
 mod monitor;
 mod order;
 mod position_manager;
-mod quote_generator;
+mod processor;       // NEW: symbol processing consolidation
 mod qmel;
-#[cfg(test)]
-mod qmel_tests;
 mod risk;
-mod strategy;
-mod direction_selector;
-mod symbol_discovery;
-mod symbol_processor;
+mod strategy;        // Now includes direction_selector
 mod types;
 mod utils;
 
 use anyhow::Result;
 use crate::types::*;
-use crate::binance_ws::UserEvent;
+use crate::exchange::UserEvent;
 use crate::constants::*;
 use crate::exec::Venue;
 use crate::risk::RiskAction;
@@ -43,8 +34,8 @@ use utils::{
     process_order_canceled, process_order_fill_with_logging,
 };
 use app_init::{initialize_app, AppInitResult};
-use event_handler::handle_reconnect_sync;
-use symbol_processor::process_symbol;
+use logger::handle_reconnect_sync;
+use processor::process_symbol;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -388,7 +379,5 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "position_order_tests.rs"]
-mod position_order_tests;
+// Tests are embedded in modules
 

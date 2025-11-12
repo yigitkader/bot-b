@@ -2,15 +2,14 @@
 // Application initialization logic extracted from main.rs
 
 use anyhow::{anyhow, Result};
-use crate::binance_exec::{BinanceCommon, BinanceFutures};
-use crate::binance_ws::{UserDataStream, UserEvent, UserStreamKind};
+use crate::exchange::{BinanceCommon, BinanceFutures, UserDataStream, UserEvent, UserStreamKind};
 use crate::config::AppCfg;
 use crate::types::*;
 use crate::exec::decimal_places;
 use crate::logger::create_logger;
 use crate::risk::RiskLimits;
 use crate::strategy::DynMmCfg;
-use crate::symbol_discovery;
+// processor module re-exports discovery functions
 use crate::utils::tif_from_cfg;
 use crate::types::SymbolState;
 use crate::utils::init_rate_limiter;
@@ -239,7 +238,7 @@ async fn initialize_symbols(
     let metadata = venue.symbol_metadata().await?;
 
     // Discover symbols
-    let mut selected = symbol_discovery::discover_symbols(venue, cfg, &metadata).await?;
+    let mut selected = crate::processor::discover_symbols(venue, cfg, &metadata).await?;
 
     // Wait for balance if no symbols found
     if selected.is_empty() {
@@ -248,15 +247,15 @@ async fn initialize_symbols(
             min_required = cfg.min_quote_balance_usd,
             "no eligible symbols found - waiting for balance to become available"
         );
-        selected = symbol_discovery::wait_and_retry_discovery(venue, cfg, &metadata).await?;
+        selected = crate::processor::wait_and_retry_discovery(venue, cfg, &metadata).await?;
     }
 
     // Clear cache for fresh startup
     info!("clearing cached exchange rules for fresh startup");
-    crate::binance_exec::FUT_RULES.clear();
+    crate::exchange::FUT_RULES.clear();
 
     // Initialize symbol states
-    let mut states = symbol_discovery::initialize_symbol_states(selected, dyn_cfg, strategy_name, cfg);
+    let mut states = crate::processor::initialize_symbol_states(selected, dyn_cfg, strategy_name, cfg);
     
     // Fetch per-symbol metadata in parallel
     info!(
@@ -321,7 +320,7 @@ async fn initialize_symbols(
     }
 
     // Setup margin and leverage
-    symbol_discovery::setup_margin_and_leverage(venue, &mut states, cfg).await?;
+    crate::processor::setup_margin_and_leverage(venue, &mut states, cfg).await?;
 
     let symbol_list: Vec<String> = states.iter().map(|s| s.meta.symbol.clone()).collect();
     info!(symbols = ?symbol_list, mode = %cfg.mode, "bot started with real Binance venue");

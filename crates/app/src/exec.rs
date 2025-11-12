@@ -53,9 +53,9 @@ pub trait Venue: Send + Sync {
 
 // Quantization helpers moved to utils.rs to avoid duplication
 // Re-export for backward compatibility
-// Re-export binance_exec types for convenience (binance_exec is a separate module)
+// Re-export exchange types for convenience
 pub mod binance {
-    pub use crate::binance_exec::*;
+    pub use crate::exchange::*;
 }
 
 // Re-export quantization helpers from utils (only commonly used ones)

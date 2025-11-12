@@ -2701,3 +2701,8 @@ mod tests {
         );
     }
 }
+
+// ============================================================================
+// Direction Selector Module (from direction_selector.rs)
+// ============================================================================
+// direction_selector.rs is empty, no content to merge

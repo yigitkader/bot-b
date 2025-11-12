@@ -2,15 +2,15 @@
 // All utility functions and helpers
 
 use crate::types::*;
-use crate::exec::binance::SymbolRules;
-use crate::binance_exec::BinanceFutures;
+use crate::exchange::SymbolRules;
+use crate::exchange::BinanceFutures;
 use crate::exec::Venue;
-use crate::cap_manager::Caps;
+use crate::risk::Caps;
 use crate::risk::RiskAction;
 use crate::order::place_orders_with_profit_guarantee;
 use crate::logger::{self, SharedLogger};
 use crate::config::AppCfg;
-use crate::event_handler::handle_order_fill;
+use crate::logger::handle_order_fill;
 use crate::constants::*;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{ToPrimitive, FromPrimitive};
@@ -278,7 +278,7 @@ pub fn calc_qty_from_margin(
     price: Decimal,
     rules: &SymbolRules,
     side: crate::types::Side,
-) -> Option<(String, String)> {
+) -> Option<(Decimal, Decimal)> {
     // ✅ KRİTİK: Precision/Decimal - kritik hesaplarda f64 yerine Decimal kullan
     // margin_chunk_leveraged: ZATEN leverage uygulanmış notional (USD)
     // notional: pozisyon büyüklüğü (USD) = margin_chunk_leveraged (leverage UYGULANMAZ!)
@@ -375,15 +375,13 @@ pub fn calc_qty_from_margin(
         let min_notional = rules.min_notional;
         
         if notional_check >= min_notional {
-            // Format with precision (Decimal kullanarak)
-            let qty_str = format_qty_with_precision(qty_ceil, rules.qty_precision);
-            let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
-            return Some((qty_str, price_str));
-        } else {
-            return None; // Cannot satisfy minNotional even with minQty
-        }
-    }
-    
+            // Return decimal values (qty, price)
+            return Some((qty_ceil, price_quantized));
+         } else {
+             return None; // Cannot satisfy minNotional even with minQty
+         }
+     }
+
     // Check minNotional (Decimal olarak)
     let notional_check = qty_floor * price_quantized;
     let min_notional = rules.min_notional;
@@ -397,19 +395,28 @@ pub fn calc_qty_from_margin(
         let qty_needed_raw = min_notional / price_quantized;
         let qty_needed = quant_utils_ceil_to_step(qty_needed_raw, step_size);
         if qty_needed >= min_qty {
-            // Format with precision (Decimal kullanarak)
-            let qty_str = format_qty_with_precision(qty_needed, rules.qty_precision);
-            let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
-            return Some((qty_str, price_str));
-        } else {
-            return None; // Cannot satisfy both minQty and minNotional
-        }
-    }
-    
-    // Format with precision (Decimal kullanarak)
-    let qty_str = format_qty_with_precision(qty_floor, rules.qty_precision);
-    let price_str = format_price_with_precision(price_quantized, rules.price_precision, side);
-    Some((qty_str, price_str))
+            // Return decimal values (qty, price)
+            return Some((qty_needed, price_quantized));
+         } else {
+             return None; // Cannot satisfy both minQty and minNotional
+         }
+     }
+
+    Some((qty_floor, price_quantized))
+}
+
+/// Compatibility wrapper: return string representations (price_str, qty_str)
+pub fn calc_qty_from_margin_strings(
+    margin_chunk_leveraged: f64,
+    price: Decimal,
+    rules: &SymbolRules,
+    side: crate::types::Side,
+) -> Option<(String, String)> {
+    calc_qty_from_margin(margin_chunk_leveraged, price, rules, side).map(|(qty_dec, price_dec)| {
+        let qty_str = format_qty_with_precision(qty_dec, rules.qty_precision);
+        let price_str = format_price_with_precision(price_dec, rules.price_precision, side);
+        (qty_str, price_str)
+    })
 }
 
 /// KRİTİK DÜZELTME: ProfitGuarantee wrapper - maker→taker fallback zinciri standardize
@@ -1723,10 +1730,6 @@ pub fn validate_quotes(
     }
 }
 
-// ============================================================================
-// Risk Adjustment (moved from risk_adjuster.rs)
-// ============================================================================
-
 /// Adjust quotes based on risk action
 pub fn adjust_quotes_for_risk(
     quotes: &mut Quotes,
@@ -1735,6 +1738,9 @@ pub fn adjust_quotes_for_risk(
     spread_widen_factor: f64,
 ) {
     match risk_action {
+        RiskAction::Narrow => {
+            // Narrow spread (more aggressive)
+        }
         RiskAction::Reduce => {
             let widen = Decimal::from_f64_retain(order_price_distance_no_position).unwrap_or(Decimal::ZERO);
             quotes.bid = quotes.bid.map(|(px, qty)| (Px(px.0 * (Decimal::ONE - widen)), qty));

@@ -311,6 +311,8 @@ pub struct AppCfg {
     pub leverage: Option<u32>,
     pub price_tick: f64,
     pub qty_step: f64,
+    #[serde(default)]
+    pub dry_run: bool, // When true, the bot will simulate orders and won't send real orders to the exchange
     pub binance: BinanceCfg,
     pub risk: RiskCfg,
     pub strategy: StratCfg,
@@ -556,11 +558,13 @@ mod tests {
             leverage: Some(3),
             price_tick: 0.001,
             qty_step: 0.001,
+            dry_run: false,
             binance: BinanceCfg {
                 futures_base: "https://fapi.binance.com".to_string(),
-                api_key: "6WkI51B0dbz9gbtRm5PphsWYFmr3oaoagJECl0UiGX13ySnLxXlhuEoR5brk74ZU".to_string(),
-                secret_key: "8N3PxGEp1CTrirTbmkM42mHaNTo5jbyamUFgatfeueHHkH5RBsDgGLCh3b6Ki3nw".to_string(),
+                api_key: "testkey".to_string(),
+                secret_key: "testsecret".to_string(),
                 recv_window_ms: 5000,
+                hedge_mode: false,
             },
             risk: RiskCfg {
                 inv_cap: "0.50".to_string(),
@@ -568,6 +572,8 @@ mod tests {
                 dd_limit_bps: 2000,
                 max_leverage: 20,
                 slippage_bps_reserve: 2.0,
+                use_isolated_margin: true,
+                max_open_chunks_per_symbol_per_side: 5,
             },
             strategy: StratCfg {
                 r#type: "dyn_mm".to_string(),
@@ -597,12 +603,32 @@ mod tests {
                 min_book_depth_usd: Some(0.0),
                 opportunity_size_multiplier: Some(1.05),
                 strong_trend_multiplier: Some(1.0),
+                min_profit_usd: Some(0.50),
+                maker_fee_rate: Some(0.0002),
+                taker_fee_rate: Some(0.0004),
+                tp_timebox_secs: Some(15),
+                position_close_cooldown_ms: Some(500),
+                direction_cooldown_secs: Some(60),
+                direction_signal_strength_threshold: Some(0.2),
+                direction_min_signal_strength: Some(0.3),
+                orderbook_imbalance_long_threshold: Some(1.2),
+                orderbook_imbalance_short_threshold: Some(0.83),
+                qmel_ev_threshold: Some(0.10),
+                qmel_min_margin_usdc: Some(10.0),
+                qmel_max_margin_usdc: Some(100.0),
+                qmel_f_min: Some(0.02),
+                qmel_f_max: Some(0.15),
+                qmel_alpha: Some(0.5),
+                qmel_beta: Some(1.0),
+                qmel_edge_decay_half_life_ms: Some(500.0),
+                qmel_exploration_rate: Some(0.1),
             },
             exec: ExecCfg {
                 tif: "post_only".to_string(),
                 venue: "binance".to_string(),
                 cancel_replace_interval_ms: 1500,
                 max_order_age_ms: 10000,
+                default_leverage: Some(20),
             },
             websocket: WebsocketCfg {
                 enabled: true,
@@ -741,4 +767,3 @@ mod tests {
         assert!(validate_config(&cfg).is_ok());
     }
 }
-

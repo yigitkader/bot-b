@@ -2,6 +2,10 @@
 // Structured JSON logging system for trading events
 
 use crate::types::*;
+use crate::exchange::BinanceFutures;
+use crate::exec::Venue;
+use crate::utils::{rate_limit_guard, update_fill_rate_on_cancel};
+use tracing::{info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -87,6 +91,20 @@ pub enum LogEvent {
         leverage: u32,
         reason: String,
     },
+    #[serde(rename = "pnl_summary")]
+    PnlSummary {
+        timestamp: u64,
+        period: String, // "hourly", "daily", etc.
+        trade_count: u32,
+        profitable_trade_count: u32,
+        losing_trade_count: u32,
+        total_profit: f64,
+        total_loss: f64,
+        net_pnl: f64,
+        largest_win: f64,
+        largest_loss: f64,
+        total_fees: f64,
+    },
     #[serde(rename = "trade_completed")]
     TradeCompleted {
         timestamp: u64,
@@ -111,23 +129,6 @@ pub enum LogEvent {
         spread_bps: f64,
         position_size_usd: f64,
         min_spread_bps: f64,
-    },
-    #[serde(rename = "pnl_summary")]
-    PnLSummary {
-        timestamp: u64,
-        period: String, // "daily", "hourly", etc.
-        total_trades: u64,
-        profitable_trades: u64,
-        losing_trades: u64,
-        total_profit: f64,
-        total_loss: f64,
-        net_pnl: f64,
-        win_rate: f64,
-        avg_profit_per_trade: f64,
-        avg_loss_per_trade: f64,
-        largest_win: f64,
-        largest_loss: f64,
-        total_fees: f64,
     },
 }
 
@@ -467,13 +468,13 @@ impl JsonLogger {
         }
     }
     
-    /// Log PnL summary (daily/hourly)
+    /// Log PnL summary
     pub fn log_pnl_summary(
         &self,
         period: &str,
-        total_trades: u64,
-        profitable_trades: u64,
-        losing_trades: u64,
+        trade_count: u32,
+        profitable_trade_count: u32,
+        losing_trade_count: u32,
         total_profit: f64,
         total_loss: f64,
         net_pnl: f64,
@@ -481,36 +482,15 @@ impl JsonLogger {
         largest_loss: f64,
         total_fees: f64,
     ) {
-        let win_rate = if total_trades > 0 {
-            profitable_trades as f64 / total_trades as f64
-        } else {
-            0.0
-        };
-        
-        let avg_profit_per_trade = if profitable_trades > 0 {
-            total_profit / profitable_trades as f64
-        } else {
-            0.0
-        };
-        
-        let avg_loss_per_trade = if losing_trades > 0 {
-            total_loss / losing_trades as f64
-        } else {
-            0.0
-        };
-        
-        let event = LogEvent::PnLSummary {
+        let event = LogEvent::PnlSummary {
             timestamp: Self::timestamp_ms(),
             period: period.to_string(),
-            total_trades,
-            profitable_trades,
-            losing_trades,
+            trade_count,
+            profitable_trade_count,
+            losing_trade_count,
             total_profit,
             total_loss,
             net_pnl,
-            win_rate,
-            avg_profit_per_trade,
-            avg_loss_per_trade,
             largest_win,
             largest_loss,
             total_fees,
@@ -525,334 +505,136 @@ impl JsonLogger {
 // Thread-safe logger wrapper
 pub type SharedLogger = Arc<Mutex<JsonLogger>>;
 
-/// KRİTİK DÜZELTME: Async logger with bounded channel (blocking risk önleme)
-/// Bounded channel ile writer task asenkron flush eder
-pub struct AsyncJsonLogger {
-    sender: tokio::sync::mpsc::Sender<LogEvent>,
-}
-
-impl AsyncJsonLogger {
-    /// Create a new async logger with bounded channel
-    pub fn new(log_file: &str) -> Result<Self, std::io::Error> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEvent>(1000); // Bounded channel: 1000 event
-        
-        // Writer task: asenkron flush
-        let logger = JsonLogger::new(log_file)?;
-        let logger_arc = Arc::new(Mutex::new(logger));
-        let logger_clone = logger_arc.clone();
-        
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                if let Ok(logger) = logger_clone.lock() {
-                    if let Err(e) = logger.write_event(&event) {
-                        eprintln!("Async logger write failed: {}", e);
-                    }
-                }
-            }
-        });
-        
-        Ok(Self { sender: tx })
-    }
-    
-    /// Send event to async channel (non-blocking)
-    pub fn log_event(&self, event: LogEvent) {
-        // Non-blocking send: channel doluysa drop et (lossy logging)
-        let _ = self.sender.try_send(event);
-    }
-    
-    // Convenience methods that match JsonLogger interface
-    pub fn log_order_created(
-        &self,
-        symbol: &str,
-        order_id: &str,
-        side: Side,
-        price: Px,
-        qty: Qty,
-        reason: &str,
-        tif: &str,
-    ) {
-        let notional = price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0);
-        let event = LogEvent::OrderCreated {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            order_id: order_id.to_string(),
-            side: format!("{:?}", side),
-            price: price.0.to_f64().unwrap_or(0.0),
-            quantity: qty.0.to_f64().unwrap_or(0.0),
-            notional_usd: notional,
-            reason: reason.to_string(),
-            tif: tif.to_string(),
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_order_filled(
-        &self,
-        symbol: &str,
-        order_id: &str,
-        side: Side,
-        price: Px,
-        qty: Qty,
-        is_maker: bool,
-        new_inventory: Qty,
-        fill_rate: f64,
-    ) {
-        let notional = price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0);
-        let event = LogEvent::OrderFilled {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            order_id: order_id.to_string(),
-            side: format!("{:?}", side),
-            price: price.0.to_f64().unwrap_or(0.0),
-            quantity: qty.0.to_f64().unwrap_or(0.0),
-            notional_usd: notional,
-            is_maker,
-            new_inventory: new_inventory.0.to_f64().unwrap_or(0.0),
-            fill_rate,
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_order_canceled(
-        &self,
-        symbol: &str,
-        order_id: &str,
-        reason: &str,
-        fill_rate: f64,
-    ) {
-        let event = LogEvent::OrderCanceled {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            order_id: order_id.to_string(),
-            reason: reason.to_string(),
-            fill_rate,
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_position_opened(
-        &self,
-        symbol: &str,
-        side: &str,
-        entry_price: Px,
-        qty: Qty,
-        leverage: u32,
-        reason: &str,
-    ) {
-        let notional = entry_price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0).abs();
-        let event = LogEvent::PositionOpened {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_price.0.to_f64().unwrap_or(0.0),
-            quantity: qty.0.to_f64().unwrap_or(0.0),
-            notional_usd: notional,
-            leverage,
-            reason: reason.to_string(),
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_position_updated(
-        &self,
-        symbol: &str,
-        side: &str,
-        entry_price: Px,
-        qty: Qty,
-        mark_price: Px,
-        leverage: u32,
-    ) {
-        let notional = entry_price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0).abs();
-        let qty_f = qty.0.to_f64().unwrap_or(0.0);
-        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
-        let mark_f = mark_price.0.to_f64().unwrap_or(0.0);
-        
-        let unrealized_pnl = (mark_f - entry_f) * qty_f;
-        let unrealized_pnl_pct = if entry_f > 0.0 {
-            ((mark_f - entry_f) / entry_f) * 100.0
-        } else {
-            0.0
-        };
-        
-        let event = LogEvent::PositionUpdated {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_f,
-            quantity: qty_f,
-            mark_price: mark_f,
-            notional_usd: notional,
-            unrealized_pnl,
-            unrealized_pnl_pct,
-            leverage,
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_position_closed(
-        &self,
-        symbol: &str,
-        side: &str,
-        entry_price: Px,
-        exit_price: Px,
-        qty: Qty,
-        leverage: u32,
-        reason: &str,
-    ) {
-        let qty_f = qty.0.to_f64().unwrap_or(0.0);
-        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
-        let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-        
-        let realized_pnl = (exit_f - entry_f) * qty_f;
-        let realized_pnl_pct = if entry_f > 0.0 {
-            ((exit_f - entry_f) / entry_f) * 100.0
-        } else {
-            0.0
-        };
-        
-        let event = LogEvent::PositionClosed {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_f,
-            exit_price: exit_f,
-            quantity: qty_f,
-            realized_pnl,
-            realized_pnl_pct,
-            leverage,
-            reason: reason.to_string(),
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_trade_completed(
-        &self,
-        symbol: &str,
-        side: &str,
-        entry_price: Px,
-        exit_price: Px,
-        qty: Qty,
-        fees: f64,
-        leverage: u32,
-    ) {
-        let qty_f = qty.0.to_f64().unwrap_or(0.0);
-        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
-        let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-        
-        let notional = entry_f * qty_f.abs();
-        let realized_pnl = (exit_f - entry_f) * qty_f;
-        let realized_pnl_pct = if entry_f > 0.0 {
-            ((exit_f - entry_f) / entry_f) * 100.0
-        } else {
-            0.0
-        };
-        
-        let net_profit = realized_pnl - fees;
-        let is_profitable = net_profit > 0.0;
-        
-        let event = LogEvent::TradeCompleted {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_f,
-            exit_price: exit_f,
-            quantity: qty_f,
-            notional_usd: notional,
-            realized_pnl,
-            realized_pnl_pct,
-            fees,
-            net_profit,
-            is_profitable,
-            leverage,
-        };
-        self.log_event(event);
-    }
-    
-    pub fn log_trade_rejected(
-        &self,
-        symbol: &str,
-        reason: &str,
-        spread_bps: f64,
-        position_size_usd: f64,
-        min_spread_bps: f64,
-    ) {
-        let event = LogEvent::TradeRejected {
-            timestamp: JsonLogger::timestamp_ms(),
-            symbol: symbol.to_string(),
-            reason: reason.to_string(),
-            spread_bps,
-            position_size_usd,
-            min_spread_bps,
-        };
-        self.log_event(event);
-    }
-    
-    /// Log PnL summary (daily/hourly)
-    pub fn log_pnl_summary(
-        &self,
-        period: &str,
-        total_trades: u64,
-        profitable_trades: u64,
-        losing_trades: u64,
-        total_profit: f64,
-        total_loss: f64,
-        net_pnl: f64,
-        largest_win: f64,
-        largest_loss: f64,
-        total_fees: f64,
-    ) {
-        let win_rate = if total_trades > 0 {
-            profitable_trades as f64 / total_trades as f64
-        } else {
-            0.0
-        };
-        
-        let avg_profit_per_trade = if profitable_trades > 0 {
-            total_profit / profitable_trades as f64
-        } else {
-            0.0
-        };
-        
-        let avg_loss_per_trade = if losing_trades > 0 {
-            total_loss / losing_trades as f64
-        } else {
-            0.0
-        };
-        
-        let event = LogEvent::PnLSummary {
-            timestamp: JsonLogger::timestamp_ms(),
-            period: period.to_string(),
-            total_trades,
-            profitable_trades,
-            losing_trades,
-            total_profit,
-            total_loss,
-            net_pnl,
-            win_rate,
-            avg_profit_per_trade,
-            avg_loss_per_trade,
-            largest_win,
-            largest_loss,
-            total_fees,
-        };
-        self.log_event(event);
-    }
-}
-
-// Thread-safe async logger wrapper
-pub type SharedAsyncLogger = Arc<AsyncJsonLogger>;
-
-/// Create a shared async logger instance (bounded channel ile)
+/// Create a shared logger instance
 pub fn create_logger(log_file: &str) -> Result<SharedLogger, std::io::Error> {
-    // Backward compatibility: eski sync logger döndür
-    // Async logger için ayrı bir fonksiyon kullanılabilir
     let logger = JsonLogger::new(log_file)?;
     Ok(Arc::new(Mutex::new(logger)))
 }
 
-/// Create an async logger instance (bounded channel ile, non-blocking)
-pub fn create_async_logger(log_file: &str) -> Result<SharedAsyncLogger, std::io::Error> {
-    let logger = AsyncJsonLogger::new(log_file)?;
-    Ok(Arc::new(logger))
+
+// ============================================================================
+// Event Handler Module (from event_handler.rs)
+// ============================================================================
+
+/// Handle WebSocket reconnect sync for all symbols
+pub async fn handle_reconnect_sync(
+    venue: &BinanceFutures,
+    states: &mut [SymbolState],
+    cfg: &crate::config::AppCfg,
+) {
+    for state in states.iter_mut() {
+        let current_pos = <BinanceFutures as Venue>::get_position(venue, &state.meta.symbol).await.ok();
+        
+        rate_limit_guard(3).await;
+        if let Ok(api_orders) = <BinanceFutures as Venue>::get_open_orders(venue, &state.meta.symbol).await {
+            let api_order_ids: std::collections::HashSet<String> = api_orders
+                .iter()
+                .map(|o| o.order_id.clone())
+                .collect();
+            
+            let mut removed_orders = Vec::new();
+            state.active_orders.retain(|order_id, order_info| {
+                if !api_order_ids.contains(order_id) {
+                    removed_orders.push(order_info.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            
+            if !removed_orders.is_empty() {
+                if let Some(pos) = current_pos {
+                    let old_inv = state.inv.0;
+                    state.inv = Qty(pos.qty.0);
+                    state.last_inventory_update = Some(std::time::Instant::now());
+                    
+                    if old_inv != pos.qty.0 {
+                        state.consecutive_no_fills = 0;
+                        state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
+                        info!(
+                            symbol = %state.meta.symbol,
+                            removed_orders = removed_orders.len(),
+                            inv_change = %(pos.qty.0 - old_inv),
+                            "reconnect sync: orders removed and inventory changed - likely filled"
+                        );
+                    } else {
+                        update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+                        info!(
+                            symbol = %state.meta.symbol,
+                            removed_orders = removed_orders.len(),
+                            "reconnect sync: orders removed but inventory unchanged - likely canceled"
+                        );
+                    }
+                } else {
+                    state.consecutive_no_fills = 0;
+                    state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_reconnect_factor + cfg.internal.fill_rate_reconnect_bonus).min(1.0);
+                    warn!(
+                        symbol = %state.meta.symbol,
+                        removed_orders = removed_orders.len(),
+                        "reconnect sync: orders removed but position unavailable, assuming filled"
+                    );
+                }
+            }
+        } else {
+            warn!(symbol = %state.meta.symbol, "failed to sync orders after reconnect");
+        }
+    }
 }
+
+/// Handle order fill event with deduplication
+pub fn handle_order_fill(
+    state: &mut SymbolState,
+    symbol: &str,
+    order_id: &str,
+    cumulative_filled_qty: Qty,
+    _order_status: &str,
+) -> bool {
+    // Event ID bazlı duplicate kontrolü
+    let event_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let event_id = format!("{}-{}-{}", order_id, cumulative_filled_qty.0, event_timestamp);
+    
+    if state.processed_events.contains(&event_id) {
+        warn!(
+            %symbol,
+            order_id = %order_id,
+            cumulative_filled_qty = %cumulative_filled_qty.0,
+            "duplicate fill event ignored"
+        );
+        return false;
+    }
+    
+    // Legacy duplicate check
+    let is_duplicate = state.active_orders.get(order_id)
+        .map(|o| o.filled_qty.0 >= cumulative_filled_qty.0)
+        .unwrap_or(false);
+    
+    if is_duplicate {
+        warn!(
+            %symbol,
+            order_id = %order_id,
+            "duplicate fill event ignored (legacy check)"
+        );
+        return false;
+    }
+    
+    // Event ID'yi kaydet ve memory leak önle
+    state.processed_events.insert(event_id);
+    if state.processed_events.len() > 1000 {
+        if state.last_event_cleanup
+            .map(|t| t.elapsed().as_secs() > 3600)
+            .unwrap_or(true)
+        {
+            state.processed_events.clear();
+            state.last_event_cleanup = Some(std::time::Instant::now());
+        } else if state.last_event_cleanup.is_none() {
+            state.last_event_cleanup = Some(std::time::Instant::now());
+        }
+    }
+    
+    true
+}
+
 
