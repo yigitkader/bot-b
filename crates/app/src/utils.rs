@@ -214,7 +214,8 @@ pub fn is_usd_stable(asset: &str) -> bool {
 ///
 /// # Rules
 /// - Min margin per trade: 10 USD (margin, not leveraged)
-/// - Max margin per trade: 100 USD (margin, not leveraged)
+/// - Max margin per trade: 100 USD (margin, not leveraged) - ✅ KRİTİK: Cüzdan kontrolü için hard limit
+/// - Leverage ile notional ne kadar olursa olsun sorun değil, ama margin 100 USD'yi geçmemeli
 /// - If available >= 10 and <= 100: use all of it in one operation
 /// - If available > 100: split into chunks of 100, then use remaining if >= 10
 ///
@@ -230,9 +231,9 @@ pub fn split_margin_into_chunks(
     min_margin_per_trade: f64,
     max_margin_per_trade: f64,
 ) -> Vec<f64> {
-    // Enforce min 10, max 100 USD per operation
+    // ✅ KRİTİK: Enforce min 10, max 100 USD per operation (cüzdan kontrolü için hard limit)
     let min_margin = min_margin_per_trade.max(10.0);
-    let max_margin = max_margin_per_trade.min(100.0);
+    let max_margin = max_margin_per_trade.min(100.0); // ✅ 100 USD hard limit
 
     let mut chunks = Vec::new();
     let mut remaining = available_margin;
@@ -336,23 +337,33 @@ pub fn calc_qty_from_margin(
         return None;
     }
 
-    // KRİTİK DÜZELTME: tick_size çok büyükse (price'dan büyük veya eşitse) price precision'dan tick hesapla
-    // Örnek: price=0.0113390, tick_size=0.1 (yanlış) -> price precision'dan tick=0.0000001 hesapla
-    let (price_quantized, effective_tick_size) = if tick_size >= price {
-        // Price precision'dan tick size hesapla: 10^(-price_precision)
-        let price_precision = rules.price_precision;
-        let calculated_tick = if price_precision > 0 {
-            Decimal::new(1, price_precision as u32)
-        } else {
-            // Fallback: price'dan decimal basamak sayısını hesapla
-            let price_str = price.to_string();
-            let decimal_places = if let Some(dot_pos) = price_str.find('.') {
-                price_str[dot_pos + 1..].len().min(8) // Max 8 decimal places
+    // KRİTİK DÜZELTME: tick_size çok büyükse (price'dan büyük veya eşitse) gerçek price'dan tick hesapla
+    // Örnek: price=0.0113390, tick_size=0.1 (yanlış) -> price'dan decimal basamak sayısını kullan: tick=0.0000001
+    // API'den gelen price_precision genellikle yanlış (örn: 2), gerçek price'ın decimal basamak sayısını kullan
+    let (price_quantized, _effective_tick_size) = if tick_size >= price {
+        // KRİTİK: API'den gelen price_precision genellikle yanlış, gerçek price'ın decimal basamak sayısını kullan
+        let price_str = price.to_string();
+        let decimal_places = if let Some(dot_pos) = price_str.find('.') {
+            let decimal_part = &price_str[dot_pos + 1..];
+            // Trailing zero'ları sayma, sadece anlamlı basamakları say
+            let significant_digits = decimal_part.trim_end_matches('0').len();
+            if significant_digits > 0 {
+                significant_digits.min(8) // Max 8 decimal places
             } else {
-                0
-            };
-            if decimal_places > 0 {
-                Decimal::new(1, decimal_places as u32)
+                // Eğer sadece trailing zero varsa, en az 1 basamak kullan
+                1
+            }
+        } else {
+            0
+        };
+        
+        let calculated_tick = if decimal_places > 0 {
+            Decimal::new(1, decimal_places as u32)
+        } else {
+            // Fallback: API'den gelen precision'ı kullan (ama genellikle yanlış)
+            let api_precision = rules.price_precision;
+            if api_precision > 0 {
+                Decimal::new(1, api_precision as u32)
             } else {
                 Decimal::new(1, 8) // Default: 0.00000001
             }
@@ -362,8 +373,9 @@ pub fn calc_qty_from_margin(
             price = %price,
             tick_size_from_api = %tick_size,
             calculated_tick = %calculated_tick,
-            price_precision = price_precision,
-            "tick_size >= price, using calculated tick from price precision"
+            decimal_places_from_price = decimal_places,
+            api_price_precision = rules.price_precision,
+            "tick_size >= price, using calculated tick from actual price decimal places"
         );
         
         let quantized = match side {
@@ -1845,7 +1857,7 @@ pub async fn place_side_orders(
     json_logger: &logger::SharedLogger,
     ob: &OrderBook,
     profit_guarantee: &ProfitGuarantee,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // ✅ DEBUG: place_side_orders fonksiyonuna girdiğimizi logla
     use tracing::info;
     info!(
@@ -1911,7 +1923,7 @@ pub async fn place_side_orders(
             "DEBUG: place_side_orders called"
         );
 
-        place_orders_with_profit_guarantee(
+        let order_placed = place_orders_with_profit_guarantee(
             venue,
             symbol,
             side,
@@ -1937,6 +1949,9 @@ pub async fn place_side_orders(
             min_margin,
         )
         .await?;
+        
+        // Return order_placed status to caller
+        Ok(order_placed)
     } else {
         // ✅ DEBUG: Quote yoksa logla
         use tracing::info;
@@ -1945,8 +1960,8 @@ pub async fn place_side_orders(
             side = ?side,
             "DEBUG: place_side_orders skipped - no quote available"
         );
+        Ok(false) // Quote yok, emir gönderilmedi
     }
-    Ok(())
 }
 
 // ============================================================================

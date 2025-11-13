@@ -256,10 +256,17 @@ pub fn should_close_position_smart(
 /// Close position with retry mechanism
 /// KRİTİK: Race condition önleme - WebSocket event sync kontrolü
 /// ✅ Thread-safe: AtomicBool kullanarak aynı anda sadece bir close işlemi yapılmasını garanti eder
+/// Close position with optional fast close mode
+///
+/// # Arguments
+/// * `use_fast_close` - Hızlı kapanış gereksiniminde true (risk halt, stop loss).
+///   Fast close modunda MARKET + reduceOnly kullanılır, LIMIT fallback yapılmaz.
+///   Normal modda MARKET başarısız olursa LIMIT fallback yapılır.
 pub async fn close_position(
     venue: &BinanceFutures,
     symbol: &str,
     state: &mut SymbolState,
+    use_fast_close: bool,
 ) -> Result<()> {
     // ✅ KRİTİK: Atomik swap - eğer zaten true ise (başka thread close ediyor), false döner ve skip eder
     if state.position_closing.swap(true, Ordering::AcqRel) {
@@ -321,9 +328,17 @@ pub async fn close_position(
             }
 
             rate_limit_guard(1).await;
-            match venue.close_position(symbol).await {
+            // ✅ KRİTİK: Hızlı kapanış gereksiniminde MARKET + reduceOnly kullan, LIMIT fallback yapma
+            // Normal kapanışta MARKET başarısız olursa LIMIT fallback yap
+            let close_result = if use_fast_close {
+                venue.flatten_position(symbol, venue.hedge_mode, true).await
+            } else {
+                venue.close_position(symbol).await
+            };
+            
+            match close_result {
                 Ok(_) => {
-                    info!(symbol = %symbol, attempt, "position closed successfully");
+                    info!(symbol = %symbol, attempt, use_fast_close, "position closed successfully");
                     state.position_closing.store(false, Ordering::Release);
                     return Ok(());
                 }

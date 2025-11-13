@@ -286,8 +286,7 @@ struct FutPosition {
     #[serde(rename = "liquidationPrice")]
     liquidation_price: String,
     #[serde(rename = "positionSide", default)]
-    #[allow(dead_code)]
-    position_side: Option<String>, // "LONG" | "SHORT" | "BOTH" (hedge mode) veya None (one-way mode)
+    position_side: Option<String>, // ✅ KRİTİK: "LONG" | "SHORT" | "BOTH" (hedge mode) veya None (one-way mode)
     #[serde(rename = "marginType", default)]
     margin_type: String, // "isolated" or "cross"
 }
@@ -604,26 +603,164 @@ impl BinanceFutures {
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
         .await?;
-        let pos = positions
-            .drain(..)
-            .find(|p| p.symbol.eq_ignore_ascii_case(sym))
-            .ok_or_else(|| anyhow!("position not found for symbol"))?;
-        let qty = Decimal::from_str(&pos.position_amt)?;
-        let entry = Decimal::from_str(&pos.entry_price)?;
-        let leverage = pos.leverage.parse::<u32>().unwrap_or(1);
-        let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
-        let liq_px = if liq > Decimal::ZERO {
-            Some(Px(liq))
+        
+        // ✅ KRİTİK: Hedge mode tutarlılığı - positionSide kontrolü
+        // Tek-yön modunda (hedge_mode=false): positionSide "BOTH" veya None olmalı, sadece bir pozisyon olmalı
+        // Hedge modunda (hedge_mode=true): positionSide "LONG" veya "SHORT" olabilir, birden fazla pozisyon olabilir
+        // Birden fazla pozisyon varsa (hedge mode), net pozisyonu hesapla (LONG - SHORT)
+        let matching_positions: Vec<&FutPosition> = positions
+            .iter()
+            .filter(|p| p.symbol.eq_ignore_ascii_case(sym))
+            .collect();
+        
+        if matching_positions.is_empty() {
+            return Err(anyhow!("position not found for symbol"));
+        }
+        
+        // ✅ KRİTİK: Tek-yön modunda positionSide kontrolü
+        // Tek-yön modunda positionSide "BOTH" veya None olmalı, "LONG"/"SHORT" olmamalı
+        if !self.hedge_mode {
+            for pos in &matching_positions {
+                if let Some(ref ps) = pos.position_side {
+                    if ps == "LONG" || ps == "SHORT" {
+                        warn!(
+                            symbol = %sym,
+                            position_side = %ps,
+                            hedge_mode = self.hedge_mode,
+                            "WARNING: positionSide is '{}' but hedge_mode is false - possible API inconsistency",
+                            ps
+                        );
+                    }
+                }
+            }
+            
+            // Tek-yön modunda: Net pozisyonu hesapla (birden fazla pozisyon olmamalı ama kontrol edelim)
+            let net_qty: Decimal = matching_positions
+                .iter()
+                .map(|p| Decimal::from_str(&p.position_amt).unwrap_or(Decimal::ZERO))
+                .sum();
+            
+            // Tek-yön modunda sadece bir pozisyon olmalı (net pozisyon)
+            let pos = matching_positions[0];
+            let qty = Decimal::from_str(&pos.position_amt)?;
+            let entry = Decimal::from_str(&pos.entry_price)?;
+            let leverage = pos.leverage.parse::<u32>().unwrap_or(1);
+            let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
+            let liq_px = if liq > Decimal::ZERO {
+                Some(Px(liq))
+            } else {
+                None
+            };
+            
+            // ✅ KRİTİK: Tek-yön modunda net pozisyon kontrolü
+            // Eğer birden fazla pozisyon varsa (API tutarsızlığı), net pozisyonu kullan
+            if matching_positions.len() > 1 {
+                warn!(
+                    symbol = %sym,
+                    positions_count = matching_positions.len(),
+                    net_qty = %net_qty,
+                    hedge_mode = self.hedge_mode,
+                    "WARNING: Multiple positions found in one-way mode, using net position"
+                );
+                // Net pozisyonu kullan (LONG - SHORT)
+                Ok(Position {
+                    symbol: sym.to_string(),
+                    qty: Qty(net_qty),
+                    entry: Px(entry), // İlk pozisyonun entry'si (net pozisyon için ortalama hesaplanabilir ama basit tutuyoruz)
+                    leverage,
+                    liq_px,
+                })
+            } else {
+                Ok(Position {
+                    symbol: sym.to_string(),
+                    qty: Qty(qty),
+                    entry: Px(entry),
+                    leverage,
+                    liq_px,
+                })
+            }
         } else {
-            None
-        };
-        Ok(Position {
-            symbol: sym.to_string(),
-            qty: Qty(qty),
-            entry: Px(entry),
-            leverage,
-            liq_px,
-        })
+            // ✅ KRİTİK: Hedge modunda - net pozisyonu hesapla (LONG - SHORT)
+            // Hedge modunda birden fazla pozisyon olabilir (LONG ve SHORT ayrı ayrı)
+            let mut long_qty = Decimal::ZERO;
+            let mut short_qty = Decimal::ZERO;
+            let mut long_entry = Decimal::ZERO;
+            let mut short_entry = Decimal::ZERO;
+            let mut leverage = 1u32;
+            let mut liq_px = None;
+            
+            for pos in matching_positions {
+                let qty = Decimal::from_str(&pos.position_amt).unwrap_or(Decimal::ZERO);
+                let entry = Decimal::from_str(&pos.entry_price).unwrap_or(Decimal::ZERO);
+                let lev = pos.leverage.parse::<u32>().unwrap_or(1);
+                let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
+                
+                // ✅ KRİTİK: positionSide kontrolü - hedge modunda "LONG" veya "SHORT" olmalı
+                match pos.position_side.as_deref() {
+                    Some("LONG") => {
+                        long_qty = qty;
+                        long_entry = entry;
+                        leverage = lev;
+                        if liq > Decimal::ZERO {
+                            liq_px = Some(Px(liq));
+                        }
+                    }
+                    Some("SHORT") => {
+                        short_qty = qty;
+                        short_entry = entry;
+                        leverage = lev;
+                        if liq > Decimal::ZERO {
+                            liq_px = Some(Px(liq));
+                        }
+                    }
+                    Some("BOTH") | None => {
+                        // ✅ KRİTİK: Hedge modunda "BOTH" veya None beklenmiyor, uyarı ver
+                        warn!(
+                            symbol = %sym,
+                            position_side = ?pos.position_side,
+                            hedge_mode = self.hedge_mode,
+                            "WARNING: positionSide is 'BOTH' or None in hedge mode - possible API inconsistency"
+                        );
+                        // Net pozisyonu hesapla (qty zaten net olabilir)
+                        long_qty = qty.max(Decimal::ZERO);
+                        short_qty = (-qty).max(Decimal::ZERO);
+                        long_entry = entry;
+                        short_entry = entry;
+                        leverage = lev;
+                        if liq > Decimal::ZERO {
+                            liq_px = Some(Px(liq));
+                        }
+                    }
+                    Some(other) => {
+                        warn!(
+                            symbol = %sym,
+                            position_side = %other,
+                            hedge_mode = self.hedge_mode,
+                            "WARNING: Unknown positionSide value in hedge mode"
+                        );
+                    }
+                }
+            }
+            
+            // Net pozisyon: LONG - SHORT
+            let net_qty = long_qty - short_qty;
+            // Net entry: Weighted average (basit versiyon - ilk pozisyonun entry'si)
+            let net_entry = if net_qty.is_sign_positive() {
+                long_entry
+            } else if net_qty.is_sign_negative() {
+                short_entry
+            } else {
+                Decimal::ZERO
+            };
+            
+            Ok(Position {
+                symbol: sym.to_string(),
+                qty: Qty(net_qty),
+                entry: Px(net_entry),
+                leverage,
+                liq_px,
+            })
+        }
     }
 
     pub async fn fetch_premium_index(&self, sym: &str) -> Result<(Px, Option<f64>, Option<u64>)> {
@@ -641,12 +778,16 @@ impl BinanceFutures {
     /// Close position with reduceOnly guarantee and verification
     ///
     /// KRİTİK: Futures için pozisyon kapatma garantisi:
-    /// 1. reduceOnly=true ile market order gönder
+    /// 1. reduceOnly=true ile market order gönder (veya use_market_only=false ise limit fallback)
     /// 2. Pozisyon tam olarak kapatıldığını doğrula
     /// 3. Kısmi kapatma durumunda retry yap
     /// 4. Leverage ile uyumlu olduğundan emin ol
     /// 5. Hedge mode açıksa positionSide parametresi ekle
-    pub async fn flatten_position(&self, sym: &str, hedge_mode: bool) -> Result<()> {
+    ///
+    /// # Arguments
+    /// * `use_market_only` - Hızlı kapanış gereksiniminde true (risk halt, stop loss). 
+    ///   False ise MARKET başarısız olursa LIMIT fallback yapar.
+    pub async fn flatten_position(&self, sym: &str, hedge_mode: bool, use_market_only: bool) -> Result<()> {
         // İlk pozisyon kontrolü
         let initial_pos = self.fetch_position(sym).await?;
         let initial_qty = initial_pos.qty.0;
@@ -825,8 +966,32 @@ impl BinanceFutures {
                     let error_str = e.to_string();
                     let error_lower = error_str.to_lowercase();
 
+                    // ✅ KRİTİK: Hızlı kapanış gereksiniminde (use_market_only=true) LIMIT fallback yapma
+                    // Risk halt, stop loss gibi durumlarda hızlı kapanış kritik, LIMIT yavaş olabilir
+                    if use_market_only {
+                        // Hızlı kapanış gereksiniminde: Retry yap veya hata döndür, LIMIT fallback yapma
+                        warn!(
+                            symbol = %sym,
+                            attempt = attempt + 1,
+                            error = %e,
+                            remaining_qty = %remaining_qty,
+                            "MARKET reduce-only failed in fast close mode, retrying..."
+                        );
+                        if attempt < max_attempts - 1 {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Failed to close position with MARKET reduce-only after {} attempts: {}",
+                                max_attempts,
+                                e
+                            ));
+                        }
+                    }
+
                     // KRİTİK DÜZELTME: MIN_NOTIONAL hatası yakalama (-1013 veya "min notional")
                     // Küçük "artık" miktarlarda reduce-only market close borsa min_notional eşiğini sağlamayabilir
+                    // Normal kapanış modunda LIMIT fallback yap
                     if error_lower.contains("-1013")
                         || error_lower.contains("min notional")
                         || error_lower.contains("min_notional")
@@ -1274,7 +1439,8 @@ impl Venue for BinanceFutures {
     }
 
     async fn close_position(&self, sym: &str) -> Result<()> {
-        self.flatten_position(sym, self.hedge_mode).await
+        // Normal kapanış: MARKET başarısız olursa LIMIT fallback yap
+        self.flatten_position(sym, self.hedge_mode, false).await
     }
 }
 

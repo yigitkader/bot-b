@@ -96,9 +96,34 @@ pub async fn initialize_app() -> Result<AppInitResult> {
     let states = initialize_symbols(&venue, &cfg, &dyn_cfg, &strategy_name).await?;
 
     // Build risk limits
+    // ✅ KRİTİK: inv_cap artık USD notional tabanlı (fiyat * qty) - base asset miktarı değil!
+    // Config'deki değer USD olarak yorumlanır (örn: "1000" = 1000 USD notional limit)
+    let inv_cap_usd = cfg.risk.inv_cap.parse::<f64>()
+        .map_err(|e| anyhow!("invalid risk.inv_cap (must be USD notional): {}", e))?;
+    
+    // ✅ KRİTİK: Range validation - inv_cap > 0 ve akılcı üst sınır
+    const MIN_INV_CAP_USD: f64 = 1.0; // Minimum 1 USD
+    const MAX_INV_CAP_USD: f64 = 1_000_000.0; // Maximum 1M USD (akılcı üst sınır)
+    if inv_cap_usd <= 0.0 {
+        return Err(anyhow!("risk.inv_cap must be positive, got: {}", inv_cap_usd));
+    }
+    if inv_cap_usd < MIN_INV_CAP_USD {
+        return Err(anyhow!(
+            "risk.inv_cap must be at least {} USD, got: {}",
+            MIN_INV_CAP_USD,
+            inv_cap_usd
+        ));
+    }
+    if inv_cap_usd > MAX_INV_CAP_USD {
+        return Err(anyhow!(
+            "risk.inv_cap exceeds maximum allowed value of {} USD, got: {}",
+            MAX_INV_CAP_USD,
+            inv_cap_usd
+        ));
+    }
+    
     let risk_limits = RiskLimits {
-        inv_cap: Qty(Decimal::from_str(&cfg.risk.inv_cap)
-            .map_err(|e| anyhow!("invalid risk.inv_cap: {}", e))?),
+        inv_cap_usd, // ✅ USD notional limit
         min_liq_gap_bps: cfg.risk.min_liq_gap_bps,
         dd_limit_bps: cfg.risk.dd_limit_bps,
         max_leverage: cfg.risk.max_leverage,
@@ -140,13 +165,64 @@ pub async fn initialize_app() -> Result<AppInitResult> {
 }
 
 fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
+    // ✅ KRİTİK: Parse ve validate base_size
+    let base_size = Decimal::from_str(&cfg.strategy.base_size)
+        .map_err(|e| anyhow!("invalid strategy.base_size: {}", e))?;
+    
+    // ✅ KRİTİK: Range validation - base_size > 0 ve akılcı üst sınır
+    let min_base_size = Decimal::new(1, 8); // Minimum 0.00000001 (çok küçük değerler için)
+    let max_base_size = Decimal::from(1_000_000); // Maximum 1M (akılcı üst sınır)
+    if base_size <= Decimal::ZERO {
+        return Err(anyhow!("strategy.base_size must be positive, got: {}", base_size));
+    }
+    if base_size < min_base_size {
+        return Err(anyhow!(
+            "strategy.base_size must be at least {}, got: {}",
+            min_base_size,
+            base_size
+        ));
+    }
+    if base_size > max_base_size {
+        return Err(anyhow!(
+            "strategy.base_size exceeds maximum allowed value of {}, got: {}",
+            max_base_size,
+            base_size
+        ));
+    }
+    
+    // ✅ KRİTİK: Parse ve validate inv_cap (strategy.inv_cap veya risk.inv_cap fallback)
+    let inv_cap_str = cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap);
+    let inv_cap = Decimal::from_str(inv_cap_str)
+        .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap (must be USD notional): {}", e))?;
+    
+    // ✅ KRİTİK: Range validation - inv_cap > 0 ve akılcı üst sınır (USD notional)
+    let min_inv_cap = Decimal::from(1); // Minimum 1 USD
+    let max_inv_cap = Decimal::from(1_000_000); // Maximum 1M USD (akılcı üst sınır)
+    if inv_cap <= Decimal::ZERO {
+        return Err(anyhow!("strategy.inv_cap (or risk.inv_cap) must be positive, got: {}", inv_cap));
+    }
+    if inv_cap < min_inv_cap {
+        return Err(anyhow!(
+            "strategy.inv_cap (or risk.inv_cap) must be at least {} USD, got: {}",
+            min_inv_cap,
+            inv_cap
+        ));
+    }
+    if inv_cap > max_inv_cap {
+        return Err(anyhow!(
+            "strategy.inv_cap (or risk.inv_cap) exceeds maximum allowed value of {} USD, got: {}",
+            max_inv_cap,
+            inv_cap
+        ));
+    }
+    
     Ok(DynMmCfg {
         a: cfg.strategy.a,
         b: cfg.strategy.b,
-        base_size: Decimal::from_str(&cfg.strategy.base_size)
-            .map_err(|e| anyhow!("invalid strategy.base_size: {}", e))?,
-        inv_cap: Decimal::from_str(cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap))
-            .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap: {}", e))?,
+        base_size,
+        // ✅ KRİTİK: inv_cap artık USD notional tabanlı (fiyat * qty) - base asset miktarı değil!
+        // Config'deki değer USD olarak yorumlanır (örn: "1000" = 1000 USD notional limit)
+        inv_cap,
         min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(30.0),
         max_spread_bps: cfg.strategy.max_spread_bps.unwrap_or(100.0),
         spread_arbitrage_min_bps: cfg.strategy.spread_arbitrage_min_bps.unwrap_or(30.0),

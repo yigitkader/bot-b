@@ -381,7 +381,8 @@ async fn main() -> Result<()> {
         // Step 2: Close positions sequentially (rate limit protection)
         for symbol in positions_to_close {
             if let Some(state) = states.iter_mut().find(|s| s.meta.symbol == symbol) {
-                if let Err(e) = position_manager::close_position(&venue, &symbol, state).await {
+                // ✅ KRİTİK: Shutdown sırasında normal kapanış (LIMIT fallback ile)
+                if let Err(e) = position_manager::close_position(&venue, &symbol, state, false).await {
                     error!(symbol = %symbol, error = %e, "failed to close position during shutdown");
                 } else {
                     info!(symbol = %symbol, "position closed successfully during shutdown");

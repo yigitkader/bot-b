@@ -296,6 +296,7 @@ pub async fn sync_orders_from_api<V: Venue>(
 
 /// Place orders for a side with profit guarantee check
 /// IMPORTANT: Opening LIMIT orders always use PostOnly to guarantee maker fee
+/// Returns true if an order was actually placed, false otherwise
 pub async fn place_orders_with_profit_guarantee(
     venue: &BinanceFutures,
     symbol: &str,
@@ -320,7 +321,7 @@ pub async fn place_orders_with_profit_guarantee(
     _maker_fee_rate: f64,
     taker_fee_rate: f64,
     min_margin: f64,
-) -> Result<()> {
+) -> Result<bool> {
     const OPENING_ORDER_TIF: Tif = Tif::PostOnly;
     let (px_raw, _qty) = match quote {
         Some(q) => q,
@@ -330,7 +331,7 @@ pub async fn place_orders_with_profit_guarantee(
                 side = ?side,
                 "DEBUG: place_orders_with_profit_guarantee skipped - quote is None"
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -406,10 +407,12 @@ pub async fn place_orders_with_profit_guarantee(
                 rules_fetch_failed = state.rules_fetch_failed,
                 "CRITICAL: no exchange rules available, skipping order placement (rules required for trading)"
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
+    // ✅ KRİTİK: Her chunk için maximum 100 USDT/USDC margin limiti (cüzdan kontrolü)
+    // Leverage ile notional ne kadar olursa olsun sorun değil, ama margin 100 USD'yi geçmemeli
     let volatility = state.strategy.get_volatility();
     let base_chunk_size: f64 = 20.0;
     let volatility_factor: f64 = if volatility > 0.05 {
@@ -422,8 +425,9 @@ pub async fn place_orders_with_profit_guarantee(
 
     let adaptive_chunk_size = base_chunk_size * volatility_factor;
     let min_margin_adaptive = (adaptive_chunk_size * 0.2).max(min_margin).min(100.0);
+    // ✅ KRİTİK: max_margin_adaptive her zaman cfg.max_usd_per_order (100 USD) ile sınırlandırılmış
     let max_margin_adaptive = (adaptive_chunk_size * 2.0)
-        .min(cfg.max_usd_per_order)
+        .min(cfg.max_usd_per_order) // ✅ 100 USD hard limit
         .max(10.0);
 
     let margin_chunks =
@@ -438,7 +442,7 @@ pub async fn place_orders_with_profit_guarantee(
             max_margin_adaptive,
             "DEBUG: No margin chunks available - available_margin too small"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     info!(
@@ -463,7 +467,7 @@ pub async fn place_orders_with_profit_guarantee(
             open_orders = open_orders_count,
             "max_open_chunks_per_symbol_per_side limit reached, skipping new order placement"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // KRİTİK: Bir anda sadece 1 open order veya 1 position olmalı
@@ -477,7 +481,7 @@ pub async fn place_orders_with_profit_guarantee(
             open_orders = open_orders_count,
             "skipping chunk processing: already has open order, will process next chunk when current order closes"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // ✅ KRİTİK: One-way mode'da karşı yöne emir atarken önce reduce-only emir gönder
@@ -519,7 +523,7 @@ pub async fn place_orders_with_profit_guarantee(
                         error = %e,
                         "ONE-WAY MODE: failed to close position, skipping opposite side order"
                     );
-                    return Ok(()); // Close başarısız, karşı yöne emir atma
+                    return Ok(false); // Close başarısız, karşı yöne emir atma
                 }
             }
         }
@@ -529,7 +533,7 @@ pub async fn place_orders_with_profit_guarantee(
     // Diğer chunk'lar bir sonraki tick'lerde, önceki order kapanınca işlenecek
     let margin_chunk = match margin_chunks.first() {
         Some(chunk) => chunk,
-        None => return Ok(()),
+        None => return Ok(false),
     };
     let chunk_idx = 0;
 
@@ -553,22 +557,30 @@ pub async fn place_orders_with_profit_guarantee(
     // Post-only emirler cross ederse taker olur, bu maker fee garantisini bozar
     // Cross ediyorsa fiyatı bir tick dışarı it, tekrar cross etmiyorsa devam et
     let px_final = if matches!(OPENING_ORDER_TIF, Tif::PostOnly) {
-        // Effective tick size hesapla - eğer tick_size geçersizse price precision'dan hesapla
+        // Effective tick size hesapla - eğer tick_size geçersizse gerçek price'dan hesapla
         let effective_tick_size = if rules.tick_size >= px_with_depth || rules.tick_size >= bid.0 {
-            // Price precision'dan tick size hesapla
-            let price_precision = rules.price_precision;
-            if price_precision > 0 {
-                Decimal::new(1, price_precision as u32)
-            } else {
-                // Fallback: price'dan decimal basamak sayısını hesapla
-                let price_str = px_with_depth.to_string();
-                let decimal_places = if let Some(dot_pos) = price_str.find('.') {
-                    price_str[dot_pos + 1..].len().min(8)
+            // KRİTİK: API'den gelen price_precision genellikle yanlış, gerçek price'ın decimal basamak sayısını kullan
+            let price_str = px_with_depth.to_string();
+            let decimal_places = if let Some(dot_pos) = price_str.find('.') {
+                let decimal_part = &price_str[dot_pos + 1..];
+                // Trailing zero'ları sayma, sadece anlamlı basamakları say
+                let significant_digits = decimal_part.trim_end_matches('0').len();
+                if significant_digits > 0 {
+                    significant_digits.min(8)
                 } else {
-                    0
-                };
-                if decimal_places > 0 {
-                    Decimal::new(1, decimal_places as u32)
+                    1 // En az 1 basamak
+                }
+            } else {
+                0
+            };
+            
+            if decimal_places > 0 {
+                Decimal::new(1, decimal_places as u32)
+            } else {
+                // Fallback: API'den gelen precision'ı kullan
+                let api_precision = rules.price_precision;
+                if api_precision > 0 {
+                    Decimal::new(1, api_precision as u32)
                 } else {
                     Decimal::new(1, 8) // Default: 0.00000001
                 }
@@ -619,7 +631,7 @@ pub async fn place_orders_with_profit_guarantee(
                     api_tick_size = %rules.tick_size,
                     "POST-ONLY VIOLATION: unable to adjust price without crossing, skipping"
                 );
-                return Ok(());
+                return Ok(false);
             }
 
             debug!(
@@ -660,7 +672,7 @@ pub async fn place_orders_with_profit_guarantee(
                 margin_chunk = *margin_chunk,
                 "calc_qty_from_margin returned None, skipping chunk"
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -670,22 +682,30 @@ pub async fn place_orders_with_profit_guarantee(
     // ✅ KRİTİK: Quantize sonrası final cross kontrolü
     // Quantize işlemi fiyatı değiştirebilir, tekrar kontrol et
     if matches!(OPENING_ORDER_TIF, Tif::PostOnly) {
-        // Effective tick size hesapla - eğer tick_size geçersizse price precision'dan hesapla
+        // Effective tick size hesapla - eğer tick_size geçersizse gerçek price'dan hesapla
         let effective_tick_size = if rules.tick_size >= chunk_price.0 || rules.tick_size >= bid.0 {
-            // Price precision'dan tick size hesapla
-            let price_precision = rules.price_precision;
-            if price_precision > 0 {
-                Decimal::new(1, price_precision as u32)
-            } else {
-                // Fallback: price'dan decimal basamak sayısını hesapla
-                let price_str = chunk_price.0.to_string();
-                let decimal_places = if let Some(dot_pos) = price_str.find('.') {
-                    price_str[dot_pos + 1..].len().min(8)
+            // KRİTİK: API'den gelen price_precision genellikle yanlış, gerçek price'ın decimal basamak sayısını kullan
+            let price_str = chunk_price.0.to_string();
+            let decimal_places = if let Some(dot_pos) = price_str.find('.') {
+                let decimal_part = &price_str[dot_pos + 1..];
+                // Trailing zero'ları sayma, sadece anlamlı basamakları say
+                let significant_digits = decimal_part.trim_end_matches('0').len();
+                if significant_digits > 0 {
+                    significant_digits.min(8)
                 } else {
-                    0
-                };
-                if decimal_places > 0 {
-                    Decimal::new(1, decimal_places as u32)
+                    1 // En az 1 basamak
+                }
+            } else {
+                0
+            };
+            
+            if decimal_places > 0 {
+                Decimal::new(1, decimal_places as u32)
+            } else {
+                // Fallback: API'den gelen precision'ı kullan
+                let api_precision = rules.price_precision;
+                if api_precision > 0 {
+                    Decimal::new(1, api_precision as u32)
                 } else {
                     Decimal::new(1, 8) // Default: 0.00000001
                 }
@@ -708,7 +728,7 @@ pub async fn place_orders_with_profit_guarantee(
                 ask = %ask.0,
                 "POST-ONLY VIOLATION: quantized price crosses market, skipping to prevent taker fill"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         // Ek güvenlik: En az 1 tick mesafe kontrolü (quantize sonrası)
@@ -734,7 +754,7 @@ pub async fn place_orders_with_profit_guarantee(
                 api_tick_size = %rules.tick_size,
                 "POST-ONLY SAFETY: quantized price too close to market (less than 1 tick), skipping to prevent cross"
             );
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -750,8 +770,20 @@ pub async fn place_orders_with_profit_guarantee(
         .unwrap_or(Decimal::ZERO);
 
     // 2. Risk sınırları: min_margin (10 USD) ve max_usd_per_order (100 USD)
+    // ✅ KRİTİK: Tek bir chunk maximum 100 USDT/USDC margin (cüzdan kontrolü)
+    // Leverage ile notional ne kadar olursa olsun sorun değil, ama margin 100 USD'yi geçmemeli
+    // ✅ KRİTİK: chunk_notional leverage uygulanmış notional, margin kontrolü için leverage'e böl
     let min_margin_dec = Decimal::from_f64(min_margin).unwrap_or(Decimal::ZERO);
     let max_margin_dec = Decimal::from_f64(cfg.max_usd_per_order).unwrap_or(Decimal::from(100));
+    
+    // ✅ KRİTİK: chunk_notional leverage uygulanmış notional, margin kontrolü için leverage'e böl
+    // Örnek: chunk_notional = 2000 USD (100 USD margin * 20x leverage)
+    // chunk_margin = 2000 / 20 = 100 USD → max_margin_dec (100 USD) ile karşılaştır
+    let mut chunk_margin = if effective_leverage_for_chunk > 0.0 {
+        chunk_notional / Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE)
+    } else {
+        Decimal::ZERO
+    };
 
     // 3. Quantize sonrası notional kontrolü
     // a) Exchange'in minimum notional gereksiniminden küçük olamaz
@@ -763,12 +795,15 @@ pub async fn place_orders_with_profit_guarantee(
             min_notional_req = %min_notional_req_dec,
             "chunk notional below exchange min_notional after quantization, skipping"
         );
-        return Ok(());
+        return Ok(false);
     }
 
-    // c) Risk sınırı: 100 USD maximum (quantize sonrası büyüdüyse qty'yi düşürmeyi dene)
-    if chunk_notional > max_margin_dec && chunk_price.0 > Decimal::ZERO {
-        let max_qty_raw = max_margin_dec / chunk_price.0;
+    // c) Risk sınırı: 100 USD maximum margin (quantize sonrası büyüdüyse qty'yi düşürmeyi dene)
+    // ✅ KRİTİK: chunk_margin (leverage'e bölünmüş) ile max_margin_dec karşılaştır
+    if chunk_margin > max_margin_dec && chunk_price.0 > Decimal::ZERO {
+        // max_margin_dec'den max notional hesapla (leverage ile çarp)
+        let max_notional_dec = max_margin_dec * Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE);
+        let max_qty_raw = max_notional_dec / chunk_price.0;
         let adjusted_qty = quant_utils_floor_to_step(max_qty_raw, rules.step_size);
         if adjusted_qty > Decimal::ZERO && adjusted_qty < chunk_qty.0 {
             debug!(
@@ -776,49 +811,64 @@ pub async fn place_orders_with_profit_guarantee(
                 side = ?side,
                 original_qty = %chunk_qty.0,
                 adjusted_qty = %adjusted_qty,
-                max_notional = %max_margin_dec,
-                "reducing quantity to respect max notional limit"
+                max_margin = %max_margin_dec,
+                effective_leverage = effective_leverage_for_chunk,
+                "reducing quantity to respect max margin limit (after leverage)"
             );
             chunk_qty = Qty(adjusted_qty);
             chunk_notional = chunk_price.0 * chunk_qty.0;
+            // chunk_margin'i yeniden hesapla
+            chunk_margin = if effective_leverage_for_chunk > 0.0 {
+                chunk_notional / Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE)
+            } else {
+                Decimal::ZERO
+            };
         }
     }
 
-    // b) Risk sınırı: 10 USD minimum (quantize sonrası küçüldüyse skip et)
-    if chunk_notional < min_margin_dec {
+    // b) Risk sınırı: 10 USD minimum margin (quantize sonrası küçüldüyse skip et)
+    // ✅ KRİTİK: chunk_margin (leverage'e bölünmüş) ile min_margin_dec karşılaştır
+    if chunk_margin < min_margin_dec {
         warn!(
             %symbol,
             side = ?side,
             chunk_notional = %chunk_notional,
+            chunk_margin = %chunk_margin,
             min_margin = %min_margin_dec,
+            effective_leverage = effective_leverage_for_chunk,
             margin_chunk = *margin_chunk,
-            "chunk notional below 10 USD minimum after quantization, skipping (quantize reduced size)"
+            "chunk margin below 10 USD minimum after quantization, skipping (quantize reduced size)"
         );
-        return Ok(());
+        return Ok(false);
     }
 
-    // d) Risk sınırı: 100 USD maximum (quantize sonrası hâlâ büyükse skip et)
-    if chunk_notional > max_margin_dec {
+    // d) Risk sınırı: 100 USD maximum margin (quantize sonrası hâlâ büyükse skip et)
+    // ✅ KRİTİK: chunk_margin (leverage'e bölünmüş) ile max_margin_dec karşılaştır
+    if chunk_margin > max_margin_dec {
         warn!(
             %symbol,
             side = ?side,
             chunk_notional = %chunk_notional,
+            chunk_margin = %chunk_margin,
             max_margin = %max_margin_dec,
+            effective_leverage = effective_leverage_for_chunk,
             margin_chunk = *margin_chunk,
-            "chunk notional above 100 USD maximum after quantization, skipping (quantize increased size)"
+            "chunk margin above 100 USD maximum after quantization, skipping (quantize increased size)"
         );
-        return Ok(());
+        return Ok(false);
     }
 
-    // ✅ DOĞRULAMA: Quantize sonrası notional 10-100 USD aralığında
+    // ✅ DOĞRULAMA: Quantize sonrası margin 10-100 USD aralığında (leverage'e bölünmüş)
     debug!(
         %symbol,
         side = ?side,
         chunk_notional = %chunk_notional,
+        chunk_margin = %chunk_margin,
+        effective_leverage = effective_leverage_for_chunk,
         min_margin = %min_margin_dec,
         max_margin = %max_margin_dec,
         margin_chunk = *margin_chunk,
-        "quantize validation passed: notional in 10-100 USD range"
+        "quantize validation passed: margin in 10-100 USD range (after leverage division)"
     );
 
     // Profit guarantee check with TP calculation
@@ -907,7 +957,7 @@ pub async fn place_orders_with_profit_guarantee(
     };
 
     if !tp_valid {
-        return Ok(());
+        return Ok(false);
     }
 
     // Test order for first chunk
@@ -959,7 +1009,7 @@ pub async fn place_orders_with_profit_guarantee(
                                     error!(%symbol, side = ?side, error = %e2, "test order still failed, disabling symbol");
                                     state.disabled = true;
                                     state.rules_fetch_failed = true;
-                                    return Ok(());
+                                    return Ok(false);
                                 }
                             }
                         }
@@ -967,13 +1017,13 @@ pub async fn place_orders_with_profit_guarantee(
                             error!(%symbol, side = ?side, error = %e2, "failed to refresh rules, disabling symbol");
                             state.disabled = true;
                             state.rules_fetch_failed = true;
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                 } else {
                     warn!(%symbol, side = ?side, error = %e, "test order failed (non-precision), disabling symbol");
                     state.disabled = true;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -1068,6 +1118,7 @@ pub async fn place_orders_with_profit_guarantee(
                 action = if matches!(side, Side::Buy) { "\u{1f7e2} BUY" } else { "\u{1f534} SELL" },
                 "order created successfully (chunk)"
             );
+            return Ok(true); // Emir başarıyla gönderildi
         }
         Err(err) => {
             warn!(
@@ -1081,5 +1132,5 @@ pub async fn place_orders_with_profit_guarantee(
         }
     }
 
-    Ok(())
+    Ok(false) // Emir gönderilmedi (POST-ONLY kontrolü, quantization hatası, vb.)
 }

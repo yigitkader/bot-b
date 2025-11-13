@@ -40,7 +40,7 @@ binance:
   hedge_mode: false  # Hedge mode (dual-side position) açık mı? Default: false (one-way mode)
 
 risk:
-  inv_cap: "0.50"
+  inv_cap: "1000.0"  # ✅ KRİTİK: USD notional tabanlı (fiyat * qty) - base asset miktarı değil! Örnek: 1000 USD notional limit
   min_liq_gap_bps: 300
   dd_limit_bps: 2000
   max_leverage: 50  # KRİTİK DÜZELTME: 100x çok tehlikeli, 50x ile sınırla
@@ -53,7 +53,7 @@ strategy:
   # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
   a: 60.0   # 100.0 → 60.0: spread'i daralt (daha agresif, daha fazla işlem)
   b: 20.0    # 35.0 → 20.0: spread'i daralt (daha agresif, daha fazla işlem)
-  base_size: "11.0"  # 20 → 50 (daha fazla kazanç/işlem)
+  base_size: "10.0"  # 20 → 50 (daha fazla kazanç/işlem)
 
   # --- Q-MEL Algoritma Parametreleri (type: "qmel" için) ---
   # Q-MEL: Micro-Edge Trading Algorithm

@@ -244,7 +244,7 @@ pub struct DynMm {
     pub a: f64,
     pub b: f64,
     pub base_notional: Decimal,
-    pub inv_cap: Qty,
+    pub inv_cap_usd: f64, // ✅ KRİTİK: USD notional tabanlı (fiyat * qty) - base asset miktarı değil!
     // --- CONFIG DEĞERLERİ: Tüm eşikler ve katsayılar config'den ---
     min_spread_bps: f64,
     max_spread_bps: f64,
@@ -332,7 +332,7 @@ impl From<DynMmCfg> for DynMm {
             a: c.a,
             b: c.b,
             base_notional,
-            inv_cap: Qty(c.inv_cap),
+            inv_cap_usd: c.inv_cap.to_f64().unwrap_or(0.0), // ✅ USD notional
             // Config değerleri
             min_spread_bps: c.min_spread_bps,
             max_spread_bps: c.max_spread_bps,
@@ -575,7 +575,8 @@ impl DynMm {
     }
 
     // Hedef envanter hesaplama: funding rate ve trend'e göre
-    fn calculate_target_inventory(&mut self, funding_rate: Option<f64>, trend_bps: f64) -> Qty {
+    // ✅ KRİTİK: inv_cap artık USD notional tabanlı - mark_price ile bölerek base asset miktarına çevir
+    fn calculate_target_inventory(&mut self, funding_rate: Option<f64>, trend_bps: f64, mark_price: Px) -> Qty {
         // Funding rate pozitifse long (pozitif envanter), negatifse short (negatif envanter)
         let funding_bias = self.funding_bias(funding_rate);
         // Trend yukarıysa long, aşağıysa short
@@ -585,7 +586,7 @@ impl DynMm {
         // Kombine bias: funding + trend
         let combined_bias = funding_bias + trend_bias;
 
-        // Hedef envanter: bias'a göre inv_cap'in bir yüzdesi
+        // Hedef envanter: bias'a göre inv_cap_usd'nin bir yüzdesi (USD notional)
         // Tanh benzeri fonksiyon: -1 ile 1 arası sınırla
         let bias_f64 = combined_bias / 100.0;
         let target_ratio = if bias_f64 > 10.0 {
@@ -596,20 +597,33 @@ impl DynMm {
             // Basit sigmoid: x / (1 + |x|)
             bias_f64 / (1.0 + bias_f64.abs())
         };
-        let target =
-            self.inv_cap.0 * Decimal::from_f64_retain(target_ratio).unwrap_or(Decimal::ZERO);
+        // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir (mark_price ile böl)
+        let target_notional_usd = self.inv_cap_usd * target_ratio;
+        let target_notional = Decimal::from_f64_retain(target_notional_usd).unwrap_or(Decimal::ZERO);
+        let target = if mark_price.0 > Decimal::ZERO {
+            target_notional / mark_price.0
+        } else {
+            Decimal::ZERO
+        };
         Qty(target)
     }
 
     // Envanter yönetimi: hedef envantere göre al/sat kararı
+    // ✅ KRİTİK: inv_cap artık USD notional tabanlı - mark_price ile bölerek base asset miktarına çevir
     // KRİTİK DÜZELTME: Envanter kontrolü etkili hale getirildi
     // Threshold içindeyse: Market making (her iki taraf)
     // Threshold dışındaysa: Tek taraflı işlem (hedefe doğru)
-    fn inventory_decision(&self, current_inv: Qty, target_inv: Qty) -> (bool, bool) {
+    fn inventory_decision(&self, current_inv: Qty, target_inv: Qty, mark_price: Px) -> (bool, bool) {
         let diff = (current_inv.0 - target_inv.0).abs();
-        // Config'den: Envanter threshold oranı
-        let threshold = self.inv_cap.0
-            * Decimal::from_f64_retain(self.inventory_threshold_ratio).unwrap_or(Decimal::ZERO);
+        // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir (mark_price ile böl)
+        let threshold_notional_usd = self.inv_cap_usd
+            * Decimal::from_f64_retain(self.inventory_threshold_ratio).unwrap_or(Decimal::ZERO).to_f64().unwrap_or(0.0);
+        let threshold_notional = Decimal::from_f64_retain(threshold_notional_usd).unwrap_or(Decimal::ZERO);
+        let threshold = if mark_price.0 > Decimal::ZERO {
+            threshold_notional / mark_price.0
+        } else {
+            Decimal::ZERO
+        };
 
         if diff < threshold {
             // Hedef envantere yakınsa: market making (her iki taraf)
@@ -1259,11 +1273,13 @@ impl Strategy for DynMm {
         let trend_bps = self.detect_trend();
 
         // Hedef envanter hesapla (funding rate ve trend'e göre)
-        self.target_inventory = self.calculate_target_inventory(c.funding_rate, trend_bps);
+        // ✅ KRİTİK: mark_price ile inv_cap_usd'yi base asset miktarına çevir
+        self.target_inventory = self.calculate_target_inventory(c.funding_rate, trend_bps, c.mark_price);
 
         // Envanter kararı: hedef envantere göre al/sat
+        // ✅ KRİTİK: mark_price ile inv_cap_usd'yi base asset miktarına çevir
         let (mut should_bid, mut should_ask) =
-            self.inventory_decision(c.inv, self.target_inventory);
+            self.inventory_decision(c.inv, self.target_inventory, c.mark_price);
 
         // --- MANİPÜLASYON FIRSAT KULLANIMI: Fırsatları avantaja çevir ---
         if let Some(ref opp) = self.manipulation_opportunity {
@@ -1524,10 +1540,16 @@ impl Strategy for DynMm {
 
         // Envanter bias: pozitif envanter varsa ask'i yukarı, bid'i aşağı çek (satmaya zorla)
         // Negatif envanter varsa bid'i yukarı, ask'i aşağı çek (almaya zorla)
-        let inv_bias = if self.inv_cap.0.is_zero() {
+        // ✅ KRİTİK: inv_cap artık USD notional tabanlı - mark_price ile bölerek base asset miktarına çevir
+        let inv_cap_qty = if c.mark_price.0 > Decimal::ZERO && self.inv_cap_usd > 0.0 {
+            Decimal::from_f64_retain(self.inv_cap_usd).unwrap_or(Decimal::ZERO) / c.mark_price.0
+        } else {
+            Decimal::ZERO
+        };
+        let inv_bias = if inv_cap_qty.is_zero() {
             0.0
         } else {
-            (c.inv.0 / self.inv_cap.0).to_f64().unwrap_or(0.0).abs()
+            (c.inv.0 / inv_cap_qty).to_f64().unwrap_or(0.0).abs()
         };
         let inv_direction = if c.inv.0.is_sign_positive() {
             1.0 // Pozitif envanter: ask'i yukarı, bid'i aşağı
@@ -1789,7 +1811,7 @@ mod tests {
             a: 120.0,
             b: 40.0,
             base_size: dec!(20.0),
-            inv_cap: dec!(0.5),
+            inv_cap: dec!(1000.0), // ✅ USD notional (1000 USD limit for testing)
             // Default değerler (test için)
             min_spread_bps: default_min_spread_bps(),
             max_spread_bps: default_max_spread_bps(),
@@ -1966,9 +1988,10 @@ mod tests {
         let strategy = create_test_strategy();
         let target = Qty(dec!(0));
         let current = Qty(dec!(0));
+        let mark_price = Px(dec!(50000)); // Test mark price
 
         // When: Inventory decision is made
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target, mark_price);
 
         // Then: Should bid and ask (market making mode)
         assert!(should_bid, "Should bid when at target (market making mode)");
@@ -1979,12 +2002,14 @@ mod tests {
     fn test_inventory_decision_within_threshold() {
         // Given: Current inventory is close to target (within threshold)
         let strategy = create_test_strategy();
-        let inv_cap = strategy.inv_cap.0;
-        let target = Qty(inv_cap * dec!(0.5)); // Target: 0.25
-        let current = Qty(inv_cap * dec!(0.48)); // Current: 0.24 (diff = 0.01, within threshold)
+        let mark_price = Px(dec!(50000)); // Test mark price
+        // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir
+        let inv_cap_qty = Decimal::from_f64_retain(strategy.inv_cap_usd).unwrap_or(Decimal::ZERO) / mark_price.0;
+        let target = Qty(inv_cap_qty * dec!(0.5)); // Target: 0.5 * inv_cap
+        let current = Qty(inv_cap_qty * dec!(0.48)); // Current: 0.48 * inv_cap (diff within threshold)
 
         // When: Inventory decision is made
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target, mark_price);
 
         // Then: Should bid and ask (market making mode)
         assert!(should_bid, "Should bid when within threshold");
@@ -1995,12 +2020,14 @@ mod tests {
     fn test_inventory_decision_below_target() {
         // Given: Current inventory is below target (diff > threshold)
         let strategy = create_test_strategy();
-        let inv_cap = strategy.inv_cap.0;
-        let target = Qty(inv_cap * dec!(0.5)); // Target: 0.25
-        let current = Qty(dec!(0)); // Current: 0 (diff = 0.25, above threshold)
+        let mark_price = Px(dec!(50000)); // Test mark price
+        // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir
+        let inv_cap_qty = Decimal::from_f64_retain(strategy.inv_cap_usd).unwrap_or(Decimal::ZERO) / mark_price.0;
+        let target = Qty(inv_cap_qty * dec!(0.5)); // Target: 0.5 * inv_cap
+        let current = Qty(dec!(0)); // Current: 0 (diff > threshold)
 
         // When: Inventory decision is made
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target, mark_price);
 
         // Then: Should only bid (not ask) to increase inventory towards target
         assert!(should_bid, "Should bid when below target (aggressive bid)");
@@ -2014,12 +2041,14 @@ mod tests {
     fn test_inventory_decision_above_target() {
         // Given: Current inventory is above target (diff > threshold)
         let strategy = create_test_strategy();
-        let inv_cap = strategy.inv_cap.0;
+        let mark_price = Px(dec!(50000)); // Test mark price
+        // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir
+        let inv_cap_qty = Decimal::from_f64_retain(strategy.inv_cap_usd).unwrap_or(Decimal::ZERO) / mark_price.0;
         let target = Qty(dec!(0));
-        let current = Qty(inv_cap * dec!(0.5)); // Current: 0.25 (diff = 0.25, above threshold)
+        let current = Qty(inv_cap_qty * dec!(0.5)); // Current: 0.5 * inv_cap (diff > threshold)
 
         // When: Inventory decision is made
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target, mark_price);
 
         // Then: Should only ask (not bid) to decrease inventory towards target
         assert!(
@@ -2168,21 +2197,22 @@ mod tests {
     #[test]
     fn test_target_inventory_calculation() {
         let mut strategy = create_test_strategy();
+        let mark_price = Px(dec!(50000)); // Test mark price
 
         // Positive funding rate: should target long
-        let target = strategy.calculate_target_inventory(Some(0.01), 0.0);
+        let target = strategy.calculate_target_inventory(Some(0.01), 0.0, mark_price);
         assert!(target.0 > dec!(0));
 
         // Negative funding rate: should target short
-        let target = strategy.calculate_target_inventory(Some(-0.01), 0.0);
+        let target = strategy.calculate_target_inventory(Some(-0.01), 0.0, mark_price);
         assert!(target.0 < dec!(0));
 
         // Zero funding, uptrend: should target long
-        let target = strategy.calculate_target_inventory(None, 100.0);
+        let target = strategy.calculate_target_inventory(None, 100.0, mark_price);
         assert!(target.0 >= dec!(0));
 
         // Zero funding, downtrend: should target short
-        let target = strategy.calculate_target_inventory(None, -100.0);
+        let target = strategy.calculate_target_inventory(None, -100.0, mark_price);
         assert!(target.0 <= dec!(0));
     }
 
@@ -2220,14 +2250,16 @@ mod tests {
     #[test]
     fn test_target_inventory_with_no_funding_no_trend() {
         let mut strategy = create_test_strategy();
+        let mark_price = Px(dec!(50000)); // Test mark price
 
         // Funding rate yok, trend yok
-        let target = strategy.calculate_target_inventory(None, 0.0);
+        let target = strategy.calculate_target_inventory(None, 0.0, mark_price);
 
         // combined_bias = 0.0
         // bias_f64 = 0.0 / 100.0 = 0.0
         // target_ratio = 0.0 / (1.0 + 0.0) = 0.0
-        // target = 0.5 * 0.0 = 0.0
+        // target_notional_usd = inv_cap_usd * 0.0 = 0.0
+        // target = 0.0 / mark_price = 0.0
         assert_eq!(
             target.0,
             dec!(0),
@@ -2238,11 +2270,12 @@ mod tests {
     #[test]
     fn test_inventory_decision_when_target_and_current_both_zero() {
         let strategy = create_test_strategy();
+        let mark_price = Px(dec!(50000)); // Test mark price
 
         // Target = 0, Current = 0
         let target = Qty(dec!(0));
         let current = Qty(dec!(0));
-        let (should_bid, should_ask) = strategy.inventory_decision(current, target);
+        let (should_bid, should_ask) = strategy.inventory_decision(current, target, mark_price);
 
         // diff = |0 - 0| = 0
         // threshold = 0.5 * 0.1 = 0.05

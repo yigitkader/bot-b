@@ -59,7 +59,10 @@ pub async fn process_symbol(
         sync_orders_from_api(venue, symbol, state, cfg).await;
 
         // ✅ KRİTİK: Sync sonrası çift taraf kontrolü - sembol başına tek taraf açık emir
-        // Eğer hem BUY hem SELL açık emir varsa, birini iptal et (basit tercih: ilk giren kalsın)
+        // Eğer hem BUY hem SELL açık emir varsa, akıllı mantıkla birini iptal et:
+        // 1. Pozisyon varsa: Pozisyon yönüyle aynı olanı tut (reduce için), zıt olanı iptal et
+        // 2. Pozisyon yoksa: Strateji sinyaline göre (trend_bps) karar ver
+        // 3. Trend yoksa: Daha yeni atılan emiri tut
         let buy_exists = state
             .active_orders
             .values()
@@ -70,24 +73,116 @@ pub async fn process_symbol(
             .any(|o| matches!(o.side, Side::Sell));
 
         if buy_exists && sell_exists {
-            // Tercih: SELL'i iptal et, BUY kalsın (basit tercih)
-            warn!(
-                %symbol,
-                "both BUY and SELL orders exist, canceling SELL orders (single side rule)"
-            );
-            // SELL emirlerini iptal et
-            let sell_order_ids: Vec<String> = state
+            let current_inv = state.inv.0;
+            let side_to_cancel = if !current_inv.is_zero() {
+                // Pozisyon var: Pozisyon yönüyle aynı olanı tut, zıt olanı iptal et
+                // Long pozisyon (inv > 0) → SELL'i tut (reduce için), BUY'ı iptal et
+                // Short pozisyon (inv < 0) → BUY'ı tut (reduce için), SELL'i iptal et
+                if current_inv.is_sign_positive() {
+                    // Long pozisyon → BUY'ı iptal et, SELL'i tut
+                    warn!(
+                        %symbol,
+                        current_inv = %current_inv,
+                        "both BUY and SELL orders exist, canceling BUY (long position - keep SELL for reduce)"
+                    );
+                    Side::Buy
+                } else {
+                    // Short pozisyon → SELL'i iptal et, BUY'ı tut
+                    warn!(
+                        %symbol,
+                        current_inv = %current_inv,
+                        "both BUY and SELL orders exist, canceling SELL (short position - keep BUY for reduce)"
+                    );
+                    Side::Sell
+                }
+            } else {
+                // Pozisyon yok: Strateji sinyaline göre karar ver
+                let trend_bps = state.strategy.get_trend_bps();
+                if trend_bps > 0.0 {
+                    // Uptrend → BUY'ı tut, SELL'i iptal et
+                    warn!(
+                        %symbol,
+                        trend_bps = format!("{:.2}", trend_bps),
+                        "both BUY and SELL orders exist, canceling SELL (uptrend - keep BUY)"
+                    );
+                    Side::Sell
+                } else if trend_bps < 0.0 {
+                    // Downtrend → SELL'i tut, BUY'ı iptal et
+                    warn!(
+                        %symbol,
+                        trend_bps = format!("{:.2}", trend_bps),
+                        "both BUY and SELL orders exist, canceling BUY (downtrend - keep SELL)"
+                    );
+                    Side::Buy
+                } else {
+                    // Trend yok: Daha yeni atılan emiri tut
+                    let buy_orders: Vec<(&String, &OrderInfo)> = state
+                        .active_orders
+                        .iter()
+                        .filter(|(_, o)| matches!(o.side, Side::Buy))
+                        .collect();
+                    let sell_orders: Vec<(&String, &OrderInfo)> = state
+                        .active_orders
+                        .iter()
+                        .filter(|(_, o)| matches!(o.side, Side::Sell))
+                        .collect();
+
+                    let newest_buy = buy_orders
+                        .iter()
+                        .max_by_key(|(_, o)| o.created_at);
+                    let newest_sell = sell_orders
+                        .iter()
+                        .max_by_key(|(_, o)| o.created_at);
+
+                    match (newest_buy, newest_sell) {
+                        (Some((_, buy_order)), Some((_, sell_order))) => {
+                            if buy_order.created_at > sell_order.created_at {
+                                // BUY daha yeni → SELL'i iptal et
+                                warn!(
+                                    %symbol,
+                                    "both BUY and SELL orders exist, canceling SELL (BUY is newer)"
+                                );
+                                Side::Sell
+                            } else {
+                                // SELL daha yeni → BUY'ı iptal et
+                                warn!(
+                                    %symbol,
+                                    "both BUY and SELL orders exist, canceling BUY (SELL is newer)"
+                                );
+                                Side::Buy
+                            }
+                        }
+                        _ => {
+                            // Fallback: SELL'i iptal et
+                            warn!(
+                                %symbol,
+                                "both BUY and SELL orders exist, canceling SELL (fallback)"
+                            );
+                            Side::Sell
+                        }
+                    }
+                }
+            };
+
+            // Seçilen tarafın emirlerini iptal et
+            let orders_to_cancel: Vec<String> = state
                 .active_orders
                 .iter()
-                .filter(|(_, o)| matches!(o.side, Side::Sell))
+                .filter(|(_, o)| o.side == side_to_cancel)
                 .map(|(id, _)| id.clone())
                 .collect();
 
-            for order_id in sell_order_ids {
+            for order_id in orders_to_cancel {
                 use crate::utils::rate_limit_guard;
                 rate_limit_guard(1).await;
                 if let Err(e) = venue.cancel(&order_id, symbol).await {
-                    warn!(%symbol, order_id = %order_id, error = %e, "failed to cancel SELL order");
+                    warn!(
+                        %symbol,
+                        order_id = %order_id,
+                        side = ?side_to_cancel,
+                        error = %e,
+                        "failed to cancel order"
+                    );
                 } else {
                     state.active_orders.remove(&order_id);
                     state.last_order_price_update.remove(&order_id);
@@ -111,7 +206,8 @@ pub async fn process_symbol(
             if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
                 warn!(%symbol, position_qty = %pos.qty.0, age_secs, "FORCE CLOSE: Position exceeded max duration");
                 if !state.position_closing.load(Ordering::Acquire) {
-                    let _ = position_manager::close_position(venue, symbol, state).await;
+                    // ✅ KRİTİK: Force close hızlı kapanış gerektirir - MARKET + reduceOnly kullan
+                    let _ = position_manager::close_position(venue, symbol, state, true).await;
                 }
                 return Ok(false);
             }
@@ -119,6 +215,8 @@ pub async fn process_symbol(
     }
 
     // Calculate position metrics once (used multiple times)
+    // ✅ KRİTİK: position_size_notional ve current_pnl USD notional bazlı (quote asset'ten bağımsız)
+    // Hem USDC hem USDT için aynı USD değeri kullanılır (1 USDC ≈ 1 USDT ≈ 1 USD)
     let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
     let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
     let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
@@ -213,7 +311,8 @@ pub async fn process_symbol(
         .unwrap_or(true);
 
     if should_close && !state.position_closing.load(Ordering::Acquire) && can_attempt_close {
-        if position_manager::close_position(venue, symbol, state)
+        // ✅ KRİTİK: Stop loss hızlı kapanış gerektirir - MARKET + reduceOnly kullan
+        if position_manager::close_position(venue, symbol, state, true)
             .await
             .is_ok()
         {
@@ -276,6 +375,8 @@ pub async fn process_symbol(
             }
 
             // PnL summary log
+            // ✅ KRİTİK: PnL hesaplamaları USD notional bazlı (quote asset'ten bağımsız)
+            // Her sembol için ayrı state var, BTCUSDC ve BTCUSDT ayrı ayrı track edilir
             if state
                 .last_pnl_summary_time
                 .map(|last| last.elapsed().as_secs() >= 3600 || state.trade_count % 10 == 0)
@@ -404,7 +505,17 @@ pub async fn process_symbol(
     };
 
     let dd_bps = compute_drawdown_bps(&state.pnl_history);
-    let risk_action = crate::risk::check_risk(&pos, state.inv, liq_gap_bps, dd_bps, risk_limits);
+    // ✅ KRİTİK: position_size_notional zaten hesaplanmış (satır 218'de)
+    // ✅ KRİTİK: check_risk fonksiyonu USD notional bazlı çalışır (quote asset'ten bağımsız)
+    // inv_cap_usd kontrolü USD notional ile yapılır, USDC/USDT ayrımı yok
+    let risk_action = crate::risk::check_risk(
+        &pos,
+        state.inv,
+        position_size_notional, // ✅ USD notional (mark_price * qty) - quote asset'ten bağımsız
+        liq_gap_bps,
+        dd_bps,
+        risk_limits,
+    );
 
     apply_fill_rate_decay(state, cfg);
 
@@ -418,7 +529,9 @@ pub async fn process_symbol(
         warn!(%symbol, "risk halt triggered, cancelling and flattening");
         rate_limit_guard(2).await;
         let _ = Venue::cancel_all(venue, symbol).await;
-        let _ = Venue::close_position(venue, symbol).await;
+        // ✅ KRİTİK: Risk halt hızlı kapanış gerektirir - MARKET + reduceOnly kullan (LIMIT fallback yok)
+        // position_manager::close_position ile use_fast_close=true kullan
+        let _ = position_manager::close_position(venue, symbol, state, true).await;
         return Ok(false);
     }
 
@@ -597,12 +710,14 @@ pub async fn process_symbol(
     );
 
     // Calculate caps
+    // ✅ KRİTİK: quote_asset her sembol için ayrı (BTCUSDC → USDC, BTCUSDT → USDT)
+    // calculate_caps fonksiyonu doğru quote asset'in bakiyesini kullanır (quote_balances.get(quote_asset))
     let caps = calculate_caps(
         state,
-        &quote_asset,
+        &quote_asset, // ✅ Her sembol kendi quote asset'ini kullanır (USDC veya USDT)
         quote_balances,
-        position_size_notional,
-        current_pnl,
+        position_size_notional, // ✅ USD notional (quote asset'ten bağımsız)
+        current_pnl, // ✅ USD notional (quote asset'ten bağımsız)
         effective_leverage,
         cfg,
     );
@@ -821,7 +936,7 @@ pub async fn process_symbol(
                         has_bid_quote = bid_quote.is_some(),
                         "DEBUG: Calling place_side_orders for Buy side"
                     );
-                    place_side_orders(
+                    let order_placed = place_side_orders(
                         venue,
                         symbol,
                         Side::Buy,
@@ -843,7 +958,9 @@ pub async fn process_symbol(
                         profit_guarantee,
                     )
                     .await?;
-                    placed = true;
+                    if order_placed {
+                        placed = true;
+                    }
                 }
                 Side::Sell => {
                     let ask_quote = quotes.ask.clone();
@@ -852,7 +969,7 @@ pub async fn process_symbol(
                         has_ask_quote = ask_quote.is_some(),
                         "DEBUG: Calling place_side_orders for Sell side"
                     );
-                    place_side_orders(
+                    let order_placed = place_side_orders(
                         venue,
                         symbol,
                         Side::Sell,
@@ -874,7 +991,9 @@ pub async fn process_symbol(
                         profit_guarantee,
                     )
                     .await?;
-                    placed = true;
+                    if order_placed {
+                        placed = true;
+                    }
                 }
             }
         } else if quotes.bid.is_some() {
@@ -884,7 +1003,7 @@ pub async fn process_symbol(
                 has_bid_quote = bid_quote.is_some(),
                 "DEBUG: Only bid available, calling place_side_orders for Buy side"
             );
-            place_side_orders(
+            let order_placed = place_side_orders(
                 venue,
                 symbol,
                 Side::Buy,
@@ -906,7 +1025,9 @@ pub async fn process_symbol(
                 profit_guarantee,
             )
             .await?;
-            placed = true;
+            if order_placed {
+                placed = true;
+            }
         } else if quotes.ask.is_some() {
             let ask_quote = quotes.ask.clone();
             info!(
