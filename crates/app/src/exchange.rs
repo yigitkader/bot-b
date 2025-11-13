@@ -596,7 +596,7 @@ impl BinanceFutures {
             "{}/fapi/v2/positionRisk?{}&signature={}",
             self.base, qs, sig
         );
-        let mut positions: Vec<FutPosition> = send_json(
+        let positions: Vec<FutPosition> = send_json(
             self.common
                 .client
                 .get(url)

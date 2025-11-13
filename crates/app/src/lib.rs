@@ -12,7 +12,7 @@ pub mod position_manager;
 pub mod processor; // NEW: consolidates quote_gen/symbol_proc/discovery
 pub mod qmel;
 pub mod risk;
-pub mod strategy; // Now includes direction_selector
+pub mod strategy; // Now includes direction_selector and trend analysis with leverage
 pub mod types;
 pub mod utils;
 

@@ -52,7 +52,7 @@ pub enum PositionRiskLevel {
 /// Her sembol için ayrı state var, BTCUSDC ve BTCUSDT ayrı ayrı kontrol edilir
 pub fn check_risk(
     pos: &Position,
-    inv: Qty,
+    _inv: Qty,
     position_size_notional: f64, // ✅ USD notional (mark_price * qty) - quote asset'ten bağımsız
     liq_gap_bps: f64,
     dd_bps: i64,

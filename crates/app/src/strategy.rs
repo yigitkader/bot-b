@@ -3,6 +3,7 @@ use crate::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 /// Manipülasyon fırsatı: Tespit edilen manipülasyonu avantaja çevirme stratejisi
 #[derive(Clone, Debug)]
@@ -2725,6 +2726,191 @@ mod tests {
 }
 
 // ============================================================================
-// Direction Selector Module (from direction_selector.rs)
+// Trend Analysis with Leverage Optimization
 // ============================================================================
-// direction_selector.rs is empty, no content to merge
+// Note: types, rust_decimal, and tracing are already imported at the top of the file
+
+/// Trend leverage analysis result
+#[derive(Debug, Clone)]
+pub struct TrendLeverageAnalysis {
+    /// Trend strength in basis points
+    pub trend_bps: f64,
+    /// Recommended leverage (considering max leverage per symbol)
+    pub recommended_leverage: f64,
+    /// Maximum leverage allowed for this symbol
+    pub max_leverage_for_symbol: f64,
+    /// Expected profit with recommended leverage (in quote asset)
+    pub expected_profit: f64,
+    /// Expected profit per margin unit (ROI)
+    pub expected_roi: f64,
+    /// Risk-adjusted leverage (conservative)
+    pub risk_adjusted_leverage: f64,
+    /// Position size in USD notional with recommended leverage
+    pub position_size_notional: f64,
+}
+
+/// Analyze trend and calculate optimal leverage
+/// 
+/// # Arguments
+/// * `trend_bps` - Trend strength in basis points (positive = uptrend, negative = downtrend)
+/// * `mark_price` - Current mark price
+/// * `margin_available` - Available margin in quote asset (USDT/USDC)
+/// * `max_leverage_config` - Maximum leverage from config
+/// * `max_leverage_symbol` - Maximum leverage for this specific symbol (from exchange)
+/// * `min_profit_target` - Minimum profit target in quote asset (e.g., 0.50 USDT)
+/// * `volatility_1s` - 1-second volatility estimate
+/// * `maker_fee_rate` - Maker fee rate
+/// * `taker_fee_rate` - Taker fee rate
+pub fn analyze_trend_with_leverage(
+    trend_bps: f64,
+    mark_price: Px,
+    margin_available: f64,
+    max_leverage_config: f64,
+    max_leverage_symbol: Option<f64>, // Her coin için max leverage (API'den gelecek)
+    min_profit_target: f64,
+    volatility_1s: f64,
+    maker_fee_rate: f64,
+    taker_fee_rate: f64,
+) -> TrendLeverageAnalysis {
+    // 1. Her coin için max leverage kontrolü
+    let max_leverage_for_symbol = max_leverage_symbol
+        .unwrap_or(max_leverage_config)
+        .min(max_leverage_config); // Config'deki max'ı aşamaz
+    
+    // 2. Trend gücüne göre leverage önerisi
+    // Güçlü trend (>100 bps) → daha yüksek leverage
+    // Zayıf trend (<50 bps) → daha düşük leverage
+    let trend_strength_abs = trend_bps.abs();
+    let trend_multiplier = if trend_strength_abs > 100.0 {
+        1.0 // Güçlü trend → max leverage kullan
+    } else if trend_strength_abs > 50.0 {
+        0.8 // Orta trend → %80 leverage
+    } else if trend_strength_abs > 20.0 {
+        0.6 // Zayıf trend → %60 leverage
+    } else {
+        0.4 // Çok zayıf trend → %40 leverage
+    };
+    
+    // 3. Volatilite bazlı leverage düzeltmesi
+    // Yüksek volatilite → daha düşük leverage (risk yönetimi)
+    let volatility_factor = if volatility_1s > 0.01 {
+        0.7 // Yüksek volatilite → %70 leverage
+    } else if volatility_1s > 0.005 {
+        0.85 // Orta volatilite → %85 leverage
+    } else {
+        1.0 // Düşük volatilite → %100 leverage
+    };
+    
+    // 4. Risk-adjusted leverage hesaplama
+    let base_leverage = max_leverage_for_symbol * trend_multiplier * volatility_factor;
+    let risk_adjusted_leverage = base_leverage.min(max_leverage_for_symbol).max(1.0);
+    
+    // 5. Minimum profit hedefi için gerekli leverage kontrolü
+    // Eğer margin * leverage ile 0.50 hedefi karşılanamıyorsa leverage artır
+    let position_size_notional = margin_available * risk_adjusted_leverage;
+    let min_position_size_for_target = if min_profit_target > 0.0 {
+        // Minimum profit için gerekli spread: fees + target
+        let total_fees_bps = (maker_fee_rate + taker_fee_rate) * 10000.0;
+        let target_bps = 10000.0 * min_profit_target / position_size_notional;
+        let min_spread_bps = total_fees_bps + target_bps;
+        
+        // Trend ile beklenen spread (trend_bps kadar fiyat hareketi)
+        let expected_price_move_bps = trend_strength_abs;
+        
+        if expected_price_move_bps >= min_spread_bps {
+            // Trend yeterli, mevcut leverage yeterli
+            risk_adjusted_leverage
+        } else {
+            // Trend yetersiz, leverage artır (ama max'ı aşma)
+            let required_leverage = (min_profit_target * 10000.0) / (expected_price_move_bps * margin_available - total_fees_bps * margin_available / 10000.0);
+            required_leverage.min(max_leverage_for_symbol).max(1.0)
+        }
+    } else {
+        risk_adjusted_leverage
+    };
+    
+    let recommended_leverage = min_position_size_for_target.min(max_leverage_for_symbol).max(1.0);
+    
+    // 6. Beklenen kazanç hesaplama
+    let final_position_size = margin_available * recommended_leverage;
+    let expected_price_move = (trend_bps / 10000.0) * mark_price.0.to_f64().unwrap_or(0.0);
+    let gross_profit = if trend_bps > 0.0 {
+        // Uptrend → long pozisyon → fiyat artışı = kar
+        expected_price_move * (final_position_size / mark_price.0.to_f64().unwrap_or(1.0))
+    } else {
+        // Downtrend → short pozisyon → fiyat düşüşü = kar
+        -expected_price_move * (final_position_size / mark_price.0.to_f64().unwrap_or(1.0))
+    };
+    
+    // Fees hesaplama
+    let entry_fee = final_position_size * maker_fee_rate;
+    let exit_fee = final_position_size * taker_fee_rate;
+    let total_fees = entry_fee + exit_fee;
+    
+    let expected_profit = gross_profit.abs() - total_fees;
+    let expected_roi = if margin_available > 0.0 {
+        (expected_profit / margin_available) * 100.0
+    } else {
+        0.0
+    };
+    
+    TrendLeverageAnalysis {
+        trend_bps,
+        recommended_leverage,
+        max_leverage_for_symbol,
+        expected_profit,
+        expected_roi,
+        risk_adjusted_leverage,
+        position_size_notional: final_position_size,
+    }
+}
+
+/// Get maximum leverage for a symbol from exchange
+/// Bu fonksiyon exchange API'den her coin için max leverage değerini çeker
+/// Şimdilik config'deki değeri döndürüyor, ileride API'den çekilecek
+pub async fn get_max_leverage_for_symbol(
+    _symbol: &str,
+    _venue: &crate::exchange::BinanceFutures,
+    default_max_leverage: f64,
+) -> f64 {
+    // TODO: Exchange API'den her coin için max leverage çek
+    // Örnek: Binance'de farklı coinler farklı max leverage'lere sahip
+    // BTC: 125x, ETH: 100x, altcoinler: 50x-75x arası
+    // Şimdilik default değeri döndür
+    default_max_leverage
+}
+
+/// Log trend leverage analysis for debugging
+pub fn log_trend_leverage_analysis(
+    symbol: &str,
+    analysis: &TrendLeverageAnalysis,
+    quote_asset: &str,
+) {
+    info!(
+        %symbol,
+        trend_bps = analysis.trend_bps,
+        recommended_leverage = analysis.recommended_leverage,
+        max_leverage_symbol = analysis.max_leverage_for_symbol,
+        expected_profit = analysis.expected_profit,
+        expected_roi = analysis.expected_roi,
+        risk_adjusted_leverage = analysis.risk_adjusted_leverage,
+        position_size_notional = analysis.position_size_notional,
+        quote_asset = %quote_asset,
+        "TREND LEVERAGE ANALYSIS: trend={:.2}bps, leverage={:.1}x, expected_profit={:.4} {}, roi={:.2}%",
+        analysis.trend_bps,
+        analysis.recommended_leverage,
+        analysis.expected_profit,
+        quote_asset,
+        analysis.expected_roi
+    );
+    
+    // Uyarı: Eğer beklenen kazanç hedefin altındaysa
+    if analysis.expected_profit < 0.0 {
+        warn!(
+            %symbol,
+            expected_profit = analysis.expected_profit,
+            trend_bps = analysis.trend_bps,
+            "WARNING: Expected profit is negative with current trend and leverage"
+        );
+    }
+}

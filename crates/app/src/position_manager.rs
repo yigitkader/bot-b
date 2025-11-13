@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Sync inventory with API position
 pub fn sync_inventory(
@@ -215,8 +215,10 @@ pub fn should_close_position_smart(
 
     // ✅ KRİTİK: Rule 1: Fixed TP (0.50 quote_asset) - net PnL ≥ min_profit_usd
     // Net PnL zaten taker fee ile hesaplandı, market ile anında kapatılacak
-    // DEBUG: Kar hedefi kontrolü - log ekle
-    if net_pnl >= min_profit_usd {
+    // KRİTİK: 0.50 ve üzerini görünce mutlaka kapat (>= kontrolü)
+    // Floating point karşılaştırması için küçük bir tolerans ekle (0.001)
+    const FLOATING_POINT_TOLERANCE: f64 = 0.001;
+    if net_pnl >= (min_profit_usd - FLOATING_POINT_TOLERANCE) {
         info!(
             net_pnl = net_pnl,
             min_profit = min_profit_usd,
@@ -224,20 +226,37 @@ pub fn should_close_position_smart(
             entry_price = entry_price_f64,
             exit_price = exit_price.to_f64().unwrap_or(0.0),
             position_qty = position_qty_f64,
-            "TAKE PROFIT TRIGGERED: net PnL >= min_profit ({} {})", min_profit_usd, quote_asset
+            entry_fee_bps = entry_fee_bps,
+            exit_fee_bps = exit_fee_bps,
+            "TAKE PROFIT TRIGGERED: net PnL ({:.4} {}) >= min_profit ({} {}) - CLOSING POSITION", 
+            net_pnl, quote_asset, min_profit_usd, quote_asset
         );
         return (true, format!("take_profit_{:.2}_{}", net_pnl, quote_asset));
     } else {
-        // DEBUG: Kar hedefi henüz ulaşılmadı - log ekle (sadece yakınsa)
+        // DEBUG: Kar hedefi henüz ulaşılmadı - log ekle (sadece yakınsa veya 0.50'ye çok yakınsa)
         if net_pnl >= min_profit_usd * 0.8 {
+            let remaining = min_profit_usd - net_pnl;
             debug!(
                 net_pnl = net_pnl,
                 min_profit = min_profit_usd,
+                remaining = remaining,
                 quote_asset = %quote_asset,
                 entry_price = entry_price_f64,
                 exit_price = exit_price.to_f64().unwrap_or(0.0),
                 position_qty = position_qty_f64,
-                "take profit not yet reached (within 80% of target, need {} {})", min_profit_usd, quote_asset
+                "take profit not yet reached: {:.4} {} / {} {} (need {:.4} {} more)", 
+                net_pnl, quote_asset, min_profit_usd, quote_asset, remaining, quote_asset
+            );
+        }
+        // KRİTİK: 0.50'ye çok yakınsa (0.45+) özel log - pozisyon kapatılmalı ama kapatılmıyor
+        if net_pnl >= min_profit_usd * 0.9 && net_pnl < min_profit_usd {
+            warn!(
+                net_pnl = net_pnl,
+                min_profit = min_profit_usd,
+                remaining = min_profit_usd - net_pnl,
+                quote_asset = %quote_asset,
+                "WARNING: Position profit very close to target ({} {} / {} {}), should close soon!", 
+                net_pnl, quote_asset, min_profit_usd, quote_asset
             );
         }
     }

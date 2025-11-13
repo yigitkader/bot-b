@@ -42,7 +42,7 @@ use tracing::{debug, error, info, warn};
 pub async fn continuous_analysis_task(
     venue: Arc<BinanceFutures>,
     states: Arc<tokio::sync::RwLock<Vec<SymbolState>>>,
-    cfg: Arc<AppCfg>,
+    _cfg: Arc<AppCfg>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
     use tokio::time::{interval, Duration};
@@ -687,9 +687,12 @@ pub async fn process_symbol(
         info!(
             %symbol,
             net_pnl = pnl_f64,
+            min_profit = min_profit_usd,
             reason = %reason,
             quote_asset = %quote_asset,
-            "CLOSING POSITION: {} ({})", if is_take_profit { "take profit triggered" } else { "stop loss triggered" }, reason
+            "CLOSING POSITION: {} (net_pnl: {:.4} {} >= min_profit: {} {}) - {}",
+            if is_take_profit { "TAKE PROFIT TRIGGERED" } else { "STOP LOSS TRIGGERED" },
+            pnl_f64, quote_asset, min_profit_usd, quote_asset, reason
         );
         match position_manager::close_position(venue, symbol, state, true).await {
             Ok(_) => {
@@ -1034,7 +1037,7 @@ pub async fn process_symbol(
         let qty = Decimal::from_f64_retain(cfg.qty_step).unwrap_or(Decimal::ZERO);
         (tick, qty)
     };
-    let tick_size_f64 = tick_size_decimal.to_f64().unwrap_or(cfg.price_tick);
+    let _tick_size_f64 = tick_size_decimal.to_f64().unwrap_or(cfg.price_tick);
     let ob_for_orders = ob.clone();
 
     // Order placement için context oluştur
@@ -1065,6 +1068,56 @@ pub async fn process_symbol(
     // Trend analizi sonuçlarını background task'a gönder (non-blocking priority update)
     // Bu sayede order placement trend analizini beklemek zorunda kalmaz
     let trend_bps = state.strategy.get_trend_bps();
+    
+    // ✅ KRİTİK: Trend analizi ile kaldıraç optimizasyonu
+    // Her coin için max leverage kontrolü ve beklenen kazanç hesaplama
+    if has_position || !state.active_orders.is_empty() {
+        // Pozisyon veya açık emir varsa trend-leverage analizi yap
+        let margin_available = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+        let max_leverage_config = cfg.risk.max_leverage as f64;
+        let min_profit_target = profit_guarantee.min_profit_usd();
+        
+        // Volatilite tahmini (basit: spread'den)
+        let spread_bps = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
+            ((ask.0 - bid.0) / bid.0 * Decimal::from(10000))
+                .to_f64()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let volatility_1s = spread_bps / 10000.0; // Basit volatilite tahmini
+        
+        let leverage_analysis = crate::strategy::analyze_trend_with_leverage(
+            trend_bps,
+            mark_px,
+            margin_available,
+            max_leverage_config,
+            None, // TODO: Her coin için max leverage API'den çekilecek
+            min_profit_target,
+            volatility_1s,
+            profit_guarantee.maker_fee_rate(),
+            profit_guarantee.taker_fee_rate(),
+        );
+        
+        // Log trend-leverage analizi (sadece önemli durumlarda)
+        if leverage_analysis.expected_profit >= min_profit_target * 0.8 {
+            crate::strategy::log_trend_leverage_analysis(symbol, &leverage_analysis, quote_asset);
+        }
+        
+        // ✅ KRİTİK: Eğer beklenen kazanç hedefin üzerindeyse ve leverage yeterliyse, 
+        // pozisyon boyutunu optimize et (gelecekte kullanılacak)
+        // Şimdilik sadece log yazıyoruz, ileride position sizing için kullanılacak
+        if leverage_analysis.expected_profit >= min_profit_target 
+            && leverage_analysis.recommended_leverage <= effective_leverage {
+            debug!(
+                %symbol,
+                recommended_leverage = leverage_analysis.recommended_leverage,
+                current_leverage = effective_leverage,
+                expected_profit = leverage_analysis.expected_profit,
+                "trend-leverage analysis: optimal leverage found for profit target"
+            );
+        }
+    }
     let priority_clone = state.priority.clone();
     let symbol_clone = symbol.to_string();
 

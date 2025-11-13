@@ -7,7 +7,6 @@ use crate::exec::decimal_places;
 use crate::logger::create_logger;
 use crate::risk::RiskLimits;
 use crate::strategy::DynMmCfg;
-use crate::types::*;
 use anyhow::{anyhow, Result};
 // processor module re-exports discovery functions
 use crate::types::SymbolState;
