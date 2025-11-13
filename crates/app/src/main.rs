@@ -4,16 +4,16 @@
 mod app_init;
 mod config;
 mod constants;
+mod exchange; // NEW: binance consolidation
 mod exec;
-mod exchange;        // NEW: binance consolidation
 mod logger;
 mod monitor;
 mod order;
 mod position_manager;
-mod processor;       // NEW: symbol processing consolidation
+mod processor; // NEW: symbol processing consolidation
 mod qmel;
 mod risk;
-mod strategy;        // Now includes direction_selector
+mod strategy; // Now includes direction_selector
 mod types;
 mod utils;
 
@@ -23,22 +23,22 @@ use anyhow::Result;
 use app_init::{initialize_app, AppInitResult};
 use logger::handle_reconnect_sync;
 use processor::process_symbol;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utils::{
-    calculate_effective_leverage,
-    fetch_all_quote_balances, process_order_canceled,
+    calculate_effective_leverage, fetch_all_quote_balances, process_order_canceled,
     process_order_fill_with_logging, rate_limit_guard,
 };
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize application (config, venue, symbols, states)
     let init = initialize_app().await?;
-    
+
     let AppInitResult {
         cfg,
         venue,
@@ -52,24 +52,23 @@ async fn main() -> Result<()> {
         min_usd_per_order,
         tif,
     } = init;
-    
-    let mut interval = tokio::time::interval_at(
-        tokio::time::Instant::now(),
-        Duration::from_millis(tick_ms),
-    );
-    
+
+    let mut interval =
+        tokio::time::interval_at(tokio::time::Instant::now(), Duration::from_millis(tick_ms));
+
     static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
-    
+
     info!(
         symbol_count = states.len(),
         tick_interval_ms = tick_ms,
         min_usd_per_order,
         "main trading loop starting"
     );
-    
+
     // Build symbol index for fast lookup during events
     let build_symbol_index = || {
-        states.iter()
+        states
+            .iter()
             .enumerate()
             .map(|(idx, state)| (state.meta.symbol.clone(), idx))
             .collect::<HashMap<String, usize>>()
@@ -77,25 +76,30 @@ async fn main() -> Result<()> {
 
     let symbol_index = build_symbol_index();
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let shutdown_tx_clone = shutdown_tx.clone();
+    // ✅ KRİTİK: Hızlı shutdown için AtomicBool kullan (channel yerine)
+    // Bu sayede Ctrl+C'ye basıldığında hemen kontrol edilebilir
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_clone = shutdown_flag.clone();
+
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            info!("Ctrl+C signal received, shutting down");
-            let _ = shutdown_tx_clone.send(());
+            info!("Ctrl+C signal received, shutting down immediately");
+            shutdown_flag_clone.store(true, Ordering::Relaxed);
         }
     });
-    
+
     let mut force_sync_all = false;
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = shutdown_rx.recv() => {
-                info!("shutdown signal received, initiating graceful shutdown");
-                break;
-            }
+        // ✅ KRİTİK: Shutdown kontrolü - her tick başında kontrol et
+        if shutdown_flag.load(Ordering::Relaxed) {
+            info!("shutdown flag detected, initiating graceful shutdown");
+            break;
         }
-        
+
+        // ✅ KRİTİK: Interval tick - shutdown kontrolü loop başında yapılıyor
+        // Ctrl+C'ye basıldığında hemen break yapılır
+        interval.tick().await;
+
         let tick_num = TICK_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
         if tick_num <= 5 || tick_num % 10 == 0 {
             info!(tick_num, "=== MAIN LOOP TICK START ===");
@@ -137,7 +141,11 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                UserEvent::OrderCanceled { symbol, order_id, client_order_id } => {
+                UserEvent::OrderCanceled {
+                    symbol,
+                    order_id,
+                    client_order_id,
+                } => {
                     if let Some(idx) = symbol_index.get(&symbol) {
                         process_order_canceled(
                             &mut states[*idx],
@@ -153,16 +161,14 @@ async fn main() -> Result<()> {
         }
 
         let effective_leverage = calculate_effective_leverage(cfg.leverage, cfg.risk.max_leverage);
-        
+
         // ===== Fetch Balances =====
-        let unique_quote_assets: std::collections::HashSet<String> = states
-            .iter()
-            .map(|s| s.meta.quote_asset.clone())
-            .collect();
-        
+        let unique_quote_assets: std::collections::HashSet<String> =
+            states.iter().map(|s| s.meta.quote_asset.clone()).collect();
+
         let quote_assets_vec: Vec<String> = unique_quote_assets.iter().cloned().collect();
         let mut quote_balances = fetch_all_quote_balances(&venue, &quote_assets_vec).await;
-        
+
         // ===== Symbol Processing Statistics =====
         let mut processed_count = 0;
         let mut skipped_count = 0;
@@ -173,14 +179,15 @@ async fn main() -> Result<()> {
 
         let max_symbols_per_tick = cfg.internal.max_symbols_per_tick;
         let mut symbols_processed_this_tick = 0;
-        
+
         // Calculate prioritized indices: priority field + open orders/positions
         static ROUND_ROBIN_OFFSET: AtomicUsize = AtomicUsize::new(0);
         let max_states = states.len().max(1);
         let round_robin_offset = ROUND_ROBIN_OFFSET.fetch_add(1, Ordering::Relaxed) % max_states;
 
         let prioritized_indices: Vec<usize> = {
-            let mut indices: Vec<(usize, u32, bool)> = states.iter()
+            let mut indices: Vec<(usize, u32, bool)> = states
+                .iter()
                 .enumerate()
                 .map(|(i, s)| {
                     let has_active = !s.active_orders.is_empty() || !s.inv.0.is_zero();
@@ -195,39 +202,57 @@ async fn main() -> Result<()> {
             // Sort: highest priority first, then by active orders/positions
             indices.sort_by_key(|(_, priority_score, _)| std::cmp::Reverse(*priority_score));
 
-            indices.into_iter()
+            indices
+                .into_iter()
                 .map(|(i, _, _)| i)
                 .cycle()
                 .skip(round_robin_offset)
                 .take(states.len())
                 .collect()
         };
-        
+
         // ✅ KRİTİK: Global tek-pozisyon/tek-order kuralı
         // Tüm semboller arasında aynı anda sadece bir "exposure" olsun
         // Bu kontrol WS event'leriyle uyum sağlar - fill geldiğinde diğer semboller skip edilir
-        let any_open = states.iter().any(|s| !s.inv.0.is_zero() || !s.active_orders.is_empty());
-        
+        let any_open = states
+            .iter()
+            .any(|s| !s.inv.0.is_zero() || !s.active_orders.is_empty());
+
         for state_idx in prioritized_indices {
+            // ✅ KRİTİK: Her sembol işlendikten önce shutdown kontrolü
+            // Bu sayede Ctrl+C'ye basıldığında uzun sembol listesi işlenmeden hemen çıkılır
+            if shutdown_flag.load(Ordering::Relaxed) {
+                info!("shutdown detected during symbol processing, breaking immediately");
+                break;
+            }
+
             let state = &mut states[state_idx];
-            
+
             // ✅ KRİTİK: Per-symbol rules zorunlu - fetch başarısızsa trade etme
             // Global tek order modunda "kuralsız" sembolü tamamen skip et
             if state.disabled || state.rules_fetch_failed || state.symbol_rules.is_none() {
                 skipped_count += 1;
                 continue; // Rules yoksa trade etme - tamamen skip et
             }
-            
+
             // ✅ KRİTİK: Global kontrol - başka bir sembolde exposure varsa, bu sembol beklesin
             // Bu sayede gereksiz API çağrıları (best_prices, fetch_market_data) azalır
             if any_open {
                 // Sadece exposure sahibi sembole izin ver
                 if state.inv.0.is_zero() && state.active_orders.is_empty() {
                     skipped_count += 1;
+                    // ✅ DEBUG: Global exposure kontrolü logla (sadece ilk birkaç tick'te)
+                    if tick_num <= 5 || tick_num % 20 == 0 {
+                        let symbol = state.meta.symbol.clone();
+                        debug!(
+                            %symbol,
+                            "skipping symbol: another symbol has open order/position (global single exposure rule)"
+                        );
+                    }
                     continue; // Bu sembol bu tick beklesin - API çağrısı yapma
                 }
             }
-            
+
             // Rate limit protection: Maximum symbols per tick
             if symbols_processed_this_tick >= max_symbols_per_tick {
                 skipped_count += 1;
@@ -252,7 +277,7 @@ async fn main() -> Result<()> {
                 disabled_count += 1;
                 continue;
             }
-            
+
             let symbol = state.meta.symbol.clone();
             let quote_asset = state.meta.quote_asset.clone();
 
@@ -260,17 +285,17 @@ async fn main() -> Result<()> {
             let q_free = quote_balances.get(&quote_asset).copied().unwrap_or(0.0);
             let has_balance = q_free >= cfg.min_quote_balance_usd && q_free >= min_usd_per_order;
             let has_open_orders = !state.active_orders.is_empty();
-            
+
             if !has_balance && !has_open_orders {
                 skipped_count += 1;
                 no_balance_count += 1;
                 continue;
             }
-            
+
             if !has_balance && has_open_orders {
                 info!(%symbol, active_orders = state.active_orders.len(), "no balance but has open orders, continuing");
             }
-            
+
             processed_count += 1;
             symbols_processed_this_tick += 1;
 
@@ -282,12 +307,12 @@ async fn main() -> Result<()> {
                     continue;
                 }
             };
-            
+
             if force_sync_all && symbol_index_counter == total_symbols {
                 force_sync_all = false;
                 info!("WebSocket reconnect sync completed for all symbols");
             }
-            
+
             match process_symbol(
                 &venue,
                 &symbol,
@@ -304,7 +329,9 @@ async fn main() -> Result<()> {
                 tif,
                 &json_logger,
                 force_sync_all,
-            ).await {
+            )
+            .await
+            {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -312,9 +339,8 @@ async fn main() -> Result<()> {
                     continue;
                 }
             }
-
         }
-        
+
         let current_tick = TICK_COUNTER.load(Ordering::Relaxed);
         if current_tick <= 5 || current_tick % 10 == 0 {
             info!(
@@ -328,11 +354,12 @@ async fn main() -> Result<()> {
             );
         }
     }
-    
+
     info!("main loop ended, performing graceful shutdown");
-    
+
     // ===== Graceful Shutdown Sequence =====
-    let shutdown_timeout = Duration::from_secs(10);
+    // ✅ KRİTİK: Timeout'u 3 saniyeye düşür (10 saniye çok uzun, Ctrl+C'ye basıldığında hemen kapanmalı)
+    let shutdown_timeout = Duration::from_secs(3);
 
     let cleanup_result = tokio::time::timeout(shutdown_timeout, async {
         // Step 1: Collect positions and orders to close
@@ -375,11 +402,14 @@ async fn main() -> Result<()> {
         info!("cleanup completed for all symbols");
     })
     .await;
-    
+
     match cleanup_result {
         Ok(_) => info!("graceful shutdown cleanup completed successfully"),
         Err(_) => {
-            warn!("graceful shutdown cleanup timed out after {} seconds, forcing exit", shutdown_timeout.as_secs());
+            warn!(
+                "graceful shutdown cleanup timed out after {} seconds, forcing exit",
+                shutdown_timeout.as_secs()
+            );
             // Log remaining open positions and orders
             for state in states.iter() {
                 if !state.inv.0.is_zero() {
@@ -391,18 +421,17 @@ async fn main() -> Result<()> {
             }
         }
     }
-    
+
     // Step 4: Release resources
     drop(event_tx);
     drop(json_logger);
-    drop(shutdown_tx);
-    
-    // Brief wait for WebSocket cleanup
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
+
+    // ✅ KRİTİK: WebSocket cleanup için kısa bekleme (500ms → 200ms)
+    // Daha hızlı kapanma için timeout azaltıldı
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     info!("graceful shutdown completed");
     Ok(())
 }
 
 // Tests are embedded in modules
-

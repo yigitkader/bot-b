@@ -16,7 +16,8 @@ pub struct RiskCfg {
     pub dd_limit_bps: i64,
     pub max_leverage: u32,
     #[serde(default = "default_slippage_bps_reserve")]
-    #[allow(dead_code)] // Artık kullanılmıyor, calculate_min_spread_bps içinde safety margin var
+    #[allow(dead_code)]
+    // Artık kullanılmıyor, calculate_min_spread_bps içinde safety margin var
     pub slippage_bps_reserve: f64, // Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
     #[serde(default = "default_use_isolated_margin")]
     pub use_isolated_margin: bool, // Isolated margin kullan (default: true)
@@ -88,11 +89,11 @@ pub struct StratCfg {
     #[serde(default)]
     pub taker_fee_rate: Option<f64>, // Taker fee oranı (default: 0.0004 = 4 bps)
     // Not: slippage_bps_reserve artık RiskCfg altında (risk.slippage_bps_reserve)
-    
+
     // TP ve time-box ayarları
     #[serde(default)]
     pub position_close_cooldown_ms: Option<u64>, // Pozisyon kapatma cooldown (ms) - default: 500
-    
+
     // Q-MEL parameters
     #[serde(default)]
     pub qmel_ev_threshold: Option<f64>, // Minimum EV to trade (USD) - default: 0.10
@@ -232,9 +233,7 @@ pub struct AppCfg {
     #[serde(default)]
     pub leverage: Option<u32>, // Optional leverage (if not set, uses max_leverage from risk config)
     pub price_tick: f64, // Required: price tick size
-    pub qty_step: f64, // Required: quantity step size
-    #[serde(default)]
-    pub dry_run: bool, // When true, the bot will simulate orders and won't send real orders to the exchange
+    pub qty_step: f64,   // Required: quantity step size
     pub binance: BinanceCfg,
     pub risk: RiskCfg,
     pub strategy: StratCfg,
@@ -293,71 +292,201 @@ pub struct StrategyInternalCfg {
 // Default Value Functions
 // ============================================================================
 
-fn default_cancel_interval() -> u64 { 1_000 }
-fn default_max_order_age() -> u64 { 10_000 }
-fn default_ws_reconnect_delay() -> u64 { 5_000 }
-fn default_ws_ping_interval() -> u64 { 30_000 }
-fn default_slippage_bps_reserve() -> f64 { 2.0 } // Default: 2 bps slippage reserve
-fn default_use_isolated_margin() -> bool { true } // Default: isolated margin kullan
-fn default_max_open_chunks_per_symbol_per_side() -> usize { 1 } // ✅ KRİTİK: Tek chunk kuralı - aynı anda sadece 1 open_order veya 1 position
-fn default_pnl_history_max_len() -> usize { 1024 }
-fn default_position_size_history_max_len() -> usize { 100 }
-fn default_max_symbols_per_tick() -> usize { 8 }
-fn default_rate_limiter_safety_factor() -> f64 { 0.8 }
-fn default_rate_limiter_min_interval_ms() -> u64 { 1000 }
-fn default_order_sync_interval_sec() -> u64 { 8 } // ✅ KRİTİK: Daha az request - WS event'leriyle uyum için 8 sn (önceden 2 sn)
-fn default_cancel_stagger_delay_ms() -> u64 { 50 }
-fn default_fill_rate_increase_factor() -> f64 { 0.95 }
-fn default_fill_rate_increase_bonus() -> f64 { 0.05 }
-fn default_fill_rate_decrease_factor() -> f64 { 0.98 }
-fn default_fill_rate_slow_decrease_factor() -> f64 { 0.995 }
-fn default_fill_rate_slow_decrease_bonus() -> f64 { 0.005 }
-fn default_order_price_distance_with_position() -> f64 { 0.01 } // %1.0 (maker fee + slippage + kar için yeterli)
-fn default_order_price_distance_no_position() -> f64 { 0.008 } // %0.8 (maker fee + slippage + kar için yeterli)
-fn default_inventory_reconcile_threshold() -> String { "0.00000001".to_string() }
-fn default_position_qty_threshold() -> String { "0.00000001".to_string() }
-fn default_pnl_alert_interval_sec() -> u64 { 10 }
-fn default_pnl_alert_threshold_positive() -> f64 { 0.05 }
-fn default_pnl_alert_threshold_negative() -> f64 { -0.03 }
-fn default_stop_loss_threshold() -> f64 { -0.005 }
-fn default_max_position_size_buffer() -> f64 { 10.0 }
-fn default_opportunity_mode_position_multiplier() -> f64 { 1.5 } // 2.0 → 1.5: daha konservatif
-fn default_opportunity_mode_leverage_reduction() -> f64 { 0.5 }
-fn default_opportunity_mode_soft_limit_ratio() -> f64 { 0.80 } // %80'de yeni emirleri durdur (0.95 → 0.80: daha erken dur)
-fn default_opportunity_mode_medium_limit_ratio() -> f64 { 0.90 } // %90'da mevcut emirleri azalt (1.0 → 0.90: daha erken azalt)
-fn default_opportunity_mode_hard_limit_ratio() -> f64 { 1.0 } // %100'de force-close
-fn default_min_risk_reward_ratio() -> f64 { 2.0 }
-fn default_initial_fill_rate() -> f64 { 0.5 }
-fn default_recv_window() -> u64 { 5_000 }
-fn default_hedge_mode() -> bool { false } // Default: one-way mode (hedge mode kapalı)
-fn default_quote_asset() -> String { "USDC".to_string() }
-fn default_allow_usdt_quote() -> bool { true }
-fn default_min_quote_balance_usd() -> f64 { 1.0 }
-fn default_manipulation_volume_ratio_threshold() -> f64 { 5.0 }
-fn default_manipulation_time_threshold_ms() -> u64 { 2000 }
-fn default_manipulation_price_history_max_len() -> usize { 200 }
-fn default_flash_crash_recovery_window_ms() -> u64 { 30000 }
-fn default_flash_crash_recovery_min_points() -> usize { 10 }
-fn default_flash_crash_recovery_min_ratio() -> f64 { 0.3 }
-fn default_confidence_price_drop_max() -> f64 { 500.0 }
-fn default_confidence_volume_ratio_min() -> f64 { 5.0 }
-fn default_confidence_volume_ratio_max() -> f64 { 10.0 }
-fn default_confidence_spread_min() -> f64 { 50.0 }
-fn default_confidence_spread_max() -> f64 { 150.0 }
-fn default_confidence_bonus_multiplier() -> f64 { 0.3 }
-fn default_confidence_max_multiplier() -> f64 { 1.5 }
-fn default_confidence_min_threshold() -> f64 { 0.70 } // 0.75 → 0.70: False positive azalt, gerçek fırsatları kaçırma
-fn default_default_confidence() -> f64 { 0.7 }
-fn default_min_confidence_value() -> f64 { 0.5 }
-fn default_min_tick_interval_ms() -> u64 { 100 }
-fn default_symbol_discovery_retry_interval_sec() -> u64 { 30 }
-fn default_progress_log_first_n_symbols() -> usize { 10 }
-fn default_progress_log_interval() -> usize { 50 }
-fn default_fill_rate_reconnect_factor() -> f64 { 0.95 }
-fn default_fill_rate_reconnect_bonus() -> f64 { 0.05 }
-fn default_trend_analysis_min_history() -> usize { 10 }
-fn default_trend_analysis_threshold_negative() -> f64 { -0.15 }
-fn default_trend_analysis_threshold_strong_negative() -> f64 { -0.20 }
+fn default_cancel_interval() -> u64 {
+    1_000
+}
+fn default_max_order_age() -> u64 {
+    10_000
+}
+fn default_ws_reconnect_delay() -> u64 {
+    5_000
+}
+fn default_ws_ping_interval() -> u64 {
+    30_000
+}
+fn default_slippage_bps_reserve() -> f64 {
+    2.0
+} // Default: 2 bps slippage reserve
+fn default_use_isolated_margin() -> bool {
+    true
+} // Default: isolated margin kullan
+fn default_max_open_chunks_per_symbol_per_side() -> usize {
+    1
+} // ✅ KRİTİK: Tek chunk kuralı - aynı anda sadece 1 open_order veya 1 position
+fn default_pnl_history_max_len() -> usize {
+    1024
+}
+fn default_position_size_history_max_len() -> usize {
+    100
+}
+fn default_max_symbols_per_tick() -> usize {
+    8
+}
+fn default_rate_limiter_safety_factor() -> f64 {
+    0.8
+}
+fn default_rate_limiter_min_interval_ms() -> u64 {
+    1000
+}
+fn default_order_sync_interval_sec() -> u64 {
+    8
+} // ✅ KRİTİK: Daha az request - WS event'leriyle uyum için 8 sn (önceden 2 sn)
+fn default_cancel_stagger_delay_ms() -> u64 {
+    50
+}
+fn default_fill_rate_increase_factor() -> f64 {
+    0.95
+}
+fn default_fill_rate_increase_bonus() -> f64 {
+    0.05
+}
+fn default_fill_rate_decrease_factor() -> f64 {
+    0.98
+}
+fn default_fill_rate_slow_decrease_factor() -> f64 {
+    0.995
+}
+fn default_fill_rate_slow_decrease_bonus() -> f64 {
+    0.005
+}
+fn default_order_price_distance_with_position() -> f64 {
+    0.01
+} // %1.0 (maker fee + slippage + kar için yeterli)
+fn default_order_price_distance_no_position() -> f64 {
+    0.008
+} // %0.8 (maker fee + slippage + kar için yeterli)
+fn default_inventory_reconcile_threshold() -> String {
+    "0.00000001".to_string()
+}
+fn default_position_qty_threshold() -> String {
+    "0.00000001".to_string()
+}
+fn default_pnl_alert_interval_sec() -> u64 {
+    10
+}
+fn default_pnl_alert_threshold_positive() -> f64 {
+    0.05
+}
+fn default_pnl_alert_threshold_negative() -> f64 {
+    -0.03
+}
+fn default_stop_loss_threshold() -> f64 {
+    -0.005
+}
+fn default_max_position_size_buffer() -> f64 {
+    10.0
+}
+fn default_opportunity_mode_position_multiplier() -> f64 {
+    1.5
+} // 2.0 → 1.5: daha konservatif
+fn default_opportunity_mode_leverage_reduction() -> f64 {
+    0.5
+}
+fn default_opportunity_mode_soft_limit_ratio() -> f64 {
+    0.80
+} // %80'de yeni emirleri durdur (0.95 → 0.80: daha erken dur)
+fn default_opportunity_mode_medium_limit_ratio() -> f64 {
+    0.90
+} // %90'da mevcut emirleri azalt (1.0 → 0.90: daha erken azalt)
+fn default_opportunity_mode_hard_limit_ratio() -> f64 {
+    1.0
+} // %100'de force-close
+fn default_min_risk_reward_ratio() -> f64 {
+    2.0
+}
+fn default_initial_fill_rate() -> f64 {
+    0.5
+}
+fn default_recv_window() -> u64 {
+    5_000
+}
+fn default_hedge_mode() -> bool {
+    false
+} // Default: one-way mode (hedge mode kapalı)
+fn default_quote_asset() -> String {
+    "USDC".to_string()
+}
+fn default_allow_usdt_quote() -> bool {
+    true
+}
+fn default_min_quote_balance_usd() -> f64 {
+    1.0
+}
+fn default_manipulation_volume_ratio_threshold() -> f64 {
+    5.0
+}
+fn default_manipulation_time_threshold_ms() -> u64 {
+    2000
+}
+fn default_manipulation_price_history_max_len() -> usize {
+    200
+}
+fn default_flash_crash_recovery_window_ms() -> u64 {
+    30000
+}
+fn default_flash_crash_recovery_min_points() -> usize {
+    10
+}
+fn default_flash_crash_recovery_min_ratio() -> f64 {
+    0.3
+}
+fn default_confidence_price_drop_max() -> f64 {
+    500.0
+}
+fn default_confidence_volume_ratio_min() -> f64 {
+    5.0
+}
+fn default_confidence_volume_ratio_max() -> f64 {
+    10.0
+}
+fn default_confidence_spread_min() -> f64 {
+    50.0
+}
+fn default_confidence_spread_max() -> f64 {
+    150.0
+}
+fn default_confidence_bonus_multiplier() -> f64 {
+    0.3
+}
+fn default_confidence_max_multiplier() -> f64 {
+    1.5
+}
+fn default_confidence_min_threshold() -> f64 {
+    0.70
+} // 0.75 → 0.70: False positive azalt, gerçek fırsatları kaçırma
+fn default_default_confidence() -> f64 {
+    0.7
+}
+fn default_min_confidence_value() -> f64 {
+    0.5
+}
+fn default_min_tick_interval_ms() -> u64 {
+    100
+}
+fn default_symbol_discovery_retry_interval_sec() -> u64 {
+    30
+}
+fn default_progress_log_first_n_symbols() -> usize {
+    10
+}
+fn default_progress_log_interval() -> usize {
+    50
+}
+fn default_fill_rate_reconnect_factor() -> f64 {
+    0.95
+}
+fn default_fill_rate_reconnect_bonus() -> f64 {
+    0.05
+}
+fn default_trend_analysis_min_history() -> usize {
+    10
+}
+fn default_trend_analysis_threshold_negative() -> f64 {
+    -0.15
+}
+fn default_trend_analysis_threshold_strong_negative() -> f64 {
+    -0.20
+}
 
 // ============================================================================
 // Configuration Loading
@@ -376,10 +505,10 @@ pub fn load_config() -> Result<AppCfg> {
             }
         })
         .unwrap_or_else(|| "./config.yaml".to_string());
-    
+
     let content = std::fs::read_to_string(&path)?;
     let cfg: AppCfg = serde_yaml::from_str(&content)?;
-    
+
     validate_config(&cfg)?;
     Ok(cfg)
 }
@@ -395,21 +524,23 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.max_usd_per_order <= 0.0 {
         return Err(anyhow!("max_usd_per_order must be positive"));
     }
-    
+
     // Quote asset validasyonu: Sadece USDC veya USDT kabul edilir
     let quote_upper = cfg.quote_asset.to_uppercase();
     if quote_upper != "USDC" && quote_upper != "USDT" {
         return Err(anyhow!("quote_asset must be either 'USDC' or 'USDT', got '{}'. Only USDC and USDT are supported.", cfg.quote_asset));
     }
-    
+
     // API key validasyonu
     if cfg.binance.api_key.trim().is_empty() {
-        return Err(anyhow!("binance.api_key is required but is empty. Please set your API key in config.yaml"));
+        return Err(anyhow!(
+            "binance.api_key is required but is empty. Please set your API key in config.yaml"
+        ));
     }
     if cfg.binance.secret_key.trim().is_empty() {
         return Err(anyhow!("binance.secret_key is required but is empty. Please set your secret key in config.yaml"));
     }
-    
+
     // API key format kontrolü (Binance API key'leri genellikle 64 karakter)
     if cfg.binance.api_key.len() < 20 {
         return Err(anyhow!("binance.api_key appears to be invalid (too short). Binance API keys are typically 64 characters long"));
@@ -417,7 +548,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.binance.secret_key.len() < 20 {
         return Err(anyhow!("binance.secret_key appears to be invalid (too short). Binance secret keys are typically 64 characters long"));
     }
-    
+
     Ok(())
 }
 
@@ -440,7 +571,6 @@ mod tests {
             leverage: Some(3),
             price_tick: 0.001,
             qty_step: 0.001,
-            dry_run: false,
             binance: BinanceCfg {
                 futures_base: "https://fapi.binance.com".to_string(),
                 api_key: "testkey".to_string(),
@@ -519,7 +649,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.price_tick = 0.0;
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.price_tick = -1.0;
         assert!(validate_config(&cfg).is_err());
     }
@@ -529,7 +659,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.qty_step = 0.0;
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.qty_step = -1.0;
         assert!(validate_config(&cfg).is_err());
     }
@@ -539,7 +669,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.max_usd_per_order = 0.0;
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.max_usd_per_order = -1.0;
         assert!(validate_config(&cfg).is_err());
     }
@@ -549,13 +679,13 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.quote_asset = "BUSD".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.quote_asset = "BTC".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.quote_asset = "".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.quote_asset = "EUR".to_string();
         assert!(validate_config(&cfg).is_err());
     }
@@ -565,10 +695,10 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.quote_asset = "USDC".to_string();
         assert!(validate_config(&cfg).is_ok());
-        
+
         cfg.quote_asset = "usdc".to_string();
         assert!(validate_config(&cfg).is_ok());
-        
+
         cfg.quote_asset = "UsDc".to_string();
         assert!(validate_config(&cfg).is_ok());
     }
@@ -578,10 +708,10 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.quote_asset = "USDT".to_string();
         assert!(validate_config(&cfg).is_ok());
-        
+
         cfg.quote_asset = "usdt".to_string();
         assert!(validate_config(&cfg).is_ok());
-        
+
         cfg.quote_asset = "UsDt".to_string();
         assert!(validate_config(&cfg).is_ok());
     }
@@ -591,7 +721,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.binance.api_key = "".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.binance.api_key = "   ".to_string();
         assert!(validate_config(&cfg).is_err());
     }
@@ -601,7 +731,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.binance.secret_key = "".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.binance.secret_key = "   ".to_string();
         assert!(validate_config(&cfg).is_err());
     }
@@ -611,7 +741,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.binance.api_key = "short".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.binance.api_key = "1234567890123456789".to_string(); // 19 chars
         assert!(validate_config(&cfg).is_err());
     }
@@ -621,7 +751,7 @@ mod tests {
         let mut cfg = create_test_config();
         cfg.binance.secret_key = "short".to_string();
         assert!(validate_config(&cfg).is_err());
-        
+
         cfg.binance.secret_key = "1234567890123456789".to_string(); // 19 chars
         assert!(validate_config(&cfg).is_err());
     }

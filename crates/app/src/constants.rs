@@ -60,4 +60,3 @@ pub const MAX_POSITION_DURATION_SEC: f64 = 120.0; // 2 dakika (120 saniye)
 pub fn fee_rate_to_bps(rate: f64) -> f64 {
     rate * 10_000.0
 }
-

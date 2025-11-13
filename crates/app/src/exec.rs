@@ -1,7 +1,7 @@
 //location: /crates/exec/src/lib.rs
+use crate::types::*;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::types::*;
 use rust_decimal::Decimal;
 
 #[derive(Clone, Debug)]
@@ -49,10 +49,7 @@ pub mod binance {
 }
 
 // Re-export quantization helpers from utils (only commonly used ones)
-pub use crate::utils::{
-    quant_utils_floor_to_step,
-    quant_utils_ceil_to_step,
-};
+pub use crate::utils::{quant_utils_ceil_to_step, quant_utils_floor_to_step};
 
 /// Decimal adımından hassasiyet (ondalık hane sayısı) çıkarır
 pub fn decimal_places(step: Decimal) -> usize {

@@ -1,18 +1,19 @@
 //location: /crates/app/src/position_manager.rs
 // Position management, PnL tracking, and position closing logic
 
-use anyhow::Result;
-use crate::types::*;
+use crate::config::AppCfg;
 use crate::exec::binance::BinanceFutures;
 use crate::exec::Venue;
+use crate::types::SymbolState;
+use crate::types::*;
+use crate::utils::{calc_net_pnl_usd, rate_limit_guard, record_pnl_snapshot, with_order_lock};
+use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use crate::config::AppCfg;
-use crate::types::SymbolState;
-use crate::utils::{calc_net_pnl_usd, rate_limit_guard, record_pnl_snapshot, with_order_lock};
 
 /// Sync inventory with API position
 pub fn sync_inventory(
@@ -23,7 +24,8 @@ pub fn sync_inventory(
     min_sync_interval_ms: u128,
 ) {
     let inv_diff = (state.inv.0 - api_position.qty.0).abs();
-    let time_since_last_update = state.last_inventory_update
+    let time_since_last_update = state
+        .last_inventory_update
         .map(|t| t.elapsed().as_millis())
         .unwrap_or(1000);
 
@@ -52,22 +54,19 @@ pub fn sync_inventory(
 
 /// Update daily PnL reset if needed
 pub fn update_daily_pnl_reset(state: &mut SymbolState) {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
-    let should_reset_daily = if let Some(last_reset) = state.last_daily_reset {
-        const DAY_MS: u64 = 24 * 3600 * 1000;
-        now_ms.saturating_sub(last_reset) >= DAY_MS
-    } else {
-        true
+    let should_reset_daily = match state.last_daily_reset_at {
+        Some(last_reset) => last_reset.elapsed() >= Duration::from_secs(24 * 3600),
+        None => {
+            // İlk initialization - sadece timestamp set et, log yazma
+            state.last_daily_reset_at = Some(Instant::now());
+            return;
+        }
     };
 
     if should_reset_daily {
         let old_daily_pnl = state.daily_pnl;
         state.daily_pnl = Decimal::ZERO;
-        state.last_daily_reset = Some(now_ms);
+        state.last_daily_reset_at = Some(Instant::now());
         info!(
             old_daily_pnl = %old_daily_pnl,
             "daily PnL reset (new day started)"
@@ -94,7 +93,8 @@ pub fn apply_funding_cost(
 
         if should_apply && position_size_notional > 0.0 {
             let funding_cost = funding_rate * position_size_notional;
-            state.total_funding_cost += Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
+            state.total_funding_cost +=
+                Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO);
             state.last_applied_funding_time = Some(this_funding_ts);
 
             info!(
@@ -134,7 +134,9 @@ pub fn update_position_tracking(
 
     // Update position size history
     let position_size_notional = (mark_px.0 * position.qty.0.abs()).to_f64().unwrap_or(0.0);
-    state.position_size_notional_history.push(position_size_notional);
+    state
+        .position_size_notional_history
+        .push(position_size_notional);
     if state.position_size_notional_history.len() > cfg.internal.position_size_history_max_len {
         state.position_size_notional_history.remove(0);
     }
@@ -143,8 +145,8 @@ pub fn update_position_tracking(
     // KRİTİK DÜZELTME: Position entry time SADECE WebSocket fill event'te set edilir
     // Fallback kaldırıldı - WebSocket geç gelirse bile yanlış zaman set etmek yerine bekler
     // Bu, PnL hesaplamalarının doğruluğunu garanti eder
-    let position_qty_threshold = Decimal::from_str_radix(&cfg.internal.position_qty_threshold, 10)
-        .unwrap_or(Decimal::new(1, 8));
+    let position_qty_threshold = Decimal::from_str(&cfg.internal.position_qty_threshold)
+        .unwrap_or_else(|_| Decimal::new(1, 8));
     if position.qty.0.abs() > position_qty_threshold {
         // Entry time varsa hold duration'ı güncelle
         if let Some(entry_time) = state.position_entry_time {
@@ -189,7 +191,7 @@ pub fn should_close_position_smart(
     // ✅ KRİTİK: Exit price = market price (bid/ask) - market order ile kapatılacak
     // Taker fee ile hesaplama yapılıyor (market exit garantisi)
     let exit_price = match position_side {
-        Side::Buy => bid.0, // Long pozisyon → Sell (bid'den sat)
+        Side::Buy => bid.0,  // Long pozisyon → Sell (bid'den sat)
         Side::Sell => ask.0, // Short pozisyon → Buy (ask'ten al)
     };
 
@@ -199,7 +201,7 @@ pub fn should_close_position_smart(
     let exit_fee_bps = taker_fee_rate * 10000.0; // Market exit = taker fee
 
     let qty_abs = position.qty.0.abs();
-    
+
     // ✅ KRİTİK: Net PnL hesaplama - taker fee ile (market exit)
     let net_pnl = calc_net_pnl_usd(
         position.entry.0,
@@ -227,14 +229,23 @@ pub fn should_close_position_smart(
     if let Some(entry_time) = state.position_entry_time {
         let age_secs = entry_time.elapsed().as_secs() as f64;
         if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
-            return (true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
+            return (
+                true,
+                format!(
+                    "max_duration_timeout_{:.2}_usd_{:.0}_sec",
+                    net_pnl, age_secs
+                ),
+            );
         }
     }
 
     // ✅ KRİTİK: Inventory threshold kontrolü - pozisyon birikirse zorla kapat
     // Basit threshold: pozisyon çok büyükse kapat (0.5'ten fazla)
     if position_qty_f64.abs() > 0.5 {
-        return (true, format!("inventory_threshold_exceeded_{:.2}", position_qty_f64));
+        return (
+            true,
+            format!("inventory_threshold_exceeded_{:.2}", position_qty_f64),
+        );
     }
 
     // ✅ KRİTİK: Tüm "smart" kurallar kaldırıldı (trailing, volatilite, momentum, recovery, drawdown)
@@ -256,7 +267,7 @@ pub async fn close_position(
         info!(symbol = %symbol, "position close already in progress, skipping duplicate close");
         return Ok(());
     }
-    
+
     state.last_close_attempt = Some(Instant::now());
 
     // KRİTİK RACE CONDITION FIX: WebSocket event sonrası inventory sync kontrolü
@@ -290,7 +301,7 @@ pub async fn close_position(
         // Pozisyonu kapat (retry mekanizması ile)
         let max_retries = 3;
         let mut last_error = None;
-        
+
         for attempt in 1..=max_retries {
             // KRİTİK RACE CONDITION FIX: Her attempt öncesi WebSocket sync kontrolü
             // Retry sırasında WebSocket event handler pozisyonu kapatmış olabilir
@@ -308,7 +319,7 @@ pub async fn close_position(
                     return Ok(());
                 }
             }
-            
+
             rate_limit_guard(1).await;
             match venue.close_position(symbol).await {
                 Ok(_) => {
@@ -325,9 +336,9 @@ pub async fn close_position(
                 }
             }
         }
-        
+
         state.position_closing.store(false, Ordering::Release);
-        
+
         if let Some(e) = last_error {
             error!(symbol = %symbol, error = %e, "failed to close position after {} attempts", max_retries);
             Err(e)
@@ -335,6 +346,4 @@ pub async fn close_position(
             Ok(())
         }
     }).await
-
 }
-

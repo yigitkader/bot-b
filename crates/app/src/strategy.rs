@@ -52,7 +52,12 @@ pub trait Strategy: Send + Sync {
     }
     /// Trade sonucunu öğren (online learning için)
     /// Bu metod botu "akıllı" yapar - geçmiş trade'lerden öğrenir
-    fn learn_from_trade(&mut self, _net_pnl_usd: f64, _entry_state: Option<&dyn std::any::Any>, _actual_direction: Option<f64>) {
+    fn learn_from_trade(
+        &mut self,
+        _net_pnl_usd: f64,
+        _entry_state: Option<&dyn std::any::Any>,
+        _actual_direction: Option<f64>,
+    ) {
         // Default: öğrenme yok (override edilebilir)
     }
     /// Feature importance bilgisini döndür (analiz için)
@@ -76,9 +81,7 @@ pub trait Strategy: Send + Sync {
     fn get_ofi_signal(&self) -> f64 {
         0.0 // Default: OFI bilgisi yok
     }
-    
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DynMmCfg {
@@ -177,7 +180,7 @@ pub struct DynMmCfg {
 
 // Default değerler
 fn default_min_spread_bps() -> f64 {
-    30.0  // ✅ Optimized for $0.50 profit target: Fees (8 bps) + Target (50 bps) = 58 bps needed, 30 bps floor is sufficient with dynamic calculation
+    30.0 // ✅ Optimized for $0.50 profit target: Fees (8 bps) + Target (50 bps) = 58 bps needed, 30 bps floor is sufficient with dynamic calculation
 }
 fn default_max_spread_bps() -> f64 {
     100.0
@@ -500,7 +503,7 @@ impl DynMm {
                     self.ofi_signal *= decay_factor;
                 }
             }
-            
+
             // Kümülatif OFI: Her increment'i ekle
             self.ofi_signal += ofi_increment;
         } else {
@@ -560,7 +563,10 @@ impl DynMm {
         // Trend = (yeni - eski) / eski
         // Pozitif = fiyat artıyor (uptrend)
         // Negatif = fiyat düşüyor (downtrend)
-        ((newer_avg - older_avg) / older_avg).to_f64().unwrap_or(0.0) * 10000.0 // bps
+        ((newer_avg - older_avg) / older_avg)
+            .to_f64()
+            .unwrap_or(0.0)
+            * 10000.0 // bps
     }
 
     // Funding rate analizi: pozitif funding = long bias, negatif = short bias
@@ -627,17 +633,18 @@ impl Strategy for DynMm {
 
         // KRİTİK İYİLEŞTİRME: Top-K levels kullan (daha güvenilir imbalance için)
         // Top-K levels varsa toplam volume'u kullan, yoksa best bid/ask volume'u kullan
-        let (bid_vol, ask_vol) = if let (Some(top_bids), Some(top_asks)) = (&c.ob.top_bids, &c.ob.top_asks) {
-            // Top-K levels mevcut: tüm level'ların volume'larını topla
-            let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
-            let ask_vol_sum: Decimal = top_asks.iter().map(|a| a.qty.0).sum();
-            (bid_vol_sum.max(Decimal::ONE), ask_vol_sum.max(Decimal::ONE))
-        } else {
-            // Fallback: best bid/ask volumes (backward compatibility)
-            let bid_vol = c.ob.best_bid.map(|b| b.qty.0).unwrap_or(Decimal::ONE);
-            let ask_vol = c.ob.best_ask.map(|a| a.qty.0).unwrap_or(Decimal::ONE);
-            (bid_vol, ask_vol)
-        };
+        let (bid_vol, ask_vol) =
+            if let (Some(top_bids), Some(top_asks)) = (&c.ob.top_bids, &c.ob.top_asks) {
+                // Top-K levels mevcut: tüm level'ların volume'larını topla
+                let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
+                let ask_vol_sum: Decimal = top_asks.iter().map(|a| a.qty.0).sum();
+                (bid_vol_sum.max(Decimal::ONE), ask_vol_sum.max(Decimal::ONE))
+            } else {
+                // Fallback: best bid/ask volumes (backward compatibility)
+                let bid_vol = c.ob.best_bid.map(|b| b.qty.0).unwrap_or(Decimal::ONE);
+                let ask_vol = c.ob.best_ask.map(|a| a.qty.0).unwrap_or(Decimal::ONE);
+                (bid_vol, ask_vol)
+            };
 
         // 3. Klasik mid price (fallback)
         let mid = (bid + ask) / Decimal::from(2u32);
@@ -717,163 +724,194 @@ impl Strategy for DynMm {
                     false // Flash crash detection'ı engelle (güvenli tarafta kal)
                 } else {
                     let recovery_check_result = {
-                    let window_start_ms = now_ms.saturating_sub(self.flash_crash_recovery_window_ms);
-                    
-                    // KRİTİK DÜZELTME: Timestamp'e göre sıralı kullan
-                    // price_history timestamp'e göre sıralı olmalı (en eski → en yeni)
-                    // Zaman penceresi içindeki fiyatları filtrele ve timestamp'e göre sırala
-                    let mut recent_prices: Vec<(u64, Decimal)> = self
-                        .price_history
-                        .iter()
-                        .filter(|(ts, _)| *ts >= window_start_ms)
-                        .map(|(ts, p)| (*ts, *p))
-                        .collect();
-                    
-                    // KRİTİK: Timestamp'e göre sırala (en eski → en yeni)
-                    // Bu, iter().rev() sonrası index karışıklığını önler
-                    recent_prices.sort_by_key(|(ts, _)| *ts);
-                    
-                    // Son N elemanı al (en yeni fiyatlar)
-                    if recent_prices.len() > self.flash_crash_recovery_min_points * 2 {
-                        recent_prices = recent_prices
+                        let window_start_ms =
+                            now_ms.saturating_sub(self.flash_crash_recovery_window_ms);
+
+                        // KRİTİK DÜZELTME: Timestamp'e göre sıralı kullan
+                        // price_history timestamp'e göre sıralı olmalı (en eski → en yeni)
+                        // Zaman penceresi içindeki fiyatları filtrele ve timestamp'e göre sırala
+                        let mut recent_prices: Vec<(u64, Decimal)> = self
+                            .price_history
                             .iter()
-                            .rev()
-                            .take(self.flash_crash_recovery_min_points * 2)
-                            .copied()
+                            .filter(|(ts, _)| *ts >= window_start_ms)
+                            .map(|(ts, p)| (*ts, *p))
                             .collect();
-                        // Tekrar sırala (en eski → en yeni)
+
+                        // KRİTİK: Timestamp'e göre sırala (en eski → en yeni)
+                        // Bu, iter().rev() sonrası index karışıklığını önler
                         recent_prices.sort_by_key(|(ts, _)| *ts);
-                    }
-                    
-                    if recent_prices.len() >= self.flash_crash_recovery_min_points {
-                        if price_change_bps < -self.price_jump_threshold_bps {
-                            // Flash crash: Düşüş sonrası geri yükseliyor mu?
-                            // Minimum noktayı bul
-                            let (min_idx, min_price) = recent_prices
+
+                        // Son N elemanı al (en yeni fiyatlar)
+                        if recent_prices.len() > self.flash_crash_recovery_min_points * 2 {
+                            recent_prices = recent_prices
                                 .iter()
-                                .enumerate()
-                                .min_by(|(_, (_, p1)), (_, (_, p2))| p1.cmp(p2))
-                                .map(|(idx, (_, p))| (idx, *p))
-                                .unwrap_or((0, mid));
-                            
-                            // Minimum noktadan sonra recovery var mı?
-                            if min_idx < recent_prices.len() - 1 {
-                                let min_price_f = min_price.to_f64().unwrap_or(0.0);
-                                let current_price_f = mid.to_f64().unwrap_or(0.0);
-                                
-                                // Min noktanın timestamp'ini al
-                                let min_timestamp = recent_prices[min_idx].0;
-                                let current_timestamp = recent_prices[recent_prices.len() - 1].0;
-                                let seconds_since_min = (current_timestamp.saturating_sub(min_timestamp)) as f64 / 1000.0;
-                                
-                                // Önceki fiyatı bul (minimum noktadan önce)
-                                let before_min_price = if min_idx > 0 {
-                                    recent_prices[min_idx - 1].1.to_f64().unwrap_or(min_price_f)
-                                } else {
-                                    min_price_f
-                                };
-                                
-                                // Recovery kontrolü: En az %X geri yükselme
-                                if min_price_f > 0.0 && before_min_price > 0.0 {
-                                    let drop_ratio = (before_min_price - min_price_f) / before_min_price;
-                                    let recovery_ratio = (current_price_f - min_price_f) / min_price_f;
-                                    
-                                    // ✅ İYİLEŞTİRME: Volume surge kontrolü (bull trap önleme)
-                                    // Min noktadan sonra volume artışı var mı?
-                                    let volume_surge = if self.volume_history.len() >= 10 {
-                                        let recent_volume: f64 = self.volume_history.iter().rev().take(5).sum::<f64>() / 5.0;
-                                        let avg_volume: f64 = self.volume_history.iter().sum::<f64>() / self.volume_history.len() as f64;
-                                        recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                .rev()
+                                .take(self.flash_crash_recovery_min_points * 2)
+                                .copied()
+                                .collect();
+                            // Tekrar sırala (en eski → en yeni)
+                            recent_prices.sort_by_key(|(ts, _)| *ts);
+                        }
+
+                        if recent_prices.len() >= self.flash_crash_recovery_min_points {
+                            if price_change_bps < -self.price_jump_threshold_bps {
+                                // Flash crash: Düşüş sonrası geri yükseliyor mu?
+                                // Minimum noktayı bul
+                                let (min_idx, min_price) = recent_prices
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|(_, (_, p1)), (_, (_, p2))| p1.cmp(p2))
+                                    .map(|(idx, (_, p))| (idx, *p))
+                                    .unwrap_or((0, mid));
+
+                                // Minimum noktadan sonra recovery var mı?
+                                if min_idx < recent_prices.len() - 1 {
+                                    let min_price_f = min_price.to_f64().unwrap_or(0.0);
+                                    let current_price_f = mid.to_f64().unwrap_or(0.0);
+
+                                    // Min noktanın timestamp'ini al
+                                    let min_timestamp = recent_prices[min_idx].0;
+                                    let current_timestamp =
+                                        recent_prices[recent_prices.len() - 1].0;
+                                    let seconds_since_min =
+                                        (current_timestamp.saturating_sub(min_timestamp)) as f64
+                                            / 1000.0;
+
+                                    // Önceki fiyatı bul (minimum noktadan önce)
+                                    let before_min_price = if min_idx > 0 {
+                                        recent_prices[min_idx - 1].1.to_f64().unwrap_or(min_price_f)
                                     } else {
-                                        true // Yeterli veri yok, volume kontrolünü skip et
+                                        min_price_f
                                     };
-                                    
-                                    // ✅ İYİLEŞTİRME: Time stability kontrolü (geçici toparlanma önleme)
-                                    // En az 10 saniye stabil mi? (bull trap önleme)
-                                    let time_stable = seconds_since_min >= 10.0;
-                                    
-                                    // Minimum drop var mı ve recovery yeterli mi?
-                                    let basic_recovery = drop_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
-                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio;
-                                    
-                                    // ✅ GÜÇLENDİRİLMİŞ KONTROL: Recovery + Volume + Time
-                                    basic_recovery && volume_surge && time_stable
+
+                                    // Recovery kontrolü: En az %X geri yükselme
+                                    if min_price_f > 0.0 && before_min_price > 0.0 {
+                                        let drop_ratio =
+                                            (before_min_price - min_price_f) / before_min_price;
+                                        let recovery_ratio =
+                                            (current_price_f - min_price_f) / min_price_f;
+
+                                        // ✅ İYİLEŞTİRME: Volume surge kontrolü (bull trap önleme)
+                                        // Min noktadan sonra volume artışı var mı?
+                                        let volume_surge = if self.volume_history.len() >= 10 {
+                                            let recent_volume: f64 = self
+                                                .volume_history
+                                                .iter()
+                                                .rev()
+                                                .take(5)
+                                                .sum::<f64>()
+                                                / 5.0;
+                                            let avg_volume: f64 =
+                                                self.volume_history.iter().sum::<f64>()
+                                                    / self.volume_history.len() as f64;
+                                            recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                        } else {
+                                            true // Yeterli veri yok, volume kontrolünü skip et
+                                        };
+
+                                        // ✅ İYİLEŞTİRME: Time stability kontrolü (geçici toparlanma önleme)
+                                        // En az 10 saniye stabil mi? (bull trap önleme)
+                                        let time_stable = seconds_since_min >= 10.0;
+
+                                        // Minimum drop var mı ve recovery yeterli mi?
+                                        let basic_recovery = drop_ratio
+                                            > (self.price_jump_threshold_bps / 10000.0) * 0.5
+                                            && recovery_ratio
+                                                >= self.flash_crash_recovery_min_ratio;
+
+                                        // ✅ GÜÇLENDİRİLMİŞ KONTROL: Recovery + Volume + Time
+                                        basic_recovery && volume_surge && time_stable
+                                    } else {
+                                        false
+                                    }
                                 } else {
-                                    false
+                                    false // Minimum nokta en son, recovery yok
+                                }
+                            } else if price_change_bps > self.price_jump_threshold_bps {
+                                // Flash pump: Yükseliş sonrası geri düşüyor mu?
+                                // Maksimum noktayı bul
+                                let (max_idx, max_price) = recent_prices
+                                    .iter()
+                                    .enumerate()
+                                    .max_by(|(_, (_, p1)), (_, (_, p2))| p1.cmp(p2))
+                                    .map(|(idx, (_, p))| (idx, *p))
+                                    .unwrap_or((0, mid));
+
+                                // Maksimum noktadan sonra düşüş var mı?
+                                if max_idx < recent_prices.len() - 1 {
+                                    let max_price_f = max_price.to_f64().unwrap_or(0.0);
+                                    let current_price_f = mid.to_f64().unwrap_or(0.0);
+
+                                    // Max noktanın timestamp'ini al
+                                    let max_timestamp = recent_prices[max_idx].0;
+                                    let current_timestamp =
+                                        recent_prices[recent_prices.len() - 1].0;
+                                    let seconds_since_max =
+                                        (current_timestamp.saturating_sub(max_timestamp)) as f64
+                                            / 1000.0;
+
+                                    // Önceki fiyatı bul (maksimum noktadan önce)
+                                    let before_max_price = if max_idx > 0 {
+                                        recent_prices[max_idx - 1].1.to_f64().unwrap_or(max_price_f)
+                                    } else {
+                                        max_price_f
+                                    };
+
+                                    // Recovery kontrolü: En az %X geri düşme
+                                    if max_price_f > 0.0 && before_max_price > 0.0 {
+                                        let rise_ratio =
+                                            (max_price_f - before_max_price) / before_max_price;
+                                        let recovery_ratio =
+                                            (max_price_f - current_price_f) / max_price_f;
+
+                                        // ✅ İYİLEŞTİRME: Volume surge kontrolü (bear trap önleme)
+                                        // Max noktadan sonra volume artışı var mı?
+                                        let volume_surge = if self.volume_history.len() >= 10 {
+                                            let recent_volume: f64 = self
+                                                .volume_history
+                                                .iter()
+                                                .rev()
+                                                .take(5)
+                                                .sum::<f64>()
+                                                / 5.0;
+                                            let avg_volume: f64 =
+                                                self.volume_history.iter().sum::<f64>()
+                                                    / self.volume_history.len() as f64;
+                                            recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                        } else {
+                                            true // Yeterli veri yok, volume kontrolünü skip et
+                                        };
+
+                                        // ✅ İYİLEŞTİRME: Time stability kontrolü (geçici düşüş önleme)
+                                        // En az 10 saniye stabil mi? (bear trap önleme)
+                                        let time_stable = seconds_since_max >= 10.0;
+
+                                        // Minimum rise var mı ve recovery yeterli mi?
+                                        let basic_recovery = rise_ratio
+                                            > (self.price_jump_threshold_bps / 10000.0) * 0.5
+                                            && recovery_ratio
+                                                >= self.flash_crash_recovery_min_ratio;
+
+                                        // ✅ GÜÇLENDİRİLMİŞ KONTROL: Recovery + Volume + Time
+                                        basic_recovery && volume_surge && time_stable
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false // Maksimum nokta en son, recovery yok
                                 }
                             } else {
-                                false // Minimum nokta en son, recovery yok
-                            }
-                        } else if price_change_bps > self.price_jump_threshold_bps {
-                            // Flash pump: Yükseliş sonrası geri düşüyor mu?
-                            // Maksimum noktayı bul
-                            let (max_idx, max_price) = recent_prices
-                                .iter()
-                                .enumerate()
-                                .max_by(|(_, (_, p1)), (_, (_, p2))| p1.cmp(p2))
-                                .map(|(idx, (_, p))| (idx, *p))
-                                .unwrap_or((0, mid));
-                            
-                            // Maksimum noktadan sonra düşüş var mı?
-                            if max_idx < recent_prices.len() - 1 {
-                                let max_price_f = max_price.to_f64().unwrap_or(0.0);
-                                let current_price_f = mid.to_f64().unwrap_or(0.0);
-                                
-                                // Max noktanın timestamp'ini al
-                                let max_timestamp = recent_prices[max_idx].0;
-                                let current_timestamp = recent_prices[recent_prices.len() - 1].0;
-                                let seconds_since_max = (current_timestamp.saturating_sub(max_timestamp)) as f64 / 1000.0;
-                                
-                                // Önceki fiyatı bul (maksimum noktadan önce)
-                                let before_max_price = if max_idx > 0 {
-                                    recent_prices[max_idx - 1].1.to_f64().unwrap_or(max_price_f)
-                                } else {
-                                    max_price_f
-                                };
-                                
-                                // Recovery kontrolü: En az %X geri düşme
-                                if max_price_f > 0.0 && before_max_price > 0.0 {
-                                    let rise_ratio = (max_price_f - before_max_price) / before_max_price;
-                                    let recovery_ratio = (max_price_f - current_price_f) / max_price_f;
-                                    
-                                    // ✅ İYİLEŞTİRME: Volume surge kontrolü (bear trap önleme)
-                                    // Max noktadan sonra volume artışı var mı?
-                                    let volume_surge = if self.volume_history.len() >= 10 {
-                                        let recent_volume: f64 = self.volume_history.iter().rev().take(5).sum::<f64>() / 5.0;
-                                        let avg_volume: f64 = self.volume_history.iter().sum::<f64>() / self.volume_history.len() as f64;
-                                        recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
-                                    } else {
-                                        true // Yeterli veri yok, volume kontrolünü skip et
-                                    };
-                                    
-                                    // ✅ İYİLEŞTİRME: Time stability kontrolü (geçici düşüş önleme)
-                                    // En az 10 saniye stabil mi? (bear trap önleme)
-                                    let time_stable = seconds_since_max >= 10.0;
-                                    
-                                    // Minimum rise var mı ve recovery yeterli mi?
-                                    let basic_recovery = rise_ratio > (self.price_jump_threshold_bps / 10000.0) * 0.5
-                                        && recovery_ratio >= self.flash_crash_recovery_min_ratio;
-                                    
-                                    // ✅ GÜÇLENDİRİLMİŞ KONTROL: Recovery + Volume + Time
-                                    basic_recovery && volume_surge && time_stable
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false // Maksimum nokta en son, recovery yok
+                                true // Threshold'u geçmedi, recovery check gerekmez
                             }
                         } else {
-                            true // Threshold'u geçmedi, recovery check gerekmez
+                            // Yeterli veri yok, ama gevşetilmiş kontrol: eğer çok büyük bir değişim varsa geç
+                            price_change_bps.abs() > self.price_jump_threshold_bps * 2.0
                         }
-                    } else {
-                        // Yeterli veri yok, ama gevşetilmiş kontrol: eğer çok büyük bir değişim varsa geç
-                        price_change_bps.abs() > self.price_jump_threshold_bps * 2.0
-                    }
                     };
                     recovery_check_result
                 };
 
-                if price_change_bps.abs() > self.price_jump_threshold_bps 
+                if price_change_bps.abs() > self.price_jump_threshold_bps
                    && volume_ratio > self.manipulation_volume_ratio_threshold  // Config'den: Volume ratio threshold
                    && time_elapsed_ms < self.manipulation_time_threshold_ms   // Config'den: Time threshold
                    && liquidity_stable                // Likidite stabil
@@ -1181,7 +1219,8 @@ impl Strategy for DynMm {
             // İlk tick: Warm-up için 20 dummy price ekle (mevcut mid price ile)
             let warm_up_count: usize = 20;
             for i in 0..warm_up_count {
-                let dummy_timestamp = now_ms.saturating_sub((warm_up_count as u64 - i as u64) * 100); // 100ms aralıklarla
+                let dummy_timestamp =
+                    now_ms.saturating_sub((warm_up_count as u64 - i as u64) * 100); // 100ms aralıklarla
                 self.price_history.push((dummy_timestamp, c.mark_price.0));
             }
             // KRİTİK DÜZELTME: Timestamp'e göre sırala (warm-up sonrası)
@@ -1189,7 +1228,7 @@ impl Strategy for DynMm {
             // Warm-up başlat: İlk 20 tick'te recovery check'i skip et
             self.warm_up_ticks_remaining = warm_up_count;
         }
-        
+
         // Warm-up tick sayacını azalt
         if self.warm_up_ticks_remaining > 0 {
             self.warm_up_ticks_remaining -= 1;
@@ -1202,7 +1241,7 @@ impl Strategy for DynMm {
         if self.price_history.len() > self.manipulation_price_history_max_len {
             self.price_history.remove(0);
         }
-        
+
         // KRİTİK DÜZELTME: Timestamp'e göre sıralı tut (en eski → en yeni)
         // Bu, detect_trend() ve flash_crash_recovery'de index karışıklığını önler
         // NOT: push() ve remove(0) kullanıldığı için genelde sıralı kalır,
@@ -1713,27 +1752,26 @@ impl Strategy for DynMm {
     fn is_opportunity_mode(&self) -> bool {
         self.manipulation_opportunity.is_some()
     }
-    
+
     fn get_trend_bps(&self) -> f64 {
         // Mevcut detect_trend() metodunu kullan
         self.detect_trend()
     }
-    
+
     fn get_volatility(&self) -> f64 {
         // EWMA volatilite'yi döndür
         self.ewma_volatility
     }
-    
+
     fn get_volatility_bps(&self) -> f64 {
         let vol = self.ewma_volatility;
         (vol.sqrt() * 10000.0).max(0.0) // sqrt(σ²) * 10000 = bps
     }
-    
+
     fn get_ofi_signal(&self) -> f64 {
         self.ofi_signal
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1826,7 +1864,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_microprice_calculation() {
         let strategy = create_test_strategy();
@@ -1886,24 +1923,35 @@ mod tests {
         // First update: should update from initial (bootstrap)
         strategy.update_volatility(dec!(50000));
         // İlk çağrıda volatility güncellenmeli (bootstrap)
-        assert!(strategy.ewma_volatility > 0.0, "Volatility should be updated on first call");
+        assert!(
+            strategy.ewma_volatility > 0.0,
+            "Volatility should be updated on first call"
+        );
 
         // Price increase: volatility should increase (EWMA smoothing nedeniyle hemen artmayabilir)
         let vol_before = strategy.ewma_volatility;
         strategy.update_volatility(dec!(51000)); // 2% increase
-        // EWMA smoothing nedeniyle volatility hemen artmayabilir, ama pozitif olmalı
-        assert!(strategy.ewma_volatility > 0.0, "Volatility should remain positive after price change");
+                                                 // EWMA smoothing nedeniyle volatility hemen artmayabilir, ama pozitif olmalı
+        assert!(
+            strategy.ewma_volatility > 0.0,
+            "Volatility should remain positive after price change"
+        );
         // EWMA smoothing: σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
         // λ genellikle 0.9-0.95 arası, bu yüzden volatility yavaş güncellenir
         // Büyük fiyat değişimi için volatility artmalı (en azından değişmeli)
         // Sadece pozitif olduğunu ve değiştiğini kontrol et
-        assert!(strategy.ewma_volatility != vol_before || strategy.ewma_volatility > 0.0, 
-                "Volatility should change or remain positive");
+        assert!(
+            strategy.ewma_volatility != vol_before || strategy.ewma_volatility > 0.0,
+            "Volatility should change or remain positive"
+        );
 
         // Small price change: volatility should still update but less
         let _vol_before_small = strategy.ewma_volatility;
         strategy.update_volatility(dec!(51010)); // 0.02% increase
-        assert!(strategy.ewma_volatility > 0.0, "Volatility should remain positive");
+        assert!(
+            strategy.ewma_volatility > 0.0,
+            "Volatility should remain positive"
+        );
         // Küçük fiyat değişimi için volatility artabilir veya azalabilir (EWMA smoothing)
         // Sadece pozitif olduğunu kontrol et
     }
@@ -2337,8 +2385,7 @@ mod tests {
 
         // Spread = 2 * (half + skew + inv_skew)
         // = 2 * (50 + 10 + 5) = 2 * 65 = 130 bps
-        let expected_spread_bps =
-            2.0 * (half_ratio * 1e4 + funding_skew_bps + inv_skew_bps);
+        let expected_spread_bps = 2.0 * (half_ratio * 1e4 + funding_skew_bps + inv_skew_bps);
         // Tolerans: 1 bps (hesaplama hataları ve rounding için)
         assert!(
             (spread_bps_calc - expected_spread_bps).abs() < 1.0,
@@ -2483,10 +2530,7 @@ mod tests {
 
         // Limit değerinin mantıklı olduğunu kontrol et
         assert!(max_len > 0, "Price history max length should be positive");
-        assert!(
-            max_len >= 3,
-            "Max length should be >= min length (3)"
-        );
+        assert!(max_len >= 3, "Max length should be >= min length (3)");
 
         // Limit kontrolü mantığını test et
         let mut test_history: Vec<(u64, Decimal)> = Vec::new();

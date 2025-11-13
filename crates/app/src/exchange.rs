@@ -1,10 +1,13 @@
 // Exchange module - Consolidates binance_exec, binance_rest, binance_ws
 // This file includes all Binance Futures API implementations
 
+use crate::exec::{Venue, VenueOrder};
+use crate::types::*;
+use crate::types::{Px, Qty, Side};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use crate::types::*;
 use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
 use reqwest::{Client, RequestBuilder, Response};
@@ -12,19 +15,16 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::Sha256;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{timeout, Duration, Instant};
+use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream};
 use tracing::{debug, error, info, warn};
 use urlencoding::encode;
-use crate::exec::{Venue, VenueOrder};
-use crate::types::{Px, Qty, Side};
-use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
-use std::str::FromStr;
-use tokio::time::{timeout, Duration, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream};
-use tokio_tungstenite::tungstenite::Error as WsError;
 
 // ============================================================================
 // Binance Exec Module (from binance_exec.rs)
@@ -79,7 +79,11 @@ struct FutExchangeSymbol {
 pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
 
 fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
-    Decimal::from_str_radix(s.as_ref(), 10).unwrap_or(Decimal::ZERO)
+    let value = s.as_ref();
+    Decimal::from_str(value).unwrap_or_else(|err| {
+        warn!(input = value, ?err, "failed to parse decimal from string");
+        Decimal::ZERO
+    })
 }
 
 fn scale_from_step(step: Decimal) -> usize {
@@ -146,7 +150,7 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         );
         calc
     });
-    
+
     let q_prec = sym.qty_precision.unwrap_or_else(|| {
         let calc = scale_from_step(step);
         tracing::warn!(
@@ -165,7 +169,7 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
     } else {
         tick
     };
-    
+
     let final_step = if step.is_zero() {
         tracing::warn!(symbol = %sym.symbol, "stepSize is zero, using fallback 0.001");
         Decimal::new(1, 3) // 0.001
@@ -314,7 +318,7 @@ impl BinanceFutures {
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/leverage?{}&signature={}", self.base, qs, sig);
-        
+
         match send_void(
             self.common
                 .client
@@ -333,7 +337,7 @@ impl BinanceFutures {
             }
         }
     }
-    
+
     /// Position side mode ayarla (hedge mode aç/kapa)
     /// KRİTİK: Başlangıçta hesap modunu açıkça ayarla
     /// /fapi/v1/positionSide/dual endpoint'i ile hedge mode açılır/kapanır
@@ -345,8 +349,11 @@ impl BinanceFutures {
         ];
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
-        let url = format!("{}/fapi/v1/positionSide/dual?{}&signature={}", self.base, qs, sig);
-        
+        let url = format!(
+            "{}/fapi/v1/positionSide/dual?{}&signature={}",
+            self.base, qs, sig
+        );
+
         match send_void(
             self.common
                 .client
@@ -365,11 +372,11 @@ impl BinanceFutures {
             }
         }
     }
-    
+
     /// Margin type ayarla (isolated veya cross)
     /// KRİTİK: Başlangıçta her sembol için margin type'ı açıkça ayarla
     /// /fapi/v1/marginType endpoint'i ile isolated/cross margin set edilir
-    /// 
+    ///
     /// # Arguments
     /// * `sym` - Symbol (örn: "BTCUSDT")
     /// * `isolated` - true = isolated margin, false = cross margin
@@ -384,7 +391,7 @@ impl BinanceFutures {
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/marginType?{}&signature={}", self.base, qs, sig);
-        
+
         match send_void(
             self.common
                 .client
@@ -403,7 +410,7 @@ impl BinanceFutures {
             }
         }
     }
-    
+
     /// Per-symbol metadata (tick_size, step_size) alır
     /// KRİTİK: Global fallback kullanmaz - her sembol için gerçek rules gerekli
     /// Fallback kullanmak LOT_SIZE ve PRICE_FILTER hatalarına yol açabilir
@@ -415,7 +422,7 @@ impl BinanceFutures {
         // Geçici hata durumunda retry mekanizması (max 2 retry)
         const MAX_RETRIES: u32 = 2;
         let mut last_error = None;
-        
+
         for attempt in 0..=MAX_RETRIES {
             let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
             match send_json::<FutExchangeInfo>(self.common.client.get(url)).await {
@@ -448,7 +455,7 @@ impl BinanceFutures {
                 }
             }
         }
-        
+
         // Tüm retry'ler başarısız oldu - hata dön (fallback kullanma)
         error!(
             error = ?last_error,
@@ -460,10 +467,11 @@ impl BinanceFutures {
             "failed to fetch symbol rules for {} after {} retries: {}",
             sym,
             MAX_RETRIES + 1,
-            last_error.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".to_string())
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
         ))
     }
-
 
     pub async fn symbol_metadata(&self) -> Result<Vec<SymbolMeta>> {
         let url = format!("{}/fapi/v1/exchangeInfo", self.base);
@@ -506,7 +514,7 @@ impl BinanceFutures {
 
         let bal = balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
-            Some(b) => Decimal::from_str_radix(&b.available_balance, 10)?,
+            Some(b) => Decimal::from_str(&b.available_balance)?,
             None => Decimal::ZERO,
         };
         Ok(amt)
@@ -530,8 +538,8 @@ impl BinanceFutures {
         .await?;
         let mut res = Vec::new();
         for o in orders {
-            let price = Decimal::from_str_radix(&o.price, 10)?;
-            let qty = Decimal::from_str_radix(&o.orig_qty, 10)?;
+            let price = Decimal::from_str(&o.price)?;
+            let qty = Decimal::from_str(&o.orig_qty)?;
             let side = if o.side.eq_ignore_ascii_case("buy") {
                 Side::Buy
             } else {
@@ -576,8 +584,7 @@ impl BinanceFutures {
         let is_isolated = pos.margin_type.eq_ignore_ascii_case("isolated");
         Ok(is_isolated)
     }
-    
-    
+
     pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
@@ -601,10 +608,10 @@ impl BinanceFutures {
             .drain(..)
             .find(|p| p.symbol.eq_ignore_ascii_case(sym))
             .ok_or_else(|| anyhow!("position not found for symbol"))?;
-        let qty = Decimal::from_str_radix(&pos.position_amt, 10)?;
-        let entry = Decimal::from_str_radix(&pos.entry_price, 10)?;
+        let qty = Decimal::from_str(&pos.position_amt)?;
+        let entry = Decimal::from_str(&pos.entry_price)?;
         let leverage = pos.leverage.parse::<u32>().unwrap_or(1);
-        let liq = Decimal::from_str_radix(&pos.liquidation_price, 10).unwrap_or(Decimal::ZERO);
+        let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
         let liq_px = if liq > Decimal::ZERO {
             Some(Px(liq))
         } else {
@@ -622,7 +629,7 @@ impl BinanceFutures {
     pub async fn fetch_premium_index(&self, sym: &str) -> Result<(Px, Option<f64>, Option<u64>)> {
         let url = format!("{}/fapi/v1/premiumIndex?symbol={}", self.base, sym);
         let premium: PremiumIndex = send_json(self.common.client.get(url)).await?;
-        let mark = Decimal::from_str_radix(&premium.mark_price, 10)?;
+        let mark = Decimal::from_str(&premium.mark_price)?;
         let funding_rate = premium
             .last_funding_rate
             .as_deref()
@@ -630,7 +637,6 @@ impl BinanceFutures {
         let next_time = premium.next_funding_time.filter(|ts| *ts > 0);
         Ok((Px(mark), funding_rate, next_time))
     }
-
 
     /// Close position with reduceOnly guarantee and verification
     ///
@@ -730,7 +736,7 @@ impl BinanceFutures {
                 format!("timestamp={}", BinanceCommon::ts()),
                 format!("recvWindow={}", self.common.recv_window_ms),
             ];
-            
+
             // Hedge mode açıksa positionSide ekle
             if let Some(pos_side) = position_side {
                 params.push(format!("positionSide={}", pos_side));
@@ -778,7 +784,7 @@ impl BinanceFutures {
                         } else {
                             Decimal::ZERO
                         };
-                        
+
                         // Kalan pozisyon yüzdesi (initial'a göre)
                         let remaining_pct = if initial_qty.abs() > Decimal::ZERO {
                             (verify_qty.abs() / initial_qty.abs() * Decimal::from(100))
@@ -818,10 +824,13 @@ impl BinanceFutures {
                 Err(e) => {
                     let error_str = e.to_string();
                     let error_lower = error_str.to_lowercase();
-                    
+
                     // KRİTİK DÜZELTME: MIN_NOTIONAL hatası yakalama (-1013 veya "min notional")
                     // Küçük "artık" miktarlarda reduce-only market close borsa min_notional eşiğini sağlamayabilir
-                    if error_lower.contains("-1013") || error_lower.contains("min notional") || error_lower.contains("min_notional") {
+                    if error_lower.contains("-1013")
+                        || error_lower.contains("min notional")
+                        || error_lower.contains("min_notional")
+                    {
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -830,7 +839,7 @@ impl BinanceFutures {
                             min_notional = %rules.min_notional,
                             "MIN_NOTIONAL error in reduce-only market close, trying limit reduce-only fallback"
                         );
-                        
+
                         // Fallback: Limit reduce-only ile karşı tarafta 1-2 tick avantajlı pasif bırak
                         let (best_bid, best_ask) = match self.best_prices(sym).await {
                             Ok(prices) => prices,
@@ -840,11 +849,14 @@ impl BinanceFutures {
                                     tokio::time::sleep(Duration::from_millis(500)).await;
                                     continue;
                                 } else {
-                                    return Err(anyhow!("MIN_NOTIONAL error and limit fallback failed: {}", e));
+                                    return Err(anyhow!(
+                                        "MIN_NOTIONAL error and limit fallback failed: {}",
+                                        e
+                                    ));
                                 }
                             }
                         };
-                        
+
                         // Limit reduce-only emri: karşı tarafta 1-2 tick avantajlı
                         let tick_size = rules.tick_size;
                         let limit_price = if matches!(side, Side::Buy) {
@@ -854,14 +866,22 @@ impl BinanceFutures {
                             // Long kapatma: Sell limit, ask'ten 1 tick aşağı (maker olabilir)
                             best_ask.0 - tick_size
                         };
-                        
+
                         let limit_price_quantized = quantize_decimal(limit_price, tick_size);
-                        let limit_price_str = format_decimal_fixed(limit_price_quantized, rules.price_precision);
-                        
+                        let limit_price_str =
+                            format_decimal_fixed(limit_price_quantized, rules.price_precision);
+
                         // Limit reduce-only emri gönder
                         let mut limit_params = vec![
                             format!("symbol={}", sym),
-                            format!("side={}", if matches!(side, Side::Buy) { "BUY" } else { "SELL" }),
+                            format!(
+                                "side={}",
+                                if matches!(side, Side::Buy) {
+                                    "BUY"
+                                } else {
+                                    "SELL"
+                                }
+                            ),
                             "type=LIMIT".to_string(),
                             "timeInForce=GTC".to_string(),
                             format!("price={}", limit_price_str),
@@ -870,15 +890,18 @@ impl BinanceFutures {
                             format!("timestamp={}", BinanceCommon::ts()),
                             format!("recvWindow={}", self.common.recv_window_ms),
                         ];
-                        
+
                         if let Some(pos_side) = position_side {
                             limit_params.push(format!("positionSide={}", pos_side));
                         }
-                        
+
                         let limit_qs = limit_params.join("&");
                         let limit_sig = self.common.sign(&limit_qs);
-                        let limit_url = format!("{}/fapi/v1/order?{}&signature={}", self.base, limit_qs, limit_sig);
-                        
+                        let limit_url = format!(
+                            "{}/fapi/v1/order?{}&signature={}",
+                            self.base, limit_qs, limit_sig
+                        );
+
                         match send_void(
                             self.common
                                 .client
@@ -980,7 +1003,7 @@ impl Venue for BinanceFutures {
 
         // KRİTİK DÜZELTME: Validation guard - tek nokta kontrol
         // Bu fonksiyon -1111 hatasını imkânsız hale getirir
-        let (price_str, qty_str, price_quantized, qty_quantized) = 
+        let (price_str, qty_str, price_quantized, qty_quantized) =
             Self::validate_and_format_order_params(px, qty, &rules, sym)?;
 
         // KRİTİK: Log'ları zenginleştir - gönderilen değerleri logla
@@ -1010,14 +1033,18 @@ impl Venue for BinanceFutures {
             format!("recvWindow={}", self.common.recv_window_ms),
             "newOrderRespType=RESULT".to_string(),
         ];
-        
+
         // ✅ YENİ: reduceOnly desteği (TP emirleri için) - şimdilik false (normal emirler için)
         // TP emirleri için ayrı bir public method kullanılacak
-        
+
         // ClientOrderId ekle (idempotency için) - sadece boş değilse
         if !client_order_id.is_empty() {
             // Binance: max 36 karakter, alphanumeric
-            if client_order_id.len() <= 36 && client_order_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            if client_order_id.len() <= 36
+                && client_order_id
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
                 params.push(format!("newClientOrderId={}", client_order_id));
             } else {
                 warn!(
@@ -1031,17 +1058,21 @@ impl Venue for BinanceFutures {
         // Transient hatalar için exponential backoff ile retry (aynı clientOrderId ile)
         const MAX_RETRIES: u32 = 3;
         const INITIAL_BACKOFF_MS: u64 = 100;
-        
+
         let mut last_error = None;
         let mut order_result: Option<FutPlacedOrder> = None;
-        
+
         for attempt in 0..=MAX_RETRIES {
             // Her retry'de yeni request oluştur (aynı parametrelerle, aynı clientOrderId ile)
             let retry_qs = params.join("&");
             let retry_sig = self.common.sign(&retry_qs);
-            let retry_url = format!("{}/fapi/v1/order?{}&signature={}", self.base, retry_qs, retry_sig);
-            
-            match self.common
+            let retry_url = format!(
+                "{}/fapi/v1/order?{}&signature={}",
+                self.base, retry_qs, retry_sig
+            );
+
+            match self
+                .common
                 .client
                 .post(&retry_url)
                 .header("X-MBX-APIKEY", &self.common.api_key)
@@ -1072,21 +1103,28 @@ impl Venue for BinanceFutures {
                         // Status code hata
                         let body = resp.text().await.unwrap_or_default();
                         let body_lower = body.to_lowercase();
-                        
+
                         // KRİTİK DÜZELTME: -1111 (precision) hatası - rules'ı yeniden çek ve retry
-                        if body_lower.contains("precision is over") || body_lower.contains("-1111") {
+                        if body_lower.contains("precision is over") || body_lower.contains("-1111")
+                        {
                             if attempt < MAX_RETRIES {
                                 // Rules'ı yeniden çek
                                 warn!(%sym, attempt = attempt + 1, "precision error (-1111), refreshing rules and retrying");
                                 match self.rules_for(sym).await {
                                     Ok(new_rules) => {
                                         // Yeni rules ile yeniden validate et
-                                        match Self::validate_and_format_order_params(px, qty, &new_rules, sym) {
+                                        match Self::validate_and_format_order_params(
+                                            px, qty, &new_rules, sym,
+                                        ) {
                                             Ok((new_price_str, new_qty_str, _, _)) => {
                                                 // Yeni değerlerle retry
-                                                let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                                                
+                                                let backoff_ms =
+                                                    INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
+                                                tokio::time::sleep(Duration::from_millis(
+                                                    backoff_ms,
+                                                ))
+                                                .await;
+
                                                 // Params'ı güncelle
                                                 params = vec![
                                                     format!("symbol={}", sym),
@@ -1096,13 +1134,19 @@ impl Venue for BinanceFutures {
                                                     format!("price={}", new_price_str),
                                                     format!("quantity={}", new_qty_str),
                                                     format!("timestamp={}", BinanceCommon::ts()),
-                                                    format!("recvWindow={}", self.common.recv_window_ms),
+                                                    format!(
+                                                        "recvWindow={}",
+                                                        self.common.recv_window_ms
+                                                    ),
                                                     "newOrderRespType=RESULT".to_string(),
                                                 ];
                                                 if !client_order_id.is_empty() {
-                                                    params.push(format!("newClientOrderId={}", client_order_id));
+                                                    params.push(format!(
+                                                        "newClientOrderId={}",
+                                                        client_order_id
+                                                    ));
                                                 }
-                                                
+
                                                 last_error = Some(anyhow!("precision error, retrying with refreshed rules"));
                                                 continue;
                                             }
@@ -1114,21 +1158,32 @@ impl Venue for BinanceFutures {
                                     }
                                     Err(e) => {
                                         error!(%sym, error = %e, "failed to refresh rules, giving up");
-                                        return Err(anyhow!("precision error, failed to refresh rules: {}", e));
+                                        return Err(anyhow!(
+                                            "precision error, failed to refresh rules: {}",
+                                            e
+                                        ));
                                     }
                                 }
                             } else {
                                 error!(%sym, attempt, "precision error (-1111) after max retries, symbol should be quarantined");
-                                return Err(anyhow!("binance api error: {} - {} (precision error, max retries)", status, body));
+                                return Err(anyhow!(
+                                    "binance api error: {} - {} (precision error, max retries)",
+                                    status,
+                                    body
+                                ));
                             }
                         }
-                        
+
                         // Kalıcı hata kontrolü
                         if is_permanent_error(status.as_u16(), &body) {
                             tracing::error!(%status, %body, attempt, "permanent error, no retry");
-                            return Err(anyhow!("binance api error: {} - {} (permanent)", status, body));
+                            return Err(anyhow!(
+                                "binance api error: {} - {} (permanent)",
+                                status,
+                                body
+                            ));
                         }
-                        
+
                         // Transient hata kontrolü
                         if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
                             let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
@@ -1158,11 +1213,10 @@ impl Venue for BinanceFutures {
                 }
             }
         }
-        
+
         // Başarılı sonuç döndür
-        let order = order_result.ok_or_else(|| {
-            last_error.unwrap_or_else(|| anyhow!("unknown error after retries"))
-        })?;
+        let order = order_result
+            .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("unknown error after retries")))?;
 
         info!(
             %sym,
@@ -1206,8 +1260,8 @@ impl Venue for BinanceFutures {
         let best_bid = d.bids.get(0).ok_or_else(|| anyhow!("no bid"))?.0.clone();
         let best_ask = d.asks.get(0).ok_or_else(|| anyhow!("no ask"))?.0.clone();
         Ok((
-            Px(Decimal::from_str_radix(&best_bid, 10)?),
-            Px(Decimal::from_str_radix(&best_ask, 10)?),
+            Px(Decimal::from_str(&best_bid)?),
+            Px(Decimal::from_str(&best_ask)?),
         ))
     }
 
@@ -1247,9 +1301,9 @@ impl BinanceFutures {
         };
 
         let rules = self.rules_for(sym).await?;
-        
+
         // Validation guard ile format et
-        let (price_str, qty_str, _, _) = 
+        let (price_str, qty_str, _, _) =
             Self::validate_and_format_order_params(px, qty, &rules, sym)?;
 
         let params = vec![
@@ -1282,7 +1336,7 @@ impl BinanceFutures {
             Err(e) => {
                 let error_str = e.to_string();
                 let error_lower = error_str.to_lowercase();
-                
+
                 // -1111 hatası gelirse sembolü disable et
                 if error_lower.contains("precision is over") || error_lower.contains("-1111") {
                     warn!(
@@ -1300,7 +1354,7 @@ impl BinanceFutures {
             }
         }
     }
-    
+
     /// Validation guard: Emir gönderiminden önce son doğrulama
     /// Bu fonksiyon -1111 hatasını imkânsız hale getirir
     /// price = floor_to_step(price, tick_size)
@@ -1421,10 +1475,15 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
             let integer_part = &s[..dot_pos];
             let decimal_part = &s[dot_pos + 1..];
             let current_decimals = decimal_part.len();
-            
+
             if current_decimals < scale as usize {
                 // Eksik trailing zero'ları ekle
-                format!("{}.{}{}", integer_part, decimal_part, "0".repeat(scale as usize - current_decimals))
+                format!(
+                    "{}.{}{}",
+                    integer_part,
+                    decimal_part,
+                    "0".repeat(scale as usize - current_decimals)
+                )
             } else if current_decimals > scale as usize {
                 // KRİTİK: Fazla decimal varsa kes - kesinlikle precision'dan fazla basamak gösterme
                 // String'i kes - bu "Precision is over the maximum" hatasını önler
@@ -1457,9 +1516,9 @@ async fn ensure_success(resp: Response) -> Result<Response> {
 /// 400 (Bad Request) → body'ye göre karar ver (bazıları transient olabilir)
 fn is_transient_error(status: u16, _body: &str) -> bool {
     match status {
-        408 => true,  // Request Timeout
-        429 => true,  // Too Many Requests
-        500..=599 => true,  // Server Errors
+        408 => true,       // Request Timeout
+        429 => true,       // Too Many Requests
+        500..=599 => true, // Server Errors
         400 => {
             // 400 için body'ye bak - bazı hatalar transient olabilir
             // "Invalid symbol" gibi kalıcı hatalar retry edilmemeli
@@ -1469,7 +1528,7 @@ fn is_transient_error(status: u16, _body: &str) -> bool {
             // Şimdilik 400'leri kalıcı sayalım (daha güvenli)
             false
         }
-        _ => false,  // Diğer hatalar kalıcı
+        _ => false, // Diğer hatalar kalıcı
     }
 }
 
@@ -1483,16 +1542,15 @@ fn is_permanent_error(status: u16, body: &str) -> bool {
         if body_lower.contains("precision is over") || body_lower.contains("-1111") {
             return false; // Precision hatası retry edilebilir
         }
-        body_lower.contains("invalid") ||
-        body_lower.contains("margin") ||
-        body_lower.contains("insufficient balance") ||
-        body_lower.contains("min notional") ||
-        body_lower.contains("below min notional")
+        body_lower.contains("invalid")
+            || body_lower.contains("margin")
+            || body_lower.contains("insufficient balance")
+            || body_lower.contains("min notional")
+            || body_lower.contains("below min notional")
     } else {
         false
     }
 }
-
 
 async fn send_json<T>(builder: RequestBuilder) -> Result<T>
 where
@@ -1596,7 +1654,6 @@ mod tests {
     }
 }
 
-
 // ============================================================================
 // Binance WebSocket Module (from binance_ws.rs)
 // ============================================================================
@@ -1625,7 +1682,7 @@ pub enum UserEvent {
         price: Px,
         is_maker: bool,       // true = maker, false = taker
         order_status: String, // Order status: NEW, PARTIALLY_FILLED, FILLED, CANCELED, etc.
-        commission: Decimal,   // KRİTİK: Gerçek komisyon (executionReport'tan "n" field'ı)
+        commission: Decimal,  // KRİTİK: Gerçek komisyon (executionReport'tan "n" field'ı)
     },
     OrderCanceled {
         symbol: String,
@@ -1726,11 +1783,11 @@ impl UserDataStream {
         } else {
             warn!(%url, "WebSocket reconnected, but no sync callback set - missed events may not be synced");
         }
-        
+
         info!(%url, "reconnected user data websocket");
         Ok(())
     }
-    
+
     /// Reconnect sonrası missed events sync callback'i set et
     /// Callback reconnect sonrası çağrılır ve REST API'den missed events'leri sync etmek için kullanılır
     pub fn set_on_reconnect<F>(&mut self, callback: F)
@@ -1896,12 +1953,12 @@ impl UserDataStream {
                 // KRİTİK DÜZELTME: Gerçek komisyon (executionReport'tan "n" field'ı)
                 // "n" = commission (last executed qty için komisyon, incremental)
                 let commission = Self::parse_decimal(value, "n");
-                    return Ok(Some(UserEvent::OrderFill {
-                        symbol,
-                        order_id,
-                        side,
-                        qty: Qty(qty),
-                        cumulative_filled_qty: Qty(cumulative_filled_qty),
+                return Ok(Some(UserEvent::OrderFill {
+                    symbol,
+                    order_id,
+                    side,
+                    qty: Qty(qty),
+                    cumulative_filled_qty: Qty(cumulative_filled_qty),
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),
@@ -1947,12 +2004,12 @@ impl UserDataStream {
                 // KRİTİK DÜZELTME: Gerçek komisyon (ORDER_TRADE_UPDATE'ten "n" field'ı)
                 // "n" = commission (last executed qty için komisyon, incremental)
                 let commission = Self::parse_decimal(data, "n");
-                    return Ok(Some(UserEvent::OrderFill {
-                        symbol,
-                        order_id,
-                        side,
-                        qty: Qty(qty),
-                        cumulative_filled_qty: Qty(cumulative_filled_qty),
+                return Ok(Some(UserEvent::OrderFill {
+                    symbol,
+                    order_id,
+                    side,
+                    qty: Qty(qty),
+                    cumulative_filled_qty: Qty(cumulative_filled_qty),
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),
@@ -1965,4 +2022,3 @@ impl UserDataStream {
         Ok(Some(UserEvent::Heartbeat))
     }
 }
-

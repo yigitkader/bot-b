@@ -1,13 +1,13 @@
 //location: /crates/app/src/risk.rs
 // All risk management logic (consolidated from risk.rs, risk_handler.rs, risk_manager.rs)
 
-use crate::types::*;
-use std::collections::HashMap;
-use crate::exec::Venue;
 use crate::config::AppCfg;
+use crate::exec::Venue;
+use crate::types::*;
 use crate::utils::rate_limit_guard;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -88,7 +88,10 @@ pub fn check_position_size_risk(
         1.0
     };
 
-    let max_position_size_usd = max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer * max_position_multiplier;
+    let max_position_size_usd = max_usd_per_order
+        * effective_leverage
+        * cfg.internal.max_position_size_buffer
+        * max_position_multiplier;
     let total_exposure_notional = position_size_notional + total_active_orders_notional;
 
     let soft_limit = max_position_size_usd * cfg.internal.opportunity_mode_soft_limit_ratio;
@@ -112,8 +115,14 @@ pub fn check_position_size_risk(
 
 /// Calculate total active orders notional
 pub fn calculate_total_active_orders_notional(state: &SymbolState) -> f64 {
-    state.active_orders.values()
-        .map(|order| (order.price.0 * order.remaining_qty.0).to_f64().unwrap_or(0.0))
+    state
+        .active_orders
+        .values()
+        .map(|order| {
+            (order.price.0 * order.remaining_qty.0)
+                .to_f64()
+                .unwrap_or(0.0)
+        })
         .sum()
 }
 
@@ -124,7 +133,8 @@ pub fn check_pnl_alerts(
     position_size_notional: f64,
     cfg: &AppCfg,
 ) {
-    let should_alert = state.last_pnl_alert
+    let should_alert = state
+        .last_pnl_alert
         .map(|last| last.elapsed().as_secs() >= cfg.internal.pnl_alert_interval_sec)
         .unwrap_or(true);
 
@@ -192,7 +202,7 @@ pub async fn handle_risk_level<V: Venue>(
             // ✅ Thread-safe: Atomik swap - eğer zaten true ise skip eder
             if !state.position_closing.swap(true, Ordering::AcqRel) {
                 state.last_close_attempt = Some(Instant::now());
-                
+
                 rate_limit_guard(2).await;
                 let _ = venue.cancel_all(symbol).await;
                 if venue.close_position(symbol).await.is_ok() {
@@ -213,17 +223,19 @@ pub async fn handle_risk_level<V: Venue>(
                 total_exposure,
                 "MEDIUM LIMIT: reducing active orders"
             );
-            let mut orders_with_times: Vec<(String, Instant)> = state.active_orders.iter()
+            let mut orders_with_times: Vec<(String, Instant)> = state
+                .active_orders
+                .iter()
                 .map(|(id, o)| (id.clone(), o.created_at))
                 .collect();
             orders_with_times.sort_by_key(|(_, t)| *t);
-            
+
             let to_cancel: Vec<String> = orders_with_times
                 .into_iter()
                 .take((state.active_orders.len() / 2).max(1))
                 .map(|(id, _)| id)
                 .collect();
-            
+
             for order_id in &to_cancel {
                 rate_limit_guard(1).await;
                 if venue.cancel(order_id, symbol).await.is_ok() {
@@ -431,4 +443,3 @@ pub fn check_caps_sufficient(
 
     (buy_cap_ok, sell_cap_ok)
 }
-

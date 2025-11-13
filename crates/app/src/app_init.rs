@@ -1,24 +1,25 @@
 //location: /crates/app/src/app_init.rs
 // Application initialization logic extracted from main.rs
 
-use anyhow::{anyhow, Result};
-use crate::exchange::{BinanceCommon, BinanceFutures, UserDataStream, UserEvent, UserStreamKind};
 use crate::config::AppCfg;
-use crate::types::*;
+use crate::exchange::{BinanceCommon, BinanceFutures, UserDataStream, UserEvent, UserStreamKind};
 use crate::exec::decimal_places;
 use crate::logger::create_logger;
 use crate::risk::RiskLimits;
 use crate::strategy::DynMmCfg;
+use crate::types::*;
+use anyhow::{anyhow, Result};
 // processor module re-exports discovery functions
-use crate::utils::tif_from_cfg;
 use crate::types::SymbolState;
 use crate::utils::init_rate_limiter;
+use crate::utils::tif_from_cfg;
+use futures_util::stream::{self, StreamExt};
 use rust_decimal::Decimal;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use futures_util::stream::{self, StreamExt};
 
 pub struct AppInitResult {
     pub cfg: AppCfg,
@@ -46,7 +47,7 @@ pub async fn initialize_app() -> Result<AppInitResult> {
         .init();
 
     let cfg = crate::config::load_config()?;
-    
+
     // Validate config
     if cfg.price_tick <= 0.0 {
         return Err(anyhow!("price_tick must be positive"));
@@ -57,7 +58,7 @@ pub async fn initialize_app() -> Result<AppInitResult> {
     if cfg.max_usd_per_order <= 0.0 {
         return Err(anyhow!("max_usd_per_order must be positive"));
     }
-    
+
     // Initialize metrics
     if let Some(port) = cfg.metrics_port {
         crate::monitor::init_prom(port);
@@ -90,13 +91,13 @@ pub async fn initialize_app() -> Result<AppInitResult> {
 
     // Initialize venue
     let venue = initialize_venue(&cfg).await?;
-    
+
     // Discover and initialize symbols
     let states = initialize_symbols(&venue, &cfg, &dyn_cfg, &strategy_name).await?;
 
     // Build risk limits
     let risk_limits = RiskLimits {
-        inv_cap: Qty(Decimal::from_str_radix(&cfg.risk.inv_cap, 10)
+        inv_cap: Qty(Decimal::from_str(&cfg.risk.inv_cap)
             .map_err(|e| anyhow!("invalid risk.inv_cap: {}", e))?),
         min_liq_gap_bps: cfg.risk.min_liq_gap_bps,
         dd_limit_bps: cfg.risk.dd_limit_bps,
@@ -110,13 +111,17 @@ pub async fn initialize_app() -> Result<AppInitResult> {
     }
 
     // Calculate trading parameters
-    let tick_ms = std::cmp::max(cfg.internal.min_tick_interval_ms, cfg.exec.cancel_replace_interval_ms);
+    let tick_ms = std::cmp::max(
+        cfg.internal.min_tick_interval_ms,
+        cfg.exec.cancel_replace_interval_ms,
+    );
     let min_usd_per_order = cfg.min_usd_per_order.unwrap_or(0.0);
-    
+
     let min_profit_usd = cfg.strategy.min_profit_usd.unwrap_or(0.50);
     let maker_fee_rate = cfg.strategy.maker_fee_rate.unwrap_or(0.0002);
     let taker_fee_rate = cfg.strategy.taker_fee_rate.unwrap_or(0.0004);
-    let profit_guarantee = crate::utils::ProfitGuarantee::new(min_profit_usd, maker_fee_rate, taker_fee_rate);
+    let profit_guarantee =
+        crate::utils::ProfitGuarantee::new(min_profit_usd, maker_fee_rate, taker_fee_rate);
     let tif = tif_from_cfg(&cfg.exec.tif);
 
     Ok(AppInitResult {
@@ -138,13 +143,10 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
     Ok(DynMmCfg {
         a: cfg.strategy.a,
         b: cfg.strategy.b,
-        base_size: Decimal::from_str_radix(&cfg.strategy.base_size, 10)
+        base_size: Decimal::from_str(&cfg.strategy.base_size)
             .map_err(|e| anyhow!("invalid strategy.base_size: {}", e))?,
-        inv_cap: Decimal::from_str_radix(
-            cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap),
-            10,
-        )
-        .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap: {}", e))?,
+        inv_cap: Decimal::from_str(cfg.strategy.inv_cap.as_deref().unwrap_or(&cfg.risk.inv_cap))
+            .map_err(|e| anyhow!("invalid strategy.inv_cap or risk.inv_cap: {}", e))?,
         min_spread_bps: cfg.strategy.min_spread_bps.unwrap_or(30.0),
         max_spread_bps: cfg.strategy.max_spread_bps.unwrap_or(100.0),
         spread_arbitrage_min_bps: cfg.strategy.spread_arbitrage_min_bps.unwrap_or(30.0),
@@ -153,7 +155,10 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
         momentum_strong_bps: cfg.strategy.momentum_strong_bps.unwrap_or(50.0),
         trend_bias_multiplier: cfg.strategy.trend_bias_multiplier.unwrap_or(1.0),
         adverse_selection_threshold_on: cfg.strategy.adverse_selection_threshold_on.unwrap_or(0.6),
-        adverse_selection_threshold_off: cfg.strategy.adverse_selection_threshold_off.unwrap_or(0.4),
+        adverse_selection_threshold_off: cfg
+            .strategy
+            .adverse_selection_threshold_off
+            .unwrap_or(0.4),
         opportunity_threshold_on: cfg.strategy.opportunity_threshold_on.unwrap_or(0.5),
         opportunity_threshold_off: cfg.strategy.opportunity_threshold_off.unwrap_or(0.2),
         price_jump_threshold_bps: cfg.strategy.price_jump_threshold_bps.unwrap_or(150.0),
@@ -165,11 +170,17 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
         min_liquidity_required: cfg.strategy.min_liquidity_required.unwrap_or(0.01),
         opportunity_size_multiplier: cfg.strategy.opportunity_size_multiplier.unwrap_or(1.05),
         strong_trend_multiplier: cfg.strategy.strong_trend_multiplier.unwrap_or(1.0),
-        manipulation_volume_ratio_threshold: Some(cfg.strategy_internal.manipulation_volume_ratio_threshold),
+        manipulation_volume_ratio_threshold: Some(
+            cfg.strategy_internal.manipulation_volume_ratio_threshold,
+        ),
         manipulation_time_threshold_ms: Some(cfg.strategy_internal.manipulation_time_threshold_ms),
-        manipulation_price_history_max_len: Some(cfg.strategy_internal.manipulation_price_history_max_len),
+        manipulation_price_history_max_len: Some(
+            cfg.strategy_internal.manipulation_price_history_max_len,
+        ),
         flash_crash_recovery_window_ms: Some(cfg.strategy_internal.flash_crash_recovery_window_ms),
-        flash_crash_recovery_min_points: Some(cfg.strategy_internal.flash_crash_recovery_min_points),
+        flash_crash_recovery_min_points: Some(
+            cfg.strategy_internal.flash_crash_recovery_min_points,
+        ),
         flash_crash_recovery_min_ratio: Some(cfg.strategy_internal.flash_crash_recovery_min_ratio),
         confidence_price_drop_max: Some(cfg.strategy_internal.confidence_price_drop_max),
         confidence_volume_ratio_min: Some(cfg.strategy_internal.confidence_volume_ratio_min),
@@ -182,8 +193,13 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
         default_confidence: Some(cfg.strategy_internal.default_confidence),
         min_confidence_value: Some(cfg.strategy_internal.min_confidence_value),
         trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
-        trend_analysis_threshold_negative: Some(cfg.strategy_internal.trend_analysis_threshold_negative),
-        trend_analysis_threshold_strong_negative: Some(cfg.strategy_internal.trend_analysis_threshold_strong_negative),
+        trend_analysis_threshold_negative: Some(
+            cfg.strategy_internal.trend_analysis_threshold_negative,
+        ),
+        trend_analysis_threshold_strong_negative: Some(
+            cfg.strategy_internal
+                .trend_analysis_threshold_strong_negative,
+        ),
     })
 }
 
@@ -202,10 +218,10 @@ async fn initialize_venue(cfg: &AppCfg) -> Result<BinanceFutures> {
         .ok_or_else(|| anyhow!("Failed to convert qty_step {} to Decimal", cfg.qty_step))?;
     let price_precision = decimal_places(price_tick_dec);
     let qty_precision = decimal_places(qty_step_dec);
-    
+
     init_rate_limiter();
     info!("rate limiter initialized for futures");
-    
+
     let hedge_mode = cfg.binance.hedge_mode;
     let venue = BinanceFutures {
         base: cfg.binance.futures_base.clone(),
@@ -216,7 +232,7 @@ async fn initialize_venue(cfg: &AppCfg) -> Result<BinanceFutures> {
         qty_precision,
         hedge_mode,
     };
-    
+
     // Set position side mode
     if let Err(err) = venue.set_position_side_dual(hedge_mode).await {
         warn!(hedge_mode, error = %err, "failed to set position side mode, continuing anyway");
@@ -253,20 +269,22 @@ async fn initialize_symbols(
     crate::exchange::FUT_RULES.clear();
 
     // Initialize symbol states
-    let mut states = crate::processor::initialize_symbol_states(selected, dyn_cfg, strategy_name, cfg);
-    
+    let mut states =
+        crate::processor::initialize_symbol_states(selected, dyn_cfg, strategy_name, cfg);
+
     // Fetch per-symbol metadata in parallel
     info!(
         total_symbols = states.len(),
         "fetching per-symbol metadata for quantization (parallel processing)..."
     );
-    
+
     let venue_arc = Arc::new(venue.clone());
-    let symbols: Vec<(String, usize)> = states.iter()
+    let symbols: Vec<(String, usize)> = states
+        .iter()
         .enumerate()
         .map(|(idx, state)| (state.meta.symbol.clone(), idx))
         .collect();
-    
+
     const CONCURRENT_LIMIT: usize = 10;
     let rules_results: Vec<_> = stream::iter(symbols.iter())
         .map(|(symbol, idx)| {
@@ -281,12 +299,12 @@ async fn initialize_symbols(
         .buffer_unordered(CONCURRENT_LIMIT)
         .collect()
         .await;
-    
+
     // Update states with fetched rules
     for (idx, symbol, symbol_rules) in rules_results {
         let state = &mut states[idx];
         let rules_fetch_failed = symbol_rules.is_none();
-        
+
         info!(
             symbol = %symbol,
             base_asset = %state.meta.base_asset,
@@ -294,7 +312,7 @@ async fn initialize_symbols(
             mode = %cfg.mode,
             "bot initialized assets"
         );
-        
+
         if let Some(ref rules) = symbol_rules {
             info!(
                 symbol = %symbol,
@@ -311,7 +329,7 @@ async fn initialize_symbols(
                 "CRITICAL: failed to fetch per-symbol metadata, symbol DISABLED (will not trade)"
             );
         }
-        
+
         state.disabled = rules_fetch_failed;
         state.symbol_rules = symbol_rules;
         state.rules_fetch_failed = rules_fetch_failed;
@@ -332,14 +350,14 @@ async fn setup_websocket(cfg: &AppCfg, event_tx: mpsc::UnboundedSender<UserEvent
     let futures_base = cfg.binance.futures_base.clone();
     let reconnect_delay = Duration::from_millis(cfg.websocket.reconnect_delay_ms);
     let kind = UserStreamKind::Futures;
-    
+
     info!(
         reconnect_delay_ms = cfg.websocket.reconnect_delay_ms,
         ping_interval_ms = cfg.websocket.ping_interval_ms,
         ?kind,
         "launching user data stream task"
     );
-    
+
     tokio::spawn(async move {
         let base = futures_base;
         loop {
@@ -351,7 +369,7 @@ async fn setup_websocket(cfg: &AppCfg, event_tx: mpsc::UnboundedSender<UserEvent
                         let _ = tx_sync.send(UserEvent::Heartbeat);
                         info!("reconnect callback triggered, sync event sent");
                     });
-                    
+
                     let mut first_event_after_reconnect = true;
                     loop {
                         match stream.next_event().await {
@@ -379,4 +397,3 @@ async fn setup_websocket(cfg: &AppCfg, event_tx: mpsc::UnboundedSender<UserEvent
         }
     });
 }
-

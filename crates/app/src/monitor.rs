@@ -9,4 +9,3 @@ pub fn init_prom(metrics_port: u16) {
         .expect("failed to install prometheus recorder");
     tracing::info!(port = metrics_port, "prometheus exporter running");
 }
-

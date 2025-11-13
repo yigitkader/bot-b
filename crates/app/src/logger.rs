@@ -1,11 +1,10 @@
 //location: /crates/app/src/logger.rs
 // Structured JSON logging system for trading events
 
-use crate::types::*;
 use crate::exchange::BinanceFutures;
 use crate::exec::Venue;
+use crate::types::*;
 use crate::utils::{rate_limit_guard, update_fill_rate_on_cancel};
-use tracing::{info, warn};
 use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 use std::fs::OpenOptions;
@@ -14,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 // ============================================================================
 // Log Event Types
@@ -137,18 +137,18 @@ impl JsonLogger {
     /// Returns (logger, task_handle) - task_handle can be used to wait for logger shutdown
     pub fn new(log_file: &str) -> Result<(Self, tokio::task::JoinHandle<()>), std::io::Error> {
         let path = PathBuf::from(log_file);
-        
+
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         // Open file for writing (will be used by background task)
         let file_path = path.clone();
-        
+
         // Create channel for async event logging
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LogEvent>();
-        
+
         // Spawn background task to write events to file
         let task_handle = tokio::spawn(async move {
             let mut file = match OpenOptions::new()
@@ -162,7 +162,7 @@ impl JsonLogger {
                     return;
                 }
             };
-            
+
             // Process events from channel
             while let Some(event) = event_rx.recv().await {
                 match serde_json::to_string(&event) {
@@ -179,19 +179,14 @@ impl JsonLogger {
                     }
                 }
             }
-            
+
             // Channel closed, flush and close file
             let _ = file.flush();
         });
-        
-        Ok((
-            Self {
-                event_tx,
-            },
-            task_handle,
-        ))
+
+        Ok((Self { event_tx }, task_handle))
     }
-    
+
     /// Get current timestamp in milliseconds
     fn timestamp_ms() -> u64 {
         SystemTime::now()
@@ -199,7 +194,7 @@ impl JsonLogger {
             .unwrap()
             .as_millis() as u64
     }
-    
+
     /// Send event to channel (non-blocking, async-safe)
     fn send_event(&self, event: LogEvent) {
         // Unbounded channel - send never blocks
@@ -207,11 +202,11 @@ impl JsonLogger {
             eprintln!("Failed to send log event to channel: {}", e);
         }
     }
-    
+
     // ============================================================================
     // Order Event Logging
     // ============================================================================
-    
+
     /// Log order creation
     pub fn log_order_created(
         &self,
@@ -235,10 +230,10 @@ impl JsonLogger {
             reason: reason.to_string(),
             tif: tif.to_string(),
         };
-        
+
         self.send_event(event);
     }
-    
+
     /// Log order fill
     pub fn log_order_filled(
         &self,
@@ -264,18 +259,12 @@ impl JsonLogger {
             new_inventory: new_inventory.0.to_f64().unwrap_or(0.0),
             fill_rate,
         };
-        
+
         self.send_event(event);
     }
-    
+
     /// Log order cancellation
-    pub fn log_order_canceled(
-        &self,
-        symbol: &str,
-        order_id: &str,
-        reason: &str,
-        fill_rate: f64,
-    ) {
+    pub fn log_order_canceled(&self, symbol: &str, order_id: &str, reason: &str, fill_rate: f64) {
         let event = LogEvent::OrderCanceled {
             timestamp: Self::timestamp_ms(),
             symbol: symbol.to_string(),
@@ -283,14 +272,14 @@ impl JsonLogger {
             reason: reason.to_string(),
             fill_rate,
         };
-        
+
         self.send_event(event);
     }
-    
+
     // ============================================================================
     // Position Event Logging
     // ============================================================================
-    
+
     /// Log position update
     pub fn log_position_updated(
         &self,
@@ -305,14 +294,14 @@ impl JsonLogger {
         let qty_f = qty.0.to_f64().unwrap_or(0.0);
         let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
         let mark_f = mark_price.0.to_f64().unwrap_or(0.0);
-        
+
         let unrealized_pnl = (mark_f - entry_f) * qty_f;
         let unrealized_pnl_pct = if entry_f > 0.0 {
             ((mark_f - entry_f) / entry_f) * 100.0
         } else {
             0.0
         };
-        
+
         let event = LogEvent::PositionUpdated {
             timestamp: Self::timestamp_ms(),
             symbol: symbol.to_string(),
@@ -325,10 +314,10 @@ impl JsonLogger {
             unrealized_pnl_pct,
             leverage,
         };
-        
+
         self.send_event(event);
     }
-    
+
     /// Log position closed
     pub fn log_position_closed(
         &self,
@@ -343,14 +332,14 @@ impl JsonLogger {
         let qty_f = qty.0.to_f64().unwrap_or(0.0);
         let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
         let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-        
+
         let realized_pnl = (exit_f - entry_f) * qty_f;
         let realized_pnl_pct = if entry_f > 0.0 {
             ((exit_f - entry_f) / entry_f) * 100.0
         } else {
             0.0
         };
-        
+
         let event = LogEvent::PositionClosed {
             timestamp: Self::timestamp_ms(),
             symbol: symbol.to_string(),
@@ -363,14 +352,14 @@ impl JsonLogger {
             leverage,
             reason: reason.to_string(),
         };
-        
+
         self.send_event(event);
     }
-    
+
     // ============================================================================
     // Trade Event Logging
     // ============================================================================
-    
+
     /// Log completed trade
     pub fn log_trade_completed(
         &self,
@@ -385,7 +374,7 @@ impl JsonLogger {
         let qty_f = qty.0.to_f64().unwrap_or(0.0);
         let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
         let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-        
+
         let notional = entry_f * qty_f.abs();
         let realized_pnl = (exit_f - entry_f) * qty_f;
         let realized_pnl_pct = if entry_f > 0.0 {
@@ -393,10 +382,10 @@ impl JsonLogger {
         } else {
             0.0
         };
-        
+
         let net_profit = realized_pnl - fees;
         let is_profitable = net_profit > 0.0;
-        
+
         let event = LogEvent::TradeCompleted {
             timestamp: Self::timestamp_ms(),
             symbol: symbol.to_string(),
@@ -412,10 +401,10 @@ impl JsonLogger {
             is_profitable,
             leverage,
         };
-        
+
         self.send_event(event);
     }
-    
+
     /// Log rejected trade
     pub fn log_trade_rejected(
         &self,
@@ -433,10 +422,10 @@ impl JsonLogger {
             position_size_usd,
             min_spread_bps,
         };
-        
+
         self.send_event(event);
     }
-    
+
     /// Log PnL summary
     pub fn log_pnl_summary(
         &self,
@@ -464,7 +453,7 @@ impl JsonLogger {
             largest_loss,
             total_fees,
         };
-        
+
         self.send_event(event);
     }
 }
@@ -475,11 +464,12 @@ pub type SharedLogger = Arc<JsonLogger>;
 
 /// Create a shared logger instance with background task
 /// Returns (logger, task_handle) - task_handle can be used to wait for logger shutdown
-pub fn create_logger(log_file: &str) -> Result<(SharedLogger, tokio::task::JoinHandle<()>), std::io::Error> {
+pub fn create_logger(
+    log_file: &str,
+) -> Result<(SharedLogger, tokio::task::JoinHandle<()>), std::io::Error> {
     let (logger, task_handle) = JsonLogger::new(log_file)?;
     Ok((Arc::new(logger), task_handle))
 }
-
 
 // ============================================================================
 // Event Handler Module (from event_handler.rs)
@@ -492,15 +482,17 @@ pub async fn handle_reconnect_sync(
     cfg: &crate::config::AppCfg,
 ) {
     for state in states.iter_mut() {
-        let current_pos = <BinanceFutures as Venue>::get_position(venue, &state.meta.symbol).await.ok();
-        
+        let current_pos = <BinanceFutures as Venue>::get_position(venue, &state.meta.symbol)
+            .await
+            .ok();
+
         rate_limit_guard(3).await;
-        if let Ok(api_orders) = <BinanceFutures as Venue>::get_open_orders(venue, &state.meta.symbol).await {
-            let api_order_ids: std::collections::HashSet<String> = api_orders
-                .iter()
-                .map(|o| o.order_id.clone())
-                .collect();
-            
+        if let Ok(api_orders) =
+            <BinanceFutures as Venue>::get_open_orders(venue, &state.meta.symbol).await
+        {
+            let api_order_ids: std::collections::HashSet<String> =
+                api_orders.iter().map(|o| o.order_id.clone()).collect();
+
             let mut removed_orders = Vec::new();
             state.active_orders.retain(|order_id, order_info| {
                 if !api_order_ids.contains(order_id) {
@@ -510,13 +502,13 @@ pub async fn handle_reconnect_sync(
                     true
                 }
             });
-            
+
             if !removed_orders.is_empty() {
                 if let Some(pos) = current_pos {
                     let old_inv = state.inv.0;
                     state.inv = Qty(pos.qty.0);
                     state.last_inventory_update = Some(std::time::Instant::now());
-                    
+
                     if old_inv != pos.qty.0 {
                         state.consecutive_no_fills = 0;
                         state.order_fill_rate = (state.order_fill_rate * 0.95 + 0.05).min(1.0);
@@ -536,7 +528,10 @@ pub async fn handle_reconnect_sync(
                     }
                 } else {
                     state.consecutive_no_fills = 0;
-                    state.order_fill_rate = (state.order_fill_rate * cfg.internal.fill_rate_reconnect_factor + cfg.internal.fill_rate_reconnect_bonus).min(1.0);
+                    state.order_fill_rate = (state.order_fill_rate
+                        * cfg.internal.fill_rate_reconnect_factor
+                        + cfg.internal.fill_rate_reconnect_bonus)
+                        .min(1.0);
                     warn!(
                         symbol = %state.meta.symbol,
                         removed_orders = removed_orders.len(),
@@ -563,8 +558,11 @@ pub fn handle_order_fill(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let event_id = format!("{}-{}-{}", order_id, cumulative_filled_qty.0, event_timestamp);
-    
+    let event_id = format!(
+        "{}-{}-{}",
+        order_id, cumulative_filled_qty.0, event_timestamp
+    );
+
     if state.processed_events.contains(&event_id) {
         warn!(
             %symbol,
@@ -574,12 +572,14 @@ pub fn handle_order_fill(
         );
         return false;
     }
-    
+
     // Legacy duplicate check
-    let is_duplicate = state.active_orders.get(order_id)
+    let is_duplicate = state
+        .active_orders
+        .get(order_id)
         .map(|o| o.filled_qty.0 >= cumulative_filled_qty.0)
         .unwrap_or(false);
-    
+
     if is_duplicate {
         warn!(
             %symbol,
@@ -588,11 +588,12 @@ pub fn handle_order_fill(
         );
         return false;
     }
-    
+
     // Event ID'yi kaydet ve memory leak önle
     state.processed_events.insert(event_id);
     if state.processed_events.len() > 1000 {
-        if state.last_event_cleanup
+        if state
+            .last_event_cleanup
             .map(|t| t.elapsed().as_secs() > 3600)
             .unwrap_or(true)
         {
@@ -602,8 +603,6 @@ pub fn handle_order_fill(
             state.last_event_cleanup = Some(std::time::Instant::now());
         }
     }
-    
+
     true
 }
-
-
