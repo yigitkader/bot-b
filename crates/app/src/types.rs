@@ -154,6 +154,12 @@ pub struct SymbolState {
     // Used to prioritize which coins to trade first
     // Thread-safe: can be updated by background trend analysis task
     pub priority: Arc<std::sync::atomic::AtomicU32>, // Default: 0, higher values = higher priority
+
+    // EV scores for opportunity selection (from QMelStrategy)
+    pub last_ev_long: f64,
+    pub last_ev_short: f64,
+    pub last_best_side: Option<Side>,
+    pub last_score_time: Option<Instant>,
 }
 
 // ============================================================================

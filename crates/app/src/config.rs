@@ -9,7 +9,7 @@ use serde::Deserialize;
 // Configuration Structures
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RiskCfg {
     pub inv_cap: String,
     pub min_liq_gap_bps: f64,
@@ -23,9 +23,11 @@ pub struct RiskCfg {
     pub use_isolated_margin: bool, // Isolated margin kullan (default: true)
     #[serde(default = "default_max_open_chunks_per_symbol_per_side")]
     pub max_open_chunks_per_symbol_per_side: usize, // Sembol başına yönde maksimum açık chunk sayısı
+    #[serde(default = "default_max_parallel_symbols")]
+    pub max_parallel_symbols: Option<u32>, // Maximum number of symbols to trade simultaneously (default: 2)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct StratCfg {
     pub r#type: String,
     pub a: f64,
@@ -103,7 +105,7 @@ pub struct StratCfg {
     pub qmel_max_margin_usdc: Option<f64>, // Maximum margin per trade (USDC) - default: 100.0
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExecCfg {
     pub tif: String,
     pub venue: String,
@@ -115,7 +117,7 @@ pub struct ExecCfg {
     pub default_leverage: Option<u32>, // Default leverage (futures için) - her sembol için set edilir
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct WebsocketCfg {
     #[serde(default)]
     pub enabled: bool,
@@ -125,7 +127,7 @@ pub struct WebsocketCfg {
     pub ping_interval_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct InternalCfg {
     #[serde(default = "default_pnl_history_max_len")]
     pub pnl_history_max_len: usize,
@@ -199,7 +201,7 @@ pub struct InternalCfg {
     pub fill_rate_reconnect_bonus: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BinanceCfg {
     pub api_key: String,
     pub secret_key: String,
@@ -210,7 +212,7 @@ pub struct BinanceCfg {
     pub hedge_mode: bool, // Hedge mode (dual-side position) açık mı? Default: false (one-way mode)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AppCfg {
     #[serde(default)]
     pub symbol: Option<String>,
@@ -246,7 +248,7 @@ pub struct AppCfg {
     pub strategy_internal: StrategyInternalCfg,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct StrategyInternalCfg {
     #[serde(default = "default_manipulation_volume_ratio_threshold")]
     pub manipulation_volume_ratio_threshold: f64,
@@ -313,6 +315,9 @@ fn default_use_isolated_margin() -> bool {
 fn default_max_open_chunks_per_symbol_per_side() -> usize {
     1
 } // ✅ KRİTİK: Tek chunk kuralı - aynı anda sadece 1 open_order veya 1 position
+fn default_max_parallel_symbols() -> Option<u32> {
+    Some(2)
+} // Default: maximum 2 symbols traded simultaneously
 fn default_pnl_history_max_len() -> usize {
     1024
 }

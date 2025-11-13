@@ -1093,6 +1093,11 @@ pub struct QMelStrategy {
     last_trade_time: Option<Instant>,
     last_state: Option<MarketState>, // Store last state for OFI signal
     last_trade_direction: Option<bool>, // true = long, false = short (entry'de kaydedilir)
+    
+    // EV scores for opportunity selection
+    last_ev_long: f64,
+    last_ev_short: f64,
+    last_edge_timestamp: Option<Instant>,
 }
 
 impl QMelStrategy {
@@ -1139,6 +1144,9 @@ impl QMelStrategy {
             last_trade_time: None,
             last_state: None,
             last_trade_direction: None,
+            last_ev_long: 0.0,
+            last_ev_short: 0.0,
+            last_edge_timestamp: None,
         }
     }
 
@@ -1161,6 +1169,10 @@ impl QMelStrategy {
 }
 
 impl Strategy for QMelStrategy {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    
     fn on_tick(&mut self, ctx: &Context) -> Quotes {
         let now = Instant::now();
 
@@ -1252,6 +1264,11 @@ impl Strategy for QMelStrategy {
             estimated_slippage,
             true,
         );
+
+        // Store EV scores for opportunity selection
+        self.last_ev_long = ev_long;
+        self.last_ev_short = ev_short;
+        self.last_edge_timestamp = Some(now);
 
         // KRİTİK DÜZELTME: Adaptive threshold ve edge validation kullan
         // Win rate'e göre dinamik threshold
@@ -1543,5 +1560,25 @@ impl Strategy for QMelStrategy {
     /// Get feature importance (Strategy trait implementation)
     fn get_feature_importance(&self) -> Option<Vec<(String, f64)>> {
         Some(self.direction_model.calculate_feature_importance())
+    }
+}
+
+impl QMelStrategy {
+    /// Get last calculated EV scores (for opportunity selection)
+    pub fn last_scores(&self) -> (f64, f64) {
+        (self.last_ev_long, self.last_ev_short)
+    }
+
+    /// Get best side based on EV scores
+    pub fn last_best_side(&self) -> Option<(Side, f64)> {
+        let (ev_long, ev_short) = (self.last_ev_long, self.last_ev_short);
+        if ev_long <= 0.0 && ev_short <= 0.0 {
+            return None;
+        }
+        if ev_long >= ev_short {
+            Some((Side::Buy, ev_long))
+        } else {
+            Some((Side::Sell, ev_short))
+        }
     }
 }

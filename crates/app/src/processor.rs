@@ -30,7 +30,362 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Continuous Analysis Background Task
+// ============================================================================
+
+/// Continuously analyze all symbols for trends and EV scores
+/// This runs in the background to keep scores and priorities always up-to-date
+/// Runs every 1-2 seconds to ensure we're always ready for the next trade
+pub async fn continuous_analysis_task(
+    venue: Arc<BinanceFutures>,
+    states: Arc<tokio::sync::RwLock<Vec<SymbolState>>>,
+    cfg: Arc<AppCfg>,
+    shutdown_flag: Arc<AtomicBool>,
+) {
+    use tokio::time::{interval, Duration};
+    use crate::qmel::QMelStrategy;
+    use crate::strategy::Context;
+    use crate::types::OrderBook;
+    
+    let mut analysis_interval = interval(Duration::from_millis(1500)); // Her 1.5 saniyede bir
+    let mut iteration = 0u64;
+    
+    info!("continuous analysis task started: will analyze trends and EV scores every 1.5s");
+    
+    loop {
+        // Shutdown kontrolü
+        if shutdown_flag.load(Ordering::Relaxed) {
+            info!("continuous analysis task: shutdown detected, exiting");
+            break;
+        }
+        
+        analysis_interval.tick().await;
+        iteration += 1;
+        
+        // Her sembol için trend analizi ve EV hesaplama
+        // Bu döngü tüm sembolleri analiz eder ve bir sonraki işlem için hazırlar
+        // Her iterasyonda read lock al, işle, write lock al, güncelle, bırak
+        let states_len = {
+            let states_read = states.read().await;
+            states_read.len()
+        };
+        
+        for idx in 0..states_len {
+            // Shutdown kontrolü (uzun sembol listesi için)
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            // Read state info (immutable) - kısa süreli lock
+            let (symbol, inv, tick_size_opt) = {
+                let states_read = states.read().await;
+                if let Some(state) = states_read.get(idx) {
+                    // Skip disabled symbols
+                    if state.disabled || state.rules_fetch_failed || state.symbol_rules.is_none() {
+                        continue;
+                    }
+                    (
+                        state.meta.symbol.clone(),
+                        state.inv,
+                        state.symbol_rules.as_ref().map(|r| r.tick_size),
+                    )
+                } else {
+                    continue;
+                }
+            };
+            
+            // Fetch best prices for trend analysis (non-blocking, with rate limiting)
+            let venue_clone = venue.clone();
+            let symbol_clone = symbol.clone();
+            
+            // Rate limit: Her sembol için 1 request, staggered
+            tokio::time::sleep(Duration::from_millis(((idx % 10) as u64) * 50)).await;
+            
+            match venue_clone.best_prices(&symbol_clone).await {
+                Ok((bid, ask)) => {
+                    // Create minimal orderbook for strategy
+                    let ob = OrderBook {
+                        best_bid: Some(BookLevel {
+                            px: bid,
+                            qty: Qty(Decimal::ONE),
+                        }),
+                        best_ask: Some(BookLevel {
+                            px: ask,
+                            qty: Qty(Decimal::ONE),
+                        }),
+                        top_bids: None,
+                        top_asks: None,
+                    };
+                    
+                    // Get funding rate (optional, can fail)
+                    let funding_rate = venue_clone
+                        .fetch_premium_index(&symbol_clone)
+                        .await
+                        .ok()
+                        .map(|(_, fr, _)| fr)
+                        .flatten();
+                    
+                    // Create context for strategy
+                    let ctx = Context {
+                        ob,
+                        sigma: 0.5,
+                        inv,
+                        liq_gap_bps: 500.0, // Default, will be updated in main processing
+                        funding_rate,
+                        next_funding_time: None,
+                        mark_price: Px((bid.0 + ask.0) / Decimal::from(2u32)),
+                        tick_size: tick_size_opt,
+                    };
+                    
+                    // Update strategy state (write lock needed)
+                    let mut states_write = states.write().await;
+                    
+                    if let Some(state_mut) = states_write.get_mut(idx) {
+                        // Call on_tick to update strategy state and get EV scores
+                        let _quotes = state_mut.strategy.on_tick(&ctx);
+                        
+                        // Update EV scores from QMelStrategy
+                        if let Some(qmel) = state_mut.strategy.as_any().downcast_ref::<QMelStrategy>() {
+                            let (ev_long, ev_short) = qmel.last_scores();
+                            state_mut.last_ev_long = ev_long;
+                            state_mut.last_ev_short = ev_short;
+                            state_mut.last_best_side = qmel.last_best_side().map(|(side, _)| side);
+                            state_mut.last_score_time = Some(Instant::now());
+                            
+                            // Update priority based on trend and EV
+                            let trend_bps = state_mut.strategy.get_trend_bps();
+                            let ev_score = ev_long.max(ev_short);
+                            
+                            // Priority calculation: trend strength + EV score
+                            // Bu puanlama sistemi en kazançlı işlemleri önceliklendirir
+                            let new_priority = if trend_bps.abs() > 50.0 && ev_score > 0.1 {
+                                // Güçlü trend + yüksek EV = yüksek priority (en kazançlı kombinasyon)
+                                ((trend_bps.abs() / 10.0) + (ev_score * 100.0)) as u32
+                            } else if ev_score > 0.15 {
+                                // Yüksek EV (trend yoksa bile) = orta priority (kazanç potansiyeli yüksek)
+                                (ev_score * 50.0) as u32
+                            } else if trend_bps.abs() > 50.0 {
+                                // Güçlü trend (düşük EV) = düşük priority (trend var ama kazanç belirsiz)
+                                (trend_bps.abs() / 20.0) as u32
+                            } else {
+                                0 // Düşük trend + düşük EV = en düşük priority
+                            };
+                            
+                            let old_priority = state_mut.priority.load(Ordering::Relaxed);
+                            state_mut.priority.store(new_priority, Ordering::Relaxed);
+                            
+                            // Log significant changes (every 20 iterations to reduce noise)
+                            if iteration % 20 == 0 && (old_priority != new_priority || ev_score > 0.1) {
+                                debug!(
+                                    symbol = %symbol,
+                                    trend_bps = format!("{:.2}", trend_bps),
+                                    ev_long = format!("{:.3}", ev_long),
+                                    ev_short = format!("{:.3}", ev_short),
+                                    priority = new_priority,
+                                    "continuous analysis: updated scores and priority (ready for next trade)"
+                                );
+                            }
+                        }
+                    }
+                    
+                    drop(states_write); // Release write lock
+                }
+                Err(e) => {
+                    // Rate limit veya network hatası - skip, bir sonraki iterasyonda tekrar dener
+                    if iteration % 100 == 0 {
+                        debug!(%symbol, error = %e, "continuous analysis: failed to fetch prices (will retry)");
+                    }
+                }
+            }
+        }
+        
+        // Log summary every 20 iterations (~30 seconds)
+        if iteration % 20 == 0 {
+            let states_read = states.read().await;
+            let active_count = states_read.iter()
+                .filter(|s| !s.inv.0.is_zero() || !s.active_orders.is_empty())
+                .count();
+            let high_ev_count = states_read.iter()
+                .filter(|s| s.last_ev_long.max(s.last_ev_short) > 0.1)
+                .count();
+            
+            info!(
+                iteration,
+                total_symbols = states_read.len(),
+                active_symbols = active_count,
+                high_ev_symbols = high_ev_count,
+                "continuous analysis: summary"
+            );
+        }
+    }
+    
+    info!("continuous analysis task ended");
+}
+
+// ============================================================================
+// Opportunity Selection (Cross-Symbol)
+// ============================================================================
+
+/// Opportunity for trading a symbol
+#[derive(Debug, Clone)]
+pub struct Opportunity {
+    pub symbol: String,
+    pub side: Side,
+    pub ev: f64,
+}
+
+/// Select best opportunities across all symbols based on EV scores
+/// Returns top N symbols with highest EV that pass risk, liquidity, and balance filters
+/// 
+/// # Arguments
+/// * `states` - All symbol states to evaluate
+/// * `cfg` - Application configuration
+/// * `_risk_limits` - Risk limits (currently unused but kept for future use)
+/// * `quote_balances` - Map of quote asset balances (e.g., "USDC" -> 1000.0, "USDT" -> 500.0)
+/// * `min_usd_per_order` - Minimum USD per order (for balance check)
+/// 
+/// # Returns
+/// Vector of opportunities sorted by EV (descending), filtered by:
+/// - EV threshold
+/// - Quote asset balance (USDC/USDT specific)
+/// - Max parallel symbols limit
+/// - Score freshness (60 seconds)
+/// - Symbol rules and enabled status
+pub fn select_best_opportunities(
+    states: &[SymbolState],
+    cfg: &AppCfg,
+    _risk_limits: &crate::risk::RiskLimits,
+    quote_balances: &HashMap<String, f64>,
+    min_usd_per_order: f64,
+) -> Vec<Opportunity> {
+    let mut opps = Vec::new();
+    
+    // Get min EV threshold from config (default: 0.10)
+    let min_ev_threshold = cfg.strategy.qmel_ev_threshold.unwrap_or(0.10);
+    
+    // Count active symbols (with open orders or positions)
+    let active_symbols: Vec<String> = states
+        .iter()
+        .filter(|s| !s.inv.0.is_zero() || !s.active_orders.is_empty())
+        .map(|s| s.meta.symbol.clone())
+        .collect();
+    
+    // Get max parallel symbols from config (default: 2)
+    let max_parallel_symbols = cfg.risk.max_parallel_symbols.unwrap_or(2) as usize;
+    
+    for state in states {
+        // Skip disabled symbols
+        if state.disabled || state.rules_fetch_failed || state.symbol_rules.is_none() {
+            continue;
+        }
+        
+        // ✅ KRİTİK: Quote asset bazlı bakiye kontrolü
+        // Her sembol kendi quote asset'ini kullanır (BTCUSDC → USDC, BTCUSDT → USDT)
+        // USDC'de para varsa USDC sembolleri, USDT'de para varsa USDT sembolleri değerlendirilir
+        let quote_asset = &state.meta.quote_asset;
+        let quote_balance = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+        let has_exposure = !state.inv.0.is_zero() || !state.active_orders.is_empty();
+        
+        // Bakiye kontrolü: Eğer açık emir/pozisyon yoksa, yeterli bakiye olmalı
+        if !has_exposure {
+            let has_sufficient_balance = quote_balance >= cfg.min_quote_balance_usd 
+                && quote_balance >= min_usd_per_order;
+            
+            if !has_sufficient_balance {
+                // Bakiye yetersiz - bu sembolü skip et (diğer quote asset'li semboller devam edebilir)
+                debug!(
+                    symbol = %state.meta.symbol,
+                    quote_asset = %quote_asset,
+                    balance = quote_balance,
+                    min_required = cfg.min_quote_balance_usd.max(min_usd_per_order),
+                    "skipping opportunity: insufficient quote asset balance"
+                );
+                continue;
+            }
+        }
+        
+        // Get EV scores
+        let (ev_long, ev_short) = (state.last_ev_long, state.last_ev_short);
+        
+        // Select best side
+        let (side, ev) = if ev_long >= ev_short {
+            (Side::Buy, ev_long)
+        } else {
+            (Side::Sell, ev_short)
+        };
+        
+        // EV threshold filter
+        if ev < min_ev_threshold {
+            continue;
+        }
+        
+        // If symbol already has exposure, allow it (for position management)
+        // Otherwise, check if we can open new position
+        if !has_exposure {
+            // Check max parallel symbols limit
+            if active_symbols.len() >= max_parallel_symbols {
+                continue;
+            }
+            
+            // Check if score is recent (within last 60 seconds)
+            if let Some(score_time) = state.last_score_time {
+                let age_secs = score_time.elapsed().as_secs();
+                if age_secs > 60 {
+                    continue; // Score too old
+                }
+            } else {
+                continue; // No score yet
+            }
+        }
+        
+        // Basic liquidity check (can be enhanced)
+        // For now, just check if symbol has rules (which implies it's tradeable)
+        if state.symbol_rules.is_none() {
+            continue;
+        }
+        
+        opps.push(Opportunity {
+            symbol: state.meta.symbol.clone(),
+            side,
+            ev,
+        });
+    }
+    
+    // Sort by EV (descending) and take top N
+    opps.sort_by(|a, b| b.ev.partial_cmp(&a.ev).unwrap_or(std::cmp::Ordering::Equal));
+    
+    // Limit to max parallel symbols (but allow existing positions to continue)
+    let existing_symbols: Vec<String> = states
+        .iter()
+        .filter(|s| !s.inv.0.is_zero() || !s.active_orders.is_empty())
+        .map(|s| s.meta.symbol.clone())
+        .collect();
+    
+    let mut result = Vec::new();
+    for opp in opps {
+        // Always include symbols with existing exposure (for position management)
+        if existing_symbols.contains(&opp.symbol) {
+            result.push(opp);
+        } else if result.len() < max_parallel_symbols {
+            result.push(opp);
+        }
+    }
+    
+    // Log selected opportunities for debugging
+    if !result.is_empty() {
+        debug!(
+            selected_count = result.len(),
+            max_parallel = max_parallel_symbols,
+            opportunities = ?result.iter().map(|o| format!("{}:{}:{:.2}", o.symbol, if matches!(o.side, Side::Buy) { "LONG" } else { "SHORT" }, o.ev)).collect::<Vec<_>>(),
+            "opportunity selector: selected best opportunities"
+        );
+    }
+    
+    result
+}
 
 // ============================================================================
 // Symbol Processing
@@ -293,16 +648,32 @@ pub async fn process_symbol(
     update_peak_pnl(state, current_pnl);
 
     // Check position close
+    let min_profit_usd = profit_guarantee.min_profit_usd();
     let (should_close, reason) = position_manager::should_close_position_smart(
         state,
         &pos,
         mark_px,
         bid,
         ask,
-        profit_guarantee.min_profit_usd(),
+        min_profit_usd,
         profit_guarantee.maker_fee_rate(),
         profit_guarantee.taker_fee_rate(),
+        quote_asset,
     );
+    
+    // DEBUG: Kar hedefi kontrolü - log ekle (sadece pozisyon varsa ve kar hedefi yakınsa)
+    if has_position && !should_close {
+        let current_pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
+        if current_pnl_f64 >= min_profit_usd * 0.8 && current_pnl_f64 < min_profit_usd {
+            debug!(
+                %symbol,
+                current_pnl = current_pnl_f64,
+                min_profit = min_profit_usd,
+                quote_asset = %quote_asset,
+                "position profit approaching target (within 80% of target, need {} {})", min_profit_usd, quote_asset
+            );
+        }
+    }
 
     let close_cooldown_ms = cfg.strategy.position_close_cooldown_ms.unwrap_or(500) as u128;
     let can_attempt_close = state
@@ -311,117 +682,173 @@ pub async fn process_symbol(
         .unwrap_or(true);
 
     if should_close && !state.position_closing.load(Ordering::Acquire) && can_attempt_close {
-        // ✅ KRİTİK: Stop loss hızlı kapanış gerektirir - MARKET + reduceOnly kullan
-        if position_manager::close_position(venue, symbol, state, true)
-            .await
-            .is_ok()
-        {
-            let side_str = if pos.qty.0.is_sign_positive() {
-                "long"
-            } else {
-                "short"
-            };
-            let exit_price = if side_str == "long" { bid } else { ask };
+        // ✅ KRİTİK: Take profit veya stop loss hızlı kapanış gerektirir - MARKET + reduceOnly kullan
+        let is_take_profit = reason.contains("take_profit");
+        info!(
+            %symbol,
+            net_pnl = pnl_f64,
+            reason = %reason,
+            quote_asset = %quote_asset,
+            "CLOSING POSITION: {} ({})", if is_take_profit { "take profit triggered" } else { "stop loss triggered" }, reason
+        );
+        match position_manager::close_position(venue, symbol, state, true).await {
+            Ok(_) => {
+                let side_str = if pos.qty.0.is_sign_positive() {
+                    "long"
+                } else {
+                    "short"
+                };
+                let exit_price = if side_str == "long" { bid } else { ask };
 
-            let (realized_pnl, total_fees, net_profit) = crate::utils::calculate_close_pnl(
-                pos.entry,
-                exit_price,
-                pos.qty,
-                profit_guarantee.maker_fee_rate(),
-            );
-
-            // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
-            json_logger.log_position_closed(
-                symbol,
-                side_str,
-                pos.entry,
-                exit_price,
-                pos.qty,
-                pos.leverage,
-                &reason,
-            );
-            json_logger.log_trade_completed(
-                symbol,
-                side_str,
-                pos.entry,
-                exit_price,
-                pos.qty,
-                total_fees,
-                pos.leverage,
-            );
-
-            crate::utils::update_trade_stats(
-                state,
-                net_profit,
-                realized_pnl,
-                total_fees,
-                pos.entry,
-                exit_price,
-                pos.qty,
-                symbol,
-            );
-
-            state.strategy.learn_from_trade(net_profit, None, None);
-
-            if state.trade_count > 0 && state.trade_count % 20 == 0 {
-                if let Some(top_features) = state.strategy.get_feature_importance() {
-                    info!(
-                        %symbol,
-                        total_trades = state.trade_count,
-                        top_5_features = ?top_features.iter().take(5).map(|(name, score)| format!("{}: {:.4}", name, score)).collect::<Vec<_>>(),
-                        "feature importance analysis"
-                    );
-                }
-            }
-
-            // PnL summary log
-            // ✅ KRİTİK: PnL hesaplamaları USD notional bazlı (quote asset'ten bağımsız)
-            // Her sembol için ayrı state var, BTCUSDC ve BTCUSDT ayrı ayrı track edilir
-            if state
-                .last_pnl_summary_time
-                .map(|last| last.elapsed().as_secs() >= 3600 || state.trade_count % 10 == 0)
-                .unwrap_or(false)
-                && state.trade_count > 0
-            {
-                let total_profit_f = state.total_profit.to_f64().unwrap_or(0.0);
-                let total_loss_f = state.total_loss.to_f64().unwrap_or(0.0);
-                let net_pnl_f = total_profit_f - total_loss_f;
+                let (realized_pnl, total_fees, net_profit) = crate::utils::calculate_close_pnl(
+                    pos.entry,
+                    exit_price,
+                    pos.qty,
+                    profit_guarantee.maker_fee_rate(),
+                );
 
                 // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
-                json_logger.log_pnl_summary(
-                    "hourly",
-                    state.trade_count as u32,
-                    state.profitable_trade_count as u32,
-                    state.losing_trade_count as u32,
-                    total_profit_f,
-                    total_loss_f,
-                    net_pnl_f,
-                    state.largest_win.to_f64().unwrap_or(0.0),
-                    state.largest_loss.to_f64().unwrap_or(0.0),
-                    state.total_fees_paid.to_f64().unwrap_or(0.0),
+                json_logger.log_position_closed(
+                    symbol,
+                    side_str,
+                    pos.entry,
+                    exit_price,
+                    pos.qty,
+                    pos.leverage,
+                    &reason,
+                );
+                json_logger.log_trade_completed(
+                    symbol,
+                    side_str,
+                    pos.entry,
+                    exit_price,
+                    pos.qty,
+                    total_fees,
+                    pos.leverage,
                 );
 
-                info!(
-                    %symbol,
-                    total_trades = state.trade_count,
-                    profitable = state.profitable_trade_count,
-                    losing = state.losing_trade_count,
-                    total_profit = total_profit_f,
-                    total_loss = total_loss_f,
-                    net_pnl = net_pnl_f,
-                    "PnL summary"
+                crate::utils::update_trade_stats(
+                    state,
+                    net_profit,
+                    realized_pnl,
+                    total_fees,
+                    pos.entry,
+                    exit_price,
+                    pos.qty,
+                    symbol,
                 );
 
-                state.last_pnl_summary_time = Some(Instant::now());
+                state.strategy.learn_from_trade(net_profit, None, None);
+
+                if state.trade_count > 0 && state.trade_count % 20 == 0 {
+                    if let Some(top_features) = state.strategy.get_feature_importance() {
+                        info!(
+                            %symbol,
+                            total_trades = state.trade_count,
+                            top_5_features = ?top_features.iter().take(5).map(|(name, score)| format!("{}: {:.4}", name, score)).collect::<Vec<_>>(),
+                            "feature importance analysis"
+                        );
+                    }
+                }
             }
-
-            state.position_entry_time = None;
-            state.avg_entry_price = None;
-            state.peak_pnl = Decimal::ZERO;
-            state.position_hold_duration_ms = 0;
-            state.last_logged_position_qty = None;
-            state.last_logged_pnl = None;
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                // ✅ KRİTİK: Manuel kapatma durumlarını handle et - pozisyon zaten kapalıysa hata verme
+                if error_str.contains("position not found")
+                    || error_str.contains("no position")
+                    || error_str.contains("position already closed")
+                    || error_str.contains("already closed")
+                    || error_str.contains("zero quantity")
+                {
+                    // Pozisyon zaten kapalı veya manuel kapatılmış - hata verme, başarılı say
+                    info!(
+                        %symbol,
+                        error = %e,
+                        net_pnl = pnl_f64,
+                        reason = %reason,
+                        "position already closed (manual intervention detected), treating as success"
+                    );
+                    // Manuel kapatma durumunda da trade stats'i güncelle (eğer mümkünse)
+                    // Ancak pozisyon zaten kapalı olduğu için entry/exit bilgileri mevcut olmayabilir
+                    // Bu durumda sadece log yaz, hata verme
+                } else {
+                    error!(
+                        %symbol,
+                        error = %e,
+                        net_pnl = pnl_f64,
+                        reason = %reason,
+                        "FAILED TO CLOSE POSITION: stop loss triggered but close failed"
+                    );
+                    // Retry after cooldown
+                    state.last_close_attempt = Some(Instant::now());
+                }
+            }
         }
+        return Ok(false);
+    } else if should_close {
+        // Log why we're not closing
+        warn!(
+            %symbol,
+            net_pnl = pnl_f64,
+            reason = %reason,
+            position_closing = state.position_closing.load(Ordering::Relaxed),
+            can_attempt_close,
+            "WANT TO CLOSE POSITION but blocked (cooldown or already closing)"
+        );
+    }
+
+    // Log position status if in loss (for debugging)
+    if pnl_f64 < -0.50 {
+        debug!(
+            %symbol,
+            net_pnl = pnl_f64,
+            position_qty = %pos.qty.0,
+            entry_price = %pos.entry.0,
+            mark_price = %mark_px.0,
+            position_entry_time = ?state.position_entry_time,
+            "POSITION IN LOSS: monitoring for stop loss trigger"
+        );
+    }
+
+    // PnL summary log
+    // ✅ KRİTİK: PnL hesaplamaları USD notional bazlı (quote asset'ten bağımsız)
+    // Her sembol için ayrı state var, BTCUSDC ve BTCUSDT ayrı ayrı track edilir
+    if state
+        .last_pnl_summary_time
+        .map(|last| last.elapsed().as_secs() >= 3600 || state.trade_count % 10 == 0)
+        .unwrap_or(false)
+        && state.trade_count > 0
+    {
+        let total_profit_f = state.total_profit.to_f64().unwrap_or(0.0);
+        let total_loss_f = state.total_loss.to_f64().unwrap_or(0.0);
+        let net_pnl_f = total_profit_f - total_loss_f;
+
+        // ✅ KRİTİK: Async-safe logger - lock yok, kanal kullanır (non-blocking)
+        json_logger.log_pnl_summary(
+            "hourly",
+            state.trade_count as u32,
+            state.profitable_trade_count as u32,
+            state.losing_trade_count as u32,
+            total_profit_f,
+            total_loss_f,
+            net_pnl_f,
+            state.largest_win.to_f64().unwrap_or(0.0),
+            state.largest_loss.to_f64().unwrap_or(0.0),
+            state.total_fees_paid.to_f64().unwrap_or(0.0),
+        );
+
+        info!(
+            %symbol,
+            total_trades = state.trade_count,
+            profitable = state.profitable_trade_count,
+            losing = state.losing_trade_count,
+            total_profit = total_profit_f,
+            total_loss = total_loss_f,
+            net_pnl = net_pnl_f,
+            "PnL summary"
+        );
+
+        state.last_pnl_summary_time = Some(Instant::now());
     }
 
     // Log position updates
@@ -625,6 +1052,15 @@ pub async fn process_symbol(
     // Generate quotes - strategy.on_tick() çağrısı hızlıdır ve order placement'ı bloklamaz
     // Trend analizi strategy içinde yapılır ama bu hızlı bir işlemdir
     let mut quotes = state.strategy.on_tick(&ctx);
+
+    // Update EV scores from QMelStrategy (for opportunity selection)
+    if let Some(qmel) = state.strategy.as_any().downcast_ref::<QMelStrategy>() {
+        let (ev_long, ev_short) = qmel.last_scores();
+        state.last_ev_long = ev_long;
+        state.last_ev_short = ev_short;
+        state.last_best_side = qmel.last_best_side().map(|(side, _)| side);
+        state.last_score_time = Some(Instant::now());
+    }
 
     // Trend analizi sonuçlarını background task'a gönder (non-blocking priority update)
     // Bu sayede order placement trend analizini beklemek zorunda kalmaz
@@ -1398,6 +1834,10 @@ pub fn initialize_symbol_states(
             processed_events: HashSet::new(),
             last_event_cleanup: None,
             priority: Arc::new(std::sync::atomic::AtomicU32::new(0)), // Default priority, updated by trend analysis
+            last_ev_long: 0.0,
+            last_ev_short: 0.0,
+            last_best_side: None,
+            last_score_time: None,
         });
     }
 

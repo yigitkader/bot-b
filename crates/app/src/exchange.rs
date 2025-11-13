@@ -789,11 +789,25 @@ impl BinanceFutures {
     ///   False ise MARKET başarısız olursa LIMIT fallback yapar.
     pub async fn flatten_position(&self, sym: &str, hedge_mode: bool, use_market_only: bool) -> Result<()> {
         // İlk pozisyon kontrolü
-        let initial_pos = self.fetch_position(sym).await?;
+        let initial_pos = match self.fetch_position(sym).await {
+            Ok(pos) => pos,
+            Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                // Manuel kapatma durumlarını handle et - pozisyon zaten kapalıysa hata verme
+                if error_str.contains("position not found") 
+                    || error_str.contains("no position")
+                    || error_str.contains("position already closed") {
+                    info!(symbol = %sym, "position already closed (manual intervention detected), skipping close");
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
         let initial_qty = initial_pos.qty.0;
 
         if initial_qty.is_zero() {
             // Pozisyon zaten kapalı
+            info!(symbol = %sym, "position already closed (zero quantity), skipping close");
             return Ok(());
         }
 
@@ -814,8 +828,21 @@ impl BinanceFutures {
 
         for attempt in 0..max_attempts {
             // KRİTİK İYİLEŞTİRME: Her attempt'te mevcut pozisyonu kontrol et
-            // Retry durumunda pozisyon değişmiş olabilir (kısmi kapatma)
-            let current_pos = self.fetch_position(sym).await?;
+            // Retry durumunda pozisyon değişmiş olabilir (kısmi kapatma veya manuel kapatma)
+            let current_pos = match self.fetch_position(sym).await {
+                Ok(pos) => pos,
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    // Manuel kapatma durumlarını handle et
+                    if error_str.contains("position not found") 
+                        || error_str.contains("no position")
+                        || error_str.contains("position already closed") {
+                        info!(symbol = %sym, attempt, "position already closed during retry (manual intervention detected)");
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
             let current_qty = current_pos.qty.0;
 
             if current_qty.is_zero() {
@@ -965,6 +992,26 @@ impl BinanceFutures {
                 Err(e) => {
                     let error_str = e.to_string();
                     let error_lower = error_str.to_lowercase();
+
+                    // ✅ KRİTİK: Manuel kapatma durumlarını handle et - pozisyon zaten kapalıysa hata verme
+                    if error_lower.contains("position not found")
+                        || error_lower.contains("no position")
+                        || error_lower.contains("position already closed")
+                        || error_lower.contains("reduceonly")
+                        || error_lower.contains("reduce only")
+                        || error_lower.contains("-2011") // Binance: "Unknown order sent"
+                        || error_lower.contains("-2019") // Binance: "Margin is insufficient"
+                        || error_lower.contains("-2021") // Binance: "Order would immediately match"
+                    {
+                        // Pozisyon zaten kapalı veya manuel kapatılmış - hata verme, başarılı say
+                        info!(
+                            symbol = %sym,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "position already closed (manual intervention or already closed), treating as success"
+                        );
+                        return Ok(());
+                    }
 
                     // ✅ KRİTİK: Hızlı kapanış gereksiniminde (use_market_only=true) LIMIT fallback yapma
                     // Risk halt, stop loss gibi durumlarda hızlı kapanış kritik, LIMIT yavaş olabilir

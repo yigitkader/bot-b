@@ -161,9 +161,9 @@ pub fn update_position_tracking(
     }
 }
 
-/// ✅ KRİTİK: Basit scalping kapatma mantığı - $0.50 net kâr garantisi
+/// ✅ KRİTİK: Basit scalping kapatma mantığı - 0.50 quote_asset net kâr garantisi
 /// Trailing/volatilite/akıllı kurallar kaldırıldı (sadelik, daha az request)
-/// Sadece TP ($0.50) ve opsiyonel SL (-$0.10) kaldı
+/// Sadece TP (0.50 quote_asset) ve opsiyonel SL (-0.10 quote_asset) kaldı
 pub fn should_close_position_smart(
     state: &SymbolState,
     position: &Position,
@@ -173,6 +173,7 @@ pub fn should_close_position_smart(
     min_profit_usd: f64,
     maker_fee_rate: f64,
     taker_fee_rate: f64,
+    quote_asset: &str,
 ) -> (bool, String) {
     let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
     let entry_price_f64 = position.entry.0.to_f64().unwrap_or(0.0);
@@ -212,16 +213,89 @@ pub fn should_close_position_smart(
         exit_fee_bps,
     );
 
-    // ✅ KRİTİK: Rule 1: Fixed TP ($0.50) - net PnL ≥ min_profit_usd
+    // ✅ KRİTİK: Rule 1: Fixed TP (0.50 quote_asset) - net PnL ≥ min_profit_usd
     // Net PnL zaten taker fee ile hesaplandı, market ile anında kapatılacak
+    // DEBUG: Kar hedefi kontrolü - log ekle
     if net_pnl >= min_profit_usd {
-        return (true, format!("take_profit_{:.2}_usd", net_pnl));
+        info!(
+            net_pnl = net_pnl,
+            min_profit = min_profit_usd,
+            quote_asset = %quote_asset,
+            entry_price = entry_price_f64,
+            exit_price = exit_price.to_f64().unwrap_or(0.0),
+            position_qty = position_qty_f64,
+            "TAKE PROFIT TRIGGERED: net PnL >= min_profit ({} {})", min_profit_usd, quote_asset
+        );
+        return (true, format!("take_profit_{:.2}_{}", net_pnl, quote_asset));
+    } else {
+        // DEBUG: Kar hedefi henüz ulaşılmadı - log ekle (sadece yakınsa)
+        if net_pnl >= min_profit_usd * 0.8 {
+            debug!(
+                net_pnl = net_pnl,
+                min_profit = min_profit_usd,
+                quote_asset = %quote_asset,
+                entry_price = entry_price_f64,
+                exit_price = exit_price.to_f64().unwrap_or(0.0),
+                position_qty = position_qty_f64,
+                "take profit not yet reached (within 80% of target, need {} {})", min_profit_usd, quote_asset
+            );
+        }
     }
 
-    // ✅ KRİTİK: Opsiyonel SL (-$0.10) - küçük zararlarda hemen kapat
-    // İstersen bu satırı kaldırarak sadece kârla kapanış yapabilirsin
+    // ✅ KRİTİK: Agresif zarar kapatma mekanizması - zararları hızlıca kes
+    // 1. Mutlak zarar eşikleri (öncelikli - en hızlı)
+    if net_pnl <= -3.0 {
+        // Büyük zararlarda hemen kapat (-3.0 quote_asset veya daha fazla)
+        return (true, format!("stop_loss_absolute_large_{:.2}_{}", net_pnl, quote_asset));
+    }
+    if net_pnl <= -1.0 {
+        // Orta zararlarda kapat (-1.0 quote_asset veya daha fazla)
+        return (true, format!("stop_loss_absolute_medium_{:.2}_{}", net_pnl, quote_asset));
+    }
     if net_pnl <= -0.10 {
-        return (true, format!("stop_loss_{:.2}_usd", net_pnl));
+        // Küçük zararlarda kapat (-0.10 quote_asset veya daha fazla)
+        return (true, format!("stop_loss_absolute_small_{:.2}_{}", net_pnl, quote_asset));
+    }
+    
+    // 2. Zarar yüzdesi bazlı kapatma - pozisyon değerinin %X'inden fazla zarar varsa kapat
+    // Örnek: $100 pozisyon, -$5 zarar = %5 zarar → eğer threshold %2 ise kapat
+    let position_notional = (entry_price_f64 * position_qty_f64.abs()).max(0.01); // Pozisyon değeri (USD)
+    let loss_pct = if position_notional > 0.0 {
+        (-net_pnl / position_notional).abs()
+    } else {
+        0.0
+    };
+    
+    // Eğer zarar pozisyon değerinin %2'sinden fazlaysa kapat (daha agresif: %3 → %2)
+    const LOSS_PCT_THRESHOLD: f64 = 0.02; // %2 zarar eşiği (daha agresif)
+    if loss_pct > LOSS_PCT_THRESHOLD && net_pnl < 0.0 {
+        return (true, format!("stop_loss_pct_{:.1}%_{:.2}_{}", loss_pct * 100.0, net_pnl, quote_asset));
+    }
+    
+    // 3. Zaman bazlı zarar kapatma - pozisyon kısa süredir açık ve zarardaysa kapat (daha agresif)
+    if let Some(entry_time) = state.position_entry_time {
+        let age_secs = entry_time.elapsed().as_secs() as f64;
+        // Eğer pozisyon 2 dakikadan fazla açık ve zarardaysa kapat (daha agresif: 5dk → 2dk)
+        const LOSS_TIMEOUT_SEC: f64 = 120.0; // 2 dakika (daha agresif)
+        if age_secs > LOSS_TIMEOUT_SEC && net_pnl < 0.0 {
+            return (true, format!("stop_loss_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
+        }
+    }
+    
+    // 4. Trend bazlı zarar kapatma - pozisyon zarardayken trend tersine döndüyse kapat
+    // Long pozisyonda: trend negatifse (düşüş) ve zarardaysak → kapat
+    // Short pozisyonda: trend pozitifse (yükseliş) ve zarardaysak → kapat
+    if net_pnl < 0.0 {
+        let trend_bps = state.strategy.get_trend_bps();
+        // Daha hassas trend kontrolü (50 bps → 30 bps)
+        let should_close_on_trend = match position_side {
+            Side::Buy => trend_bps < -30.0,  // Long pozisyon: trend -30 bps'den düşükse (daha hassas)
+            Side::Sell => trend_bps > 30.0,   // Short pozisyon: trend +30 bps'den yüksekse (daha hassas)
+        };
+        
+        if should_close_on_trend {
+            return (true, format!("stop_loss_trend_reversal_{:.2}_{}_trend_{:.1}_bps", net_pnl, quote_asset, trend_bps));
+        }
     }
 
     // ✅ KRİTİK: Mutlak timeout - pozisyon ne durumda olursa olsun maksimum süre
@@ -232,8 +306,8 @@ pub fn should_close_position_smart(
             return (
                 true,
                 format!(
-                    "max_duration_timeout_{:.2}_usd_{:.0}_sec",
-                    net_pnl, age_secs
+                    "max_duration_timeout_{:.2}_{}_{:.0}_sec",
+                    net_pnl, quote_asset, age_secs
                 ),
             );
         }
@@ -343,6 +417,25 @@ pub async fn close_position(
                     return Ok(());
                 }
                 Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    // ✅ KRİTİK: Manuel kapatma durumlarını handle et - pozisyon zaten kapalıysa hata verme
+                    if error_str.contains("position not found")
+                        || error_str.contains("no position")
+                        || error_str.contains("position already closed")
+                        || error_str.contains("already closed")
+                        || error_str.contains("zero quantity")
+                    {
+                        // Pozisyon zaten kapalı veya manuel kapatılmış - hata verme, başarılı say
+                        info!(
+                            symbol = %symbol,
+                            attempt,
+                            error = %e,
+                            "position already closed (manual intervention detected), treating as success"
+                        );
+                        state.position_closing.store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                    
                     last_error = Some(e);
                     if attempt < max_retries {
                         warn!(symbol = %symbol, attempt, max_retries, "failed to close position, retrying...");

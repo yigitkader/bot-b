@@ -41,6 +41,9 @@ pub struct Context {
 /// Base Strategy trait - Tüm stratejiler için ortak metodlar
 pub trait Strategy: Send + Sync {
     fn on_tick(&mut self, ctx: &Context) -> Quotes;
+    
+    /// Get reference to self as Any (for downcasting)
+    fn as_any(&self) -> &dyn std::any::Any;
     /// Fırsat modu aktif mi? (manipulation_opportunity var mı?)
     fn is_opportunity_mode(&self) -> bool {
         false // Default: fırsat modu yok
@@ -639,6 +642,10 @@ impl DynMm {
 }
 
 impl Strategy for DynMm {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    
     fn on_tick(&mut self, c: &Context) -> Quotes {
         let (bid, ask) = match (c.ob.best_bid, c.ob.best_ask) {
             (Some(b), Some(a)) => (b.px.0, a.px.0),
