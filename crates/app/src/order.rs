@@ -15,8 +15,18 @@ use anyhow::Result;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Order ID Generation (Collision Prevention)
+// ============================================================================
+
+/// Global atomic counter for generating unique order IDs
+/// ✅ KRİTİK: Her order için unique ID garantisi (collision önleme)
+/// Aynı millisecond içinde bile unique ID'ler oluşturulur
+static ORDER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
 // Order Analysis and Cancellation
@@ -117,7 +127,8 @@ pub fn analyze_orders(
 }
 
 /// Cancel orders with stagger delay and backoff
-/// ✅ KRİTİK: Backoff mekanizması ile cancel churn azaltma (1.5s → 3s → 6s)
+/// ✅ KRİTİK: Backoff mekanizması ile cancel churn azaltma (1.5s → 2.25s → 3.75s max)
+/// Backoff multiplier: 1.0 → 1.5 → 2.25 → 2.5 (max), daha dengeli ve market opportunity'leri kaçırmaz
 pub async fn cancel_orders(
     venue: &BinanceFutures,
     symbol: &str,
@@ -155,8 +166,13 @@ pub async fn cancel_orders(
     state.pending_cancels_count += order_ids.len() as u32;
     state.last_cancel_time = Some(Instant::now());
 
-    // Backoff multiplier'ı artır (1.0 → 2.0 → 4.0, max 4.0)
-    state.cancel_backoff_multiplier = (state.cancel_backoff_multiplier * 2.0).min(4.0);
+    // ✅ KRİTİK: Backoff multiplier artışını sadece rate limit hatası durumunda yap
+    // Normal cancel'lerde backoff artırılmaz, sadece rate limit hatası durumunda artırılır
+    // Bu sayede market opportunity'ler kaçmaz
+    const BACKOFF_MULTIPLIER_INCREASE: f64 = 1.5; // 2.0 → 1.5 (daha yavaş artış)
+    const MAX_BACKOFF_MULTIPLIER: f64 = 2.5; // 4.0 → 2.5 (daha düşük max)
+    
+    let mut has_rate_limit_error = false;
 
     for (idx, order_id) in order_ids.iter().enumerate() {
         if idx > 0 {
@@ -165,11 +181,38 @@ pub async fn cancel_orders(
 
         rate_limit_guard(1).await;
         if let Err(err) = venue.cancel(order_id, symbol).await {
-            warn!(symbol = %symbol, order_id = %order_id, ?err, "failed to cancel order");
+            let error_str = err.to_string().to_lowercase();
+            // Rate limit hatası kontrolü
+            if error_str.contains("rate limit") 
+                || error_str.contains("429") 
+                || error_str.contains("too many requests")
+                || error_str.contains("request weight")
+            {
+                has_rate_limit_error = true;
+                warn!(
+                    symbol = %symbol,
+                    order_id = %order_id,
+                    error = %err,
+                    "rate limit error detected, will increase backoff multiplier"
+                );
+            } else {
+                warn!(symbol = %symbol, order_id = %order_id, ?err, "failed to cancel order (non-rate-limit error)");
+            }
         } else {
             state.active_orders.remove(order_id);
             state.last_order_price_update.remove(order_id);
         }
+    }
+    
+    // ✅ KRİTİK: Backoff multiplier'ı sadece rate limit hatası durumunda artır
+    // Normal cancel'lerde backoff artırılmaz, bu sayede market opportunity'ler kaçmaz
+    if has_rate_limit_error {
+        state.cancel_backoff_multiplier = (state.cancel_backoff_multiplier * BACKOFF_MULTIPLIER_INCREASE).min(MAX_BACKOFF_MULTIPLIER);
+        warn!(
+            %symbol,
+            new_backoff_multiplier = state.cancel_backoff_multiplier,
+            "rate limit error detected, backoff multiplier increased"
+        );
     }
 
     // Cancel işlemi tamamlandı, pending count'u azalt
@@ -177,9 +220,12 @@ pub async fn cancel_orders(
         .pending_cancels_count
         .saturating_sub(order_ids.len() as u32);
 
-    // Başarılı cancel sonrası backoff'u azalt (yavaşça normale dön)
+    // ✅ KRİTİK: Başarılı cancel sonrası backoff'u daha hızlı azalt (normale dön)
+    // Eski: 0.9 ile çarpma (yavaş azalma)
+    // Yeni: 0.8 ile çarpma (daha hızlı azalma, market opportunity'ler kaçmaz)
     if state.pending_cancels_count == 0 {
-        state.cancel_backoff_multiplier = (state.cancel_backoff_multiplier * 0.9).max(1.0);
+        const BACKOFF_MULTIPLIER_DECREASE: f64 = 0.8; // 0.9 → 0.8 (daha hızlı azalma)
+        state.cancel_backoff_multiplier = (state.cancel_backoff_multiplier * BACKOFF_MULTIPLIER_DECREASE).max(1.0);
     }
 
     Ok(())
@@ -427,15 +473,20 @@ pub async fn place_orders_with_profit_guarantee(
     let min_margin_adaptive = (adaptive_chunk_size * 0.2).max(min_margin).min(100.0);
     
     // ✅ KRİTİK: Isolated margin kontrolü - chunk oluşturmadan ÖNCE maksimum chunk size'ı hesapla
-    // Binance isolated margin için minimum %7 margin gerektiriyor
+    // Binance isolated margin için maintenance margin rate (MMR) genellikle %3-5 arası
+    // %5 kullanarak güvenli bir buffer sağlıyoruz (tipik MMR %3-4, biz %5 ile güvenli taraftayız)
     // Maksimum notional = available_margin / ISOLATED_MARGIN_REQUIREMENT_PCT
     // Maksimum margin chunk = maksimum notional / effective_leverage
-    const ISOLATED_MARGIN_REQUIREMENT_PCT: f64 = 0.07; // %7 minimum
+    const ISOLATED_MARGIN_REQUIREMENT_PCT: f64 = 0.05; // %5 minimum (Binance futures tipik MMR %3-5, %5 güvenli buffer)
     let effective_leverage_for_chunk_calc = if is_opportunity_mode {
         effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
     } else {
         effective_leverage
     };
+    
+    // ✅ KRİTİK GÜVENLİK: Division by zero önleme - effective_leverage_for_chunk_calc 0.0 olamaz
+    // Eğer opportunity_mode_leverage_reduction 0.0 ise veya effective_leverage 0.0 ise, minimum 1.0 kullan
+    let effective_leverage_for_chunk_calc = effective_leverage_for_chunk_calc.max(1.0);
     
     // Mevcut margin'e göre maksimum notional hesapla
     let max_notional_from_margin = if ISOLATED_MARGIN_REQUIREMENT_PCT > 0.0 {
@@ -445,11 +496,8 @@ pub async fn place_orders_with_profit_guarantee(
     };
     
     // Maksimum margin chunk = maksimum notional / leverage
-    let max_margin_from_isolated_req = if effective_leverage_for_chunk_calc > 0.0 {
-        max_notional_from_margin / effective_leverage_for_chunk_calc
-    } else {
-        cfg.max_usd_per_order
-    };
+    // ✅ KRİTİK: effective_leverage_for_chunk_calc artık garanti > 0.0 (yukarıda max(1.0) ile korundu)
+    let max_margin_from_isolated_req = max_notional_from_margin / effective_leverage_for_chunk_calc;
     
     // ✅ KRİTİK: max_margin_adaptive her zaman cfg.max_usd_per_order (100 USD) ile sınırlandırılmış
     // Ama isolated margin gereksiniminden küçük olmalı
@@ -598,6 +646,10 @@ pub async fn place_orders_with_profit_guarantee(
     } else {
         effective_leverage
     };
+    
+    // ✅ KRİTİK GÜVENLİK: Division by zero önleme - effective_leverage_for_chunk 0.0 olamaz
+    // Eğer opportunity_mode_leverage_reduction 0.0 ise veya effective_leverage 0.0 ise, minimum 1.0 kullan
+    let effective_leverage_for_chunk = effective_leverage_for_chunk.max(1.0);
 
     let chunk_notional_estimate = *margin_chunk * effective_leverage_for_chunk;
     let min_required_volume_usd = chunk_notional_estimate * DEPTH_VOLUME_MULTIPLIER;
@@ -711,7 +763,45 @@ pub async fn place_orders_with_profit_guarantee(
     // margin_chunk: USD (leverage uygulanmamış)
     // margin_chunk_leveraged: USD (leverage uygulanmış notional)
     // calc_qty_from_margin() içinde leverage UYGULANMAZ, direkt notional kullanılır
+    
+    // ✅ KRİTİK GÜVENLİK: Leverage'in sadece bir kez uygulandığını doğrula
+    // margin_chunk normal aralıkta olmalı (10-100 USD)
+    // effective_leverage_for_chunk normal aralıkta olmalı (1-50x)
+    // margin_chunk_leveraged = margin_chunk * leverage (10-100 USD * 1-50x = 10-5000 USD)
+    if *margin_chunk < 1.0 || *margin_chunk > 200.0 {
+        warn!(
+            %symbol,
+            side = ?side,
+            margin_chunk = *margin_chunk,
+            "margin_chunk out of expected range (1-200 USD), possible calculation error"
+        );
+    }
+    // ✅ KRİTİK: effective_leverage_for_chunk artık garanti >= 1.0 (yukarıda max(1.0) ile korundu)
+    // Ama yine de kontrol edelim (çok yüksek değerler için)
+    if effective_leverage_for_chunk > 100.0 {
+        warn!(
+            %symbol,
+            side = ?side,
+            effective_leverage = effective_leverage_for_chunk,
+            "effective_leverage_for_chunk out of expected range (>100x), possible calculation error"
+        );
+    }
+    
     let margin_chunk_leveraged = *margin_chunk * effective_leverage_for_chunk;
+    
+    // ✅ KRİTİK GÜVENLİK: margin_chunk_leveraged'in makul bir değer olduğunu kontrol et
+    // Normal aralık: 10-5000 USD (10 USD margin * 1x leverage = 10 USD, 100 USD margin * 50x = 5000 USD)
+    if margin_chunk_leveraged < 1.0 || margin_chunk_leveraged > 100000.0 {
+        warn!(
+            %symbol,
+            side = ?side,
+            margin_chunk = *margin_chunk,
+            effective_leverage = effective_leverage_for_chunk,
+            margin_chunk_leveraged,
+            "margin_chunk_leveraged out of expected range (1-100000 USD), possible leverage double-application or calculation error"
+        );
+    }
+    
     let qty_price_result = crate::utils::calc_qty_from_margin(
         margin_chunk_leveraged, // ✅ Zaten leveraged notional
         px_final,               // ✅ Post-only cross kontrolü sonrası final fiyat
@@ -747,7 +837,7 @@ pub async fn place_orders_with_profit_guarantee(
     };
 
     let mut chunk_qty = Qty(chunk_qty_dec);
-    let chunk_price = Px(chunk_price_dec);
+    let mut chunk_price = Px(chunk_price_dec);
 
     // ✅ KRİTİK: Quantize sonrası final cross kontrolü
     // Quantize işlemi fiyatı değiştirebilir, tekrar kontrol et
@@ -817,15 +907,21 @@ pub async fn place_orders_with_profit_guarantee(
 
         if !min_safe_distance {
             // ✅ KRİTİK: Fiyat çok yakınsa, bir tick daha uzaklaştırmayı dene
-            let adjusted_price = match side {
+            let adjusted_price_raw = match side {
                 Side::Buy => chunk_price.0 - effective_tick_size,
                 Side::Sell => chunk_price.0 + effective_tick_size,
             };
             
+            // Adjusted price'ı quantize et (tick_size'a göre)
+            let adjusted_price_quantized = match side {
+                Side::Buy => quant_utils_floor_to_step(adjusted_price_raw, effective_tick_size),
+                Side::Sell => quant_utils_ceil_to_step(adjusted_price_raw, effective_tick_size),
+            };
+            
             // Adjusted price hala cross ediyor mu kontrol et
             let would_still_cross = match side {
-                Side::Buy => adjusted_price >= ask.0,
-                Side::Sell => adjusted_price <= bid.0,
+                Side::Buy => adjusted_price_quantized >= ask.0,
+                Side::Sell => adjusted_price_quantized <= bid.0,
             };
             
             if would_still_cross {
@@ -833,7 +929,7 @@ pub async fn place_orders_with_profit_guarantee(
                     %symbol,
                     side = ?side,
                     chunk_price = %chunk_price.0,
-                    adjusted_price = %adjusted_price,
+                    adjusted_price = %adjusted_price_quantized,
                     bid = %bid.0,
                     ask = %ask.0,
                     effective_tick_size = %effective_tick_size,
@@ -841,25 +937,34 @@ pub async fn place_orders_with_profit_guarantee(
                     "POST-ONLY SAFETY: quantized price too close to market even after adjustment, skipping to prevent cross"
                 );
                 return Ok(false);
-            } else {
-                // Adjusted price kullanılabilir, ama burada chunk_price'ı değiştiremeyiz
-                // Bu durumda skip etmek yerine, bir sonraki tick'te tekrar deneyeceğiz
-                debug!(
-                    %symbol,
-                    side = ?side,
-                    chunk_price = %chunk_price.0,
-                    adjusted_price = %adjusted_price,
-                    effective_tick_size = %effective_tick_size,
-                    "POST-ONLY SAFETY: price too close, will retry with adjusted price on next tick"
-                );
-                return Ok(false);
             }
+            
+            // ✅ KRİTİK: Adjusted price kullanılabilir, chunk_price'ı güncelle
+            // Bu sayede bir sonraki tick'te tekrar aynı fiyat denenmez
+            debug!(
+                %symbol,
+                side = ?side,
+                original_price = %chunk_price.0,
+                adjusted_price = %adjusted_price_quantized,
+                effective_tick_size = %effective_tick_size,
+                "POST-ONLY SAFETY: price adjusted to maintain safe distance from market"
+            );
+            
+            // chunk_price'ı güncelle
+            chunk_price = Px(adjusted_price_quantized);
+            
+            // ✅ KRİTİK: Fiyat değiştiği için notional değişebilir
+            // Notional = price * qty olduğu için, fiyat değişince notional da değişir
+            // Bu durumda notional biraz azalabilir (Buy için fiyat düştü) veya artabilir (Sell için fiyat arttı)
+            // Bu kabul edilebilir çünkü margin kontrolü zaten yapılıyor ve notional hala makul aralıkta olmalı
+            // Notional'ı yeniden hesaplamak için aşağıdaki kodda chunk_notional hesaplanacak
         }
     }
 
     // ✅ KRİTİK: Quantize sonrası notional hesaplama ve 10-100 USD kuralı doğrulama
     // Quantize işlemi (calc_qty_from_margin) qty ve price'ı yuvarladığı için notional değişebilir
     // Örnek: 15 USD margin → quantize sonrası 8 USD notional olabilir → < 10 USD → skip edilmeli
+    // NOT: Eğer yukarıdaki POST-ONLY SAFETY adjustment yapıldıysa, chunk_price güncellenmiş olabilir
     let mut chunk_notional = chunk_price.0 * chunk_qty.0;
 
     // 1. Exchange'in minimum notional gereksinimi (genellikle 5-10 USD)
@@ -878,11 +983,8 @@ pub async fn place_orders_with_profit_guarantee(
     // ✅ KRİTİK: chunk_notional leverage uygulanmış notional, margin kontrolü için leverage'e böl
     // Örnek: chunk_notional = 2000 USD (100 USD margin * 20x leverage)
     // chunk_margin = 2000 / 20 = 100 USD → max_margin_dec (100 USD) ile karşılaştır
-    let mut chunk_margin = if effective_leverage_for_chunk > 0.0 {
-        chunk_notional / Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE)
-    } else {
-        Decimal::ZERO
-    };
+    // ✅ KRİTİK GÜVENLİK: effective_leverage_for_chunk artık garanti >= 1.0 (yukarıda max(1.0) ile korundu)
+    let mut chunk_margin = chunk_notional / Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE);
 
     // 3. Quantize sonrası notional kontrolü
     // ✅ KRİTİK GÜVENLİK: Notional 0 olamaz
@@ -914,6 +1016,7 @@ pub async fn place_orders_with_profit_guarantee(
     // ✅ KRİTİK: chunk_margin (leverage'e bölünmüş) ile max_margin_dec karşılaştır
     if chunk_margin > max_margin_dec && chunk_price.0 > Decimal::ZERO {
         // max_margin_dec'den max notional hesapla (leverage ile çarp)
+        // ✅ KRİTİK GÜVENLİK: effective_leverage_for_chunk artık garanti >= 1.0 (yukarıda max(1.0) ile korundu)
         let max_notional_dec = max_margin_dec * Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE);
         let max_qty_raw = max_notional_dec / chunk_price.0;
         let adjusted_qty = quant_utils_floor_to_step(max_qty_raw, rules.step_size);
@@ -930,11 +1033,8 @@ pub async fn place_orders_with_profit_guarantee(
             chunk_qty = Qty(adjusted_qty);
             chunk_notional = chunk_price.0 * chunk_qty.0;
             // chunk_margin'i yeniden hesapla
-            chunk_margin = if effective_leverage_for_chunk > 0.0 {
-                chunk_notional / Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE)
-            } else {
-                Decimal::ZERO
-            };
+            // ✅ KRİTİK GÜVENLİK: effective_leverage_for_chunk artık garanti >= 1.0 (yukarıda max(1.0) ile korundu)
+            chunk_margin = chunk_notional / Decimal::from_f64_retain(effective_leverage_for_chunk).unwrap_or(Decimal::ONE);
         }
     }
 
@@ -971,12 +1071,13 @@ pub async fn place_orders_with_profit_guarantee(
     }
 
     // ✅ KRİTİK GÜVENLİK: Isolated margin için minimum margin gereksinimi kontrolü
-    // Binance isolated margin için minimum margin gereksinimi genellikle pozisyon boyutunun %5-10'u
-    // Örnek: 599 USD notional → minimum margin gereksinimi: 30-60 USD
+    // Binance isolated margin için maintenance margin rate (MMR) genellikle %3-5 arası
+    // %5 kullanarak güvenli bir buffer sağlıyoruz (tipik MMR %3-4, biz %5 ile güvenli taraftayız)
+    // Örnek: 600 USD notional → minimum margin gereksinimi: 30 USD (%5)
     // Eğer mevcut margin bu gereksinimden küçükse, Binance "Margin is insufficient" hatası verir
-    // ✅ KRİTİK: Test order geçiyor ama gerçek emir başarısız oluyor - daha sıkı kontrol gerekiyor
+    // ✅ KRİTİK: Test order geçiyor ama gerçek emir başarısız oluyor - kontrol gerekiyor
     // Test order küçük bir miktarla yapılıyor olabilir, ama gerçek emir daha büyük olabilir
-    // Bu yüzden %7 minimum kullanıyoruz (daha konservatif) ve tolerance'ı kaldırıyoruz
+    // %5 Binance'in tipik MMR değerlerine (%3-5) uygun ve güvenli bir buffer sağlıyor
     // NOT: ISOLATED_MARGIN_REQUIREMENT_PCT sabiti fonksiyonun başında tanımlanmıştır
     let min_isolated_margin_requirement = chunk_notional.to_f64().unwrap_or(0.0) * ISOLATED_MARGIN_REQUIREMENT_PCT;
     let chunk_margin_f64 = chunk_margin.to_f64().unwrap_or(0.0);
@@ -989,7 +1090,7 @@ pub async fn place_orders_with_profit_guarantee(
             min_isolated_margin_required = min_isolated_margin_requirement,
             requirement_pct = ISOLATED_MARGIN_REQUIREMENT_PCT * 100.0,
             effective_leverage = effective_leverage_for_chunk,
-            "chunk margin below isolated margin minimum requirement (7% of notional), skipping to prevent 'Margin is insufficient' error (test order may pass but real order will fail)"
+            "chunk margin below isolated margin minimum requirement (5% of notional), skipping to prevent 'Margin is insufficient' error (test order may pass but real order will fail)"
         );
         return Ok(false);
     }
@@ -1202,11 +1303,20 @@ pub async fn place_orders_with_profit_guarantee(
     // Place order
     rate_limit_guard(1).await;
 
+    // ✅ KRİTİK GÜVENLİK: Unique order ID generation (collision önleme)
+    // Aynı millisecond içinde aynı symbol için 2 order gönderilirse collision riski var
+    // Çözüm: Global atomic counter kullanarak her order için unique suffix oluştur
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let random_suffix = (timestamp_ms % 10000) as u64;
+    
+    // ✅ KRİTİK: Atomic counter ile unique suffix oluştur
+    // Her order için counter artırılır, böylece aynı millisecond içinde bile unique ID'ler oluşturulur
+    let unique_counter = ORDER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Counter'ı 4 haneli bir sayıya dönüştür (0-9999 arası, sonra wrap around)
+    let unique_suffix = (unique_counter % 10000) as u64;
+    
     let side_char = match side {
         Side::Buy => "B",
         Side::Sell => "S",
@@ -1217,17 +1327,125 @@ pub async fn place_orders_with_profit_guarantee(
         side_char,
         chunk_idx,
         timestamp_ms,
-        random_suffix
+        unique_suffix
     );
     if client_order_id.len() > 36 {
+        // ✅ KRİTİK: 36 karakter limiti aşılırsa, unique_suffix'i de dahil et (collision önleme)
         let symbol_short = symbol.chars().take(8).collect::<String>();
+        // Timestamp'in son 8 hanesini al (daha kısa) ve unique_suffix'i ekle
+        let timestamp_short = timestamp_ms % 100000000; // Son 8 hane
         client_order_id = format!(
-            "{}_{}_C{}_{}",
-            symbol_short, side_char, chunk_idx, timestamp_ms
+            "{}_{}_C{}_{}_{}",
+            symbol_short, side_char, chunk_idx, timestamp_short, unique_suffix
         )
         .chars()
         .take(36)
         .collect::<String>();
+    }
+
+    // ✅ KRİTİK DÜZELTME: Test order ile real order arasındaki time gap sorunu
+    // Test order'dan sonra market fiyatı değişmiş olabilir, gerçek order öncesi tekrar kontrol et
+    // Bu sayede test order geçer ama real order cross edebilir sorunu önlenir
+    if matches!(OPENING_ORDER_TIF, Tif::PostOnly) {
+        // Güncel market fiyatlarını tekrar al
+        rate_limit_guard(5).await; // best_prices weight = 5
+        let (current_bid, current_ask) = match venue.best_prices(symbol).await {
+            Ok((bid, ask)) => (bid, ask),
+            Err(e) => {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    error = %e,
+                    "failed to re-fetch prices before real order, using original prices"
+                );
+                // Fallback: Orijinal fiyatları kullan (test order zaten geçti)
+                (bid, ask)
+            }
+        };
+
+        // Quantize sonrası fiyat ile güncel market fiyatlarını karşılaştır
+        let would_cross_now = match side {
+            Side::Buy => chunk_price.0 >= current_ask.0,
+            Side::Sell => chunk_price.0 <= current_bid.0,
+        };
+
+        if would_cross_now {
+            warn!(
+                %symbol,
+                side = ?side,
+                chunk_price = %chunk_price.0,
+                original_bid = %bid.0,
+                original_ask = %ask.0,
+                current_bid = %current_bid.0,
+                current_ask = %current_ask.0,
+                "POST-ONLY VIOLATION: price would cross after test order (market moved), skipping real order"
+            );
+            return Ok(false);
+        }
+
+        // ✅ KRİTİK: Ek güvenlik - En az 1 tick mesafe kontrolü (güncel fiyatlarla)
+        let effective_tick_size = if rules.tick_size >= chunk_price.0 || rules.tick_size >= current_bid.0 {
+            let price_str = chunk_price.0.to_string();
+            let decimal_places = if let Some(dot_pos) = price_str.find('.') {
+                let decimal_part = &price_str[dot_pos + 1..];
+                let significant_digits = decimal_part.trim_end_matches('0').len();
+                if significant_digits > 0 {
+                    significant_digits.min(8)
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
+            
+            if decimal_places > 0 {
+                Decimal::new(1, decimal_places as u32)
+            } else {
+                let api_precision = rules.price_precision;
+                if api_precision > 0 {
+                    Decimal::new(1, api_precision as u32)
+                } else {
+                    Decimal::new(1, 8)
+                }
+            }
+        } else {
+            rules.tick_size
+        };
+
+        let min_safe_distance = match side {
+            Side::Buy => {
+                let min_safe_price = current_ask.0 - effective_tick_size;
+                chunk_price.0 <= min_safe_price
+            }
+            Side::Sell => {
+                let min_safe_price = current_bid.0 + effective_tick_size;
+                chunk_price.0 >= min_safe_price
+            }
+        };
+
+        if !min_safe_distance {
+            warn!(
+                %symbol,
+                side = ?side,
+                chunk_price = %chunk_price.0,
+                current_bid = %current_bid.0,
+                current_ask = %current_ask.0,
+                effective_tick_size = %effective_tick_size,
+                "POST-ONLY VIOLATION: price too close to market after test order (market moved), skipping real order"
+            );
+            return Ok(false);
+        }
+
+        debug!(
+            %symbol,
+            side = ?side,
+            chunk_price = %chunk_price.0,
+            original_bid = %bid.0,
+            original_ask = %ask.0,
+            current_bid = %current_bid.0,
+            current_ask = %current_ask.0,
+            "price validated with current market prices before real order"
+        );
     }
 
     match venue

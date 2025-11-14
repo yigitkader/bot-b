@@ -104,7 +104,7 @@ pub struct SymbolState {
     // Cancel/replace churn control
     pub pending_cancels_count: u32, // Symbol başına bekleyen cancel sayısı (rate limit koruması)
     pub last_cancel_time: Option<Instant>, // Son cancel zamanı (backoff için)
-    pub cancel_backoff_multiplier: f64, // Cancel backoff çarpanı (1.0 → 2.0 → 4.0)
+    pub cancel_backoff_multiplier: f64, // Cancel backoff çarpanı (1.0 → 1.5 → 2.25 → 2.5 max, sadece rate limit hatası durumunda artar)
 
     // Position management
     pub position_entry_time: Option<Instant>,

@@ -103,6 +103,47 @@ pub struct StratCfg {
     pub qmel_min_margin_usdc: Option<f64>, // Minimum margin per trade (USDC) - default: 10.0
     #[serde(default)]
     pub qmel_max_margin_usdc: Option<f64>, // Maximum margin per trade (USDC) - default: 100.0
+    // Strategy Internal Config (opsiyonel, main.rs'den geçirilir)
+    #[serde(default)]
+    pub manipulation_volume_ratio_threshold: Option<f64>,
+    #[serde(default)]
+    pub manipulation_time_threshold_ms: Option<u64>,
+    #[serde(default)]
+    pub manipulation_price_history_max_len: Option<usize>,
+    #[serde(default)]
+    pub flash_crash_recovery_window_ms: Option<u64>,
+    #[serde(default)]
+    pub flash_crash_recovery_min_points: Option<usize>,
+    #[serde(default)]
+    pub flash_crash_recovery_min_ratio: Option<f64>,
+    #[serde(default)]
+    pub confidence_price_drop_max: Option<f64>,
+    #[serde(default)]
+    pub confidence_volume_ratio_min: Option<f64>,
+    #[serde(default)]
+    pub confidence_volume_ratio_max: Option<f64>,
+    #[serde(default)]
+    pub confidence_spread_min: Option<f64>,
+    #[serde(default)]
+    pub confidence_spread_max: Option<f64>,
+    #[serde(default)]
+    pub confidence_bonus_multiplier: Option<f64>,
+    #[serde(default)]
+    pub confidence_max_multiplier: Option<f64>,
+    #[serde(default)]
+    pub confidence_min_threshold: Option<f64>,
+    #[serde(default)]
+    pub volume_anomaly_confidence_threshold: Option<f64>, // VolumeAnomalyTrend için özel threshold
+    #[serde(default)]
+    pub default_confidence: Option<f64>,
+    #[serde(default)]
+    pub min_confidence_value: Option<f64>,
+    #[serde(default)]
+    pub trend_analysis_min_history: Option<usize>,
+    #[serde(default)]
+    pub trend_analysis_threshold_negative: Option<f64>,
+    #[serde(default)]
+    pub trend_analysis_threshold_strong_negative: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -278,6 +319,8 @@ pub struct StrategyInternalCfg {
     pub confidence_max_multiplier: f64,
     #[serde(default = "default_confidence_min_threshold")]
     pub confidence_min_threshold: f64,
+    #[serde(default = "default_volume_anomaly_confidence_threshold")]
+    pub volume_anomaly_confidence_threshold: f64, // VolumeAnomalyTrend için özel threshold (genellikle daha düşük, çünkü volume-based fırsatlar daha gürültülü)
     #[serde(default = "default_default_confidence")]
     pub default_confidence: f64,
     #[serde(default = "default_min_confidence_value")]
@@ -459,6 +502,9 @@ fn default_confidence_max_multiplier() -> f64 {
 fn default_confidence_min_threshold() -> f64 {
     0.70
 } // 0.75 → 0.70: False positive azalt, gerçek fırsatları kaçırma
+fn default_volume_anomaly_confidence_threshold() -> f64 {
+    0.55 // Volume-based fırsatlar için daha düşük threshold (gürültülü olabilir, false negative önleme)
+}
 fn default_default_confidence() -> f64 {
     0.7
 }

@@ -207,9 +207,15 @@ pub struct SymbolMeta {
     pub contract_type: Option<String>,
 }
 
+/// Binance API common configuration
+/// 
+/// ✅ KRİTİK: Thread-safety ve performans optimizasyonu
+/// - `client: Arc<Client>`: reqwest::Client thread-safe ama clone edilmesi gereksiz overhead
+///   Arc ile wrap ederek clone işlemi sadece pointer kopyalama olur
+/// - `sign()` fonksiyonu thread-safe (immutable data kullanıyor, sadece read-only)
 #[derive(Clone)]
 pub struct BinanceCommon {
-    pub client: Client,
+    pub client: Arc<Client>,
     pub api_key: String,
     pub secret_key: String,
     pub recv_window_ms: u64,
@@ -223,6 +229,13 @@ impl BinanceCommon {
             .expect("system time is before UNIX epoch")
             .as_millis() as u64
     }
+    /// Sign a query string with HMAC-SHA256
+    /// 
+    /// ✅ KRİTİK: Thread-safe - immutable data kullanıyor (sadece read-only)
+    /// - `self.secret_key` immutable olarak okunuyor (String clone edilmiyor)
+    /// - `qs` parametresi immutable
+    /// - HMAC hesaplama thread-safe (her çağrı bağımsız)
+    /// - İki thread aynı anda farklı request'ler için sign() çağırabilir (race condition yok)
     fn sign(&self, qs: &str) -> String {
         // secret_key boş olsa bile new_from_slice başarılı olur (boş key ile imza üretir)
         // Ancak yine de expect ile açık hale getiriyoruz
@@ -420,6 +433,7 @@ impl BinanceFutures {
 
         // Geçici hata durumunda retry mekanizması (max 2 retry)
         const MAX_RETRIES: u32 = 2;
+        const INITIAL_BACKOFF_MS: u64 = 100; // Exponential backoff başlangıç değeri
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -438,15 +452,17 @@ impl BinanceFutures {
                 Err(err) => {
                     last_error = Some(err);
                     if attempt < MAX_RETRIES {
-                        // Geçici hata olabilir, kısa bir bekleme ile retry
-                        let backoff_ms = 100 * (attempt + 1) as u64;
+                        // ✅ KRİTİK GÜVENLİK: Exponential backoff kullan (rate limit durumunda daha etkili)
+                        // Linear backoff (100ms, 200ms, 300ms) yerine exponential (100ms, 200ms, 400ms)
+                        // Exchange rate limit durumunda linear backoff yetersiz kalabilir
+                        let backoff_ms = INITIAL_BACKOFF_MS * 2_u64.pow(attempt);
                         warn!(
                             error = ?last_error,
                             %sym,
                             attempt = attempt + 1,
                             max_retries = MAX_RETRIES + 1,
                             backoff_ms,
-                            "failed to fetch futures symbol rules, retrying..."
+                            "failed to fetch futures symbol rules, retrying with exponential backoff..."
                         );
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
@@ -825,6 +841,10 @@ impl BinanceFutures {
 
         // KRİTİK: Pozisyon kapatma retry mekanizması (kısmi kapatma durumunda)
         let max_attempts = 3;
+        // ✅ KRİTİK GÜVENLİK: LIMIT fallback flag'i - sonsuz loop önleme
+        // MIN_NOTIONAL hatası yakalandığında LIMIT fallback yapılır, ama LIMIT de başarısız olursa
+        // tekrar MARKET denenmemeli (sonsuz loop riski)
+        let mut limit_fallback_attempted = false;
 
         for attempt in 0..max_attempts {
             // KRİTİK İYİLEŞTİRME: Her attempt'te mevcut pozisyonu kontrol et
@@ -944,6 +964,49 @@ impl BinanceFutures {
                         );
                         return Ok(());
                     } else {
+                        // ✅ KRİTİK DÜZELTME: Position growth tespiti - sonsuz loop önleme
+                        // 1 saniye bekleme sırasında WebSocket'ten yeni fill event gelebilir
+                        // Position büyüyebilir (yeni order fill oldu), bu durumda sonsuz loop riski var
+                        let position_grew_from_attempt = verify_qty.abs() > current_qty.abs();
+                        let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
+                        
+                        if position_grew_from_attempt || position_grew_from_initial {
+                            // Position büyüdü - yeni bir order fill oldu
+                            // Bu durumda close işlemi başarısız sayılmalı (yeni position close edilmeli)
+                            // Ancak sonsuz loop riski var, bu yüzden hata döndür veya yeni position'ı close etmeye çalış
+                            warn!(
+                                symbol = %sym,
+                                attempt = attempt + 1,
+                                initial_qty = %initial_qty,
+                                current_qty_at_attempt = %current_qty,
+                                verify_qty = %verify_qty,
+                                grew_from_attempt = position_grew_from_attempt,
+                                grew_from_initial = position_grew_from_initial,
+                                "POSITION GROWTH DETECTED: new order filled during close, position increased (possible infinite loop risk)"
+                            );
+                            
+                            // ✅ KRİTİK: Position initial'dan büyüdüyse, bu kesinlikle yeni bir order'ın fill olduğu anlamına gelir
+                            // Bu durumda close işlemi başarısız sayılmalı ve yeni position'ı close etmeye çalışmalı
+                            // Ancak max_attempts kontrolü ile sonsuz loop önlenir
+                            if attempt < max_attempts - 1 {
+                                // Son deneme değilse, yeni position'ı close etmeye çalış
+                                warn!(
+                                    symbol = %sym,
+                                    attempt = attempt + 1,
+                                    "retrying close with new (larger) position size"
+                                );
+                                continue; // Loop devam eder, yeni position'ı close etmeye çalışır
+                            } else {
+                                // Son denemede hala position büyüdüyse, hata döndür
+                                return Err(anyhow::anyhow!(
+                                    "Failed to close position: position grew during close (new order filled). Initial: {}, Attempt qty: {}, Final qty: {}. Possible infinite loop prevented.",
+                                    initial_qty,
+                                    current_qty,
+                                    verify_qty
+                                ));
+                            }
+                        }
+                        
                         // KRİTİK İYİLEŞTİRME: Kısmi kapatma tespiti - kapatılan miktarı hesapla
                         // Bu attempt'te ne kadar kapatıldı?
                         let closed_amount = current_qty.abs() - verify_qty.abs();
@@ -1039,17 +1102,20 @@ impl BinanceFutures {
                     // KRİTİK DÜZELTME: MIN_NOTIONAL hatası yakalama (-1013 veya "min notional")
                     // Küçük "artık" miktarlarda reduce-only market close borsa min_notional eşiğini sağlamayabilir
                     // Normal kapanış modunda LIMIT fallback yap
-                    if error_lower.contains("-1013")
+                    // ✅ KRİTİK GÜVENLİK: LIMIT fallback sadece bir kez denenmeli (sonsuz loop önleme)
+                    if (error_lower.contains("-1013")
                         || error_lower.contains("min notional")
-                        || error_lower.contains("min_notional")
+                        || error_lower.contains("min_notional"))
+                        && !limit_fallback_attempted
                     {
+                        limit_fallback_attempted = true; // LIMIT fallback'i işaretle (tekrar denenmeyecek)
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
                             error = %e,
                             remaining_qty = %remaining_qty,
                             min_notional = %rules.min_notional,
-                            "MIN_NOTIONAL error in reduce-only market close, trying limit reduce-only fallback"
+                            "MIN_NOTIONAL error in reduce-only market close, trying limit reduce-only fallback (one-time)"
                         );
 
                         // Fallback: Limit reduce-only ile karşı tarafta 1-2 tick avantajlı pasif bırak
@@ -1057,15 +1123,11 @@ impl BinanceFutures {
                             Ok(prices) => prices,
                             Err(e2) => {
                                 warn!(symbol = %sym, error = %e2, "failed to fetch best prices for limit fallback");
-                                if attempt < max_attempts - 1 {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    continue;
-                                } else {
-                                    return Err(anyhow!(
-                                        "MIN_NOTIONAL error and limit fallback failed: {}",
-                                        e
-                                    ));
-                                }
+                                // ✅ KRİTİK: LIMIT fallback başarısız, direkt hata döndür (sonsuz loop önleme)
+                                return Err(anyhow!(
+                                    "MIN_NOTIONAL error and limit fallback failed (best prices fetch failed): {}",
+                                    e
+                                ));
                             }
                         };
 
@@ -1138,7 +1200,8 @@ impl BinanceFutures {
                                     error = %e2,
                                     "MIN_NOTIONAL fallback: limit reduce-only order also failed"
                                 );
-                                // Limit emri de başarısız, dust için komple sıfırlamaya zorla
+                                // ✅ KRİTİK GÜVENLİK: LIMIT fallback başarısız, dust kontrolü yap
+                                // Eğer dust ise (çok küçük miktar), pozisyonu kapalı kabul et
                                 if remaining_qty < rules.min_notional / Decimal::from(1000) {
                                     // Çok küçük miktar, quantize et ve sıfırla
                                     let dust_qty = quantize_decimal(remaining_qty, rules.step_size);
@@ -1150,13 +1213,12 @@ impl BinanceFutures {
                                         return Ok(());
                                     }
                                 }
-                                // Son deneme değilse devam et
-                                if attempt < max_attempts - 1 {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    continue;
-                                } else {
-                                    return Err(anyhow!("MIN_NOTIONAL error: market and limit reduce-only both failed: {}", e));
-                                }
+                                // ✅ KRİTİK: LIMIT fallback başarısız, tekrar MARKET denenmemeli (sonsuz loop önleme)
+                                // Direkt hata döndür - retry loop'a girmemeli
+                                return Err(anyhow!(
+                                    "MIN_NOTIONAL error: market and limit reduce-only both failed (market: {}, limit: {})",
+                                    e, e2
+                                ));
                             }
                         }
                     } else {
@@ -1646,6 +1708,11 @@ impl BinanceFutures {
 
 // ---- helpers ----
 
+/// Quantize decimal value to step (floor to nearest step multiple)
+/// 
+/// ✅ KRİTİK: Precision loss önleme
+/// Decimal division ve multiplication yaparken precision loss olabilir.
+/// Sonucu normalize ederek step'in tam katı olduğundan emin oluyoruz.
 pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     // KRİTİK DÜZELTME: Edge case'ler için ek kontroller
     if step.is_zero() || step.is_sign_negative() {
@@ -1656,10 +1723,23 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     let floored = ratio.floor();
     let result = floored * step;
 
-    // Decimal her zaman finite'dir, bu yüzden direkt döndür
-    result
+    // ✅ KRİTİK: Precision loss önleme - sonucu normalize et
+    // Division ve multiplication sonrası sonucun step'in tam katı olduğundan emin ol
+    // Step'in scale'ini kullanarak normalize et (step'in ondalık basamak sayısı)
+    // Bu, 0.123456789 / 0.001 * 0.001 = 0.122999999 gibi durumları önler
+    let step_scale = step.scale();
+    let normalized = result.normalize();
+    
+    // Normalize edilmiş sonucu step'in scale'ine göre yuvarla
+    // Bu, step'in tam katı olduğundan emin olur
+    normalized.round_dp_with_strategy(step_scale, rust_decimal::RoundingStrategy::ToNegativeInfinity)
 }
 
+/// Format decimal with fixed precision
+/// 
+/// ✅ KRİTİK: Precision loss önleme
+/// ToZero strategy truncate ediyor, bu precision loss'a yol açabilir.
+/// Normalize ederek ve doğru rounding strategy kullanarak precision loss'u önlüyoruz.
 pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     // KRİTİK DÜZELTME: Edge case'ler için ek kontroller
     // Precision overflow kontrolü (max 28 decimal places)
@@ -1668,24 +1748,26 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
 
     // Decimal her zaman finite'dir, bu yüzden direkt işle
 
-    // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
-    // KRİTİK: round_dp_with_strategy ile kesinlikle precision'a kadar yuvarla
-    // ToZero strategy kullanarak fazla basamakları kes
-    let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
+    // ✅ KRİTİK: Precision loss önleme
+    // 1. Önce normalize et (internal representation'ı temizle)
+    // 2. Sonra precision'a göre yuvarla
+    // ToZero yerine ToNegativeInfinity (floor) kullan - daha güvenli ve precision loss'u önler
+    let normalized = value.normalize();
+    let rounded = normalized.round_dp_with_strategy(scale, RoundingStrategy::ToNegativeInfinity);
 
     // KRİTİK: String formatlamada kesinlikle precision'dan fazla basamak gösterme
     // Decimal'in to_string() metodu bazen internal precision'ı gösterebilir
     // Bu yüzden manuel olarak string'i kontrol edip kesmeliyiz
     if scale == 0 {
         // Integer kısmı al (nokta varsa kes)
-        let s = truncated.to_string();
+        let s = rounded.to_string();
         if let Some(dot_pos) = s.find('.') {
             s[..dot_pos].to_string()
         } else {
             s
         }
     } else {
-        let s = truncated.to_string();
+        let s = rounded.to_string();
         if let Some(dot_pos) = s.find('.') {
             let integer_part = &s[..dot_pos];
             let decimal_part = &s[dot_pos + 1..];
@@ -1976,10 +2058,48 @@ impl UserDataStream {
         Ok(())
     }
 
+    /// WS'yi mevcut listenKey ile yeniden bağlar (yeni listen key oluşturmaz)
+    /// KRİTİK: Timeout durumunda listen key hala geçerli olabilir, bu yüzden önce mevcut key ile dene
+    async fn reconnect_ws_without_new_key(&mut self) -> Result<()> {
+        let url = Self::ws_url_for(self.kind, &self.listen_key);
+        let (ws, _) = connect_async(&url).await?;
+        self.ws = ws;
+        self.last_keep_alive = Instant::now();
+
+        // ✅ KRİTİK: Reconnect sonrası missed events sync callback'i çağır
+        if let Some(ref callback) = self.on_reconnect {
+            callback();
+            info!(%url, "reconnected user data websocket (same listen key), sync callback triggered - missed events will be synced");
+        } else {
+            error!(
+                %url,
+                "CRITICAL: WebSocket reconnected, but no sync callback set - missed events will NOT be synced! This may cause state inconsistencies."
+            );
+        }
+
+        info!(%url, "reconnected user data websocket (same listen key)");
+        Ok(())
+    }
+
     /// WS'yi yeni listenKey ile tekrar bağlar (var olan ws kapatılır)
     /// KRİTİK DÜZELTME: Reconnect sonrası missed events sync eklendi
+    /// ✅ KRİTİK: Bu fonksiyon sadece listen key expire olduğunda veya keep_alive başarısız olduğunda çağrılmalı
     async fn reconnect_ws(&mut self) -> Result<()> {
-        // 1. Yeni listen key oluştur (eski expire olmuş olabilir)
+        // ✅ KRİTİK DÜZELTME: Önce mevcut listen key ile yeniden bağlanmayı dene
+        // Timeout olunca listen key hala geçerli olabilir (60 dakika geçerli)
+        // Gereksiz yere yeni listen key oluşturmak API rate limit'e takılabilir
+        match self.reconnect_ws_without_new_key().await {
+            Ok(()) => {
+                // Mevcut listen key ile başarılı, yeni key oluşturmaya gerek yok
+                return Ok(());
+            }
+            Err(e) => {
+                // Mevcut listen key ile başarısız (muhtemelen expire olmuş)
+                warn!(error = %e, "reconnect with existing listen key failed, creating new listen key");
+            }
+        }
+
+        // 1. Yeni listen key oluştur (eski expire olmuş)
         let new_key =
             Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
         self.listen_key = new_key;
@@ -1990,16 +2110,22 @@ impl UserDataStream {
         self.ws = ws;
         self.last_keep_alive = Instant::now();
 
-        // 3. KRİTİK DÜZELTME: Reconnect sonrası missed events sync callback'i çağır
-        // Callback main.rs'de set edilir ve REST API'den missed events'leri sync eder
+        // 3. ✅ KRİTİK: Reconnect sonrası missed events sync callback'i çağır
+        // Callback app_init.rs'de set edilir ve REST API'den missed events'leri sync eder
+        // Callback her reconnect'te set edilmelidir (app_init.rs'deki setup_websocket içinde)
         if let Some(ref callback) = self.on_reconnect {
             callback();
-            info!(%url, "reconnected user data websocket, sync callback triggered");
+            info!(%url, "reconnected user data websocket (new listen key), sync callback triggered - missed events will be synced");
         } else {
-            warn!(%url, "WebSocket reconnected, but no sync callback set - missed events may not be synced");
+            // ✅ KRİTİK: Callback set edilmemişse uyarı ver
+            // Bu durumda missed events sync edilmeyecek ve state tutarsız olabilir
+            error!(
+                %url,
+                "CRITICAL: WebSocket reconnected, but no sync callback set - missed events will NOT be synced! This may cause state inconsistencies."
+            );
         }
 
-        info!(%url, "reconnected user data websocket");
+        info!(%url, "reconnected user data websocket (new listen key)");
         Ok(())
     }
 
@@ -2087,7 +2213,12 @@ impl UserDataStream {
         loop {
             self.keep_alive().await?;
 
-            match timeout(Duration::from_secs(70), self.ws.next()).await {
+            // ✅ KRİTİK DÜZELTME: Timeout'u 5 dakikaya çıkar (300 saniye)
+            // Binance listen key 60 dakika geçerli, keep_alive 25 dakikada bir yapılıyor
+            // 70 saniye timeout çok kısa ve her timeout'ta reconnect yapılıyordu
+            // Bu, gereksiz yere çok fazla listen key oluşturulmasına ve API rate limit'e takılmasına neden oluyordu
+            // 5 dakika timeout, listen key'in expire olmasından çok önce reconnect yapılmasını önler
+            match timeout(Duration::from_secs(300), self.ws.next()).await {
                 Ok(Some(msg)) => {
                     let msg = msg.map_err(|e| match e {
                         WsError::ConnectionClosed | WsError::AlreadyClosed => {
@@ -2120,7 +2251,7 @@ impl UserDataStream {
                 }
                 Ok(None) => return Err(anyhow!("user stream terminated")),
                 Err(_) => {
-                    warn!("websocket timeout, reconnecting");
+                    warn!("websocket timeout (5min), reconnecting");
                     self.reconnect_ws().await?;
                 }
             }

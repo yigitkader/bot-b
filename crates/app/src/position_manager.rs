@@ -145,6 +145,7 @@ pub fn update_position_tracking(
     // ✅ KRİTİK: Position entry time öncelikle WebSocket fill event'te set edilir
     // Ancak WebSocket geç gelirse veya kaçırılırsa, API'den gelen pozisyon bilgisine göre fallback yap
     // Bu, max duration timeout kontrolünün çalışmasını garanti eder
+    // Not: processor.rs'de de fallback mekanizması var, burada sadece hold_duration güncelleniyor
     let position_qty_threshold = Decimal::from_str(&cfg.internal.position_qty_threshold)
         .unwrap_or_else(|_| Decimal::new(1, 8));
     if position.qty.0.abs() > position_qty_threshold {
@@ -156,9 +157,11 @@ pub fn update_position_tracking(
             // WebSocket event kaçırılmış olabilir, bu durumda API'den gelen pozisyon bilgisine göre
             // Maksimum süre kontrolü için entry_time gerekli, bu yüzden fallback ekliyoruz
             // Not: Bu yaklaşık bir zaman olacak ama max duration kontrolü için yeterli
+            // Not: processor.rs'de de aynı fallback var, burada sadece hold_duration güncelleniyor
             state.position_entry_time = Some(Instant::now());
             state.position_hold_duration_ms = 0;
             warn!(
+                symbol = %state.meta.symbol,
                 "position_entry_time was None but position exists, setting fallback entry_time (WebSocket event may have been missed)"
             );
         }

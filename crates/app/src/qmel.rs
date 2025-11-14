@@ -350,11 +350,42 @@ impl AdamOptimizer {
 
         self.t += 1;
 
-        // Bias correction coefficients
-        let beta1_t: f64 = beta1.powi(self.t as i32);
-        let beta2_t: f64 = beta2.powi(self.t as i32);
-        let m_bias_correction = 1.0 - beta1_t;
-        let v_bias_correction = 1.0 - beta2_t;
+        // ✅ KRİTİK DÜZELTME: Bias correction overflow önleme
+        // Eğer t çok büyükse (örn: 1 ay çalışma = 25M+ iterations), beta1^t ve beta2^t underflow'a gidebilir
+        // Örnek: 0.9^25920000 ≈ 0 (underflow)
+        // Çözüm: Eğer beta1_t veya beta2_t çok küçükse (< 1e-10), bias correction'ı skip et
+        // Bu durumda m_bias_correction = 1.0 ve v_bias_correction = 1.0 olur (bias correction yok)
+        const UNDERFLOW_THRESHOLD: f64 = 1e-10;
+        const MAX_SAFE_T: u64 = 1000000; // ~11.5 gün (100ms tick, 10 ticks/sec)
+        
+        let (beta1_t, beta2_t) = if self.t > MAX_SAFE_T {
+            // t çok büyükse, powi hesaplamadan direkt 0 kabul et (underflow)
+            (0.0, 0.0)
+        } else {
+            // Normal hesaplama
+            let b1_t = beta1.powi(self.t as i32);
+            let b2_t = beta2.powi(self.t as i32);
+            
+            // Underflow kontrolü: Eğer değer çok küçükse, 0 kabul et
+            let b1_t = if b1_t < UNDERFLOW_THRESHOLD { 0.0 } else { b1_t };
+            let b2_t = if b2_t < UNDERFLOW_THRESHOLD { 0.0 } else { b2_t };
+            
+            (b1_t, b2_t)
+        };
+        
+        // Bias correction: Eğer beta_t ≈ 0 ise, bias correction = 1.0 (skip correction)
+        // Bu, uzun süre çalışan botlar için güvenli
+        let m_bias_correction = if beta1_t < UNDERFLOW_THRESHOLD {
+            1.0 // Bias correction skip (t çok büyük)
+        } else {
+            1.0 - beta1_t
+        };
+        
+        let v_bias_correction = if beta2_t < UNDERFLOW_THRESHOLD {
+            1.0 // Bias correction skip (t çok büyük)
+        } else {
+            1.0 - beta2_t
+        };
 
         // Update weights with Adam
         for i in 0..gradients.len() {
@@ -405,24 +436,44 @@ impl DirectionModel {
 
         // BEST PRACTICE: Xavier/Glorot initialization (daha iyi convergence)
         // Weights: N(0, 1/sqrt(n_features)) - küçük random değerler
+        // ✅ KRİTİK DÜZELTME: Seed collision önleme
+        // SystemTime::now() paralel initialization'da aynı nanosecond'ta collision yapabilir
+        // Çözüm: Static counter + thread ID + timestamp kombinasyonu
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        use std::thread;
 
+        // Static counter: Her initialization'da artırılır (unique seed garantisi)
+        static INIT_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = INIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        
+        // Güçlü seed: timestamp + counter + thread ID
         let mut hasher = DefaultHasher::new();
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
             .hash(&mut hasher);
-        let seed = hasher.finish();
+        counter.hash(&mut hasher);
+        // Thread ID'yi hash olarak ekle (as_u64() yok, hash kullan)
+        thread::current().id().hash(&mut hasher);
+        let base_seed = hasher.finish();
 
         // Xavier initialization: weights ~ N(0, 1/sqrt(n))
         let std_dev = 1.0 / (feature_dim as f64).sqrt();
         let mut weights = Vec::with_capacity(feature_dim);
         for i in 0..feature_dim {
-            // Basit pseudo-random (production'da proper RNG kullan)
-            let r = ((seed + i as u64) % 10000) as f64 / 10000.0;
+            // ✅ KRİTİK DÜZELTME: seed + i pattern'i zayıf randomness (sequential pattern)
+            // Çözüm: Her weight için ayrı hash hesapla (daha iyi randomness)
+            let mut weight_hasher = DefaultHasher::new();
+            base_seed.hash(&mut weight_hasher);
+            i.hash(&mut weight_hasher);
+            let weight_seed = weight_hasher.finish();
+            
+            // Pseudo-random: [0, 1) aralığında uniform dağılım
+            let r = ((weight_seed % 1000000) as f64) / 1000000.0;
             let weight = (r - 0.5) * 2.0 * std_dev; // [-std_dev, std_dev]
             weights.push(weight);
         }
@@ -470,9 +521,17 @@ impl DirectionModel {
     /// En önemli N feature'ı döndür
     ///
     /// # Race Condition Note
-    /// Bu fonksiyon `&self` alır (immutable reference), bu yüzden Rust'ın borrow checker'ı
+    /// ✅ KRİTİK GÜVENLİK: Bu fonksiyon `&self` alır (immutable reference), bu yüzden Rust'ın borrow checker'ı
     /// aynı anda `&mut self` ile update yapılmasını önler. Ancak çağıran kod empty check yapmalı.
+    /// 
+    /// # Thread Safety
+    /// Eğer `Arc<Mutex<>>` veya `Arc<RwLock<>>` kullanılıyorsa, bu fonksiyon snapshot alır
+    /// (weight'lerin kopyasını alır), bu yüzden concurrent update'lerden etkilenmez.
+    /// Ancak `learn_from_trade()` içinde çağrıldığında, `direction_model.update()` çağrısından
+    /// ÖNCE çağrılmalı (weight'ler güncellenmeden önce snapshot alınmalı).
     pub fn get_top_features(&self, n: usize) -> Vec<(String, f64)> {
+        // ✅ KRİTİK: calculate_feature_importance() weight'lerin snapshot'ını alır
+        // Bu sayede concurrent update'lerden etkilenmez (immutable read)
         let importance = self.calculate_feature_importance();
         importance.into_iter().take(n).collect()
     }
@@ -994,16 +1053,25 @@ impl ThompsonSamplingBandit {
     pub fn select_arm(&self) -> usize {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
+        use std::thread;
 
-        // Basit RNG (production'da daha iyi bir RNG kullanılabilir)
+        // ✅ KRİTİK DÜZELTME: Seed collision önleme
+        // Static counter: Her select_arm çağrısında artırılır (unique seed garantisi)
+        static SELECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = SELECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        
+        // Güçlü seed: timestamp + counter + thread ID
         let mut hasher = DefaultHasher::new();
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
             .hash(&mut hasher);
-        let seed = hasher.finish();
+        counter.hash(&mut hasher);
+        thread::current().id().hash(&mut hasher);
+        let base_seed = hasher.finish();
 
         let mut best_arm = 0;
         let mut best_sample = f64::NEG_INFINITY;
@@ -1027,10 +1095,18 @@ impl ThompsonSamplingBandit {
             let sample = if pulls == 0 {
                 f64::INFINITY // Unexplored arms get priority
             } else {
+                // ✅ KRİTİK DÜZELTME: seed + i pattern'i zayıf randomness
+                // Çözüm: Her arm için ayrı hash hesapla (daha iyi randomness)
+                let mut arm_hasher = DefaultHasher::new();
+                base_seed.hash(&mut arm_hasher);
+                i.hash(&mut arm_hasher);
+                let arm_seed = arm_hasher.finish();
+                
                 // Basit approximation: mean + noise
                 let mean = alpha / (alpha + beta);
                 let variance = (alpha * beta) / ((alpha + beta).powi(2) * (alpha + beta + 1.0));
-                let noise = ((seed + i as u64) % 1000) as f64 / 1000.0 - 0.5; // [-0.5, 0.5]
+                // Pseudo-random noise: [0, 1) aralığından [-0.5, 0.5)'e normalize et
+                let noise = ((arm_seed % 1000000) as f64 / 1000000.0) - 0.5; // [-0.5, 0.5)
                 mean + noise * variance.sqrt()
             };
 
@@ -1292,6 +1368,9 @@ impl Strategy for QMelStrategy {
         let should_trade_short = ev_short > adaptive_threshold;
 
         // YAPAY ZEKA ENTEGRASYONU: Feature importance'a göre trade kararlarını optimize et
+        // ✅ KRİTİK GÜVENLİK: get_top_features() snapshot alır (immutable read)
+        // Bu sayede concurrent update'lerden etkilenmez (on_tick() ve learn_from_trade() aynı anda çağrılamaz
+        // çünkü SymbolState Arc<RwLock<>> içinde tutuluyor, ama yine de snapshot almak güvenli)
         let top_features = self.direction_model.get_top_features(3); // En önemli 3 feature
         let max_importance = top_features.first().map(|(_, score)| *score).unwrap_or(0.0);
 
@@ -1483,9 +1562,11 @@ impl Strategy for QMelStrategy {
 
             // YAPAY ZEKA ENTEGRASYONU: Feature importance'a göre learning rate ayarla
             // Önemli feature'lar daha hızlı öğrenmeli (daha yüksek learning rate)
-            // KRİTİK DÜZELTME: Division by zero ve race condition önleme
-            // get_top_features() hesaplama yaparken weight'ler değişebilir (race condition risk)
-            // top_features.len() sıfır olabilir (division by zero risk)
+            // ✅ KRİTİK GÜVENLİK: Race condition önleme - get_top_features() snapshot alır
+            // get_top_features() weight'lerin snapshot'ını alır (immutable read), bu yüzden
+            // direction_model.update() çağrısından ÖNCE çağrılmalı (weight'ler güncellenmeden önce)
+            // Bu sayede önceki weight'lere göre learning rate hesaplanır, sonra update yapılır
+            // top_features.len() sıfır olabilir (division by zero risk) - empty check yapılıyor
             let top_features = self.direction_model.get_top_features(3);
             let avg_importance = if !top_features.is_empty() {
                 top_features.iter().map(|(_, score)| score).sum::<f64>() / top_features.len() as f64

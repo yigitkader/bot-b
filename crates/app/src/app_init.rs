@@ -265,6 +265,7 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
         confidence_bonus_multiplier: Some(cfg.strategy_internal.confidence_bonus_multiplier),
         confidence_max_multiplier: Some(cfg.strategy_internal.confidence_max_multiplier),
         confidence_min_threshold: Some(cfg.strategy_internal.confidence_min_threshold),
+        volume_anomaly_confidence_threshold: Some(cfg.strategy_internal.volume_anomaly_confidence_threshold),
         default_confidence: Some(cfg.strategy_internal.default_confidence),
         min_confidence_value: Some(cfg.strategy_internal.min_confidence_value),
         trend_analysis_min_history: Some(cfg.strategy_internal.trend_analysis_min_history),
@@ -279,7 +280,9 @@ fn build_strategy_config(cfg: &AppCfg) -> Result<DynMmCfg> {
 }
 
 async fn initialize_venue(cfg: &AppCfg) -> Result<BinanceFutures> {
-    let client = reqwest::Client::builder().build()?;
+    // ✅ KRİTİK: Client'ı Arc ile wrap et - gereksiz clone overhead'ını önle
+    // reqwest::Client thread-safe ama clone edilmesi gereksiz overhead
+    let client = Arc::new(reqwest::Client::builder().build()?);
     let common = BinanceCommon {
         client,
         api_key: cfg.binance.api_key.clone(),

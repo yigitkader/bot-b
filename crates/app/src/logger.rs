@@ -128,8 +128,10 @@ pub enum LogEvent {
 
 /// ✅ KRİTİK: Async-safe logger - kanal (mpsc) + ayrı task kullanır
 /// std::sync::Mutex yerine tokio::sync::mpsc kullanarak bloklama riskini önler
+/// ✅ Memory leak önleme: Bounded channel kullanılır (max 1000 mesaj)
+/// Eğer logger yavaş çalışıyorsa (disk I/O yavaş), channel dolu olduğunda yeni mesajlar drop edilir
 pub struct JsonLogger {
-    event_tx: mpsc::UnboundedSender<LogEvent>,
+    event_tx: mpsc::Sender<LogEvent>,
 }
 
 impl JsonLogger {
@@ -146,8 +148,12 @@ impl JsonLogger {
         // Open file for writing (will be used by background task)
         let file_path = path.clone();
 
-        // Create channel for async event logging
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<LogEvent>();
+        // ✅ KRİTİK: Bounded channel kullan - memory leak önleme
+        // Eğer logger yavaş çalışıyorsa (disk I/O yavaş, dosya yazma yavaş),
+        // channel'da mesajlar birikir ve memory patlar. Bounded channel ile max 1000 mesaj.
+        // Channel dolu olduğunda yeni mesajlar drop edilir (try_send kullanılır)
+        const CHANNEL_BUFFER_SIZE: usize = 1000;
+        let (event_tx, mut event_rx) = mpsc::channel::<LogEvent>(CHANNEL_BUFFER_SIZE);
 
         // Spawn background task to write events to file
         let task_handle = tokio::spawn(async move {
@@ -196,10 +202,23 @@ impl JsonLogger {
     }
 
     /// Send event to channel (non-blocking, async-safe)
+    /// ✅ KRİTİK: try_send kullan - bounded channel olduğu için blocking olmamalı
+    /// Eğer channel doluysa, mesaj drop edilir (memory leak önleme)
     fn send_event(&self, event: LogEvent) {
-        // Unbounded channel - send never blocks
-        if let Err(e) = self.event_tx.send(event) {
-            eprintln!("Failed to send log event to channel: {}", e);
+        // Bounded channel - try_send kullan (blocking olmaz)
+        // Eğer channel doluysa, mesaj drop edilir (logger yavaş çalışıyorsa)
+        match self.event_tx.try_send(event) {
+            Ok(()) => {
+                // Mesaj başarıyla gönderildi
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel dolu - mesaj drop edildi (memory leak önleme)
+                // Log yazmaya gerek yok (spam önleme), sadece mesajı drop et
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Channel kapalı - logger task sonlandırılmış
+                eprintln!("Failed to send log event: channel closed (logger task terminated)");
+            }
         }
     }
 
@@ -546,6 +565,11 @@ pub async fn handle_reconnect_sync(
 }
 
 /// Handle order fill event with deduplication
+/// ✅ KRİTİK DÜZELTME: Event ID'den timestamp kaldırıldı
+/// Timestamp eklemek, aynı event'in farklı zamanlarda geldiğinde farklı ID'ler almasına neden olur
+/// Bu, WebSocket reconnect sonrası aynı event'in tekrar işlenmesine izin verir
+/// Çözüm: Sadece order_id + cumulative_filled_qty kombinasyonunu kullan
+/// Aynı order için aynı cumulative_filled_qty değeri iki kez gelirse, bu duplicate'dir
 pub fn handle_order_fill(
     state: &mut SymbolState,
     symbol: &str,
@@ -553,22 +577,19 @@ pub fn handle_order_fill(
     cumulative_filled_qty: Qty,
     _order_status: &str,
 ) -> bool {
-    // Event ID bazlı duplicate kontrolü
-    let event_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let event_id = format!(
-        "{}-{}-{}",
-        order_id, cumulative_filled_qty.0, event_timestamp
-    );
+    // ✅ KRİTİK DÜZELTME: Event ID'den timestamp kaldırıldı
+    // Timestamp eklemek, aynı event'in farklı zamanlarda geldiğinde farklı ID'ler almasına neden olur
+    // Bu, WebSocket reconnect sonrası aynı event'in tekrar işlenmesine izin verir
+    // Çözüm: Sadece order_id + cumulative_filled_qty kombinasyonunu kullan
+    // Aynı order için aynı cumulative_filled_qty değeri iki kez gelirse, bu duplicate'dir
+    let event_id = format!("{}-{}", order_id, cumulative_filled_qty.0);
 
     if state.processed_events.contains(&event_id) {
         warn!(
             %symbol,
             order_id = %order_id,
             cumulative_filled_qty = %cumulative_filled_qty.0,
-            "duplicate fill event ignored"
+            "duplicate fill event ignored (already processed)"
         );
         return false;
     }

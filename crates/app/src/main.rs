@@ -277,8 +277,10 @@ async fn main() -> Result<()> {
                         let has_active = !s.active_orders.is_empty() || !s.inv.0.is_zero();
                         let is_opportunity = opportunity_symbols.contains(&s.meta.symbol);
                         // Priority calculation: opportunity bonus (highest) + priority field + active bonus
-                        // Thread-safe read from AtomicU32
-                        let priority_value = s.priority.load(std::sync::atomic::Ordering::Relaxed);
+                        // ✅ KRİTİK DÜZELTME: Acquire ordering kullan
+                        // Relaxed ordering garantisiz - farklı CPU core'ları farklı değerler görebilir
+                        // Acquire: Load'dan sonraki tüm memory işlemleri store'dan sonra görünür
+                        let priority_value = s.priority.load(std::sync::atomic::Ordering::Acquire);
                         let opportunity_bonus = if is_opportunity { 10000 } else { 0 };
                         let priority_score = opportunity_bonus + priority_value + if has_active { 1000 } else { 0 };
                         (i, priority_score, has_active)

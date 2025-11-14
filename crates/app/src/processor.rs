@@ -33,6 +33,81 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Check quote balance with USDT fallback support
+/// 
+/// If the primary quote asset balance is insufficient and `allow_usdt_quote` is true,
+/// checks the alternative USD stablecoin balance as fallback.
+/// 
+/// **Note**: The fallback is only used to determine if trading is allowed. The actual
+/// balance returned is always the primary quote asset balance, as you cannot trade
+/// a USDC symbol with USDT balance or vice versa.
+/// 
+/// # Arguments
+/// * `quote_asset` - The symbol's quote asset (e.g., "USDC" or "USDT")
+/// * `quote_balances` - Map of all quote asset balances
+/// * `cfg` - Application configuration
+/// * `min_usd_per_order` - Minimum USD per order
+/// 
+/// # Returns
+/// Tuple of (primary_balance, has_sufficient_balance)
+/// - primary_balance: The primary quote asset balance (always returned, even if fallback is used)
+/// - has_sufficient_balance: Whether the balance meets requirements (primary OR fallback if enabled)
+fn check_quote_balance_with_fallback(
+    quote_asset: &str,
+    quote_balances: &HashMap<String, f64>,
+    cfg: &AppCfg,
+    min_usd_per_order: f64,
+) -> (f64, bool) {
+    let primary_balance = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
+    
+    // Check if primary balance is sufficient
+    let primary_sufficient = primary_balance >= cfg.min_quote_balance_usd 
+        && primary_balance >= min_usd_per_order;
+    
+    if primary_sufficient {
+        return (primary_balance, true);
+    }
+    
+    // Primary balance insufficient - check fallback if enabled
+    // ✅ USDT Fallback: allow_usdt_quote=true ise, alternatif USD stablecoin bakiyesini kontrol et
+    // Bu, USDC bakiyesi yetersiz olsa bile USDT sembollerinin trade edilebilmesini sağlar
+    if cfg.allow_usdt_quote {
+        let fallback_asset = if quote_asset.eq_ignore_ascii_case("USDC") {
+            "USDT"
+        } else if quote_asset.eq_ignore_ascii_case("USDT") {
+            "USDC"
+        } else {
+            // Not a USD stablecoin, no fallback
+            return (primary_balance, false);
+        };
+        
+        let fallback_balance = quote_balances.get(fallback_asset).copied().unwrap_or(0.0);
+        let fallback_sufficient = fallback_balance >= cfg.min_quote_balance_usd 
+            && fallback_balance >= min_usd_per_order;
+        
+        if fallback_sufficient {
+            // Fallback balance is sufficient - allow trading
+            // Note: We still return primary_balance for actual trading calculations,
+            // but return true to indicate trading is allowed
+            debug!(
+                primary_quote = %quote_asset,
+                primary_balance = primary_balance,
+                fallback_quote = %fallback_asset,
+                fallback_balance = fallback_balance,
+                "fallback quote asset balance sufficient - allowing trade"
+            );
+            return (primary_balance, true);
+        }
+    }
+    
+    // No sufficient balance found
+    (primary_balance, false)
+}
+
+// ============================================================================
 // Continuous Analysis Background Task
 // ============================================================================
 
@@ -45,7 +120,7 @@ pub async fn continuous_analysis_task(
     _cfg: Arc<AppCfg>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    use tokio::time::{interval, Duration};
+    use tokio::time::{interval, timeout, Duration};
     use crate::qmel::QMelStrategy;
     use crate::strategy::Context;
     use crate::types::OrderBook;
@@ -65,39 +140,42 @@ pub async fn continuous_analysis_task(
         analysis_interval.tick().await;
         iteration += 1;
         
-        // Her sembol için trend analizi ve EV hesaplama
-        // Bu döngü tüm sembolleri analiz eder ve bir sonraki işlem için hazırlar
-        // Her iterasyonda read lock al, işle, write lock al, güncelle, bırak
+        // ✅ KRİTİK OPTİMİZASYON: Race condition'ı önlemek için batch processing
+        // Tüm sembolleri önce oku, sonra API çağrılarını yap, en son tek bir write lock ile güncelle
+        // Bu sayede write lock daha kısa süre tutulur ve read lock'lar bloklanmaz
         let states_len = {
             let states_read = states.read().await;
             states_read.len()
         };
         
-        for idx in 0..states_len {
-            // Shutdown kontrolü (uzun sembol listesi için)
-            if shutdown_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            
-            // Read state info (immutable) - kısa süreli lock
-            let (symbol, inv, tick_size_opt) = {
-                let states_read = states.read().await;
+        // Step 1: Tüm sembolleri oku (read lock kısa süreli)
+        let mut symbol_data: Vec<(usize, String, Qty, Option<Decimal>)> = Vec::new();
+        {
+            let states_read = states.read().await;
+            for idx in 0..states_len {
                 if let Some(state) = states_read.get(idx) {
                     // Skip disabled symbols
                     if state.disabled || state.rules_fetch_failed || state.symbol_rules.is_none() {
                         continue;
                     }
-                    (
+                    symbol_data.push((
+                        idx,
                         state.meta.symbol.clone(),
                         state.inv,
                         state.symbol_rules.as_ref().map(|r| r.tick_size),
-                    )
-                } else {
-                    continue;
+                    ));
                 }
-            };
+            }
+        } // Read lock burada bırakılıyor
+        
+        // Step 2: API çağrılarını yap (write lock olmadan)
+        let mut updates: Vec<(usize, String, Context, Option<(f64, f64, Option<Side>, u32)>)> = Vec::new();
+        for (idx, symbol, inv, tick_size_opt) in symbol_data {
+            // Shutdown kontrolü
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
             
-            // Fetch best prices for trend analysis (non-blocking, with rate limiting)
             let venue_clone = venue.clone();
             let symbol_clone = symbol.clone();
             
@@ -140,63 +218,96 @@ pub async fn continuous_analysis_task(
                         tick_size: tick_size_opt,
                     };
                     
-                    // Update strategy state (write lock needed)
-                    let mut states_write = states.write().await;
-                    
-                    if let Some(state_mut) = states_write.get_mut(idx) {
-                        // Call on_tick to update strategy state and get EV scores
-                        let _quotes = state_mut.strategy.on_tick(&ctx);
-                        
-                        // Update EV scores from QMelStrategy
-                        if let Some(qmel) = state_mut.strategy.as_any().downcast_ref::<QMelStrategy>() {
-                            let (ev_long, ev_short) = qmel.last_scores();
-                            state_mut.last_ev_long = ev_long;
-                            state_mut.last_ev_short = ev_short;
-                            state_mut.last_best_side = qmel.last_best_side().map(|(side, _)| side);
-                            state_mut.last_score_time = Some(Instant::now());
-                            
-                            // Update priority based on trend and EV
-                            let trend_bps = state_mut.strategy.get_trend_bps();
-                            let ev_score = ev_long.max(ev_short);
-                            
-                            // Priority calculation: trend strength + EV score
-                            // Bu puanlama sistemi en kazançlı işlemleri önceliklendirir
-                            let new_priority = if trend_bps.abs() > 50.0 && ev_score > 0.1 {
-                                // Güçlü trend + yüksek EV = yüksek priority (en kazançlı kombinasyon)
-                                ((trend_bps.abs() / 10.0) + (ev_score * 100.0)) as u32
-                            } else if ev_score > 0.15 {
-                                // Yüksek EV (trend yoksa bile) = orta priority (kazanç potansiyeli yüksek)
-                                (ev_score * 50.0) as u32
-                            } else if trend_bps.abs() > 50.0 {
-                                // Güçlü trend (düşük EV) = düşük priority (trend var ama kazanç belirsiz)
-                                (trend_bps.abs() / 20.0) as u32
-                            } else {
-                                0 // Düşük trend + düşük EV = en düşük priority
-                            };
-                            
-                            let old_priority = state_mut.priority.load(Ordering::Relaxed);
-                            state_mut.priority.store(new_priority, Ordering::Relaxed);
-                            
-                            // Log significant changes (every 20 iterations to reduce noise)
-                            if iteration % 20 == 0 && (old_priority != new_priority || ev_score > 0.1) {
-                                debug!(
-                                    symbol = %symbol,
-                                    trend_bps = format!("{:.2}", trend_bps),
-                                    ev_long = format!("{:.3}", ev_long),
-                                    ev_short = format!("{:.3}", ev_short),
-                                    priority = new_priority,
-                                    "continuous analysis: updated scores and priority (ready for next trade)"
-                                );
-                            }
-                        }
-                    }
-                    
-                    drop(states_write); // Release write lock
+                    updates.push((idx, symbol, ctx, None));
                 }
                 Err(e) => {
                     // Rate limit veya network hatası - skip, bir sonraki iterasyonda tekrar dener
                     if iteration % 100 == 0 {
-                        debug!(%symbol, error = %e, "continuous analysis: failed to fetch prices (will retry)");
+                        debug!(symbol = %symbol, error = %e, "continuous analysis: failed to fetch prices (will retry)");
+                    }
+                }
+            }
+        }
+        
+        // Step 3: Tek bir write lock ile tüm güncellemeleri yap
+        // ✅ KRİTİK DÜZELTME: Non-blocking write lock (timeout ile)
+        // Main loop read lock tutuyorsa, analysis task bloklanmaz ve skip eder
+        // Bu, main loop'un 1.5 saniye bloklanmasını önler
+        if !updates.is_empty() {
+            // Timeout: 50ms içinde write lock alınamazsa skip et
+            // Main loop'un 100ms tick interval'ı var, bu yüzden 50ms yeterli
+            // Eğer main loop uzun süreli read lock tutuyorsa, analysis task skip eder
+            const WRITE_LOCK_TIMEOUT_MS: u64 = 50;
+            match tokio::time::timeout(
+                Duration::from_millis(WRITE_LOCK_TIMEOUT_MS),
+                states.write()
+            ).await {
+                Ok(mut states_write) => {
+                    for (idx, symbol, ctx, _) in updates {
+                        if let Some(state_mut) = states_write.get_mut(idx) {
+                            // Call on_tick to update strategy state and get EV scores
+                            let _quotes = state_mut.strategy.on_tick(&ctx);
+                            
+                            // Update EV scores from QMelStrategy
+                            if let Some(qmel) = state_mut.strategy.as_any().downcast_ref::<QMelStrategy>() {
+                                let (ev_long, ev_short) = qmel.last_scores();
+                                state_mut.last_ev_long = ev_long;
+                                state_mut.last_ev_short = ev_short;
+                                state_mut.last_best_side = qmel.last_best_side().map(|(side, _)| side);
+                                state_mut.last_score_time = Some(Instant::now());
+                                
+                                // Update priority based on trend and EV
+                                let trend_bps = state_mut.strategy.get_trend_bps();
+                                let ev_score = ev_long.max(ev_short);
+                                
+                                // Priority calculation: trend strength + EV score
+                                // Bu puanlama sistemi en kazançlı işlemleri önceliklendirir
+                                let new_priority = if trend_bps.abs() > 50.0 && ev_score > 0.1 {
+                                    // Güçlü trend + yüksek EV = yüksek priority (en kazançlı kombinasyon)
+                                    ((trend_bps.abs() / 10.0) + (ev_score * 100.0)) as u32
+                                } else if ev_score > 0.15 {
+                                    // Yüksek EV (trend yoksa bile) = orta priority (kazanç potansiyeli yüksek)
+                                    (ev_score * 50.0) as u32
+                                } else if trend_bps.abs() > 50.0 {
+                                    // Güçlü trend (düşük EV) = düşük priority (trend var ama kazanç belirsiz)
+                                    (trend_bps.abs() / 20.0) as u32
+                                } else {
+                                    0 // Düşük trend + düşük EV = en düşük priority
+                                };
+                                
+                                // ✅ KRİTİK DÜZELTME: Release/Acquire ordering kullan
+                                // Relaxed ordering garantisiz - farklı CPU core'ları farklı değerler görebilir
+                                // Release: Store'dan önceki tüm memory işlemleri görünür olur
+                                // Acquire: Load'dan sonraki tüm memory işlemleri store'dan sonra görünür
+                                let old_priority = state_mut.priority.load(Ordering::Acquire);
+                                state_mut.priority.store(new_priority, Ordering::Release);
+                                
+                                // Log significant changes (every 20 iterations to reduce noise)
+                                if iteration % 20 == 0 && (old_priority != new_priority || ev_score > 0.1) {
+                                    debug!(
+                                        symbol = %symbol,
+                                        trend_bps = format!("{:.2}", trend_bps),
+                                        ev_long = format!("{:.3}", ev_long),
+                                        ev_short = format!("{:.3}", ev_short),
+                                        priority = new_priority,
+                                        "continuous analysis: updated scores and priority (ready for next trade)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    
+                    drop(states_write); // Write lock burada bırakılıyor
+                }
+                Err(_) => {
+                    // Write lock timeout - main loop read lock tutuyor
+                    // Skip et, bir sonraki iterasyonda tekrar dene
+                    // Bu, main loop'un bloklanmasını önler
+                    if iteration % 20 == 0 {
+                        debug!(
+                            skipped_updates = updates.len(),
+                            "continuous analysis: write lock timeout (main loop busy), skipping update (will retry next iteration)"
+                        );
                     }
                 }
             }
@@ -285,22 +396,29 @@ pub fn select_best_opportunities(
         // ✅ KRİTİK: Quote asset bazlı bakiye kontrolü
         // Her sembol kendi quote asset'ini kullanır (BTCUSDC → USDC, BTCUSDT → USDT)
         // USDC'de para varsa USDC sembolleri, USDT'de para varsa USDT sembolleri değerlendirilir
+        // ✅ USDT Fallback: allow_usdt_quote=true ise, bir quote asset'in bakiyesi yetersizse
+        // alternatif USD stablecoin bakiyesini kontrol et (USDC ↔ USDT)
         let quote_asset = &state.meta.quote_asset;
-        let quote_balance = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
         let has_exposure = !state.inv.0.is_zero() || !state.active_orders.is_empty();
         
         // Bakiye kontrolü: Eğer açık emir/pozisyon yoksa, yeterli bakiye olmalı
         if !has_exposure {
-            let has_sufficient_balance = quote_balance >= cfg.min_quote_balance_usd 
-                && quote_balance >= min_usd_per_order;
+            let (_effective_balance, has_sufficient_balance) = check_quote_balance_with_fallback(
+                quote_asset,
+                quote_balances,
+                cfg,
+                min_usd_per_order,
+            );
             
             if !has_sufficient_balance {
                 // Bakiye yetersiz - bu sembolü skip et (diğer quote asset'li semboller devam edebilir)
+                let primary_balance = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
                 debug!(
                     symbol = %state.meta.symbol,
                     quote_asset = %quote_asset,
-                    balance = quote_balance,
+                    balance = primary_balance,
                     min_required = cfg.min_quote_balance_usd.max(min_usd_per_order),
+                    allow_usdt_fallback = cfg.allow_usdt_quote,
                     "skipping opportunity: insufficient quote asset balance"
                 );
                 continue;
@@ -568,40 +686,68 @@ pub async fn process_symbol(
 
     // Fetch market data
     let has_open_orders = !state.active_orders.is_empty();
-    let q_free = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
-    let has_balance = q_free >= cfg.min_quote_balance_usd && q_free >= min_usd_per_order;
+    // ✅ USDT Fallback: allow_usdt_quote=true ise fallback kontrolü yap
+    let (q_free, has_balance) = check_quote_balance_with_fallback(
+        quote_asset,
+        quote_balances,
+        cfg,
+        min_usd_per_order,
+    );
     let (pos, mark_px, funding_rate, next_funding_time) =
         fetch_market_data(venue, symbol, bid, ask, has_balance, has_open_orders).await?;
 
     // Force close if position exceeded max duration
     let has_position = !pos.qty.0.is_zero();
     if has_position {
-        // ✅ KRİTİK: Entry time kontrolü - eğer yoksa update_position_tracking fallback set edecek
-        // Ama burada da kontrol edelim (update_position_tracking henüz çağrılmadı)
+        // ✅ KRİTİK: Entry time kontrolü ve fallback mekanizması
+        // Eğer WebSocket'ten fill event gelmezse ve sadece REST sync ile position tespit edilirse,
+        // position_entry_time None olabilir ve max duration kontrolü çalışmayabilir
+        // Bu yüzden burada hemen set ediyoruz (update_position_tracking'den önce)
+        if state.position_entry_time.is_none() {
+            // ✅ KRİTİK FALLBACK: Entry time yoksa ve pozisyon varsa, şimdi set et
+            // WebSocket event kaçırılmış olabilir, bu durumda API'den gelen pozisyon bilgisine göre
+            // Maksimum süre kontrolü için entry_time gerekli, bu yüzden fallback ekliyoruz
+            // Not: Bu yaklaşık bir zaman olacak ama max duration kontrolü için yeterli
+            state.position_entry_time = Some(Instant::now());
+            warn!(
+                %symbol,
+                position_qty = %pos.qty.0,
+                "position_entry_time was None but position exists, setting fallback entry_time (WebSocket event may have been missed) - max duration check will now work"
+            );
+        }
+        
+        // ✅ KRİTİK: Max duration kontrolü - entry_time artık garanti var
         if let Some(entry_time) = state.position_entry_time {
             let age_secs = entry_time.elapsed().as_secs() as f64;
             if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
                 warn!(%symbol, position_qty = %pos.qty.0, age_secs, "FORCE CLOSE: Position exceeded max duration");
-                if !state.position_closing.load(Ordering::Acquire) {
+                // ✅ KRİTİK: Race condition önleme - Atomic compare-and-swap kullan
+                // Eğer position_closing zaten true ise, başka bir thread kapatma işlemini başlatmış demektir
+                if state.position_closing.compare_exchange(
+                    false,
+                    true,
+                    Ordering::AcqRel,
+                    Ordering::Acquire
+                ).is_ok() {
                     // ✅ KRİTİK: Force close hızlı kapanış gerektirir - MARKET + reduceOnly kullan
                     let _ = position_manager::close_position(venue, symbol, state, true).await;
+                    state.position_closing.store(false, Ordering::Release);
+                } else {
+                    info!(%symbol, "force close already in progress (position_closing flag set), skipping duplicate close");
                 }
                 return Ok(false);
             }
-        } else {
-            // Entry time yok ama pozisyon var - update_position_tracking fallback set edecek
-            // Bu durumda max duration kontrolü yapamayız, update_position_tracking'den sonra tekrar kontrol edilecek
-            debug!(
-                %symbol,
-                position_qty = %pos.qty.0,
-                "position exists but entry_time is None, will be set by update_position_tracking fallback"
-            );
         }
     }
 
     // Calculate position metrics once (used multiple times)
     // ✅ KRİTİK: position_size_notional ve current_pnl USD notional bazlı (quote asset'ten bağımsız)
     // Hem USDC hem USDT için aynı USD değeri kullanılır (1 USDC ≈ 1 USDT ≈ 1 USD)
+    // Mixed position'larda (hem BTCUSDC hem BTCUSDT açıksa):
+    // - Her sembol kendi quote asset'ini kullanır (BTCUSDC → USDC, BTCUSDT → USDT)
+    // - Her sembol kendi PnL'ini takip eder (USD notional bazlı)
+    // - Toplam PnL hesaplaması yapılmaz - her sembol bağımsız olarak yönetilir
+    // - quote_balances HashMap'inden doğru quote asset'in bakiyesi alınır
     let position_size_notional = (mark_px.0 * pos.qty.0.abs()).to_f64().unwrap_or(0.0);
     let current_pnl = (mark_px.0 - pos.entry.0) * pos.qty.0;
     let pnl_f64 = current_pnl.to_f64().unwrap_or(0.0);
@@ -711,20 +857,32 @@ pub async fn process_symbol(
         .map(|last| Instant::now().duration_since(last).as_millis() >= close_cooldown_ms)
         .unwrap_or(true);
 
-    if should_close && !state.position_closing.load(Ordering::Acquire) && can_attempt_close {
-        // ✅ KRİTİK: Take profit veya stop loss hızlı kapanış gerektirir - MARKET + reduceOnly kullan
-        let is_take_profit = reason.contains("take_profit");
-        info!(
-            %symbol,
-            net_pnl = pnl_f64,
-            min_profit = min_profit_usd,
-            reason = %reason,
-            quote_asset = %quote_asset,
-            "CLOSING POSITION: {} (net_pnl: {:.4} {} >= min_profit: {} {}) - {}",
-            if is_take_profit { "TAKE PROFIT TRIGGERED" } else { "STOP LOSS TRIGGERED" },
-            pnl_f64, quote_asset, min_profit_usd, quote_asset, reason
-        );
-        match position_manager::close_position(venue, symbol, state, true).await {
+    // ✅ KRİTİK: Race condition önleme - Atomic compare-and-swap kullan
+    // can_attempt_close kontrolü ve position_closing flag set arasında race condition var
+    // İki thread aynı anda bu kontrolü geçebilir, bu yüzden atomic compare-and-swap kullanıyoruz
+    if should_close && can_attempt_close {
+        // Atomic compare-and-swap: false → true yapmaya çalış
+        // Eğer başarılı olursa, bu thread kapatma işlemini başlatır
+        // Eğer başarısız olursa (zaten true), başka bir thread zaten başlatmış demektir
+        if state.position_closing.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire
+        ).is_ok() {
+            // ✅ KRİTİK: Take profit veya stop loss hızlı kapanış gerektirir - MARKET + reduceOnly kullan
+            let is_take_profit = reason.contains("take_profit");
+            info!(
+                %symbol,
+                net_pnl = pnl_f64,
+                min_profit = min_profit_usd,
+                reason = %reason,
+                quote_asset = %quote_asset,
+                "CLOSING POSITION: {} (net_pnl: {:.4} {} >= min_profit: {} {}) - {}",
+                if is_take_profit { "TAKE PROFIT TRIGGERED" } else { "STOP LOSS TRIGGERED" },
+                pnl_f64, quote_asset, min_profit_usd, quote_asset, reason
+            );
+            match position_manager::close_position(venue, symbol, state, true).await {
             Ok(_) => {
                 let side_str = if pos.qty.0.is_sign_positive() {
                     "long"
@@ -812,10 +970,14 @@ pub async fn process_symbol(
                         reason = %reason,
                         "FAILED TO CLOSE POSITION: stop loss triggered but close failed"
                     );
-                    // Retry after cooldown
-                    state.last_close_attempt = Some(Instant::now());
                 }
             }
+            // ✅ KRİTİK: Kapatma işlemi bitti (başarılı veya başarısız), flag'i sıfırla ve cooldown set et
+            state.position_closing.store(false, Ordering::Release);
+            state.last_close_attempt = Some(Instant::now());
+        } else {
+            // Başka bir thread zaten kapatma işlemini başlatmış
+            info!(%symbol, "position close already in progress (position_closing flag set), skipping duplicate close");
         }
         return Ok(false);
     } else if should_close {
@@ -845,6 +1007,8 @@ pub async fn process_symbol(
 
     // PnL summary log
     // ✅ KRİTİK: PnL hesaplamaları USD notional bazlı (quote asset'ten bağımsız)
+    // Her sembol kendi quote asset'ini kullanır (BTCUSDC → USDC, BTCUSDT → USDT)
+    // Mixed position'larda her sembol bağımsız olarak yönetilir - toplam PnL hesaplaması yapılmaz
     // Her sembol için ayrı state var, BTCUSDC ve BTCUSDT ayrı ayrı track edilir
     if state
         .last_pnl_summary_time
@@ -985,13 +1149,28 @@ pub async fn process_symbol(
         warn!(%symbol, fill_rate = state.order_fill_rate, active_orders = state.active_orders.len(), "low fill rate detected");
     }
 
+    // ✅ KRİTİK GÜVENLİK: Risk halt kontrolü - duplicate önleme
+    // RiskAction::Halt (drawdown, liquidation gap, leverage) ve PositionRiskLevel::Hard (position size)
+    // farklı risk kontrolleri, ama ikisi de cancel + close yapıyor
+    // Bu yüzden position_closing flag kontrolü yaparak duplicate önleniyor
     if matches!(risk_action, crate::risk::RiskAction::Halt) {
-        warn!(%symbol, "risk halt triggered, cancelling and flattening");
-        rate_limit_guard(2).await;
-        let _ = Venue::cancel_all(venue, symbol).await;
-        // ✅ KRİTİK: Risk halt hızlı kapanış gerektirir - MARKET + reduceOnly kullan (LIMIT fallback yok)
-        // position_manager::close_position ile use_fast_close=true kullan
-        let _ = position_manager::close_position(venue, symbol, state, true).await;
+        // ✅ KRİTİK: Thread-safe: Atomik swap - eğer zaten true ise skip eder (duplicate önleme)
+        // handle_risk_level() içinde PositionRiskLevel::Hard durumunda da cancel + close yapılıyor
+        // Bu yüzden position_closing flag kontrolü yaparak duplicate cancel + close önleniyor
+        if !state.position_closing.swap(true, Ordering::AcqRel) {
+            state.last_close_attempt = Some(Instant::now());
+            
+            warn!(%symbol, "risk halt triggered, cancelling and flattening");
+            rate_limit_guard(2).await;
+            let _ = venue.cancel_all(symbol).await;
+            // ✅ KRİTİK: Risk halt hızlı kapanış gerektirir - MARKET + reduceOnly kullan (LIMIT fallback yok)
+            // position_manager::close_position ile use_fast_close=true kullan
+            let _ = position_manager::close_position(venue, symbol, state, true).await;
+            
+            state.position_closing.store(false, Ordering::Release);
+        } else {
+            info!(%symbol, "risk halt already in progress (position_closing flag set), skipping duplicate cancel + close");
+        }
         return Ok(false);
     }
 
@@ -1206,7 +1385,9 @@ pub async fn process_symbol(
     // Background task: Priority'yi trend'e göre güncelle (order placement'ı bloklamaz)
     tokio::spawn(async move {
         // Trend'e göre priority hesapla (güçlü trend = yüksek priority)
-        let old_priority = priority_clone.load(std::sync::atomic::Ordering::Relaxed);
+        // ✅ KRİTİK DÜZELTME: Release/Acquire ordering kullan
+        // Relaxed ordering garantisiz - farklı CPU core'ları farklı değerler görebilir
+        let old_priority = priority_clone.load(std::sync::atomic::Ordering::Acquire);
         let new_priority = if trend_bps.abs() > 50.0 {
             // Güçlü trend varsa priority'yi artır
             (trend_bps.abs() / 10.0) as u32
@@ -1215,7 +1396,8 @@ pub async fn process_symbol(
         };
 
         // Priority'yi thread-safe şekilde güncelle (order placement'ı bloklamaz)
-        priority_clone.store(new_priority, std::sync::atomic::Ordering::Relaxed);
+        // Release: Store'dan önceki tüm memory işlemleri görünür olur
+        priority_clone.store(new_priority, std::sync::atomic::Ordering::Release);
 
         // ✅ KRİTİK: Priority güncellemesi logla (sadece değiştiğinde)
         if old_priority != new_priority {
@@ -1320,9 +1502,13 @@ pub async fn process_symbol(
 
     // ✅ KRİTİK: Early exit - bakiyesi olmayan quote için emir üretme (churn önleme)
     // USDC/USDT karışık keşifte hesap bakiyesini doğru quote'a göre filtrele
-    let quote_balance = quote_balances.get(quote_asset).copied().unwrap_or(0.0);
-    let has_sufficient_balance =
-        quote_balance >= cfg.min_quote_balance_usd && quote_balance >= min_usd_per_order;
+    // ✅ USDT Fallback: allow_usdt_quote=true ise fallback kontrolü yap
+    let (quote_balance, has_sufficient_balance) = check_quote_balance_with_fallback(
+        quote_asset,
+        quote_balances,
+        cfg,
+        min_usd_per_order,
+    );
 
     if !state.active_orders.is_empty() || has_position {
         // Açık emir veya pozisyon varsa devam et (bakiye kontrolü yapma - zaten işlem var)
@@ -1333,6 +1519,7 @@ pub async fn process_symbol(
             quote_asset = %quote_asset,
             balance = quote_balance,
             min_required = cfg.min_quote_balance_usd.max(min_usd_per_order),
+            allow_usdt_fallback = cfg.allow_usdt_quote,
             "skipping order placement: insufficient balance and no active orders/position"
         );
         quotes.bid = None;
@@ -1387,6 +1574,16 @@ pub async fn process_symbol(
     use crate::utils::with_order_lock;
 
     with_order_lock(async {
+        // ✅ KRİTİK: Position closing sırasında yeni order placement'ı blokla
+        // Position close işlemi devam ederken yeni emir yerleştirmek race condition'a yol açabilir
+        if state.position_closing.load(Ordering::Acquire) {
+            debug!(
+                %symbol,
+                "skipping order placement: position closing in progress (preventing race condition)"
+            );
+            return Ok(true);
+        }
+
         // ✅ KRİTİK: Aynı tick'te yalnız bir taraf siparişi
         // Eğer zaten açık emir veya pozisyon varsa, yeni emir yerleştirme
         // Bu kontrol gereksiz test_order ve place_limit çağrılarını önler
@@ -1402,8 +1599,42 @@ pub async fn process_symbol(
 
         // ✅ KRİTİK: Tek taraf seçimi - trend bazlı
         // Trend pozitifse Buy, negatifse Sell tercih et
+        // ✅ KRİTİK OPTİMİZASYON: Trend freshness kontrolü - eski trend kullanmayı önle
+        // on_tick() zaten line 1104'te çağrıldı, bu yüzden trend güncel olmalı
+        // Ancak continuous analysis task'ten gelen trend 1.5 saniye eski olabilir
+        // Bu yüzden trend'i on_tick() çağrısından SONRA alıyoruz (zaten alındı)
         let trend_bps = state.strategy.get_trend_bps();
-        let prefer_side = if trend_bps > 0.0 {
+        
+        // ✅ KRİTİK: Trend freshness kontrolü - eğer trend çok eskiyse (2 saniyeden fazla) spread'e göre karar ver
+        let trend_is_stale = if let Some(score_time) = state.last_score_time {
+            score_time.elapsed().as_secs_f64() > 2.0 // 2 saniyeden eski trend'i kullanma
+        } else {
+            true // Trend hiç hesaplanmamış
+        };
+        
+        // Eğer trend eskiyse, spread'e göre karar ver (trend'e güvenme)
+        let prefer_side = if trend_is_stale {
+            // Trend eski, spread'e göre karar ver
+            let spread_bps = if bid.0 > Decimal::ZERO && ask.0 > Decimal::ZERO {
+                ((ask.0 - bid.0) / bid.0 * Decimal::from(10000))
+                    .to_f64()
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            if spread_bps > 50.0 {
+                // Spread çok büyük, emir yerleştirme
+                debug!(
+                    %symbol,
+                    spread_bps = format!("{:.2}", spread_bps),
+                    trend_age_sec = state.last_score_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(f64::INFINITY),
+                    "trend analysis: spread too wide or trend stale, skipping order placement"
+                );
+                return Ok(true);
+            } else {
+                Side::Buy // Default: Buy tercih et (trend bilgisi yok)
+            }
+        } else if trend_bps > 0.0 {
             Side::Buy // Uptrend → Buy tercih et
         } else if trend_bps < 0.0 {
             Side::Sell // Downtrend → Sell tercih et
@@ -1430,14 +1661,66 @@ pub async fn process_symbol(
             }
         };
 
+        // ✅ KRİTİK: max_open_chunks_per_symbol_per_side kontrolü
+        // Seçilen side için total_open_chunks hesapla ve limit kontrolü yap
+        let open_orders_count = state
+            .active_orders
+            .values()
+            .filter(|o| o.side == prefer_side)
+            .count();
+
+        // Pozisyonun chunk sayısını hesapla (sadece seçilen side ile eşleşen pozisyonlar)
+        let min_margin: f64 = cfg.min_usd_per_order.unwrap_or(10.0).max(10.0).min(100.0);
+        let max_margin: f64 = cfg.max_usd_per_order;
+        let avg_chunk_size = (min_margin + max_margin) / 2.0; // Ortalama chunk boyutu (55 USD)
+
+        let position_chunks_count = {
+            let current_inv = state.inv.0;
+            let is_position_long = current_inv.is_sign_positive();
+            let is_position_short = current_inv.is_sign_negative();
+            let position_matches_side = (prefer_side == Side::Buy && is_position_long)
+                || (prefer_side == Side::Sell && is_position_short);
+
+            if position_matches_side && position_size_notional > 0.0 {
+                // Pozisyon bu yönde (long için Buy, short için Sell)
+                // Chunk sayısı = pozisyon notional / ortalama chunk boyutu
+                let chunks = (position_size_notional / avg_chunk_size).ceil() as usize;
+                chunks.max(1) // En az 1 chunk (pozisyon varsa)
+            } else {
+                0 // Pozisyon bu yönde değil veya pozisyon yok
+            }
+        };
+
+        // Toplam açık chunk sayısı = açık emirler + aktif pozisyon
+        let total_open_chunks = open_orders_count + position_chunks_count;
+        let max_chunks = cfg.risk.max_open_chunks_per_symbol_per_side;
+
+        // ✅ KRİTİK: max_open_chunks_per_symbol_per_side limit kontrolü
+        if total_open_chunks >= max_chunks {
+            debug!(
+                %symbol,
+                side = ?prefer_side,
+                total_open_chunks,
+                max_chunks,
+                open_orders = open_orders_count,
+                position_chunks = position_chunks_count,
+                "skipping order placement: max_open_chunks_per_symbol_per_side limit reached"
+            );
+            return Ok(true);
+        }
+
         // ✅ KRİTİK: Trend bazlı karar verme logla
+        let trend_age_sec = state.last_score_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(f64::INFINITY);
         info!(
             %symbol,
             trend_bps = format!("{:.2}", trend_bps),
+            trend_age_sec = format!("{:.2}", trend_age_sec),
             prefer_side = ?prefer_side,
             has_bid = quotes.bid.is_some(),
             has_ask = quotes.ask.is_some(),
-            "trend analysis: selected side based on trend"
+            total_open_chunks,
+            max_chunks,
+            "trend analysis: selected side based on trend (freshness checked)"
         );
 
         let mut total_spent_on_bids = 0.0f64;
@@ -1819,12 +2102,16 @@ async fn auto_discover_symbols(
         }
     }
 
+    // ✅ USDT Fallback: allow_usdt_quote=true ise fallback kontrolü yap
     auto.retain(|m| {
-        if let Some(&balance) = quote_asset_balances.get(&m.quote_asset) {
-            balance >= cfg.min_quote_balance_usd
-        } else {
-            false
-        }
+        let min_usd_per_order = cfg.min_usd_per_order.unwrap_or(0.0);
+        let (_effective_balance, has_sufficient_balance) = check_quote_balance_with_fallback(
+            &m.quote_asset,
+            &quote_asset_balances,
+            cfg,
+            min_usd_per_order,
+        );
+        has_sufficient_balance
     });
 
     auto.retain(|m| m.symbol.is_ascii());

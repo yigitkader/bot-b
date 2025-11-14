@@ -208,12 +208,17 @@ pub async fn handle_risk_level<V: Venue>(
                 max_allowed,
                 "HARD LIMIT: force closing position"
             );
-            // ✅ Thread-safe: Atomik swap - eğer zaten true ise skip eder
+            // ✅ KRİTİK GÜVENLİK: Thread-safe: Atomik swap - eğer zaten true ise skip eder (duplicate önleme)
+            // RiskAction::Halt (processor.rs Line 1012) ve PositionRiskLevel::Hard (burada) farklı risk kontrolleri,
+            // ama ikisi de cancel + close yapıyor. Bu yüzden position_closing flag kontrolü yaparak duplicate önleniyor
             if !state.position_closing.swap(true, Ordering::AcqRel) {
                 state.last_close_attempt = Some(Instant::now());
 
                 rate_limit_guard(2).await;
+                // ✅ KRİTİK: Önce tüm açık emirleri iptal et (pozisyon kapatmadan önce)
                 let _ = venue.cancel_all(symbol).await;
+                // ✅ KRİTİK: Hard limit hızlı kapanış gerektirir - MARKET + reduceOnly kullan
+                // venue.close_position() kullan (generic Venue trait, position_manager::close_position değil)
                 if venue.close_position(symbol).await.is_ok() {
                     info!(%symbol, "closed position due to hard limit");
                 } else {
@@ -221,7 +226,7 @@ pub async fn handle_risk_level<V: Venue>(
                 }
                 state.position_closing.store(false, Ordering::Release);
             } else {
-                info!(%symbol, "position close already in progress, skipping duplicate close");
+                info!(%symbol, "position close already in progress (position_closing flag set), skipping duplicate cancel + close");
             }
             false
         }
@@ -396,7 +401,8 @@ pub fn calculate_caps(
     }
 
     // Calculate existing position margin (accounting for unrealized PnL)
-    let existing_position_margin = if position_size_notional > 0.0 {
+    // ✅ KRİTİK GÜVENLİK: Division by zero önleme - effective_leverage 0.0 olamaz
+    let existing_position_margin = if position_size_notional > 0.0 && effective_leverage > 0.0 {
         let base_margin = position_size_notional / effective_leverage;
         let position_pnl = current_pnl.to_f64().unwrap_or(0.0);
         (base_margin - position_pnl).max(0.0)
@@ -413,6 +419,10 @@ pub fn calculate_caps(
     } else {
         effective_leverage
     };
+    
+    // ✅ KRİTİK GÜVENLİK: Division by zero önleme - effective_leverage_for_caps 0.0 olamaz
+    // Eğer opportunity_mode_leverage_reduction 0.0 ise veya effective_leverage 0.0 ise, minimum 1.0 kullan
+    let effective_leverage_for_caps = effective_leverage_for_caps.max(1.0);
 
     // ✅ KRİTİK: Long veya short işlem için maximum 100 USDT/USDC margin limiti
     // Ama hesapta daha az varsa (örn: 30 USD), o zaman mevcut bakiyeyi kullan (30 USD)

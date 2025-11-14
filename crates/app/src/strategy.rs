@@ -3,6 +3,7 @@ use crate::types::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use tracing::{info, warn};
 
 /// Manipülasyon fırsatı: Tespit edilen manipülasyonu avantaja çevirme stratejisi
@@ -171,6 +172,8 @@ pub struct DynMmCfg {
     #[serde(default)]
     pub confidence_min_threshold: Option<f64>,
     #[serde(default)]
+    pub volume_anomaly_confidence_threshold: Option<f64>, // VolumeAnomalyTrend için özel threshold
+    #[serde(default)]
     pub trend_analysis_min_history: Option<usize>,
     #[serde(default)]
     pub trend_analysis_threshold_negative: Option<f64>,
@@ -285,6 +288,7 @@ pub struct DynMm {
     confidence_bonus_multiplier: f64,
     confidence_max_multiplier: f64,
     confidence_min_threshold: f64,
+    volume_anomaly_confidence_threshold: f64, // VolumeAnomalyTrend için özel threshold (config'den, default: 0.55)
     default_confidence: f64,
     min_confidence_value: f64,
     #[allow(dead_code)]
@@ -294,7 +298,9 @@ pub struct DynMm {
     #[allow(dead_code)]
     trend_analysis_threshold_strong_negative: f64,
     // Akıllı karar verme için state
-    price_history: Vec<(u64, Decimal)>, // (timestamp_ms, price)
+    // ✅ KRİTİK: VecDeque kullan - O(1) pop_front() vs O(n) Vec::remove(0)
+    // Her tick'te remove(0) çağrılıyor, VecDeque ile performans optimize edildi
+    price_history: VecDeque<(u64, Decimal)>, // (timestamp_ms, price)
     target_inventory: Qty,              // Hedef envanter seviyesi
     // --- MİKRO-YAPI SİNYALLERİ: Gelişmiş algoritmalar ---
     ewma_volatility: f64,       // EWMA volatilite (σ²)
@@ -309,10 +315,16 @@ pub struct DynMm {
     flash_crash_detected: bool, // Flash crash tespit edildi mi?
     flash_crash_direction: f64, // Flash crash yönü: pozitif = pump, negatif = dump
     last_spread_bps: f64,       // Son spread (bps) - anomali tespiti için
-    volume_history: Vec<f64>,   // Volume geçmişi (anomali tespiti için)
+    // ✅ KRİTİK: VecDeque kullan - O(1) pop_front() vs O(n) Vec::remove(0)
+    // Her tick'te remove(0) çağrılıyor, VecDeque ile performans optimize edildi
+    volume_history: VecDeque<f64>,   // Volume geçmişi (anomali tespiti için)
     manipulation_opportunity: Option<ManipulationOpportunity>, // Manipülasyon fırsatı
     // --- GELİŞMİŞ MANİPÜLASYON TESPİTİ: Daha zeki algılama ---
     momentum_history: Vec<(u64, Decimal, f64)>, // (timestamp, price, volume) - momentum analizi için
+    // ✅ KRİTİK: Momentum history cleanup tracking - gereksiz retain() çağrılarını önle
+    // retain() her tick'te çağrılıyor ama genellikle hiçbir şey silmez (son 60 saniyedeki veriler)
+    // Sadece gerektiğinde temizle (len > threshold veya belirli zaman geçtiyse)
+    last_momentum_cleanup: Option<u64>, // Son momentum history temizleme zamanı (ms)
     last_liquidity_level: f64,                  // Son likidite seviyesi (spoofing için)
     // --- CROSSING GUARD + HİSTERESİS: Adverse selection / fırsat modu çakışması için ---
     last_adverse_bid: bool,      // Son adverse bid durumu (histerezis için)
@@ -376,6 +388,7 @@ impl From<DynMmCfg> for DynMm {
             confidence_bonus_multiplier: c.confidence_bonus_multiplier.unwrap_or(0.3),
             confidence_max_multiplier: c.confidence_max_multiplier.unwrap_or(1.5),
             confidence_min_threshold: c.confidence_min_threshold.unwrap_or(0.70), // 0.75 → 0.70: False positive azalt, gerçek fırsatları kaçırma
+            volume_anomaly_confidence_threshold: c.volume_anomaly_confidence_threshold.unwrap_or(0.55), // Config'den gelen değer (default: 0.55)
             default_confidence: c.default_confidence.unwrap_or(0.7),
             min_confidence_value: c.min_confidence_value.unwrap_or(0.5),
             trend_analysis_min_history: c.trend_analysis_min_history.unwrap_or(10),
@@ -383,7 +396,8 @@ impl From<DynMmCfg> for DynMm {
             trend_analysis_threshold_strong_negative: c
                 .trend_analysis_threshold_strong_negative
                 .unwrap_or(-0.20),
-            price_history: Vec::with_capacity(c.manipulation_price_history_max_len.unwrap_or(200)), // Config'den: Fiyat geçmişi kapasitesi
+            // ✅ KRİTİK: VecDeque kullan - O(1) pop_front() vs O(n) Vec::remove(0)
+            price_history: VecDeque::with_capacity(c.manipulation_price_history_max_len.unwrap_or(200)), // Config'den: Fiyat geçmişi kapasitesi
             target_inventory: Qty(Decimal::ZERO), // Başlangıçta nötr
             // Mikro-yapı sinyalleri başlangıç değerleri
             ewma_volatility: 0.001, // Başlangıç volatilite (10 bps) (0.0001 → 0.001: daha gerçekçi)
@@ -397,10 +411,12 @@ impl From<DynMmCfg> for DynMm {
             flash_crash_detected: false,
             flash_crash_direction: 0.0,
             last_spread_bps: 0.0,
-            volume_history: Vec::with_capacity(50), // Son 50 volume
+            // ✅ KRİTİK: VecDeque kullan - O(1) pop_front() vs O(n) Vec::remove(0)
+            volume_history: VecDeque::with_capacity(50), // Son 50 volume
             manipulation_opportunity: None,
             // Gelişmiş manipülasyon tespiti başlangıç değerleri
             momentum_history: Vec::with_capacity(30), // Son 30 momentum noktası
+            last_momentum_cleanup: None, // Başlangıçta temizleme yapılmamış
             last_liquidity_level: 0.0,
             // Crossing guard + histerezis başlangıç değerleri
             last_adverse_bid: false,
@@ -450,7 +466,10 @@ impl DynMm {
 
     /// EWMA Volatilite güncelleme: σ²_t = λ·σ²_{t-1} + (1-λ)·r²_t
     /// r_t = log return veya basit return
-    /// KRİTİK DÜZELTME: İlk tick'te bootstrap yapılmalı
+    /// KRİTİK DÜZELTME: İlk tick'te bootstrap yapılmamalı - volatility düşürülmemeli
+    /// İlk tick'te volatility'yi güncellemek yerine, sadece last_mid_price'ı set et
+    /// İkinci tick'te gerçek return hesaplanabilir ve volatility güncellenir
+    /// Bu sayede constructor'daki initial volatility (0.001) korunur ve spread çok daralmaz
     fn update_volatility(&mut self, current_mid: Decimal) {
         if let Some(last_mid) = self.last_mid_price {
             if !last_mid.is_zero() {
@@ -469,11 +488,13 @@ impl DynMm {
                     + (1.0 - self.ewma_volatility_alpha) * return_sq_f64;
             }
         } else {
-            // İlk tick: Bootstrap volatility - küçük bir değerle başlat
-            // İlk tick'te volatility güncellenmeli ki test geçsin
-            let initial_vol = 0.0001; // Minimal initial volatility
-            self.ewma_volatility = self.ewma_volatility_alpha * self.ewma_volatility
-                + (1.0 - self.ewma_volatility_alpha) * initial_vol;
+            // ✅ KRİTİK DÜZELTME: İlk tick'te volatility'yi güncelleme
+            // Constructor'da zaten ewma_volatility = 0.001 (10 bps) olarak başlatılmış
+            // İlk tick'te güncellemek volatility'yi düşürür (0.95 × 0.001 + 0.05 × 0.0001 = 0.000955)
+            // Bu çok düşük ve spread'i çok daraltır, cross riski artar
+            // İlk tick'te sadece last_mid_price'ı set et, volatility'yi olduğu gibi bırak
+            // İkinci tick'te gerçek return hesaplanabilir ve volatility güncellenir
+            // Bu sayede initial volatility (0.001) korunur ve spread makul kalır
         }
         self.last_mid_price = Some(current_mid);
     }
@@ -499,12 +520,23 @@ impl DynMm {
             if let Some(last_ts) = self.last_timestamp_ms {
                 let time_diff_ms = timestamp_ms.saturating_sub(last_ts);
                 if time_diff_ms > 0 {
-                    // Exponential decay: ofi_signal *= exp(-time_diff / window)
-                    // Window = decay time constant: time_diff = window → signal decays to ~37% (1/e)
-                    // time_diff << window → minimal decay
-                    // time_diff >> window → heavy decay
-                    let decay_factor = (-(time_diff_ms as f64) / self.ofi_window_ms as f64).exp();
-                    self.ofi_signal *= decay_factor;
+                    // ✅ KRİTİK DÜZELTME: Time diff çok büyükse direkt sıfırla (overflow/underflow önleme)
+                    // Eğer bot durur ve uzun süre sonra restart olursa, time_diff_ms çok büyük olabilir
+                    // Örnek: 1 saat = 3,600,000 ms → decay_factor = exp(-3600000/200) = exp(-18000) ≈ 0
+                    // Bu durumda ofi_signal *= 0 → Tamamen sıfırlanır, ama overflow riski var
+                    // Çözüm: Time diff çok büyükse (10 saniyeden fazla), direkt sıfırla
+                    const MAX_TIME_DIFF_MS: u64 = 10000; // 10 saniye
+                    if time_diff_ms > MAX_TIME_DIFF_MS {
+                        // Çok uzun zaman geçti, OFI signal'in anlamı kalmadı, direkt sıfırla
+                        self.ofi_signal = 0.0;
+                    } else {
+                        // Exponential decay: ofi_signal *= exp(-time_diff / window)
+                        // Window = decay time constant: time_diff = window → signal decays to ~37% (1/e)
+                        // time_diff << window → minimal decay
+                        // time_diff >> window → heavy decay
+                        let decay_factor = (-(time_diff_ms as f64) / self.ofi_window_ms as f64).exp();
+                        self.ofi_signal *= decay_factor;
+                    }
                 }
             }
 
@@ -524,10 +556,11 @@ impl DynMm {
         // Volatiliteyi bps'e çevir: sqrt(ewma_volatility) * 10000.0
         // Örnek: ewma_volatility = 0.0001 → sqrt(0.0001) = 0.01 → 0.01 * 10000 = 100 bps
         // Ama bu çok yüksek, bu yüzden daha küçük bir katsayı kullanıyoruz
-        // KRİTİK İYİLEŞTİRME: Minimum volatility floor - çok düşük volatilitede spread çok dar oluyor
-        // Minimum volatility = 0.0001 (1 bps) → sqrt(0.0001) * 10000 = 100 bps → c1 * 100 bps
-        // Bu, düşük volatilite durumunda bile makul bir spread sağlar
-        const MIN_VOLATILITY: f64 = 0.0001; // Minimum volatility floor (1 bps)
+        // ✅ KRİTİK DÜZELTME: Minimum volatility floor çok yüksekti (0.0001 = 100 bps)
+        // Bu, düşük volatilite dönemlerinde spread'i gereksiz yere genişletiyordu
+        // Yeni değer: 0.00001 (0.1 bps) → sqrt(0.00001) * 10000 = 31.6 bps (daha makul)
+        // min_spread_bps zaten 30 bps, bu yeterli koruma sağlar
+        const MIN_VOLATILITY: f64 = 0.00001; // Minimum volatility floor (0.1 bps) → ~32 bps spread component
         let effective_volatility = self.ewma_volatility.max(MIN_VOLATILITY);
         let vol_component = (effective_volatility.sqrt() * 10000.0).max(0.0); // bps'e çevir
         let c1 = self.volatility_coefficient; // Config'den: volatilite katsayısı
@@ -591,15 +624,15 @@ impl DynMm {
         let combined_bias = funding_bias + trend_bias;
 
         // Hedef envanter: bias'a göre inv_cap_usd'nin bir yüzdesi (USD notional)
-        // Tanh benzeri fonksiyon: -1 ile 1 arası sınırla
+        // Tanh fonksiyonu: -1 ile 1 arası sınırla
         let bias_f64 = combined_bias / 100.0;
         let target_ratio = if bias_f64 > 10.0 {
             1.0
         } else if bias_f64 < -10.0 {
             -1.0
         } else {
-            // Basit sigmoid: x / (1 + |x|)
-            bias_f64 / (1.0 + bias_f64.abs())
+            // Tanh: (e^x - e^-x) / (e^x + e^-x) - doğru saturasyon
+            bias_f64.tanh()
         };
         // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir (mark_price ile böl)
         let target_notional_usd = self.inv_cap_usd * target_ratio;
@@ -617,17 +650,24 @@ impl DynMm {
     // KRİTİK DÜZELTME: Envanter kontrolü etkili hale getirildi
     // Threshold içindeyse: Market making (her iki taraf)
     // Threshold dışındaysa: Tek taraflı işlem (hedefe doğru)
+    // ✅ KRİTİK DÜZELTME: mark_price = 0 durumunda güvenli handle et
+    // Eğer mark_price = 0 (network hatası, API hatası), tüm kontroller bypass edilir
+    // Bu durumda (false, false) döndür (hiçbir taraf aktif olmamalı)
     fn inventory_decision(&self, current_inv: Qty, target_inv: Qty, mark_price: Px) -> (bool, bool) {
+        // ✅ KRİTİK DÜZELTME: mark_price = 0 kontrolü - güvenlik için
+        // Eğer mark_price = 0 ise, threshold hesaplanamaz ve tüm kontroller bypass edilir
+        // Bu durumda (false, false) döndür (hiçbir taraf aktif olmamalı)
+        if mark_price.0 <= Decimal::ZERO {
+            return (false, false); // Güvenli fallback: mark_price geçersiz, hiçbir taraf aktif olmamalı
+        }
+
         let diff = (current_inv.0 - target_inv.0).abs();
         // ✅ KRİTİK: inv_cap_usd (USD notional) → base asset miktarına çevir (mark_price ile böl)
         let threshold_notional_usd = self.inv_cap_usd
             * Decimal::from_f64_retain(self.inventory_threshold_ratio).unwrap_or(Decimal::ZERO).to_f64().unwrap_or(0.0);
         let threshold_notional = Decimal::from_f64_retain(threshold_notional_usd).unwrap_or(Decimal::ZERO);
-        let threshold = if mark_price.0 > Decimal::ZERO {
-            threshold_notional / mark_price.0
-        } else {
-            Decimal::ZERO
-        };
+        // ✅ KRİTİK: mark_price > 0 kontrolü zaten yukarıda yapıldı, burada güvenli
+        let threshold = threshold_notional / mark_price.0;
 
         if diff < threshold {
             // Hedef envantere yakınsa: market making (her iki taraf)
@@ -648,24 +688,48 @@ impl Strategy for DynMm {
     }
     
     fn on_tick(&mut self, c: &Context) -> Quotes {
-        let (bid, ask) = match (c.ob.best_bid, c.ob.best_ask) {
-            (Some(b), Some(a)) => (b.px.0, a.px.0),
-            _ => return Quotes::default(),
-        };
-
-        // KRİTİK İYİLEŞTİRME: Top-K levels kullan (daha güvenilir imbalance için)
-        // Top-K levels varsa toplam volume'u kullan, yoksa best bid/ask volume'u kullan
-        let (bid_vol, ask_vol) =
+        // ✅ KRİTİK DÜZELTME: Top-K levels ile best bid/ask consistency
+        // Eğer top_bids ve top_asks varsa, bid ve ask'i de onlardan al
+        // Çünkü top_bids[0] ve top_asks[0] en iyi fiyatları temsil eder
+        // Eğer top_bids ve top_asks WebSocket'ten gelmişse, best_bid/best_ask REST'ten gelmiş olabilir
+        // Bu durumda fiyatlar farklı olabilir ve mikroprice yanlış hesaplanır
+        let (bid, ask, bid_vol, ask_vol) =
             if let (Some(top_bids), Some(top_asks)) = (&c.ob.top_bids, &c.ob.top_asks) {
-                // Top-K levels mevcut: tüm level'ların volume'larını topla
-                let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
-                let ask_vol_sum: Decimal = top_asks.iter().map(|a| a.qty.0).sum();
-                (bid_vol_sum.max(Decimal::ONE), ask_vol_sum.max(Decimal::ONE))
+                // Top-K levels mevcut: fiyatları ve volume'ları top-K'dan al
+                if top_bids.is_empty() || top_asks.is_empty() {
+                    // Top-K boşsa fallback'e git
+                    match (c.ob.best_bid, c.ob.best_ask) {
+                        (Some(b), Some(a)) => {
+                            let bid_vol = b.qty.0;
+                            let ask_vol = a.qty.0;
+                            (b.px.0, a.px.0, bid_vol, ask_vol)
+                        }
+                        _ => return Quotes::default(),
+                    }
+                } else {
+                    // Top-K'dan en iyi fiyatları al (ilk eleman en iyi fiyat)
+                    let bid_px = top_bids[0].px.0;
+                    let ask_px = top_asks[0].px.0;
+                    // Tüm level'ların volume'larını topla
+                    let bid_vol_sum: Decimal = top_bids.iter().map(|b| b.qty.0).sum();
+                    let ask_vol_sum: Decimal = top_asks.iter().map(|a| a.qty.0).sum();
+                    (
+                        bid_px,
+                        ask_px,
+                        bid_vol_sum.max(Decimal::ONE),
+                        ask_vol_sum.max(Decimal::ONE),
+                    )
+                }
             } else {
-                // Fallback: best bid/ask volumes (backward compatibility)
-                let bid_vol = c.ob.best_bid.map(|b| b.qty.0).unwrap_or(Decimal::ONE);
-                let ask_vol = c.ob.best_ask.map(|a| a.qty.0).unwrap_or(Decimal::ONE);
-                (bid_vol, ask_vol)
+                // Fallback: best bid/ask (top-K yoksa)
+                match (c.ob.best_bid, c.ob.best_ask) {
+                    (Some(b), Some(a)) => {
+                        let bid_vol = b.qty.0;
+                        let ask_vol = a.qty.0;
+                        (b.px.0, a.px.0, bid_vol, ask_vol)
+                    }
+                    _ => return Quotes::default(),
+                }
             };
 
         // 3. Klasik mid price (fallback)
@@ -740,11 +804,11 @@ impl Strategy for DynMm {
                 // 1. Son N saniye içindeki fiyatları filtrele
                 // 2. Minimum/maksimum noktayı bul
                 // 3. Recovery var mı kontrol et (en az X% geri yükselme/düşme)
-                // NOT: Warm-up fazında recovery check'i skip et (dummy price'lar yanıltıcı olabilir)
-                let recovery_check = if self.warm_up_ticks_remaining > 0 {
-                    // Warm-up fazında: Recovery check'i skip et (dummy price'lar tüm fiyatlar aynı olduğu için yanıltıcı)
-                    false // Flash crash detection'ı engelle (güvenli tarafta kal)
-                } else {
+                // ✅ KRİTİK DÜZELTME: Warm-up sırasında da recovery check yapılmalı
+                // Dummy price'lar sadece price_history'yi doldurmak için, ama gerçek fiyat değişimleri
+                // warm-up sırasında da tespit edilebilir. Recovery check sadece gerçek fiyat değişimlerine bakmalı.
+                // Warm-up sırasında recovery check'i skip etmek, gerçek flash crash'lerin kaçırılmasına neden olur.
+                let recovery_check = {
                     let recovery_check_result = {
                         let window_start_ms =
                             now_ms.saturating_sub(self.flash_crash_recovery_window_ms);
@@ -763,17 +827,22 @@ impl Strategy for DynMm {
                         // Bu, iter().rev() sonrası index karışıklığını önler
                         recent_prices.sort_by_key(|(ts, _)| *ts);
 
-                        // Son N elemanı al (en yeni fiyatlar)
-                        if recent_prices.len() > self.flash_crash_recovery_min_points * 2 {
-                            recent_prices = recent_prices
-                                .iter()
-                                .rev()
-                                .take(self.flash_crash_recovery_min_points * 2)
-                                .copied()
-                                .collect();
-                            // Tekrar sırala (en eski → en yeni)
-                            recent_prices.sort_by_key(|(ts, _)| *ts);
-                        }
+                        // ✅ KRİTİK GÜVENLİK: Time window'un tamamını kullan, sayısal limit uygulama
+                        // Önceki kod: Time window ile filtrelenmiş veriler alınıyor (30 saniye)
+                        // Sonra sadece en yeni N nokta alınıyor → Time window'un başındaki veriler atılıyor
+                        // 
+                        // Sorun: Time window 30 saniye olabilir ama sadece son 20 nokta alınıyor
+                        // Bu, recovery check'in tam zaman penceresine bakmamasına neden oluyor
+                        // Örnek: 30 saniyelik window'da 50 nokta var, ama sadece son 20 nokta alınıyor
+                        // → İlk 30 nokta atılıyor, recovery check sadece son 20 noktaya bakıyor
+                        //
+                        // Çözüm: Time window'un tamamını kullan (sayısal limit kaldırıldı)
+                        // Eğer performans sorunu varsa, time window'u config'den daralt (daha kısa zaman penceresi)
+                        // Ama mevcut time window içindeki tüm verileri kullan (daha doğru recovery check)
+                        //
+                        // NOT: Sayısal limit kaldırıldı - time window'un tamamı kullanılıyor
+                        // Eğer çok fazla veri varsa (örneğin 1000+ nokta), time window'u config'den düşürebiliriz
+                        // Ama şimdilik time window'un tamamını kullanıyoruz (daha doğru recovery check)
 
                         if recent_prices.len() >= self.flash_crash_recovery_min_points {
                             if price_change_bps < -self.price_jump_threshold_bps {
@@ -813,9 +882,13 @@ impl Strategy for DynMm {
                                         let recovery_ratio =
                                             (current_price_f - min_price_f) / min_price_f;
 
-                                        // ✅ İYİLEŞTİRME: Volume surge kontrolü (bull trap önleme)
+                                        // ✅ KRİTİK DÜZELTME: Volume surge kontrolü (bull trap önleme + false positive önleme)
                                         // Min noktadan sonra volume artışı var mı?
-                                        let volume_surge = if self.volume_history.len() >= 10 {
+                                        // Sorun: Bot yeni başladıysa veya düşük volatilite dönemindeyse, ilk 10 tick'te volume çok düşük olabilir
+                                        // Normal bir tick'te volume 2x artabilir → False positive
+                                        // Çözüm: Daha uzun baseline kullan (20 tick) ve minimum volume threshold ekle
+                                        let volume_surge = if self.volume_history.len() >= 20 {
+                                            // Son 5 tick'in ortalaması (recent volume)
                                             let recent_volume: f64 = self
                                                 .volume_history
                                                 .iter()
@@ -823,10 +896,24 @@ impl Strategy for DynMm {
                                                 .take(5)
                                                 .sum::<f64>()
                                                 / 5.0;
-                                            let avg_volume: f64 =
-                                                self.volume_history.iter().sum::<f64>()
-                                                    / self.volume_history.len() as f64;
-                                            recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                            // Önceki 15 tick'in ortalaması (baseline - daha uzun window)
+                                            let baseline_volume: f64 = self
+                                                .volume_history
+                                                .iter()
+                                                .rev()
+                                                .skip(5)
+                                                .take(15)
+                                                .sum::<f64>()
+                                                / 15.0;
+                                            // Minimum volume threshold (çok düşük volume'lerde false positive önleme)
+                                            const MIN_VOLUME_THRESHOLD: f64 = 0.01; // Minimum 0.01 BTC volume
+                                            if baseline_volume < MIN_VOLUME_THRESHOLD {
+                                                // Baseline çok düşükse, volume surge kontrolünü skip et (false positive önleme)
+                                                true // Yeterli baseline yok, volume kontrolünü skip et
+                                            } else {
+                                                // Baseline yeterli, volume surge kontrolü yap
+                                                recent_volume > baseline_volume * 2.0 // Volume patlaması var mı?
+                                            }
                                         } else {
                                             true // Yeterli veri yok, volume kontrolünü skip et
                                         };
@@ -886,9 +973,13 @@ impl Strategy for DynMm {
                                         let recovery_ratio =
                                             (max_price_f - current_price_f) / max_price_f;
 
-                                        // ✅ İYİLEŞTİRME: Volume surge kontrolü (bear trap önleme)
+                                        // ✅ KRİTİK DÜZELTME: Volume surge kontrolü (bear trap önleme + false positive önleme)
                                         // Max noktadan sonra volume artışı var mı?
-                                        let volume_surge = if self.volume_history.len() >= 10 {
+                                        // Sorun: Bot yeni başladıysa veya düşük volatilite dönemindeyse, ilk 10 tick'te volume çok düşük olabilir
+                                        // Normal bir tick'te volume 2x artabilir → False positive
+                                        // Çözüm: Daha uzun baseline kullan (20 tick) ve minimum volume threshold ekle
+                                        let volume_surge = if self.volume_history.len() >= 20 {
+                                            // Son 5 tick'in ortalaması (recent volume)
                                             let recent_volume: f64 = self
                                                 .volume_history
                                                 .iter()
@@ -896,10 +987,24 @@ impl Strategy for DynMm {
                                                 .take(5)
                                                 .sum::<f64>()
                                                 / 5.0;
-                                            let avg_volume: f64 =
-                                                self.volume_history.iter().sum::<f64>()
-                                                    / self.volume_history.len() as f64;
-                                            recent_volume > avg_volume * 2.0 // Volume patlaması var mı?
+                                            // Önceki 15 tick'in ortalaması (baseline - daha uzun window)
+                                            let baseline_volume: f64 = self
+                                                .volume_history
+                                                .iter()
+                                                .rev()
+                                                .skip(5)
+                                                .take(15)
+                                                .sum::<f64>()
+                                                / 15.0;
+                                            // Minimum volume threshold (çok düşük volume'lerde false positive önleme)
+                                            const MIN_VOLUME_THRESHOLD: f64 = 0.01; // Minimum 0.01 BTC volume
+                                            if baseline_volume < MIN_VOLUME_THRESHOLD {
+                                                // Baseline çok düşükse, volume surge kontrolünü skip et (false positive önleme)
+                                                true // Yeterli baseline yok, volume kontrolünü skip et
+                                            } else {
+                                                // Baseline yeterli, volume surge kontrolü yap
+                                                recent_volume > baseline_volume * 2.0 // Volume patlaması var mı?
+                                            }
                                         } else {
                                             true // Yeterli veri yok, volume kontrolünü skip et
                                         };
@@ -1023,9 +1128,11 @@ impl Strategy for DynMm {
         // 4. VOLUME ANOMALY TREND: Anormal volume → Trend takibi fırsatı
         let total_volume = bid_vol + ask_vol;
         let total_volume_f = total_volume.to_f64().unwrap_or(0.0);
-        self.volume_history.push(total_volume_f);
+        self.volume_history.push_back(total_volume_f);
+        // ✅ KRİTİK: VecDeque kullan - O(1) pop_front() vs O(n) Vec::remove(0)
+        // Her tick'te çağrılıyor (100ms'de bir), VecDeque ile performans optimize edildi
         if self.volume_history.len() > 50 {
-            self.volume_history.remove(0);
+            self.volume_history.pop_front();
         }
 
         let _volume_anomaly_direction = if self.volume_history.len() >= 10 {
@@ -1101,9 +1208,25 @@ impl Strategy for DynMm {
             .as_millis() as u64;
         let total_vol_f = total_volume_f;
         self.momentum_history.push((now_ms, mid, total_vol_f));
-        // Eski verileri temizle (1 dakikadan eski)
-        let cutoff_ms = now_ms.saturating_sub(60_000);
-        self.momentum_history.retain(|(ts, _, _)| *ts > cutoff_ms);
+        
+        // ✅ KRİTİK: Momentum history cleanup optimizasyonu - gereksiz retain() çağrılarını önle
+        // retain() her tick'te çağrılıyor ama genellikle hiçbir şey silmez (son 60 saniyedeki veriler)
+        // Eğer bot 1 saat çalışırsa: 60 dakika × 600 tick/dakika = 36,000 element birikir
+        // retain() her tick'te 36,000 element scan eder → gereksiz overhead
+        // Çözüm: Sadece gerektiğinde temizle (len > threshold veya belirli zaman geçtiyse)
+        const MOMENTUM_CLEANUP_THRESHOLD: usize = 1000; // 1000 element'ten fazla olursa temizle
+        const MOMENTUM_CLEANUP_INTERVAL_MS: u64 = 60_000; // 60 saniyede bir temizle
+        
+        let should_cleanup = self.momentum_history.len() > MOMENTUM_CLEANUP_THRESHOLD
+            || self.last_momentum_cleanup
+                .map(|last| now_ms.saturating_sub(last) > MOMENTUM_CLEANUP_INTERVAL_MS)
+                .unwrap_or(true); // İlk temizleme için true
+        
+        if should_cleanup {
+            let cutoff_ms = now_ms.saturating_sub(60_000);
+            self.momentum_history.retain(|(ts, _, _)| *ts > cutoff_ms);
+            self.last_momentum_cleanup = Some(now_ms);
+        }
 
         if self.momentum_history.len() >= 5 {
             // Son 5 momentum noktasını analiz et
@@ -1156,7 +1279,11 @@ impl Strategy for DynMm {
 
         // 6. SPOOFING TESPİTİ: Büyük emir duvarı → Manipülatörün arkasında pozisyon al
         let current_liquidity = min_liquidity;
-        if self.last_liquidity_level > 0.0 {
+        // ✅ KRİTİK DÜZELTME: last_liquidity_level initialization ve division by zero önleme
+        // Sorun: Constructor'da last_liquidity_level = 0.0, ilk tick'te spoofing detection çalışmaz
+        // Daha kötüsü: İkinci tick'te division by zero riski var (current - 0) / 0
+        // Çözüm: last_liquidity_level > 0.0 kontrolü + division by zero kontrolü
+        if self.last_liquidity_level > 0.0 && current_liquidity > 0.0 {
             let liquidity_change =
                 (current_liquidity - self.last_liquidity_level) / self.last_liquidity_level;
 
@@ -1201,9 +1328,15 @@ impl Strategy for DynMm {
                 }
             }
         }
-        self.last_liquidity_level = current_liquidity;
+        // ✅ KRİTİK DÜZELTME: last_liquidity_level'ı her zaman güncelle (initialize et)
+        // İlk tick'te current_liquidity > 0.0 ise initialize et, sonraki tick'lerde spoofing detection çalışır
+        if current_liquidity > 0.0 {
+            self.last_liquidity_level = current_liquidity;
+        }
 
         // 7. LIQUIDITY WITHDRAWAL: Likidite aniden azaldı → Spread arbitrajı fırsatı
+        // ✅ KRİTİK DÜZELTME: last_liquidity_level > 0.0 kontrolü zaten yukarıda yapıldı
+        // Ama yine de division by zero kontrolü ekliyoruz (güvenlik için)
         if self.last_liquidity_level > 0.0 && current_liquidity > 0.0 {
             let liquidity_drop =
                 (self.last_liquidity_level - current_liquidity) / self.last_liquidity_level;
@@ -1228,22 +1361,33 @@ impl Strategy for DynMm {
 
         // --- MİKRO-YAPI SİNYALLERİ: Gelişmiş fiyatlama ---
         // 1. Microprice hesapla (volume-weighted mid)
+        // ✅ KRİTİK: Microprice zaten imbalance'ı içeriyor (volume-weighted)
+        // Formula: microprice = (ask * bid_vol + bid * ask_vol) / (bid_vol + ask_vol)
+        // - Bid heavy (bid_vol > ask_vol) → microprice ask'e yakın
+        // - Ask heavy (ask_vol > bid_vol) → microprice bid'e yakın
+        // Bu yüzden imbalance'ı ayrıca eklemek çift sayma yapar
         let microprice = self.calculate_microprice(bid, ask, bid_vol, ask_vol);
 
-        // 2. Order Book Imbalance
+        // 2. Order Book Imbalance (sadece logging için, fiyatlama için kullanılmıyor)
+        // ✅ KRİTİK: Imbalance hesaplanıyor ama fiyatlama için kullanılmıyor
+        // Çünkü microprice zaten imbalance'ı içeriyor (volume-weighted)
+        // Önceden imbalance_skew kullanılıyordu ama çift sayma sorunu nedeniyle kaldırıldı
         let imbalance = self.calculate_imbalance(bid_vol, ask_vol);
 
         // KRİTİK DÜZELTME: Price history warm-up - İlk 20 tick'te dummy price'lar ekle
         // Recovery check için yeterli veri sağlamak için warm-up yap
-        // NOT: Dummy price'lar tüm fiyatlar aynı olduğu için recovery check'i yanıltabilir
-        // Bu yüzden warm-up sırasında recovery check'i skip ediyoruz
+        // ✅ KRİTİK DÜZELTME: Warm-up sırasında da recovery check yapılmalı
+        // Dummy price'lar sadece price_history'yi doldurmak için, ama gerçek fiyat değişimleri
+        // warm-up sırasında da tespit edilebilir. Recovery check gerçek fiyat değişimlerine bakıyor,
+        // dummy price'lar recovery check'i yanıltmaz çünkü gerçek fiyat değişimleri (price_change_bps)
+        // warm-up sırasında da hesaplanıyor ve recovery check bu değişimlere bakıyor.
         if self.price_history.is_empty() {
             // İlk tick: Warm-up için 20 dummy price ekle (mevcut mid price ile)
             let warm_up_count: usize = 20;
             for i in 0..warm_up_count {
                 let dummy_timestamp =
                     now_ms.saturating_sub((warm_up_count as u64 - i as u64) * 100); // 100ms aralıklarla
-                self.price_history.push((dummy_timestamp, c.mark_price.0));
+                self.price_history.push_back((dummy_timestamp, c.mark_price.0));
             }
             // KRİTİK DÜZELTME: Timestamp'e göre sırala (warm-up sonrası)
             self.price_history.sort_by_key(|(ts, _)| *ts);
@@ -1258,10 +1402,12 @@ impl Strategy for DynMm {
 
         // Fiyat geçmişini güncelle (basit timestamp simülasyonu)
         // now_ms zaten yukarıda hesaplandı, tekrar hesaplamaya gerek yok
-        self.price_history.push((now_ms, c.mark_price.0));
-        // KRİTİK DÜZELTME: Fiyat geçmişi limitini config'den al - Trend analizi için daha fazla veri
+        self.price_history.push_back((now_ms, c.mark_price.0));
+        // ✅ KRİTİK: VecDeque kullan - O(1) pop_front() vs O(n) Vec::remove(0)
+        // Her tick'te çağrılıyor (100ms'de bir), VecDeque ile performans optimize edildi
+        // 10 sembol × 200 element × 10 tick/sec = 20,000 shift/sec → O(1) pop_front() ile optimize
         if self.price_history.len() > self.manipulation_price_history_max_len {
-            self.price_history.remove(0);
+            self.price_history.pop_front();
         }
 
         // KRİTİK DÜZELTME: Timestamp'e göre sıralı tut (en eski → en yeni)
@@ -1330,19 +1476,19 @@ impl Strategy for DynMm {
                 _ => 0.7,
             };
 
-            // KRİTİK İYİLEŞTİRME: Adaptive confidence threshold - opportunity type'a göre
-            // Volume-based fırsatlar (VolumeAnomalyTrend) için daha düşük threshold (0.55)
-            // Price-based fırsatlar (FlashCrashLong, FlashPumpShort) için yüksek threshold (0.70)
-            // Volume-based fırsatlar daha gürültülü olabilir, bu yüzden daha düşük threshold
-            // false negative'leri önlemek için gerekli (0.50-0.60 aralığı önerilir)
+            // ✅ KRİTİK İYİLEŞTİRME: Adaptive confidence threshold - opportunity type'a göre
+            // Volume-based fırsatlar (VolumeAnomalyTrend) için config'den gelen özel threshold kullanılır
+            // Price-based fırsatlar (FlashCrashLong, FlashPumpShort) için normal threshold kullanılır
+            // Volume-based fırsatlar daha gürültülü olabilir, bu yüzden genellikle daha düşük threshold kullanılır
+            // Bu sayede false positive/negative dengesi tutarlı bir şekilde yönetilebilir
             let min_confidence_threshold = match opp {
                 ManipulationOpportunity::VolumeAnomalyTrend { .. } => {
-                    // Volume-based: 0.55 threshold (daha düşük, false negative önleme)
-                    // Config'deki threshold'dan bağımsız olarak 0.55 kullan
-                    0.55
+                    // Volume-based: Config'den gelen özel threshold (default: 0.55)
+                    // Bu değer config.yaml'de volume_anomaly_confidence_threshold olarak ayarlanabilir
+                    self.volume_anomaly_confidence_threshold
                 }
                 _ => {
-                    // Price-based ve diğerleri: Normal threshold (0.70, config'den)
+                    // Price-based ve diğerleri: Normal threshold (config'den, default: 0.70)
                     self.confidence_min_threshold
                 }
             };
@@ -1493,6 +1639,8 @@ impl Strategy for DynMm {
         // --- ADVERSE SELECTION FİLTRESİ: OFI ve momentum yüksekse pasif tarafı geri çek ---
         // HİSTERESİS: Eşikler farklı (açılma/kapanma için) - ani değişiklikleri önler
         // Config'den: Adverse selection eşikleri
+        // ✅ KRİTİK: Adverse selection filtresi opportunity mode'da bypass edilir (Line 1765-1772)
+        // Bu yüzden adverse selection hesaplaması yapılıyor ama opportunity mode aktifse kullanılmıyor
         let adverse_selection_threshold_on = self.adverse_selection_threshold_on;
         let adverse_selection_threshold_off = self.adverse_selection_threshold_off;
         let ofi_abs = self.ofi_signal.abs();
@@ -1512,6 +1660,7 @@ impl Strategy for DynMm {
 
         // OFI pozitif (buy pressure) ve momentum yukarı → ask'i geri çek (bid riskli değil)
         // OFI negatif (sell pressure) ve momentum aşağı → bid'i geri çek (ask riskli değil)
+        // ✅ KRİTİK: Adverse selection hesaplaması yapılıyor ama opportunity mode aktifse bypass edilir
         let mut adverse_bid = false;
         let mut adverse_ask = false;
         if momentum_strong {
@@ -1575,9 +1724,12 @@ impl Strategy for DynMm {
         let mut adaptive_spread_bps =
             self.calculate_adaptive_spread(base_spread_bps, min_spread_bps);
 
-        // KRİTİK DÜZELTME: Imbalance adjustment kaldırıldı (çift sayma önleme)
-        // Imbalance zaten microprice'da dahil (volume-weighted)
-        // Spread'e eklemek çift sayma yaratıyordu
+        // ✅ KRİTİK DÜZELTME: Imbalance adjustment kaldırıldı (çift sayma önleme)
+        // Imbalance zaten microprice'da dahil (volume-weighted):
+        //   - Microprice = (ask * bid_vol + bid * ask_vol) / (bid_vol + ask_vol)
+        //   - Bid heavy (bid_vol > ask_vol) → microprice ask'e yakın
+        //   - Ask heavy (ask_vol > bid_vol) → microprice bid'e yakın
+        // Spread'e imbalance eklemek çift sayma yaratıyordu (önceden imbalance_skew kullanılıyordu)
         // Not: Imbalance'a göre spread genişletme risk yönetimi için gerekli değil,
         // çünkü microprice zaten imbalance'ı yansıtıyor (risk yönetimi)
 
@@ -1587,7 +1739,8 @@ impl Strategy for DynMm {
         }
 
         // Order book spread'i kullan (fiyatlama için), adaptive spread'i risk kontrolü için kullan
-        // NOT: Imbalance adjustment kaldırıldı, microprice zaten imbalance'ı içeriyor
+        // ✅ KRİTİK: Imbalance adjustment kaldırıldı, microprice zaten imbalance'ı içeriyor
+        // Önceden imbalance_skew kullanılıyordu ama çift sayma sorunu nedeniyle kaldırıldı
         let spread_bps_for_pricing = adaptive_spread_bps;
 
         // Funding rate skew: pozitif funding'de ask'i yukarı çek (long pozisyon için daha iyi)
@@ -1596,13 +1749,14 @@ impl Strategy for DynMm {
         // Envanter yönüne göre asimetrik spread: envanter varsa o tarafı daha agresif yap
         let inv_skew_bps = inv_direction * inv_bias * 20.0; // Envanter bias'ına göre ekstra skew
 
-        // KRİTİK DÜZELTME: Imbalance skew çift sayma sorunu
+        // ✅ KRİTİK DÜZELTME: Imbalance skew çift sayma sorunu (önceden düzeltildi)
         // Microprice zaten imbalance'ı içeriyor (volume-weighted):
         //   - Bid heavy (pozitif imbalance) → microprice ask'e yakın
         //   - Ask heavy (negatif imbalance) → microprice bid'e yakın
         // Bu yüzden imbalance_skew eklemek çift sayma yapıyor.
         // Çözüm: Microprice kullan (imbalance zaten dahil), imbalance_skew'i kaldır
         // Alternatif: Mid price kullan + imbalance_skew (ama microprice daha iyi tahmin)
+        // NOT: imbalance_skew artık kullanılmıyor (çift sayma önleme)
 
         let half = Decimal::try_from(spread_bps_for_pricing / 2.0 / 1e4).unwrap_or(Decimal::ZERO);
         let skew = Decimal::try_from(funding_skew / 1e4).unwrap_or(Decimal::ZERO);
@@ -1614,13 +1768,15 @@ impl Strategy for DynMm {
         // Bid: microprice'den aşağı (half + funding_skew + inv_skew)
         // Pozitif envanter varsa inv_skew pozitif, bid daha aşağı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, bid daha yukarı (almaya zorla)
-        // NOT: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor
+        // ✅ KRİTİK: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor (çift sayma önleme)
+        // Önceden imbalance_skew kullanılıyordu ama çift sayma sorunu nedeniyle kaldırıldı
         let mut bid_px = Px(pricing_base * (Decimal::ONE - half - skew - inv_skew));
 
         // Ask: microprice'den yukarı (half + funding_skew + inv_skew)
         // Pozitif envanter varsa inv_skew pozitif, ask daha yukarı (satmaya zorla)
         // Negatif envanter varsa inv_skew negatif, ask daha aşağı (almaya zorla)
-        // NOT: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor
+        // ✅ KRİTİK: imbalance_skew kaldırıldı - microprice zaten imbalance'ı içeriyor (çift sayma önleme)
+        // Önceden imbalance_skew kullanılıyordu ama çift sayma sorunu nedeniyle kaldırıldı
         let mut ask_px = Px(pricing_base * (Decimal::ONE + half + skew + inv_skew));
 
         // --- CROSSING GUARD: Fiyatların best bid/ask'i geçmemesi garantisi ---
@@ -1721,11 +1877,17 @@ impl Strategy for DynMm {
             // Manipülasyon fırsatı varsa agresif pozisyon, yoksa normal market making
             // HİSTERESİS: Fırsat modu açılma/kapanma için eşikler
             // Config'den: Fırsat modu eşikleri
+            // ✅ KRİTİK: Opportunity mode ve adverse selection farklı hysteresis mekanizmaları
+            // - Opportunity mode: manipulation_opportunity + OFI threshold (Line 1743-1763)
+            // - Adverse selection: OFI + momentum threshold (Line 1505-1541)
+            // Priority: Opportunity mode > Adverse selection (Line 1765-1772)
             let is_opportunity_mode = self.manipulation_opportunity.is_some();
             let opportunity_threshold_on = self.opportunity_threshold_on;
             let opportunity_threshold_off = self.opportunity_threshold_off;
 
             // Histerezis: Önceki duruma göre eşik seç
+            // ✅ KRİTİK: Opportunity mode hysteresis adverse selection'dan bağımsız
+            // İki mekanizma birbirine karışmaz çünkü priority belirlenmiş (opportunity mode öncelikli)
             let opportunity_threshold = if self.last_opportunity_mode {
                 opportunity_threshold_off // Kapanma eşiği
             } else {
@@ -1733,6 +1895,7 @@ impl Strategy for DynMm {
             };
 
             // Fırsat modu kontrolü (histerezis ile)
+            // ✅ KRİTİK: Opportunity mode aktifse adverse selection bypass edilir (Line 1765-1772)
             let effective_opportunity_mode = if is_opportunity_mode {
                 // Fırsat var, ama histerezis kontrolü: OFI yeterince yüksek mi?
                 ofi_abs >= opportunity_threshold || self.last_opportunity_mode
@@ -1743,12 +1906,28 @@ impl Strategy for DynMm {
 
             self.last_opportunity_mode = effective_opportunity_mode;
 
+            // ✅ KRİTİK GÜVENLİK: Opportunity mode ve adverse selection priority
+            // İki mekanizma birbirine karışabilir:
+            // - Opportunity mode ON (manipulation detected) → Agresif pozisyon al
+            // - Adverse selection ON (OFI yüksek) → Riskli tarafı geri çek
+            // 
+            // Priority: Opportunity mode > Adverse selection
+            // Eğer opportunity mode aktifse, adverse selection bypass edilir (agresif pozisyon al)
+            // Eğer opportunity mode aktif değilse, adverse selection uygulanır (risk yönetimi)
+            //
+            // Örnek senaryo:
+            // - Opportunity mode ON (FlashCrashLong detected)
+            // - Adverse selection ON (OFI yüksek, ask riskli)
+            // → Opportunity mode öncelikli: (should_bid, should_ask) - adverse selection bypass
+            // → Agresif pozisyon alınır (manipülasyon fırsatı)
             let (final_bid, final_ask) = if effective_opportunity_mode {
-                // FIRSAT MODU: Agresif pozisyon al, adverse selection filtresini gevşet
-                // Manipülasyon fırsatlarında daha agresif ol
+                // FIRSAT MODU: Agresif pozisyon al, adverse selection filtresini bypass et
+                // Manipülasyon fırsatlarında daha agresif ol (opportunity mode priority)
+                // Adverse selection filtresi devre dışı (risk yönetimi yerine fırsat yakalama)
                 (should_bid, should_ask) // Adverse selection filtresini bypass et
             } else {
-                // NORMAL MOD: Adverse selection filtresi aktif
+                // NORMAL MOD: Adverse selection filtresi aktif (risk yönetimi)
+                // Opportunity mode yoksa, adverse selection uygulanır (riskli tarafı geri çek)
                 (should_bid && !adverse_bid, should_ask && !adverse_ask)
             };
 
@@ -2119,7 +2298,7 @@ mod tests {
         // So if prices are increasing, newest > older, trend should be positive
         for i in 0..15 {
             let price = dec!(50000) + Decimal::from(i * 100); // Larger increments for clearer trend
-            strategy.price_history.push((now + i * 1000, price));
+            strategy.price_history.push_back((now + i * 1000, price));
         }
         let trend_up = strategy.detect_trend();
         // DÜZELTME: Function now compares newer_avg (take(5), newest) vs older_avg (skip(5), older)
@@ -2134,7 +2313,7 @@ mod tests {
         strategy.price_history.clear();
         for i in 0..15 {
             let price = dec!(501400) - Decimal::from(i * 100); // Decreasing prices
-            strategy.price_history.push((now + i * 1000, price));
+            strategy.price_history.push_back((now + i * 1000, price));
         }
         let trend_down = strategy.detect_trend();
         // DÜZELTME: Decreasing prices → newer < older → (newer - older) < 0 → negative trend
@@ -2237,7 +2416,7 @@ mod tests {
             .as_millis() as u64;
         for i in 0..10 {
             let price = dec!(50000) + Decimal::from(i);
-            strategy.price_history.push((now - (10 - i) * 1000, price));
+            strategy.price_history.push_back((now - (10 - i) * 1000, price));
         }
 
         // OFI ve volatility'yi sıfırla (adverse selection'ı önlemek için)
@@ -2310,7 +2489,7 @@ mod tests {
             .as_millis() as u64;
         for i in 0..10 {
             let price = dec!(50000) + Decimal::from(i);
-            strategy.price_history.push((now - (10 - i) * 1000, price));
+            strategy.price_history.push_back((now - (10 - i) * 1000, price));
         }
 
         // OFI ve volatility'yi sıfırla (adverse selection'ı önlemek için)

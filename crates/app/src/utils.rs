@@ -20,7 +20,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, info, warn};
+use tokio::time;
+use tracing::{debug, error, info, warn};
 
 // ============================================================================
 // Global Order Lock - Ensures only one order/position operation at a time
@@ -37,14 +38,115 @@ pub fn get_order_lock() -> &'static TokioMutex<()> {
 
 /// Execute a function with the global order lock held
 /// This ensures only one order/position operation happens at a time
+/// 
+/// ✅ KRİTİK: Deadlock önleme - timeout ve panic handling
+/// - Lock acquisition timeout: 5 saniye (eğer başka bir thread lock'u tutuyorsa)
+/// - Operation timeout: 30 saniye (eğer lock içindeki işlem çok uzun sürerse)
+/// - Panic handling: Eğer lock içinde panic olursa, lock otomatik olarak serbest bırakılır
+///   (Rust'ın RAII mekanizması sayesinde guard drop edilir)
+/// 
+/// ⚠️ UYARI: Timeout durumunda panic eder - bu durumda tüm bot durur
+/// Eğer daha graceful handling istiyorsanız, `with_order_lock_result` kullanın
 pub async fn with_order_lock<F, R>(f: F) -> R
 where
     F: std::future::Future<Output = R>,
 {
     let lock = get_order_lock();
-    let _guard = lock.lock().await;
-    f.await
+    
+    // ✅ KRİTİK: Lock acquisition timeout - eğer başka bir thread lock'u tutuyorsa
+    // 5 saniye içinde lock alınamazsa timeout hatası ver
+    const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+    let _guard = match time::timeout(LOCK_TIMEOUT, lock.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            error!(
+                "CRITICAL: Failed to acquire order lock within {} seconds - possible deadlock or stuck operation",
+                LOCK_TIMEOUT.as_secs()
+            );
+            // Timeout durumunda panic et - deadlock tespit edildi
+            // Lock guard drop edilecek ve serbest bırakılacak
+            panic!("Order lock acquisition timeout - possible deadlock detected");
+        }
+    };
+    
+    // ✅ KRİTİK: Operation timeout - lock içindeki işlem çok uzun sürerse
+    // 30 saniye içinde işlem tamamlanmazsa timeout hatası ver
+    const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+    match time::timeout(OPERATION_TIMEOUT, f).await {
+        Ok(result) => {
+            // İşlem başarıyla tamamlandı
+            result
+        }
+        Err(_) => {
+            error!(
+                "CRITICAL: Order lock operation timed out after {} seconds - possible infinite loop or stuck operation",
+                OPERATION_TIMEOUT.as_secs()
+            );
+            // Timeout durumunda panic et - lock guard drop edilecek ve serbest bırakılacak
+            panic!("Order lock operation timeout - possible infinite loop detected");
+        }
+    }
 }
+
+/// Execute a function with the global order lock held (Result-based, graceful error handling)
+/// 
+/// ✅ KRİTİK: Deadlock önleme - timeout ile graceful error handling
+/// Timeout durumunda panic etmez, Result döndürür
+/// 
+/// # Returns
+/// - `Ok(result)`: İşlem başarıyla tamamlandı
+/// - `Err(OrderLockError::LockTimeout)`: Lock alınamadı (5 saniye timeout)
+/// - `Err(OrderLockError::OperationTimeout)`: İşlem timeout oldu (30 saniye timeout)
+pub async fn with_order_lock_result<F, R>(f: F) -> Result<R, OrderLockError>
+where
+    F: std::future::Future<Output = R>,
+{
+    let lock = get_order_lock();
+    
+    const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+    let _guard = match time::timeout(LOCK_TIMEOUT, lock.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            error!(
+                "CRITICAL: Failed to acquire order lock within {} seconds - possible deadlock or stuck operation",
+                LOCK_TIMEOUT.as_secs()
+            );
+            return Err(OrderLockError::LockTimeout);
+        }
+    };
+    
+    const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+    match time::timeout(OPERATION_TIMEOUT, f).await {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            error!(
+                "CRITICAL: Order lock operation timed out after {} seconds - possible infinite loop or stuck operation",
+                OPERATION_TIMEOUT.as_secs()
+            );
+            Err(OrderLockError::OperationTimeout)
+        }
+    }
+}
+
+/// Order lock error types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderLockError {
+    /// Lock acquisition timed out (5 seconds)
+    LockTimeout,
+    /// Operation inside lock timed out (30 seconds)
+    OperationTimeout,
+}
+
+impl std::fmt::Display for OrderLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderLockError::LockTimeout => write!(f, "Order lock acquisition timeout"),
+            OrderLockError::OperationTimeout => write!(f, "Order lock operation timeout"),
+        }
+    }
+}
+
+impl std::error::Error for OrderLockError {}
 
 // ============================================================================
 // Quantization Helpers (moved from exec/mod.rs to avoid duplication)
@@ -235,32 +337,64 @@ pub fn split_margin_into_chunks(
     let min_margin = min_margin_per_trade.max(10.0);
     let max_margin = max_margin_per_trade.min(100.0); // ✅ 100 USD hard limit
 
+    // ✅ KRİTİK DÜZELTME: Floating point precision için epsilon kullan
+    // Edge case: available_margin çok küçükse (örn: 5 USD) ve min_margin = 10 USD → boş array
+    // Edge case: available_margin tam min_margin ile max_margin arasındayken yuvarlama hataları
+    const EPSILON: f64 = 0.01; // 1 cent tolerance for floating point precision
+
+    // ✅ KRİTİK EDGE CASE: available_margin < min_margin → boş array döndür
+    // Örnek: available_margin = 5 USD, min_margin = 10 USD → []
+    if available_margin < min_margin - EPSILON {
+        return Vec::new();
+    }
+
+    // ✅ KRİTİK EDGE CASE: min_margin > max_margin → boş array döndür
+    // Bu durumda hiçbir chunk oluşturulamaz
+    if min_margin > max_margin + EPSILON {
+        return Vec::new();
+    }
+
     let mut chunks = Vec::new();
     let mut remaining = available_margin;
 
     // While we have enough for at least 2 full chunks (max_margin * 2)
-    while remaining >= max_margin * 2.0 {
+    // ✅ KRİTİK: Epsilon kullanarak floating point precision sorunlarını önle
+    while remaining >= (max_margin * 2.0) - EPSILON {
         chunks.push(max_margin);
         remaining -= max_margin;
+        // ✅ KRİTİK: Negative remaining'i önle (floating point precision)
+        if remaining < 0.0 {
+            remaining = 0.0;
+            break;
+        }
     }
 
     // Handle remaining margin
-    if remaining >= max_margin {
+    // ✅ KRİTİK: Epsilon kullanarak edge case'leri daha güvenli handle et
+    if remaining >= max_margin - EPSILON {
         // Remaining is >= max but < max*2
         // Use max first, then check if remaining is >= min
         chunks.push(max_margin);
         remaining -= max_margin;
+        
+        // ✅ KRİTİK: Negative remaining'i önle
+        if remaining < 0.0 {
+            remaining = 0.0;
+        }
 
         // If remaining is >= min, add it as a chunk
-        if remaining >= min_margin {
+        // ✅ KRİTİK EDGE CASE: remaining tam min_margin'e eşit veya biraz fazla ise chunk oluştur
+        if remaining >= min_margin - EPSILON {
             chunks.push(remaining);
         }
         // If remaining < min, ignore it (already used max)
-    } else if remaining >= min_margin {
+    } else if remaining >= min_margin - EPSILON {
         // Remaining is < max but >= min, use all of it in one operation
+        // ✅ KRİTİK EDGE CASE: available_margin tam min_margin ile max_margin arasındayken
+        // Örnek: available_margin = 15 USD, min_margin = 10 USD, max_margin = 100 USD → 1 chunk = 15 USD
         chunks.push(remaining);
     }
-    // If remaining < min, ignore it
+    // If remaining < min, ignore it (no chunks created)
 
     chunks
 }
@@ -307,6 +441,19 @@ pub fn calc_qty_from_margin(
     // notional: pozisyon büyüklüğü (USD) = margin_chunk_leveraged (leverage UYGULANMAZ!)
     // KRİTİK: margin_chunk_leveraged zaten leveraged olarak gelmeli (caller'da hesaplanmış)
     // ✅ DOĞRULAMA: Leverage çift sayma yok - burada leverage uygulanmıyor, direkt notional kullanılıyor
+    
+    // ✅ KRİTİK GÜVENLİK: margin_chunk_leveraged'in makul bir değer olduğunu kontrol et
+    // Eğer margin_chunk_leveraged çok küçükse (örn: < 1 USD), leverage uygulanmamış olabilir
+    // Eğer margin_chunk_leveraged çok büyükse (örn: > 100000 USD), leverage çift uygulanmış olabilir
+    // Normal aralık: 10-2000 USD (10 USD margin * 20x leverage = 200 USD notional, 100 USD margin * 20x = 2000 USD)
+    if margin_chunk_leveraged < 1.0 || margin_chunk_leveraged > 100000.0 {
+        warn!(
+            margin_chunk_leveraged,
+            "calc_qty_from_margin: margin_chunk_leveraged out of expected range (1-100000 USD), possible leverage double-application or missing leverage"
+        );
+        // Devam et ama uyarı ver
+    }
+    
     let notional = Decimal::try_from(margin_chunk_leveraged).unwrap_or(Decimal::ZERO);
 
     if price <= Decimal::ZERO || notional <= Decimal::ZERO {
@@ -884,26 +1031,31 @@ impl CeilStep for f64 {
     }
 }
 
-/// Format decimal with fixed precision (truncate, don't round)
-/// KRİTİK: Decimal kullanarak precision kaybını önle
+/// Format decimal with fixed precision
+/// 
+/// ✅ KRİTİK: Precision loss önleme
+/// ToZero strategy truncate ediyor, bu precision loss'a yol açabilir.
+/// Normalize ederek ve doğru rounding strategy kullanarak precision loss'u önlüyoruz.
 /// Precision overflow kontrolü (max 28 decimal places)
 pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
     let precision = precision.min(28);
     let scale = precision as u32;
 
-    // ÖNEMLİ: Precision hatasını önlemek için önce quantize, sonra format
-    // KRİTİK: round_dp_with_strategy ile kesinlikle precision'a kadar yuvarla
-    // ToZero strategy kullanarak fazla basamakları kes
-    let truncated = value.round_dp_with_strategy(scale, RoundingStrategy::ToZero);
+    // ✅ KRİTİK: Precision loss önleme
+    // 1. Önce normalize et (internal representation'ı temizle)
+    // 2. Sonra precision'a göre yuvarla
+    // ToZero yerine ToNegativeInfinity (floor) kullan - daha güvenli ve precision loss'u önler
+    let normalized = value.normalize();
+    let rounded = normalized.round_dp_with_strategy(scale, RoundingStrategy::ToNegativeInfinity);
 
     // KRİTİK: String formatlamada kesinlikle precision'dan fazla basamak gösterme
     // Decimal'in to_string() metodu bazen internal precision'ı gösterebilir
     // Bu yüzden format! makrosu ile precision kontrolü yapıyoruz
     if precision == 0 {
-        format!("{:.0}", truncated)
+        format!("{:.0}", rounded)
     } else {
         // Precision kadar ondalık basamak göster
-        let formatted = format!("{:.prec$}", truncated, prec = precision);
+        let formatted = format!("{:.prec$}", rounded, prec = precision);
         formatted
     }
 }
@@ -1573,9 +1725,15 @@ pub fn update_fill_rate_on_fill(
 }
 
 /// Update fill rate on order cancel
+/// ✅ KRİTİK: Cancel sonrası decay'i skip etmek için last_decay_check'i reset et
+/// Bu sayede cancel sonrası decay uygulanmaz (cancel zaten fill rate'i düşürüyor)
 pub fn update_fill_rate_on_cancel(state: &mut SymbolState, decrease_factor: f64) {
     state.consecutive_no_fills += 1;
     state.order_fill_rate = (state.order_fill_rate * decrease_factor).max(0.0);
+    // ✅ KRİTİK: Cancel sonrası decay'i skip et - cancel zaten fill rate'i düşürdü
+    // Decay mekanizması bir sonraki check'te tekrar başlayacak
+    state.last_decay_check = Some(Instant::now());
+    state.last_cancel_time = Some(Instant::now());
 }
 
 /// Check if orders should be synced
@@ -1587,7 +1745,19 @@ pub fn should_sync_orders(state: &SymbolState, sync_interval_ms: u64) -> bool {
 }
 
 /// Apply time-based fill rate decay
+/// ✅ KRİTİK: Cancel sonrası decay'i skip et - cancel zaten fill rate'i düşürdü
+/// Bu sayede çift güncelleme riski önlenir ve gereksiz yere konservatif spread'ler oluşmaz
 pub fn apply_fill_rate_decay(state: &mut SymbolState, cfg: &crate::config::AppCfg) {
+    // ✅ KRİTİK: Cancel sonrası decay'i skip et (cancel zaten fill rate'i düşürdü)
+    // Cancel sonrası 30 saniye bekleyerek decay'i tekrar başlat
+    if let Some(last_cancel) = state.last_cancel_time {
+        let seconds_since_cancel = last_cancel.elapsed().as_secs();
+        if seconds_since_cancel < FILL_RATE_DECAY_THRESHOLD_SEC {
+            // Cancel sonrası 30 saniye geçmediyse decay'i skip et
+            return;
+        }
+    }
+    
     let should_check_decay = state
         .last_decay_check
         .map(|last| last.elapsed().as_secs() >= FILL_RATE_DECAY_CHECK_INTERVAL_SEC)
@@ -2093,6 +2263,19 @@ pub fn process_order_canceled(
     cfg: &AppCfg,
     json_logger: &SharedLogger,
 ) {
+    // ✅ KRİTİK DÜZELTME: OrderCanceled event'leri için deduplication
+    // WebSocket reconnect sonrası aynı cancel event'i tekrar gelebilir
+    // Event ID: "cancel-{order_id}" formatında
+    let cancel_event_id = format!("cancel-{}", order_id);
+    if state.processed_events.contains(&cancel_event_id) {
+        warn!(
+            %symbol,
+            order_id = %order_id,
+            "duplicate cancel event ignored (already processed)"
+        );
+        return;
+    }
+
     let should_remove = if let Some(order_info) = state.active_orders.get(order_id) {
         if let Some(ref client_id) = client_order_id {
             if let Some(ref order_client_id) = order_info.client_order_id {
@@ -2112,6 +2295,9 @@ pub fn process_order_canceled(
         state.active_orders.remove(order_id);
         state.last_order_price_update.remove(order_id);
         update_fill_rate_on_cancel(state, cfg.internal.fill_rate_decrease_factor);
+
+        // ✅ KRİTİK: Event ID'yi kaydet (deduplication için)
+        state.processed_events.insert(cancel_event_id);
 
         info!(%symbol, order_id = %order_id, client_order_id = ?client_order_id, "order canceled via event");
 
