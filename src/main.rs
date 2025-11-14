@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
     
     // Initialize ORDERING module
     let ordering = OrderingModule::new(
+        cfg.clone(),
         connection.clone(),
         event_bus.clone(),
         shutdown_flag.clone(),

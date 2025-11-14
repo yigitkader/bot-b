@@ -45,8 +45,8 @@ trending:
 # ============================================================================
 binance:
   futures_base: "https://fapi.binance.com"
-  api_key: ""
-  secret_key: ""
+  api_key: "6WkI51B0dbz9gbtRm5PphsWYFmr3oaoagJECl0UiGX13ySnLxXlhuEoR5brk74ZU"
+  secret_key: "8N3PxGEp1CTrirTbmkM42mHaNTo5jbyamUFgatfeueHHkH5RBsDgGLCh3b6Ki3nw"
   recv_window_ms: 5000
   hedge_mode: false  # Hedge mode (dual-side position) - default: false (one-way mode)
 

@@ -3,6 +3,7 @@
 // Listens to TradeSignal and CloseRequest events
 // Uses CONNECTION to send orders
 
+use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, EventBus, OrderUpdate, PositionUpdate, TradeSignal};
 use crate::state::{OpenPosition, OpenOrder, SharedState};
@@ -15,6 +16,7 @@ use tracing::{info, warn};
 /// ORDERING module - order placement and closure
 /// Guarantees single position/order at a time using global lock
 pub struct Ordering {
+    cfg: Arc<AppCfg>,
     connection: Arc<Connection>,
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
@@ -23,16 +25,27 @@ pub struct Ordering {
 
 impl Ordering {
     pub fn new(
+        cfg: Arc<AppCfg>,
         connection: Arc<Connection>,
         event_bus: Arc<EventBus>,
         shutdown_flag: Arc<AtomicBool>,
         shared_state: Arc<SharedState>,
     ) -> Self {
         Self {
+            cfg,
             connection,
             event_bus,
             shutdown_flag,
             shared_state,
+        }
+    }
+    
+    /// Convert config TIF string to Tif enum
+    fn tif_from_config(&self) -> Tif {
+        match self.cfg.exec.tif.as_str() {
+            "post_only" | "GTX" => Tif::PostOnly,
+            "ioc" | "IOC" => Tif::Ioc,
+            _ => Tif::Gtc,
         }
     }
 
@@ -43,12 +56,14 @@ impl Ordering {
         let shutdown_flag = self.shutdown_flag.clone();
         let connection = self.connection.clone();
         let shared_state = self.shared_state.clone();
+        let cfg = self.cfg.clone();
         
         // Spawn task for TradeSignal events
         let state_trade = shared_state.clone();
         let event_bus_trade = event_bus.clone();
         let connection_trade = connection.clone();
         let shutdown_flag_trade = shutdown_flag.clone();
+        let cfg_trade = cfg.clone();
         tokio::spawn(async move {
             let mut trade_signal_rx = event_bus_trade.subscribe_trade_signal();
             
@@ -65,6 +80,7 @@ impl Ordering {
                             &signal,
                             &connection_trade,
                             &state_trade,
+                            &cfg_trade,
                         ).await {
                             warn!(error = %e, symbol = %signal.symbol, "ORDERING: error handling TradeSignal");
                         }
@@ -82,6 +98,7 @@ impl Ordering {
         let event_bus_close = event_bus.clone();
         let connection_close = connection.clone();
         let shutdown_flag_close = shutdown_flag.clone();
+        let cfg_close = cfg.clone();
         tokio::spawn(async move {
             let mut close_request_rx = event_bus_close.subscribe_close_request();
             
@@ -98,6 +115,7 @@ impl Ordering {
                             &request,
                             &connection_close,
                             &state_close,
+                            &cfg_close,
                         ).await {
                             warn!(error = %e, symbol = %request.symbol, "ORDERING: error handling CloseRequest");
                         }
@@ -162,6 +180,7 @@ impl Ordering {
         signal: &TradeSignal,
         connection: &Arc<Connection>,
         shared_state: &Arc<SharedState>,
+        cfg: &Arc<AppCfg>,
     ) -> Result<()> {
         let mut state_guard = shared_state.ordering_state.lock().await;
         
@@ -174,6 +193,13 @@ impl Ordering {
             return Ok(());
         }
         
+        // Get TIF from config
+        let tif = match cfg.exec.tif.as_str() {
+            "post_only" | "GTX" => Tif::PostOnly,
+            "ioc" | "IOC" => Tif::Ioc,
+            _ => Tif::Gtc,
+        };
+        
         // Place order via CONNECTION
         use crate::connection::OrderCommand;
         let command = OrderCommand::Open {
@@ -181,7 +207,7 @@ impl Ordering {
             side: signal.side,
             price: signal.entry_price,
             qty: signal.size,
-            tif: Tif::Gtc, // Default TIF
+            tif,
         };
         
         match connection.send_order(command).await {
@@ -220,8 +246,9 @@ impl Ordering {
         request: &CloseRequest,
         connection: &Arc<Connection>,
         shared_state: &Arc<SharedState>,
+        cfg: &Arc<AppCfg>,
     ) -> Result<()> {
-        let mut state_guard = shared_state.ordering_state.lock().await;
+        let state_guard = shared_state.ordering_state.lock().await;
         
         // Check if we have an open position for this symbol
         let position = match &state_guard.open_position {
@@ -241,6 +268,13 @@ impl Ordering {
             Side::Sell => Side::Buy,
         };
         
+        // Get TIF from config
+        let tif = match cfg.exec.tif.as_str() {
+            "post_only" | "GTX" => Tif::PostOnly,
+            "ioc" | "IOC" => Tif::Ioc,
+            _ => Tif::Gtc,
+        };
+        
         // Place close order via CONNECTION
         use crate::connection::OrderCommand;
         let command = OrderCommand::Close {
@@ -248,7 +282,7 @@ impl Ordering {
             side: close_side,
             price: position.entry_price, // Use entry price as initial close price (will be adjusted)
             qty: position.qty,
-            tif: Tif::Gtc,
+            tif,
         };
         
         match connection.send_order(command).await {

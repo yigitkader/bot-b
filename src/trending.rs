@@ -83,9 +83,9 @@ impl Trending {
         let spread_bps = ((tick.ask.0 - tick.bid.0) / tick.bid.0) * Decimal::from(10000);
         let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
         
-        // Get thresholds from config (with defaults)
-        let min_spread_bps = cfg.strategy.min_spread_bps.unwrap_or(5.0);
-        let max_spread_bps = cfg.strategy.max_spread_bps.unwrap_or(200.0);
+        // Get thresholds from config
+        let min_spread_bps = cfg.trending.min_spread_bps;
+        let max_spread_bps = cfg.trending.max_spread_bps;
         
         // Generate signal if spread is within acceptable range
         if spread_bps_f64 >= min_spread_bps && spread_bps_f64 <= max_spread_bps {
@@ -100,9 +100,9 @@ impl Trending {
             let max_usd = Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(Decimal::from(100));
             let size = Qty(max_usd / entry_price.0); // Simplified size calculation
             
-            // Get TP/SL from config (if available in config, otherwise use defaults)
-            let stop_loss_pct = Some(2.0); // Default 2% stop loss
-            let take_profit_pct = Some(5.0); // Default 5% take profit
+            // Get TP/SL from config
+            let stop_loss_pct = Some(cfg.stop_loss_pct);
+            let take_profit_pct = Some(cfg.take_profit_pct);
             
             // Generate trade signal
             let signal = TradeSignal {
