@@ -753,7 +753,7 @@ impl Strategy for DynMm {
         // 1. FLASH CRASH/PUMP DETECTION: Ani fiyat değişimleri → LONG/SHORT fırsatı
         // KRİTİK İYİLEŞTİRME: Volume ve time frame kontrolü ekle (false positive önleme)
         if !self.price_history.is_empty() {
-            let last_price = self.price_history.last().map(|(_, p)| *p).unwrap_or(mid);
+            let last_price = self.price_history.back().map(|(_, p)| *p).unwrap_or(mid);
             if !last_price.is_zero() {
                 let price_change = (mid - last_price) / last_price;
                 let price_change_bps = price_change.to_f64().unwrap_or(0.0) * 10000.0;
@@ -765,7 +765,7 @@ impl Strategy for DynMm {
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
-                let time_elapsed_ms = if let Some((last_ts, _)) = self.price_history.last() {
+                let time_elapsed_ms = if let Some((last_ts, _)) = self.price_history.back() {
                     now_ms.saturating_sub(*last_ts)
                 } else {
                     0
@@ -1390,7 +1390,10 @@ impl Strategy for DynMm {
                 self.price_history.push_back((dummy_timestamp, c.mark_price.0));
             }
             // KRİTİK DÜZELTME: Timestamp'e göre sırala (warm-up sonrası)
-            self.price_history.sort_by_key(|(ts, _)| *ts);
+            // VecDeque doesn't have sort_by_key, so convert to Vec, sort, and convert back
+            let mut sorted: Vec<_> = self.price_history.drain(..).collect();
+            sorted.sort_by_key(|(ts, _)| *ts);
+            self.price_history.extend(sorted);
             // Warm-up başlat: İlk 20 tick'te recovery check'i skip et
             self.warm_up_ticks_remaining = warm_up_count;
         }
@@ -1414,7 +1417,10 @@ impl Strategy for DynMm {
         // Bu, detect_trend() ve flash_crash_recovery'de index karışıklığını önler
         // NOT: push() ve remove(0) kullanıldığı için genelde sıralı kalır,
         // ama warm-up sırasında dummy timestamp'ler eklenebilir, bu yüzden sıralama güvenli
-        self.price_history.sort_by_key(|(ts, _)| *ts);
+        // VecDeque doesn't have sort_by_key, so convert to Vec, sort, and convert back
+        let mut sorted: Vec<_> = self.price_history.drain(..).collect();
+        sorted.sort_by_key(|(ts, _)| *ts);
+        self.price_history.extend(sorted);
 
         // --- VOLATİLİTE VE OFI GÜNCELLEME ---
         // EWMA volatilite güncelle (microprice kullan)

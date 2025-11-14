@@ -177,7 +177,7 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         step
     };
 
-    tracing::info!(
+    tracing::debug!(
         symbol = %sym.symbol,
         tick_size = %final_tick,
         step_size = %final_step,
@@ -427,6 +427,8 @@ impl BinanceFutures {
     /// KRİTİK: Global fallback kullanmaz - her sembol için gerçek rules gerekli
     /// Fallback kullanmak LOT_SIZE ve PRICE_FILTER hatalarına yol açabilir
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
+        // ✅ KRİTİK: Double-check locking pattern - race condition önleme
+        // İlk kontrol: Cache'de var mı?
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }
@@ -445,6 +447,13 @@ impl BinanceFutures {
                         .into_iter()
                         .next()
                         .ok_or_else(|| anyhow!("symbol info missing"))?;
+                    
+                    // ✅ KRİTİK: Double-check - başka bir thread aynı anda eklemiş olabilir
+                    // Cache'e eklemeden önce tekrar kontrol et (race condition önleme)
+                    if let Some(existing) = FUT_RULES.get(sym) {
+                        return Ok(existing.clone());
+                    }
+                    
                     let rules = Arc::new(rules_from_fut_symbol(sym_rec));
                     FUT_RULES.insert(sym.to_string(), rules.clone());
                     return Ok(rules);

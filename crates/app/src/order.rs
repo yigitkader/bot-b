@@ -170,7 +170,7 @@ pub async fn cancel_orders(
     // Normal cancel'lerde backoff artırılmaz, sadece rate limit hatası durumunda artırılır
     // Bu sayede market opportunity'ler kaçmaz
     const BACKOFF_MULTIPLIER_INCREASE: f64 = 1.5; // 2.0 → 1.5 (daha yavaş artış)
-    const MAX_BACKOFF_MULTIPLIER: f64 = 2.5; // 4.0 → 2.5 (daha düşük max)
+    const MAX_BACKOFF_MULTIPLIER: f64 = 2.0; // 4.0 → 2.5 → 2.0 (daha düşük max, market opportunity'ler kaçmaz)
     
     let mut has_rate_limit_error = false;
 

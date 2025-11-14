@@ -120,7 +120,7 @@ pub async fn continuous_analysis_task(
     _cfg: Arc<AppCfg>,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    use tokio::time::{interval, timeout, Duration};
+    use tokio::time::{interval, Duration};
     use crate::qmel::QMelStrategy;
     use crate::strategy::Context;
     use crate::types::OrderBook;
@@ -972,6 +972,7 @@ pub async fn process_symbol(
                     );
                 }
             }
+            }; // Match statement'ı kapat
             // ✅ KRİTİK: Kapatma işlemi bitti (başarılı veya başarısız), flag'i sıfırla ve cooldown set et
             state.position_closing.store(false, Ordering::Release);
             state.last_close_attempt = Some(Instant::now());
@@ -2263,7 +2264,10 @@ pub async fn setup_margin_and_leverage(
     let leverage_to_set = cfg.exec.default_leverage.or(cfg.leverage).unwrap_or(1);
 
     // Parallel processing configuration
-    const CONCURRENT_LIMIT: usize = 10;
+    // ✅ KRİTİK: Rate limit koruması - 574 sembol için çok fazla API çağrısı yapılıyor
+    // Binance limit: 2400 request/dakika, her sembol için 2 çağrı (get + set) = 1148 çağrı
+    // Concurrent limit'i düşürerek rate limit'e takılmayı önle
+    const CONCURRENT_LIMIT: usize = 5;
 
     let venue = Arc::new(venue.clone());
     let total_symbols = states.len();
@@ -2282,32 +2286,81 @@ pub async fn setup_margin_and_leverage(
                 let venue = venue_clone.clone();
                 let symbol = symbol.clone();
                 async move {
-                    rate_limit_guard(1).await;
-                    match venue.get_margin_type(&symbol).await {
-                        Ok(current_is_isolated) => {
-                            if current_is_isolated == use_isolated {
-                                return (symbol, Ok(true), true);
+                    // ✅ KRİTİK: Rate limit hatası durumunda exponential backoff
+                    const MAX_RETRIES: u32 = 3;
+                    let mut last_error: Option<anyhow::Error> = None;
+                    
+                    for attempt in 0..=MAX_RETRIES {
+                        rate_limit_guard(1).await;
+                        match venue.get_margin_type(&symbol).await {
+                            Ok(current_is_isolated) => {
+                                if current_is_isolated == use_isolated {
+                                    return (symbol, Ok(true), true);
+                                }
+                                break; // Margin type farklı, set etmeye devam et
                             }
-                        }
-                        Err(e) => {
-                            warn!(%symbol, error = %e, "failed to get margin type, will attempt to set anyway");
+                            Err(e) => {
+                                let error_str = e.to_string().to_lowercase();
+                                if error_str.contains("429") || error_str.contains("too many requests") {
+                                    last_error = Some(anyhow::anyhow!("{}", e));
+                                    if attempt < MAX_RETRIES {
+                                        // Exponential backoff: 1s, 2s, 4s
+                                        let backoff_sec = 2_u64.pow(attempt);
+                                        warn!(
+                                            %symbol,
+                                            attempt = attempt + 1,
+                                            backoff_sec,
+                                            "rate limit hit, backing off before retry"
+                                        );
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_sec)).await;
+                                        continue;
+                                    }
+                                }
+                                warn!(%symbol, error = %e, "failed to get margin type, will attempt to set anyway");
+                                break; // Diğer hatalar için set etmeye devam et
+                            }
                         }
                     }
 
-                    rate_limit_guard(1).await;
-                    match venue.set_margin_type(&symbol, true).await {
-                        Ok(_) => (symbol, Ok(true), false),
-                        Err(err) => {
-                            let error_str = err.to_string();
-                            let error_lower = error_str.to_lowercase();
+                    // Set margin type with retry logic
+                    for attempt in 0..=MAX_RETRIES {
+                        rate_limit_guard(1).await;
+                        match venue.set_margin_type(&symbol, true).await {
+                            Ok(_) => return (symbol, Ok(true), false),
+                            Err(err) => {
+                                let error_str = err.to_string();
+                                let error_lower = error_str.to_lowercase();
 
-                            if error_lower.contains("-4046") || error_lower.contains("no need to change") {
-                                (symbol, Ok(true), true)
-                            } else {
-                                (symbol, Err(err), false)
+                                if error_lower.contains("-4046") || error_lower.contains("no need to change") {
+                                    return (symbol, Ok(true), true);
+                                }
+                                
+                                if error_lower.contains("429") || error_lower.contains("too many requests") {
+                                    last_error = Some(anyhow::anyhow!("{}", err));
+                                    if attempt < MAX_RETRIES {
+                                        // Exponential backoff: 1s, 2s, 4s
+                                        let backoff_sec = 2_u64.pow(attempt);
+                                        warn!(
+                                            %symbol,
+                                            attempt = attempt + 1,
+                                            backoff_sec,
+                                            "rate limit hit, backing off before retry"
+                                        );
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_sec)).await;
+                                        continue;
+                                    }
+                                    // Max retries reached, will return error at end
+                                    break;
+                                }
+                                
+                                // Non-rate-limit error, return immediately
+                                return (symbol, Err(err), false);
                             }
                         }
                     }
+                    
+                    // Tüm retry'ler başarısız
+                    (symbol, last_error.map(Err).unwrap_or_else(|| Err(anyhow::anyhow!("max retries exceeded"))), false)
                 }
             })
             .buffer_unordered(CONCURRENT_LIMIT)
@@ -2360,28 +2413,56 @@ pub async fn setup_margin_and_leverage(
             let venue = venue_clone.clone();
             let symbol = symbol.clone();
             async move {
-                rate_limit_guard(1).await;
-                match venue.set_leverage(&symbol, leverage_to_set).await {
-                    Ok(_) => (symbol, Ok(true), false),
-                    Err(err) => {
-                        let error_str = err.to_string();
-                        let error_lower = error_str.to_lowercase();
+                // ✅ KRİTİK: Rate limit hatası durumunda exponential backoff
+                const MAX_RETRIES: u32 = 3;
+                let mut last_error: Option<anyhow::Error> = None;
+                
+                for attempt in 0..=MAX_RETRIES {
+                    rate_limit_guard(1).await;
+                    match venue.set_leverage(&symbol, leverage_to_set).await {
+                        Ok(_) => return (symbol, Ok(true), false),
+                        Err(err) => {
+                            let error_str = err.to_string();
+                            let error_lower = error_str.to_lowercase();
 
-                        if error_lower.contains("-4059")
-                            || error_lower.contains("no need to change")
-                            || error_lower.contains("leverage not modified")
-                        {
-                            (symbol, Ok(true), true)
-                        } else {
-                            (symbol, Err(err), false)
+                            if error_lower.contains("-4059")
+                                || error_lower.contains("no need to change")
+                                || error_lower.contains("leverage not modified")
+                            {
+                                return (symbol, Ok(true), true);
+                            }
+                            
+                            if error_lower.contains("429") || error_lower.contains("too many requests") {
+                                last_error = Some(anyhow::anyhow!("{}", err));
+                                if attempt < MAX_RETRIES {
+                                    // Exponential backoff: 1s, 2s, 4s
+                                    let backoff_sec = 2_u64.pow(attempt);
+                                    warn!(
+                                        %symbol,
+                                        attempt = attempt + 1,
+                                        backoff_sec,
+                                        "rate limit hit, backing off before retry"
+                                    );
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_sec)).await;
+                                    continue;
+                                }
+                                // Max retries reached, will return error at end
+                                break;
+                            }
+                            
+                            // Non-rate-limit error, return immediately
+                            return (symbol, Err(err), false);
                         }
                     }
                 }
+                
+                // Tüm retry'ler başarısız
+                (symbol, last_error.map(Err).unwrap_or_else(|| Err(anyhow::anyhow!("max retries exceeded"))), false)
             }
         })
-        .buffer_unordered(CONCURRENT_LIMIT)
-        .collect()
-        .await;
+            .buffer_unordered(CONCURRENT_LIMIT)
+            .collect()
+            .await;
 
     let mut leverage_set_count = 0;
     let mut leverage_skip_count = 0;
