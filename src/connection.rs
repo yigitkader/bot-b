@@ -1,9 +1,13 @@
-// Exchange module - Consolidates binance_exec, binance_rest, binance_ws
-// This file includes all Binance Futures API implementations
+// CONNECTION: Exchange WS & REST single gateway
+// All external world (WS/REST) goes through here
+// Rate limit & reconnect management
+// 
+// This file contains ALL exchange-related code (previously in exchange.rs and exec.rs)
+// Single responsibility: connection.rs = everything related to exchange communication
 
-use crate::exec::{Venue, VenueOrder};
-use crate::types::*;
-use crate::types::{Px, Qty, Side};
+use crate::config::AppCfg;
+use crate::event_bus::{EventBus, MarketTick, OrderUpdate, OrderStatus, PositionUpdate, BalanceUpdate};
+use crate::types::{Px, Qty, Side, Tif};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -18,13 +22,540 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::Sha256;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{timeout, Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream};
 use tracing::{debug, error, info, warn};
 use urlencoding::encode;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Decimal adımından hassasiyet (ondalık hane sayısı) çıkarır
+fn decimal_places(step: Decimal) -> usize {
+    if step.is_zero() {
+        return 0;
+    }
+    let s = step.normalize().to_string();
+    if let Some(pos) = s.find('.') {
+        s[pos + 1..].trim_end_matches('0').len()
+    } else {
+        0
+    }
+}
+
+// ============================================================================
+// CONNECTION Module (Public API)
+// ============================================================================
+
+/// CONNECTION module - single gateway to exchange
+pub struct Connection {
+    venue: Arc<BinanceFutures>,
+    cfg: Arc<AppCfg>,
+    event_bus: Arc<EventBus>,
+    shutdown_flag: Arc<AtomicBool>,
+    // Rate limiting: simple token bucket
+    rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+}
+
+/// Simple rate limiter for REST API calls
+/// Binance limits:
+/// - Order placement: 300 orders per 5 minutes
+/// - Balance query: 1200 requests per minute
+struct RateLimiter {
+    order_requests: Vec<Instant>,
+    balance_requests: Vec<Instant>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            order_requests: Vec::new(),
+            balance_requests: Vec::new(),
+        }
+    }
+    
+    /// Check if order request is allowed (300 per 5 minutes)
+    async fn check_order_rate(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_secs(5 * 60); // 5 minutes
+        
+        // Remove old requests outside window
+        self.order_requests.retain(|&t| now.duration_since(t) < window);
+        
+        // If limit reached, wait
+        if self.order_requests.len() >= 300 {
+            if let Some(oldest) = self.order_requests.first() {
+                let wait_time = window.saturating_sub(now.duration_since(*oldest));
+                if !wait_time.is_zero() {
+                    tokio::time::sleep(wait_time).await;
+                    // Clean up again after wait
+                    let now = Instant::now();
+                    self.order_requests.retain(|&t| now.duration_since(t) < window);
+                }
+            }
+        }
+        
+        self.order_requests.push(now);
+    }
+    
+    /// Check if balance request is allowed (1200 per minute)
+    async fn check_balance_rate(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_secs(60); // 1 minute
+        
+        // Remove old requests outside window
+        self.balance_requests.retain(|&t| now.duration_since(t) < window);
+        
+        // If limit reached, wait
+        if self.balance_requests.len() >= 1200 {
+            if let Some(oldest) = self.balance_requests.first() {
+                let wait_time = window.saturating_sub(now.duration_since(*oldest));
+                if !wait_time.is_zero() {
+                    tokio::time::sleep(wait_time).await;
+                    // Clean up again after wait
+                    let now = Instant::now();
+                    self.balance_requests.retain(|&t| now.duration_since(t) < window);
+                }
+            }
+        }
+        
+        self.balance_requests.push(now);
+    }
+}
+
+impl Connection {
+    /// Create Connection from config
+    /// This is the only way to create a Connection - no other module should create BinanceFutures directly
+    pub fn from_config(
+        cfg: Arc<AppCfg>,
+        event_bus: Arc<EventBus>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let venue = Arc::new(BinanceFutures::from_config(
+            &cfg.binance,
+            cfg.price_tick,
+            cfg.qty_step,
+        )?);
+        
+        Ok(Self {
+            venue,
+            cfg,
+            event_bus,
+            shutdown_flag,
+            rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
+        })
+    }
+    
+    /// Create Connection with existing venue (for testing/internal use)
+    #[allow(dead_code)]
+    pub fn new(
+        venue: Arc<BinanceFutures>,
+        cfg: Arc<AppCfg>,
+        event_bus: Arc<EventBus>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            venue,
+            cfg,
+            event_bus,
+            shutdown_flag,
+            rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
+        }
+    }
+
+    /// Start all connection services:
+    /// - Market data WebSocket stream
+    /// - User data WebSocket stream (order/position updates)
+    /// - Rate limit management
+    pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
+        // Start market data stream
+        self.start_market_data_stream(symbols.clone()).await?;
+        
+        // Start user data stream
+        self.start_user_data_stream().await?;
+        
+        info!("CONNECTION: All streams started");
+        Ok(())
+    }
+
+    /// Start market data WebSocket stream
+    /// Publishes MarketTick events to event bus
+    async fn start_market_data_stream(&self, symbols: Vec<String>) -> Result<()> {
+        // Binance URL limit: max 200 chars, so we need to split symbols into groups
+        const MAX_SYMBOLS_PER_STREAM: usize = 10;
+        
+        info!(
+            total_symbols = symbols.len(),
+            streams_needed = (symbols.len() + MAX_SYMBOLS_PER_STREAM - 1) / MAX_SYMBOLS_PER_STREAM,
+            "CONNECTION: setting up market data websocket streams"
+        );
+        
+        // Split symbols into groups
+        for chunk in symbols.chunks(MAX_SYMBOLS_PER_STREAM) {
+            let symbols_chunk = chunk.to_vec();
+            let event_bus = self.event_bus.clone();
+            let shutdown_flag = self.shutdown_flag.clone();
+            
+            tokio::spawn(async move {
+                loop {
+                    if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    
+                    match MarketDataStream::connect(&symbols_chunk).await {
+                        Ok(mut stream) => {
+                            info!(
+                                symbol_count = symbols_chunk.len(),
+                                symbols = ?symbols_chunk.iter().take(5).collect::<Vec<_>>(),
+                                "CONNECTION: market data websocket connected"
+                            );
+                            
+                            loop {
+                                if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                                    break;
+                                }
+                                
+                                match stream.next_price_update().await {
+                                    Ok(price_update) => {
+                                        // Update price cache (for backward compatibility)
+                                        PRICE_CACHE.insert(price_update.symbol.clone(), price_update.clone());
+                                        
+                                        // Publish MarketTick event
+                                        let market_tick = MarketTick {
+                                            symbol: price_update.symbol.clone(),
+                                            bid: price_update.bid,
+                                            ask: price_update.ask,
+                                            mark_price: None, // Can be fetched if needed
+                                            volume: None, // Can be added if needed
+                                            timestamp: Instant::now(),
+                                        };
+                                        
+                                        // Broadcast channels ignore errors (subscribers may lag)
+                                        let _ = event_bus.market_tick_tx.send(market_tick);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "CONNECTION: market data websocket error, reconnecting in 5s"
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                        break; // Reconnect
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                "CONNECTION: failed to connect market data websocket, retrying in 10s"
+                            );
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                    }
+                }
+            });
+        }
+        
+        Ok(())
+    }
+
+    /// Start user data WebSocket stream
+    /// Publishes OrderUpdate and PositionUpdate events to event bus
+    async fn start_user_data_stream(&self) -> Result<()> {
+        let client = reqwest::Client::builder().build()?;
+        let api_key = self.cfg.binance.api_key.clone();
+        let futures_base = self.cfg.binance.futures_base.clone();
+        let reconnect_delay = Duration::from_millis(self.cfg.websocket.reconnect_delay_ms);
+        let kind = UserStreamKind::Futures;
+        let event_bus = self.event_bus.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+        let venue = self.venue.clone();
+        
+        info!(
+            reconnect_delay_ms = self.cfg.websocket.reconnect_delay_ms,
+            ping_interval_ms = self.cfg.websocket.ping_interval_ms,
+            ?kind,
+            "CONNECTION: launching user data stream task"
+        );
+        
+        tokio::spawn(async move {
+            let base = futures_base;
+            loop {
+                if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                
+                match UserDataStream::connect(client.clone(), &base, &api_key, kind).await {
+                    Ok(mut stream) => {
+                        info!(?kind, "CONNECTION: connected to Binance user data stream");
+                        stream.set_on_reconnect(move || {
+                            info!("CONNECTION: reconnect callback triggered, sync event sent");
+                            // Heartbeat can be sent if needed
+                        });
+                        
+                        let mut first_event_after_reconnect = true;
+                        loop {
+                            if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                                break;
+                            }
+                            
+                            match stream.next_event().await {
+                                Ok(event) => {
+                                    if first_event_after_reconnect {
+                                        first_event_after_reconnect = false;
+                                        // Can send heartbeat if needed
+                                    }
+                                    
+                                    // Convert UserEvent to OrderUpdate/PositionUpdate/BalanceUpdate
+                                    match event {
+                                        UserEvent::OrderFill {
+                                            symbol,
+                                            order_id,
+                                            side,
+                                            qty: _, // Use cumulative_filled_qty instead
+                                            cumulative_filled_qty,
+                                            price,
+                                            is_maker: _,
+                                            order_status,
+                                            commission: _,
+                                        } => {
+                                            let status = match order_status.as_str() {
+                                                "NEW" => OrderStatus::New,
+                                                "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+                                                "FILLED" => OrderStatus::Filled,
+                                                "CANCELED" => OrderStatus::Canceled,
+                                                _ => OrderStatus::Rejected,
+                                            };
+                                            
+                                            let order_update = OrderUpdate {
+                                                symbol: symbol.clone(),
+                                                order_id,
+                                                side,
+                                                price,
+                                                qty: cumulative_filled_qty, // Use cumulative for total qty
+                                                filled_qty: cumulative_filled_qty,
+                                                remaining_qty: Qty(Decimal::ZERO), // Will be calculated if needed
+                                                status,
+                                                timestamp: Instant::now(),
+                                            };
+                                            
+                                            let _ = event_bus.order_update_tx.send(order_update);
+                                            
+                                            // Order fill olduğunda position değişir - PositionUpdate yayınla
+                                            // Position bilgisini venue'dan çek
+                                            // Not: Bu async bir işlem, bu yüzden spawn edelim
+                                            let venue_clone = venue.clone();
+                                            let event_bus_pos = event_bus.clone();
+                                            let symbol_clone = symbol.clone();
+                                            tokio::spawn(async move {
+                                                if let Ok(position) = venue_clone.get_position(&symbol_clone).await {
+                                                    let position_update = PositionUpdate {
+                                                        symbol: symbol_clone,
+                                                        qty: position.qty,
+                                                        entry_price: position.entry,
+                                                        leverage: position.leverage,
+                                                        unrealized_pnl: None, // Can be calculated from mark price
+                                                        is_open: !position.qty.0.is_zero(),
+                                                        timestamp: Instant::now(),
+                                                    };
+                                                    let _ = event_bus_pos.position_update_tx.send(position_update);
+                                                }
+                                            });
+                                        }
+                                        UserEvent::OrderCanceled {
+                                            symbol: _,
+                                            order_id: _,
+                                            client_order_id: _,
+                                        } => {
+                                            // OrderCanceled event - ORDERING module will handle from its state
+                                            // We don't have enough info here to create OrderUpdate
+                                        }
+                                        UserEvent::AccountUpdate { positions, balances } => {
+                                            // Position updates
+                                            for pos in positions {
+                                                let position_update = PositionUpdate {
+                                                    symbol: pos.symbol,
+                                                    qty: Qty(pos.position_amt),
+                                                    entry_price: Px(pos.entry_price),
+                                                    leverage: pos.leverage,
+                                                    unrealized_pnl: pos.unrealized_pnl,
+                                                    is_open: !pos.position_amt.is_zero(),
+                                                    timestamp: Instant::now(),
+                                                };
+                                                let _ = event_bus.position_update_tx.send(position_update);
+                                            }
+                                            
+                                            // Balance updates (USDT/USDC)
+                                            let mut usdt_balance = Decimal::ZERO;
+                                            let mut usdc_balance = Decimal::ZERO;
+                                            for bal in balances {
+                                                if bal.asset == "USDT" {
+                                                    usdt_balance = bal.available_balance;
+                                                } else if bal.asset == "USDC" {
+                                                    usdc_balance = bal.available_balance;
+                                                }
+                                            }
+                                            
+                                            if !usdt_balance.is_zero() || !usdc_balance.is_zero() {
+                                                let balance_update = BalanceUpdate {
+                                                    usdt: usdt_balance,
+                                                    usdc: usdc_balance,
+                                                    timestamp: Instant::now(),
+                                                };
+                                                let _ = event_bus.balance_update_tx.send(balance_update);
+                                            }
+                                        }
+                                        UserEvent::Heartbeat => {
+                                            // Heartbeat can trigger sync if needed
+                                            info!("CONNECTION: user data stream heartbeat");
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    break;
+                                }
+                            }
+                        }
+                        warn!("CONNECTION: user data stream reader exited, will reconnect");
+                    }
+                    Err(err) => {
+                        warn!(?err, "CONNECTION: failed to connect user data stream");
+                    }
+                }
+                tokio::time::sleep(reconnect_delay).await;
+            }
+        });
+        
+        Ok(())
+    }
+
+    /// Send order command (used by ORDERING module)
+    /// Returns order ID on success
+    pub async fn send_order(&self, command: OrderCommand) -> Result<String> {
+        // Rate limit check
+        {
+            let mut limiter = self.rate_limiter.lock().await;
+            limiter.check_order_rate().await;
+        }
+        
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let client_order_id = format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        
+        match command {
+            OrderCommand::Open { symbol, side, price, qty, tif } => {
+                let (order_id, _) = self.venue.place_limit_with_client_id(
+                    &symbol,
+                    side,
+                    price,
+                    qty,
+                    tif,
+                    &client_order_id,
+                ).await?;
+                Ok(order_id)
+            }
+            OrderCommand::Close { symbol, side, price, qty, tif } => {
+                let (order_id, _) = self.venue.place_limit_with_client_id(
+                    &symbol,
+                    side,
+                    price,
+                    qty,
+                    tif,
+                    &client_order_id,
+                ).await?;
+                Ok(order_id)
+            }
+        }
+    }
+
+    /// Fetch balance (used by BALANCE module)
+    /// NOTE: Balance should come from WebSocket stream (AccountUpdate event)
+    /// This is only used as fallback on startup
+    pub async fn fetch_balance(&self, asset: &str) -> Result<Decimal> {
+        // Rate limit check
+        {
+            let mut limiter = self.rate_limiter.lock().await;
+            limiter.check_balance_rate().await;
+        }
+        
+        self.venue.available_balance(asset).await
+    }
+}
+
+/// Order command for ORDERING module
+#[derive(Debug, Clone)]
+pub enum OrderCommand {
+    Open {
+        symbol: String,
+        side: Side,
+        price: Px,
+        qty: Qty,
+        tif: crate::types::Tif,
+    },
+    Close {
+        symbol: String,
+        side: Side,
+        price: Px,
+        qty: Qty,
+        tif: crate::types::Tif,
+    },
+}
+
+// ============================================================================
+// Internal Types (used only within connection.rs)
+// ============================================================================
+
+/// Internal order type (used only within connection.rs)
+#[derive(Clone, Debug)]
+pub struct VenueOrder {
+    pub order_id: String,
+    pub side: Side,
+    pub price: Px,
+    pub qty: Qty,
+}
+
+/// Internal position type (used only within connection.rs)
+#[derive(Clone, Debug)]
+pub struct Position {
+    pub symbol: String,
+    pub qty: Qty,
+    pub entry: Px,
+    pub leverage: u32,
+    pub liq_px: Option<Px>,
+}
+
+/// Exchange interface trait (internal to connection.rs)
+/// Implemented by BinanceFutures
+#[async_trait]
+trait Venue: Send + Sync {
+    async fn place_limit_with_client_id(
+        &self,
+        sym: &str,
+        side: Side,
+        px: Px,
+        qty: Qty,
+        tif: Tif,
+        client_order_id: &str,
+    ) -> Result<(String, Option<String>)>;
+    
+    async fn cancel(&self, order_id: &str, sym: &str) -> Result<()>;
+    async fn best_prices(&self, sym: &str) -> Result<(Px, Px)>;
+    async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>>;
+    async fn get_position(&self, sym: &str) -> Result<Position>;
+    async fn close_position(&self, sym: &str) -> Result<()>;
+    async fn available_balance(&self, asset: &str) -> Result<Decimal>;
+}
 
 // ============================================================================
 // Binance Exec Module (from binance_exec.rs)
@@ -77,6 +608,10 @@ struct FutExchangeSymbol {
 }
 
 pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
+
+/// ✅ BEST PRACTICE: Price cache from WebSocket market data stream
+/// Thread-safe price storage - updated by WebSocket, read by main loop
+pub static PRICE_CACHE: Lazy<DashMap<String, PriceUpdate>> = Lazy::new(|| DashMap::new());
 
 fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
     let value = s.as_ref();
@@ -317,6 +852,42 @@ struct PremiumIndex {
 }
 
 impl BinanceFutures {
+    /// Create BinanceFutures from config
+    pub fn from_config(
+        binance_cfg: &crate::config::BinanceCfg,
+        price_tick: f64,
+        qty_step: f64,
+    ) -> Result<Self> {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        
+        let base = if binance_cfg.futures_base.contains("testnet") {
+            "https://testnet.binancefuture.com".to_string()
+        } else {
+            binance_cfg.futures_base.clone()
+        };
+        
+        let common = BinanceCommon {
+            client: Arc::new(Client::new()),
+            api_key: binance_cfg.api_key.clone(),
+            secret_key: binance_cfg.secret_key.clone(),
+            recv_window_ms: binance_cfg.recv_window_ms,
+        };
+        
+        let price_tick_dec = Decimal::from_str(&price_tick.to_string())?;
+        let qty_step_dec = Decimal::from_str(&qty_step.to_string())?;
+        
+        Ok(BinanceFutures {
+            base,
+            common,
+            price_tick: price_tick_dec,
+            qty_step: qty_step_dec,
+            price_precision: decimal_places(price_tick_dec),
+            qty_precision: decimal_places(qty_step_dec),
+            hedge_mode: binance_cfg.hedge_mode,
+        })
+    }
+    
     /// Leverage ayarla (sembol bazlı)
     /// KRİTİK: Başlangıçta her sembol için leverage'i açıkça ayarla
     /// /fapi/v1/leverage endpoint'i ile sembol bazlı leverage set edilir
@@ -1537,6 +2108,12 @@ impl Venue for BinanceFutures {
     }
 
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)> {
+        // ✅ BEST PRACTICE: Önce WebSocket cache'den oku, yoksa REST API'ye fallback
+        if let Some(price_update) = PRICE_CACHE.get(sym) {
+            return Ok((price_update.bid, price_update.ask));
+        }
+        
+        // Fallback: REST API (WebSocket cache'de yoksa)
         let url = format!("{}/fapi/v1/depth?symbol={}&limit=5", self.base, encode(sym));
         let d: OrderBookTop = send_json(self.common.client.get(url)).await?;
         use rust_decimal::Decimal;
@@ -1559,6 +2136,11 @@ impl Venue for BinanceFutures {
     async fn close_position(&self, sym: &str) -> Result<()> {
         // Normal kapanış: MARKET başarısız olursa LIMIT fallback yap
         self.flatten_position(sym, self.hedge_mode, false).await
+    }
+    
+    async fn available_balance(&self, asset: &str) -> Result<Decimal> {
+        // Call BinanceFutures::available_balance method (not trait method to avoid recursion)
+        BinanceFutures::available_balance(self, asset).await
     }
 }
 
@@ -1995,7 +2577,38 @@ pub enum UserEvent {
         order_id: String,
         client_order_id: Option<String>, // Idempotency için
     },
+    AccountUpdate {
+        // Position updates
+        positions: Vec<AccountPosition>,
+        // Balance updates
+        balances: Vec<AccountBalance>,
+    },
     Heartbeat,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountPosition {
+    pub symbol: String,
+    pub position_amt: Decimal,
+    pub entry_price: Decimal,
+    pub leverage: u32,
+    pub unrealized_pnl: Option<Decimal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountBalance {
+    pub asset: String,
+    pub available_balance: Decimal,
+}
+
+/// Market data price update from WebSocket (@bookTicker stream)
+#[derive(Debug, Clone)]
+pub struct PriceUpdate {
+    pub symbol: String,
+    pub bid: Px,
+    pub ask: Px,
+    pub bid_qty: Qty,
+    pub ask_qty: Qty,
 }
 
 pub struct UserDataStream {
@@ -2009,6 +2622,118 @@ pub struct UserDataStream {
     /// Reconnect sonrası missed events sync callback
     /// Callback reconnect sonrası çağrılır ve missed events'leri sync etmek için kullanılır
     on_reconnect: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+/// Market data WebSocket stream for price updates (@bookTicker)
+/// ✅ BEST PRACTICE: WebSocket kullanarak REST API rate limit'ini önle
+pub struct MarketDataStream {
+    ws: WsStream,
+    symbols: Vec<String>,
+}
+
+impl MarketDataStream {
+    /// Create market data stream for multiple symbols
+    /// Binance @bookTicker stream: wss://fstream.binance.com/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker
+    pub async fn connect(symbols: &[String]) -> Result<Self> {
+        // Build stream URL: wss://fstream.binance.com/stream?streams=symbol1@bookTicker/symbol2@bookTicker
+        let streams: Vec<String> = symbols
+            .iter()
+            .map(|s| format!("{}@bookTicker", s.to_lowercase()))
+            .collect();
+        let stream_param = streams.join("/");
+        let url = format!("wss://fstream.binance.com/stream?streams={}", stream_param);
+        
+        info!(url = %url, symbol_count = symbols.len(), "connecting to market data websocket");
+        let (ws, _) = connect_async(&url).await?;
+        info!("connected to market data websocket");
+        
+        Ok(Self {
+            ws,
+            symbols: symbols.to_vec(),
+        })
+    }
+    
+    /// Get next price update
+    pub async fn next_price_update(&mut self) -> Result<PriceUpdate> {
+        loop {
+            match timeout(Duration::from_secs(300), self.ws.next()).await {
+                Ok(Some(msg)) => {
+                    let msg = msg.map_err(|e| match e {
+                        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+                            anyhow!("market data stream closed")
+                        }
+                        other => anyhow!(other),
+                    })?;
+                    
+                    match msg {
+                        Message::Ping(payload) => {
+                            self.ws.send(Message::Pong(payload)).await?;
+                            continue;
+                        }
+                        Message::Pong(_) => continue,
+                        Message::Text(txt) => {
+                            if txt.is_empty() {
+                                continue;
+                            }
+                            
+                            // Binance format: {"stream":"btcusdt@bookTicker","data":{...}}
+                            let value: Value = serde_json::from_str(&txt)?;
+                            let stream_name = value.get("stream")
+                                .and_then(|s| s.as_str())
+                                .ok_or_else(|| anyhow!("missing stream field"))?;
+                            
+                            // Extract symbol from stream name (e.g., "btcusdt@bookTicker" -> "BTCUSDT")
+                            let symbol = stream_name
+                                .split('@')
+                                .next()
+                                .ok_or_else(|| anyhow!("invalid stream name"))?
+                                .to_uppercase();
+                            
+                            let data = value.get("data")
+                                .ok_or_else(|| anyhow!("missing data field"))?;
+                            
+                            // Parse @bookTicker format
+                            // {"b":"50000.00","B":"1.5","a":"50001.00","A":"2.0"}
+                            let bid_str = data.get("b")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| anyhow!("missing bid price"))?;
+                            let ask_str = data.get("a")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| anyhow!("missing ask price"))?;
+                            let bid_qty_str = data.get("B")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            let ask_qty_str = data.get("A")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0");
+                            
+                            let bid = Decimal::from_str(bid_str)?;
+                            let ask = Decimal::from_str(ask_str)?;
+                            let bid_qty = Decimal::from_str(bid_qty_str).unwrap_or(Decimal::ZERO);
+                            let ask_qty = Decimal::from_str(ask_qty_str).unwrap_or(Decimal::ZERO);
+                            
+                            return Ok(PriceUpdate {
+                                symbol,
+                                bid: Px(bid),
+                                ask: Px(ask),
+                                bid_qty: Qty(bid_qty),
+                                ask_qty: Qty(ask_qty),
+                            });
+                        }
+                        Message::Binary(_) => continue,
+                        Message::Close(_) => return Err(anyhow!("market data stream closed")),
+                        Message::Frame(_) => continue,
+                    }
+                }
+                Ok(None) => return Err(anyhow!("market data stream terminated")),
+                Err(_) => {
+                    warn!("market data websocket timeout, reconnecting");
+                    // Reconnect logic could be added here if needed
+                    return Err(anyhow!("market data stream timeout"));
+                }
+            }
+        }
+    }
 }
 
 impl UserDataStream {
@@ -2370,6 +3095,71 @@ impl UserDataStream {
                     order_status: status.to_string(),
                     commission,
                 }));
+            }
+
+            // ACCOUNT_UPDATE event - position and balance updates from WebSocket
+            "ACCOUNT_UPDATE" => {
+                let mut positions = Vec::new();
+                let mut balances = Vec::new();
+                
+                // Parse positions (a field)
+                if let Some(positions_data) = value.get("a").and_then(|v| v.get("P")) {
+                    if let Some(positions_array) = positions_data.as_array() {
+                        for pos_data in positions_array {
+                            if let (Some(symbol), Some(amt), Some(entry)) = (
+                                pos_data.get("s").and_then(Value::as_str),
+                                pos_data.get("pa").and_then(Value::as_str),
+                                pos_data.get("ep").and_then(Value::as_str),
+                            ) {
+                                let position_amt = Decimal::from_str(amt).unwrap_or(Decimal::ZERO);
+                                let entry_price = Decimal::from_str(entry).unwrap_or(Decimal::ZERO);
+                                let leverage = pos_data
+                                    .get("l")
+                                    .and_then(Value::as_str)
+                                    .and_then(|s| s.parse::<u32>().ok())
+                                    .unwrap_or(1);
+                                let unrealized_pnl = pos_data
+                                    .get("up")
+                                    .and_then(Value::as_str)
+                                    .and_then(|s| Decimal::from_str(s).ok());
+                                
+                                positions.push(AccountPosition {
+                                    symbol: symbol.to_string(),
+                                    position_amt,
+                                    entry_price,
+                                    leverage,
+                                    unrealized_pnl,
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                // Parse balances (a field -> B array)
+                if let Some(balances_data) = value.get("a").and_then(|v| v.get("B")) {
+                    if let Some(balances_array) = balances_data.as_array() {
+                        for bal_data in balances_array {
+                            if let (Some(asset), Some(available)) = (
+                                bal_data.get("a").and_then(Value::as_str),
+                                bal_data.get("wb").and_then(Value::as_str), // wallet balance
+                            ) {
+                                let available_balance = Decimal::from_str(available).unwrap_or(Decimal::ZERO);
+                                
+                                // Only track USDT and USDC
+                                if asset == "USDT" || asset == "USDC" {
+                                    balances.push(AccountBalance {
+                                        asset: asset.to_string(),
+                                        available_balance,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if !positions.is_empty() || !balances.is_empty() {
+                    return Ok(Some(UserEvent::AccountUpdate { positions, balances }));
+                }
             }
 
             _ => {}

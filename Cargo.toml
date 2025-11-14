@@ -1,15 +1,38 @@
-[workspace]
-members = [
-    "crates/app",
-    # Note: All crates (bot_core, strategy, exec, data) moved to app/ modules
-    # Note: risk and monitor also moved to app/ modules
-]
-resolver = "2"
-
-[workspace.package]
-edition = "2021"
+[package]
+name = "app"
 version = "0.1.0"
-authors = ["you <you@example.com>"]
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+config = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+# Binance / concurrency dependencies
+dashmap = { workspace = true }
+once_cell = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+
+[workspace]
+resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"

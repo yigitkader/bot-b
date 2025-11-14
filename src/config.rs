@@ -1,5 +1,5 @@
-//location: /crates/app/src/config.rs
 // Configuration structures and loading logic
+// Clean architecture - minimal config for event-driven modules
 
 use anyhow::{anyhow, Result};
 // Removed unused import

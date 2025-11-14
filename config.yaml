@@ -1,251 +1,74 @@
-#root config.yaml
+# Trading Bot Configuration - Clean Architecture
+# Event-driven modules with WebSocket-first approach
 
-symbols: []            # Manuel semboller; boş bırakırsan auto discovery devrede
+# ============================================================================
+# Symbol Configuration
+# ============================================================================
+symbols: []            # Manual symbols; empty = auto discovery enabled
 auto_discover_quote: true
 quote_asset: "USDC"
-allow_usdt_quote: true  # USDC yanında USDT'yi de dahil et (daha fazla likidite ve sembol)
+allow_usdt_quote: true  # Include USDT alongside USDC for more liquidity
 mode: "futures"       # "spot" | "futures"
-metrics_port: 9000
 
-# Emir boyutu sınırı (margin = hesaptan çıkan para); hem spot hem futures için uygulanır.
-# KRİTİK: Her işlem için min 10 - max 100 USDC/USDT kuralı zorunlu
+# ============================================================================
+# Order Size Limits
+# ============================================================================
 max_usd_per_order: 100.0  # Maximum margin per trade (USD)
-min_usd_per_order: 10.0   # Minimum margin per trade (USD) - 10-100 arası chunk'lar
+min_usd_per_order: 10.0   # Minimum margin per trade (USD)
+min_quote_balance_usd: 1.0  # Minimum quote asset balance threshold (USD)
 
-# Quote asset minimum bakiye eşiği (USD)
-# Her sembol kendi quote asset'ini kullanır (BTCUSDT → USDT, BTCUSDC → USDC)
-# Eğer o quote asset'te bakiye bu eşikten azsa, o sembol skip edilir
-# Diğer quote asset'li semboller devam edebilir
-min_quote_balance_usd: 1.0
+# ============================================================================
+# Trading Parameters
+# ============================================================================
+leverage: 20  # Leverage for futures (20x-50x supported with isolated margin)
 
-# Kaldıraç (sadece futures)
-# KRİTİK: 20x-50x desteklenecek (isolated margin ile)
-leverage: 20
-
-# Fiyat/lot adımı (quantize için). İstersen exchangeInfo'dan otomatik de çekebiliriz,
-# ama basit ve deterministik olsun diye konfigde tutuyoruz.
+# Price/quantity precision (for quantization)
+# Can be auto-fetched from exchangeInfo, but kept here for determinism
 price_tick: 0.001
 qty_step: 0.001
 
-# Binance API
+# ============================================================================
+# Take Profit / Stop Loss (for FOLLOW_ORDERS module)
+# ============================================================================
+take_profit_pct: 5.0   # Take profit percentage (default: 5%)
+stop_loss_pct: 2.0      # Stop loss percentage (default: 2%)
+
+# ============================================================================
+# Trend Analysis (for TRENDING module)
+# ============================================================================
+trending:
+  min_spread_bps: 5.0   # Minimum spread to generate signal (bps)
+  max_spread_bps: 200.0 # Maximum spread to generate signal (bps)
+
+# ============================================================================
+# Binance API Configuration
+# ============================================================================
 binance:
-  # SPOT
-  spot_base: "https://api.binance.com"
-  # USDⓈ-M Futures (USDT/USDC destekler - fapi.binance.com)
-  # Not: Bu endpoint USDⓈ-M Futures için kullanılır (hem USDT hem USDC quote destekler)
   futures_base: "https://fapi.binance.com"
   api_key: ""
   secret_key: ""
   recv_window_ms: 5000
-  hedge_mode: false  # Hedge mode (dual-side position) açık mı? Default: false (one-way mode)
+  hedge_mode: false  # Hedge mode (dual-side position) - default: false (one-way mode)
 
+# ============================================================================
+# Risk Management
+# ============================================================================
 risk:
-  inv_cap: "1000.0"  # ✅ KRİTİK: USD notional tabanlı (fiyat * qty) - base asset miktarı değil! Örnek: 1000 USD notional limit
-  min_liq_gap_bps: 300
-  dd_limit_bps: 2000
-  max_leverage: 50  # KRİTİK DÜZELTME: 100x çok tehlikeli, 50x ile sınırla
-  slippage_bps_reserve: 2.0  # Slipaj tamponu (bps) - spread hesaplamasından çıkarılır
-  use_isolated_margin: true  # Isolated margin kullan (20x-50x için kritik)
-  max_open_chunks_per_symbol_per_side: 1  # ✅ KRİTİK: Tek chunk kuralı - aynı anda sadece 1 open_order veya 1 position
+  max_leverage: 50  # Maximum leverage limit
+  use_isolated_margin: true  # Use isolated margin (required for 20x-50x leverage)
+  max_position_notional_usd: 1000.0  # Maximum position notional (USD)
 
-strategy:
-  type: "dyn_mm"  # "dyn_mm" | "qmel" - Q-MEL algoritması için "qmel" kullan
-  # KRİTİK DÜZELTME: Küçük kar hedefi ($0.50) için daha dar spread - market'e daha yakın emirler
-  a: 60.0   # 100.0 → 60.0: spread'i daralt (daha agresif, daha fazla işlem)
-  b: 20.0    # 35.0 → 20.0: spread'i daralt (daha agresif, daha fazla işlem)
-  base_size: "10.0"  # 20 → 50 (daha fazla kazanç/işlem)
-
-  # --- Q-MEL Algoritma Parametreleri (type: "qmel" için) ---
-  # Q-MEL: Micro-Edge Trading Algorithm
-  qmel_ev_threshold: 0.10  # Minimum EV to trade (USD) - default: $0.10
-  qmel_min_margin_usdc: 10.0  # Minimum margin per trade (USDC) - zorunlu kural
-  qmel_max_margin_usdc: 100.0  # Maximum margin per trade (USDC) - zorunlu kural
-  qmel_f_min: 0.02  # Minimum risk fraction (2%)
-  qmel_f_max: 0.15  # Maximum risk fraction (15%)
-  qmel_alpha: 0.5  # ARG safety coefficient [0.3, 0.6]
-  qmel_beta: 1.0  # ARG volatility coefficient [0.5, 1.5]
-  qmel_edge_decay_half_life_ms: 500.0  # Edge decay half-life (ms)
-  qmel_exploration_rate: 0.1  # Bandit exploration rate
-
-  # --- Spread ve Fiyatlama Eşikleri ---
-  # ✅ KRİTİK DÜZELTME: $0.50 kar hedefi için optimize edilmiş spread
-  # Hesaplama: Fees (8 bps) + Target profit (50 bps) = 58 bps gerekli
-  # 30 bps floor: Dynamic spread hesaplaması ile birlikte yeterli, daha agresif trading için
-  min_spread_bps: 30.0              # Minimum spread floor (bps) - 60.0 → 30.0: daha agresif, daha fazla işlem
-  max_spread_bps: 200.0            # Maksimum spread (bps) (150 → 200: daha toleranslı)
-  spread_arbitrage_min_bps: 5.0   # Spread arbitraj minimum eşiği (bps) (10 → 5: daha fazla fırsat)
-  spread_arbitrage_max_bps: 100.0   # Spread arbitraj maksimum eşiği (bps) (30 → 100: daha geniş aralık)
-
-  # --- Profit Guarantee ve Fee Ayarları (KRİTİK) ---
-  min_profit_usd: 0.50              # Minimum kar hedefi (USD) - işlem başına net +$0.50
-  maker_fee_rate: 0.0001            # Maker fee oranı (0.0001 = 1 bp = 0.01%) - Binance Futures maker
-  taker_fee_rate: 0.0004            # Taker fee oranı (0.0004 = 4 bps = 0.04%) - Binance Futures default
-  # Not: slippage_bps_reserve artık risk.slippage_bps_reserve altında
-  # Dynamic spread: min_spread_bps = max(min_spread_bps_floor, 2*maker_fee_bps + 10000*0.5/notional)
-
-  # --- Trend Takibi Eşikleri ---
-  strong_trend_bps: 100.0          # Güçlü trend eşiği (bps)
-  momentum_strong_bps: 50.0         # Momentum güçlü eşiği (bps)
-  trend_bias_multiplier: 1.0       # Trend bias çarpanı
-
-  # --- Adverse Selection Eşikleri ---
-  adverse_selection_threshold_on: 0.6   # Adverse selection açılma eşiği
-  adverse_selection_threshold_off: 0.4 # Adverse selection kapanma eşiği
-
-  # --- Fırsat Modu Eşikleri ---
-  opportunity_threshold_on: 0.5    # Fırsat modu açılma eşiği
-  opportunity_threshold_off: 0.2   # Fırsat modu kapanma eşiği
-
-  # --- Manipülasyon Tespit Eşikleri ---
-  price_jump_threshold_bps: 500.0  # Flash crash/pump eşiği (bps) (300 → 500: false positive azalt)
-  fake_breakout_threshold_bps: 100.0 # Fake breakout eşiği (bps)
-  liquidity_drop_threshold: 0.5    # Likidite düşüş eşiği (ratio)
-
-  # --- Envanter Yönetimi ---
-  inventory_threshold_ratio: 0.10  # Envanter threshold oranı (%) (0.15 → 0.10: daha çevik)
-
-  # --- Adaptif Spread Katsayıları ---
-  volatility_coefficient: 0.5     # Volatilite katsayısı (c1)
-  ofi_coefficient: 0.5            # OFI katsayısı (c2)
-
-  # --- Diğer ---
-  min_liquidity_required: 0.001    # Minimum likidite gereksinimi (0.01 → 0.001: daha fazla sembol için trade yapılabilir)
-  min_24h_volume_usd: 0.0         # Minimum 24h volume (USD) - 0.0 = devre dışı (rate limit riski nedeniyle opsiyonel)
-  min_book_depth_usd: 0.0         # Minimum book depth (USD) - 0.0 = devre dışı (mevcut min_liquidity_required yeterli)
-  opportunity_size_multiplier: 1.05 # Fırsat modu pozisyon çarpanı (1.1 → 1.05: konservatif)
-  strong_trend_multiplier: 1.0     # Güçlü trend pozisyon çarpanı (1.5 → 1.0: normal boyut)
-
-exec:
-  tif: "post_only"     # "gtc" | "ioc" | "post_only"
-  venue: "binance"     # sabit
-  cancel_replace_interval_ms: 1500  # Rate limit koruması: 500 → 1500 (daha az churn, rate limit riski azalır)
-  max_order_age_ms: 10000  # 5000 → 10000 (daha uzun emir ömrü, daha az cancel/replace)
-  default_leverage: 20  # Default leverage (futures için) - 20x-50x desteklenecek (cfg.leverage fallback olarak kullanılır)
-
+# ============================================================================
+# WebSocket Configuration
+# ============================================================================
 websocket:
   enabled: true
   reconnect_delay_ms: 5000
   ping_interval_ms: 30000
 
-# --- İç Mantık Parametreleri ---
-internal:
-  # PnL ve geçmiş takibi
-  pnl_history_max_len: 1024
-  position_size_history_max_len: 100
-
-  # Rate limiting ve işlem yönetimi
-  max_symbols_per_tick: 8
-  rate_limiter_safety_factor: 0.8
-  rate_limiter_min_interval_ms: 1000
-  order_sync_interval_sec: 8  # ✅ KRİTİK: Daha az request - WS event'leriyle uyum için 8 sn (önceden 2 sn)
-  cancel_stagger_delay_ms: 50
-  min_tick_interval_ms: 100  # Minimum tick interval (ms) - rate limit koruması için
-  symbol_discovery_retry_interval_sec: 30  # Symbol discovery retry interval (seconds)
-
-  # Logging ve debug parametreleri
-  progress_log_first_n_symbols: 10  # İlk N sembol için progress log
-  progress_log_interval: 50  # Her N sembolde bir progress log
-  debug_symbol_count: 5  # İlk N sembol için debug log
-  max_stale_orders_threshold: 10  # Maksimum stale order threshold
-
-  # Fill rate güncelleme katsayıları
-  fill_rate_increase_factor: 0.95
-  fill_rate_increase_bonus: 0.05
-  fill_rate_decrease_factor: 0.95  # 0.98 → 0.95 (daha agresif düşürme)
-  fill_rate_slow_decrease_factor: 0.995
-  fill_rate_slow_decrease_bonus: 0.005
-  fill_rate_partial_fill_factor: 0.98  # Partial fill sonrası fill rate artış faktörü
-  fill_rate_partial_fill_bonus: 0.02  # Partial fill sonrası fill rate artış bonusu
-  fill_rate_reconnect_factor: 0.95  # Reconnect sonrası fill rate artış faktörü
-  fill_rate_reconnect_bonus: 0.05  # Reconnect sonrası fill rate artış bonusu
-  fill_rate_periodic_decay_factor: 0.9  # Periyodik decay faktörü (30 saniyede bir %10 azalt)
-  strategy_sigma: 0.5  # Volatility coefficient for strategy (default: 0.5)
-
-  # Emir fiyat mesafesi eşikleri (decimal)
-  # KRİTİK DÜZELTME: $0.50 kar hedefi için %0.3-0.5 spread çok dar
-  # Maker fee (2 bps) + slippage + kar = minimum %0.6-1% spread gerekli
-  # %1.0 ve %0.8 değerleri daha makul - spread'den yeterli kar garantisi
-  order_price_distance_with_position: 0.01   # %1.0 (pozisyon varsa) - maker fee + slippage + kar için yeterli
-  order_price_distance_no_position: 0.008    # %0.8 (pozisyon yoksa) - maker fee + slippage + kar için yeterli
-  order_price_change_threshold: 0.001         # %0.1 fiyat değişimi eşiği (0.0001 → 0.001: gereksiz güncellemeleri azalt)
-  min_quote_life_ms: 1500                    # Minimum quote ömrü (ms) - rate limit koruması için
-
-  # Envanter uyumsuzluğu eşiği
-  inventory_reconcile_threshold: 0.00000001  # Decimal::new(1, 8)
-  position_qty_threshold: 0.00000001         # Decimal::new(1, 8)
-
-  # PnL alert eşikleri
-  pnl_alert_interval_sec: 10
-  pnl_alert_threshold_positive: 0.05  # %5 kar
-  pnl_alert_threshold_negative: -0.03 # %3 zarar
-
-  # Take profit eşikleri
-  take_profit_threshold_small: 0.005   # %0.5 (küçük pozisyonlar) (0.01 → 0.005: daha gerçekçi)
-  take_profit_threshold_large: 0.02   # %2 (büyük pozisyonlar) (0.05 → 0.02: daha gerçekçi)
-  take_profit_time_threshold_ms: 600000  # 10 dakika
-  take_profit_min_profit_threshold: 0.10  # %10
-
-  # Trailing stop eşikleri
-  trailing_stop_peak_threshold_large: 100.0  # USD (büyük karlar)
-  trailing_stop_peak_threshold_medium: 20.0   # USD (orta karlar)
-  trailing_stop_drawdown_large: 0.01    # %1 (büyük karlar için) (0.03 → 0.01: sıkı)
-  trailing_stop_drawdown_medium: 0.005  # %0.5 (orta karlar için) (0.015 → 0.005: sıkı)
-  trailing_stop_drawdown_small: 0.003   # %0.3 (küçük karlar için) (0.001 → 0.003: sıkı)
-  trailing_stop_min_peak: 1.0            # Minimum peak (USD) (0.01 → 1.0: mikro dalgalanmaları önler)
-
-  # Stop loss eşikleri
-  stop_loss_threshold: -0.01  # %1 zarar (-0.005 → -0.01: daha erken kes)
-  stop_loss_time_threshold_ms: 120000  # 2 dakika
-  stop_loss_trend_threshold: -0.2       # %20 trend düşüşü
-
-  # Pozisyon boyutu risk kontrolü
-  max_position_size_buffer: 10.0  # 10x buffer (5.0 → 10.0: daha fazla pozisyon boyutuna izin ver)
-  opportunity_mode_position_multiplier: 1.5  # Fırsat modunda pozisyon çarpanı (2.0 → 1.5: daha konservatif)
-  opportunity_mode_leverage_reduction: 0.5  # Fırsat modunda leverage azaltma faktörü (0.5 = yarıya düşür)
-  opportunity_mode_soft_limit_ratio: 0.80  # Soft limit: Yeni emirleri durdur (%80) (0.95 → 0.80: daha erken dur)
-  opportunity_mode_medium_limit_ratio: 0.90  # Medium limit: Mevcut emirleri azalt (%90) (1.0 → 0.90: daha erken azalt)
-  opportunity_mode_hard_limit_ratio: 1.0  # Hard limit: Force-close (%100)
-
-  # Risk/Reward ve Profit Guarantee
-  # Market making için: 1.0-1.5 yeterli (spread'den kazanç garantili)
-  # Directional trading için: 2.0+ gerekli
-  min_risk_reward_ratio: 1.0  # Minimum risk/reward oranı (1:1, market making için esnek)
-  take_profit_position_size_threshold: 100.0  # Take profit için pozisyon boyutu eşiği (USD)
-
-  # Fill rate yönetimi
-  initial_fill_rate: 0.5  # Başlangıç fill rate (%50)
-  no_fill_threshold_sec: 5.0  # Fill olmayan emir threshold'u (saniye)
-  fill_rate_decrease_on_no_fill: 0.90  # Fill olmayınca düşürme faktörü
-  min_fill_rate: 0.1  # Minimum fill rate (%10)
-
-  # Spread yönetimi
-  spread_widen_factor: 0.001  # Spread genişletme faktörü (0.1%)
-
-# --- Strateji İç Mantık Parametreleri ---
-strategy_internal:
-  # Manipülasyon tespiti
-  manipulation_volume_ratio_threshold: 10.0    # 10x volume artışı (2.5 → 10.0: false positive azalt)
-  manipulation_time_threshold_ms: 5000        # 5 saniye içinde (2000 → 5000: daha toleranslı)
-  manipulation_price_history_min_len: 3        # Minimum fiyat geçmişi uzunluğu
-  manipulation_price_history_max_len: 200     # Maximum fiyat geçmişi uzunluğu
-  # Flash crash recovery check (iyileştirilmiş)
-  flash_crash_recovery_window_ms: 30000      # Recovery check için zaman penceresi (30 saniye)
-  flash_crash_recovery_min_points: 10        # Recovery check için minimum fiyat noktası sayısı
-  flash_crash_recovery_min_ratio: 0.3        # Minimum recovery oranı (%30 geri yükselme)
-
-  # Confidence hesaplama
-  confidence_price_drop_max: 500.0            # Max price drop/rise for confidence (bps)
-  confidence_volume_ratio_min: 5.0            # Min volume ratio for confidence
-  confidence_volume_ratio_max: 10.0           # Max volume ratio for confidence
-  confidence_spread_min: 50.0                 # Min spread for confidence (bps)
-  confidence_spread_max: 150.0                # Max spread for confidence (bps)
-  confidence_bonus_multiplier: 0.3            # Confidence bonus multiplier
-  confidence_max_multiplier: 2.0              # Max multiplier cap (1.5 → 2.0: daha agresif)
-  confidence_min_threshold: 0.70              # Minimum confidence threshold (%70+ güven gerekli) (0.85 → 0.70: false positive azalt, gerçek fırsatları kaçırma)
-  default_confidence: 0.7                     # Default confidence değeri (opportunity türü bilinmediğinde)
-  min_confidence_value: 0.5                  # Minimum confidence değeri (clamp için)
-
-  # Trend analizi
-  trend_analysis_min_history: 10              # Minimum geçmiş uzunluğu
-  trend_analysis_threshold_negative: -0.15    # %15 trend düşüşü
-  trend_analysis_threshold_strong_negative: -0.20  # %20 güçlü trend düşüşü
+# ============================================================================
+# Order Execution (for CONNECTION module)
+# ============================================================================
+exec:
+  tif: "post_only"  # Time in force: "gtc" | "ioc" | "post_only"
+  default_leverage: 20  # Default leverage (fallback if not set per symbol)
