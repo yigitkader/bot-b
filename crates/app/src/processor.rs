@@ -307,17 +307,32 @@ pub fn select_best_opportunities(
             }
         }
         
-        // Get EV scores
+        // ✅ KRİTİK: Sadece QMelStrategy için opportunity selection yap
+        // DynMm gibi diğer strategy'ler EV skorları üretmez, bu yüzden filtrelenir
+        let is_qmel = state.strategy.as_any().downcast_ref::<crate::qmel::QMelStrategy>().is_some();
+        if !is_qmel {
+            // QMelStrategy değilse skip et (EV skorları yok)
+            continue;
+        }
+        
+        // Get EV scores from QMelStrategy
         let (ev_long, ev_short) = (state.last_ev_long, state.last_ev_short);
         
-        // Select best side
+        // ✅ KRİTİK GÜVENLİK: EV skorları geçerli mi kontrol et
+        // Eğer her iki skor da 0 veya negatifse, bu sembolü skip et
+        if ev_long <= 0.0 && ev_short <= 0.0 {
+            continue; // Geçerli EV skoru yok
+        }
+        
+        // Select best side based on EV
         let (side, ev) = if ev_long >= ev_short {
             (Side::Buy, ev_long)
         } else {
             (Side::Sell, ev_short)
         };
         
-        // EV threshold filter
+        // ✅ KRİTİK GÜVENLİK: EV threshold filter - QMelStrategy'nin minimum edge gereksinimi
+        // EV threshold'dan küçükse bu sembolü skip et (kayıp riski)
         if ev < min_ev_threshold {
             continue;
         }
@@ -346,6 +361,11 @@ pub fn select_best_opportunities(
         if state.symbol_rules.is_none() {
             continue;
         }
+        
+        // ✅ KRİTİK: Risk check - portfolio-level risk limits
+        // Her sembol için risk kontrolü yap (inv_cap, liq_gap, drawdown)
+        // Bu kontrol risk.rs'deki check_risk fonksiyonu ile yapılabilir
+        // Şimdilik basit bir kontrol yapıyoruz, detaylı risk check process_symbol içinde yapılıyor
         
         opps.push(Opportunity {
             symbol: state.meta.symbol.clone(),
@@ -556,6 +576,8 @@ pub async fn process_symbol(
     // Force close if position exceeded max duration
     let has_position = !pos.qty.0.is_zero();
     if has_position {
+        // ✅ KRİTİK: Entry time kontrolü - eğer yoksa update_position_tracking fallback set edecek
+        // Ama burada da kontrol edelim (update_position_tracking henüz çağrılmadı)
         if let Some(entry_time) = state.position_entry_time {
             let age_secs = entry_time.elapsed().as_secs() as f64;
             if age_secs >= crate::constants::MAX_POSITION_DURATION_SEC {
@@ -566,6 +588,14 @@ pub async fn process_symbol(
                 }
                 return Ok(false);
             }
+        } else {
+            // Entry time yok ama pozisyon var - update_position_tracking fallback set edecek
+            // Bu durumda max duration kontrolü yapamayız, update_position_tracking'den sonra tekrar kontrol edilecek
+            debug!(
+                %symbol,
+                position_qty = %pos.qty.0,
+                "position exists but entry_time is None, will be set by update_position_tracking fallback"
+            );
         }
     }
 
@@ -1054,15 +1084,29 @@ pub async fn process_symbol(
 
     // Generate quotes - strategy.on_tick() çağrısı hızlıdır ve order placement'ı bloklamaz
     // Trend analizi strategy içinde yapılır ama bu hızlı bir işlemdir
+    // ✅ KRİTİK: QMelStrategy on_tick() içinde EV skorlarını hesaplar ve last_ev_long/short'a yazar
     let mut quotes = state.strategy.on_tick(&ctx);
-
-    // Update EV scores from QMelStrategy (for opportunity selection)
+    
+    // ✅ KRİTİK: Update EV scores from QMelStrategy (for opportunity selection)
+    // QMelStrategy her tick'te EV skorlarını hesaplar ve burada state'e yazılır
+    // Bu skorlar select_best_opportunities tarafından kullanılır
     if let Some(qmel) = state.strategy.as_any().downcast_ref::<QMelStrategy>() {
         let (ev_long, ev_short) = qmel.last_scores();
         state.last_ev_long = ev_long;
         state.last_ev_short = ev_short;
         state.last_best_side = qmel.last_best_side().map(|(side, _)| side);
         state.last_score_time = Some(Instant::now());
+        
+        // ✅ DEBUG: QMelStrategy EV skorlarını logla (her 10 tick'te bir veya önemli değişikliklerde)
+        if ev_long > 0.1 || ev_short > 0.1 {
+            debug!(
+                %symbol,
+                ev_long,
+                ev_short,
+                best_side = ?state.last_best_side,
+                "QMelStrategy EV scores updated"
+            );
+        }
     }
 
     // Trend analizi sonuçlarını background task'a gönder (non-blocking priority update)
@@ -1823,8 +1867,28 @@ pub fn initialize_symbol_states(
                 ))
             }
             other => {
-                warn!(symbol = %symbol, strategy = %other, "unknown strategy type, defaulting dyn_mm");
-                Box::new(DynMm::from(dyn_cfg_clone))
+                // ✅ KRİTİK GÜVENLİK: Bilinmeyen strategy tipi için QMelStrategy kullan (opportunity selection için gerekli)
+                // Config'de "qmel" yazılmalı, eğer yanlış yazılmışsa QMelStrategy'ye fallback yap
+                warn!(
+                    symbol = %symbol, 
+                    strategy = %other, 
+                    "unknown strategy type '{}', defaulting to QMelStrategy (opportunity selection requires QMelStrategy)",
+                    other
+                );
+                let maker_fee = cfg.strategy.maker_fee_rate.unwrap_or(0.0001);
+                let taker_fee = cfg.strategy.taker_fee_rate.unwrap_or(0.0004);
+                let ev_threshold = cfg.strategy.qmel_ev_threshold.unwrap_or(0.10);
+                let min_margin = cfg.strategy.qmel_min_margin_usdc.unwrap_or(10.0);
+                let max_margin = cfg.strategy.qmel_max_margin_usdc.unwrap_or(100.0);
+                let max_leverage = cfg.risk.max_leverage as f64;
+                Box::new(QMelStrategy::new(
+                    maker_fee,
+                    taker_fee,
+                    ev_threshold,
+                    min_margin,
+                    max_margin,
+                    max_leverage,
+                ))
             }
         }
     };

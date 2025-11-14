@@ -1589,10 +1589,12 @@ impl BinanceFutures {
         let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
 
         // 2. Round: precision'a göre round et
+        // ✅ KRİTİK DÜZELTME: ToZero yerine ToNegativeInfinity kullan (floor) - daha güvenli
+        // ToZero yukarı yuvarlayabilir ve precision hatasına yol açabilir
         let price = price_quantized
-            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToZero);
+            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToNegativeInfinity);
         let qty_rounded =
-            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToZero);
+            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
 
         // 3. Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);

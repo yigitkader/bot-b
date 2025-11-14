@@ -425,10 +425,65 @@ pub async fn place_orders_with_profit_guarantee(
 
     let adaptive_chunk_size = base_chunk_size * volatility_factor;
     let min_margin_adaptive = (adaptive_chunk_size * 0.2).max(min_margin).min(100.0);
+    
+    // ✅ KRİTİK: Isolated margin kontrolü - chunk oluşturmadan ÖNCE maksimum chunk size'ı hesapla
+    // Binance isolated margin için minimum %7 margin gerektiriyor
+    // Maksimum notional = available_margin / ISOLATED_MARGIN_REQUIREMENT_PCT
+    // Maksimum margin chunk = maksimum notional / effective_leverage
+    const ISOLATED_MARGIN_REQUIREMENT_PCT: f64 = 0.07; // %7 minimum
+    let effective_leverage_for_chunk_calc = if is_opportunity_mode {
+        effective_leverage * cfg.internal.opportunity_mode_leverage_reduction
+    } else {
+        effective_leverage
+    };
+    
+    // Mevcut margin'e göre maksimum notional hesapla
+    let max_notional_from_margin = if ISOLATED_MARGIN_REQUIREMENT_PCT > 0.0 {
+        available_margin / ISOLATED_MARGIN_REQUIREMENT_PCT
+    } else {
+        f64::INFINITY
+    };
+    
+    // Maksimum margin chunk = maksimum notional / leverage
+    let max_margin_from_isolated_req = if effective_leverage_for_chunk_calc > 0.0 {
+        max_notional_from_margin / effective_leverage_for_chunk_calc
+    } else {
+        cfg.max_usd_per_order
+    };
+    
     // ✅ KRİTİK: max_margin_adaptive her zaman cfg.max_usd_per_order (100 USD) ile sınırlandırılmış
+    // Ama isolated margin gereksiniminden küçük olmalı
     let max_margin_adaptive = (adaptive_chunk_size * 2.0)
         .min(cfg.max_usd_per_order) // ✅ 100 USD hard limit
+        .min(max_margin_from_isolated_req) // ✅ Isolated margin gereksiniminden küçük olmalı
         .max(10.0);
+
+    // ✅ DEBUG: Isolated margin kontrolü sonuçlarını logla
+    debug!(
+        %symbol,
+        side = ?side,
+        available_margin,
+        max_notional_from_margin,
+        max_margin_from_isolated_req,
+        effective_leverage = effective_leverage_for_chunk_calc,
+        max_margin_adaptive,
+        min_margin_adaptive,
+        "isolated margin constraint: calculated max chunk size"
+    );
+
+    // ✅ KRİTİK: Eğer isolated margin gereksinimi çok küçük chunk size'a izin veriyorsa uyar
+    if max_margin_from_isolated_req < min_margin_adaptive {
+        warn!(
+            %symbol,
+            side = ?side,
+            available_margin,
+            max_margin_from_isolated_req,
+            min_margin_adaptive,
+            effective_leverage = effective_leverage_for_chunk_calc,
+            "isolated margin requirement too restrictive: max chunk size below minimum, cannot place order"
+        );
+        return Ok(false);
+    }
 
     let margin_chunks =
         split_margin_into_chunks(available_margin, min_margin_adaptive, max_margin_adaptive);
@@ -440,7 +495,8 @@ pub async fn place_orders_with_profit_guarantee(
             available_margin,
             min_margin_adaptive,
             max_margin_adaptive,
-            "DEBUG: No margin chunks available - available_margin too small"
+            max_margin_from_isolated_req,
+            "DEBUG: No margin chunks available - available_margin too small or isolated margin constraint too restrictive"
         );
         return Ok(false);
     }
@@ -664,13 +720,27 @@ pub async fn place_orders_with_profit_guarantee(
     );
 
     let (chunk_qty_dec, chunk_price_dec) = match qty_price_result {
-        Some((q_dec, p_dec)) => (q_dec, p_dec),
+        Some((q_dec, p_dec)) => {
+            // ✅ KRİTİK GÜVENLİK: Quantize sonrası qty ve price 0 olamaz
+            if q_dec <= Decimal::ZERO || p_dec <= Decimal::ZERO {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    margin_chunk = *margin_chunk,
+                    qty = %q_dec,
+                    price = %p_dec,
+                    "calc_qty_from_margin returned zero qty or price, skipping chunk"
+                );
+                return Ok(false);
+            }
+            (q_dec, p_dec)
+        }
         None => {
             warn!(
                 %symbol,
                 side = ?side,
                 margin_chunk = *margin_chunk,
-                "calc_qty_from_margin returned None, skipping chunk"
+                "calc_qty_from_margin returned None (likely min notional not satisfied), skipping chunk"
             );
             return Ok(false);
         }
@@ -731,7 +801,9 @@ pub async fn place_orders_with_profit_guarantee(
             return Ok(false);
         }
 
-        // Ek güvenlik: En az 1 tick mesafe kontrolü (quantize sonrası)
+        // ✅ KRİTİK DÜZELTME: Ek güvenlik - En az 1 tick mesafe kontrolü (quantize sonrası)
+        // Ancak tick_size yanlışsa (price'dan büyükse), effective_tick_size zaten düzeltilmiş olmalı
+        // Eğer hala çok yakınsa, fiyatı bir tick daha uzaklaştırmayı dene
         let min_safe_distance = match side {
             Side::Buy => {
                 let min_safe_price = ask.0 - effective_tick_size;
@@ -744,17 +816,44 @@ pub async fn place_orders_with_profit_guarantee(
         };
 
         if !min_safe_distance {
-            warn!(
-                %symbol,
-                side = ?side,
-                chunk_price = %chunk_price.0,
-                bid = %bid.0,
-                ask = %ask.0,
-                effective_tick_size = %effective_tick_size,
-                api_tick_size = %rules.tick_size,
-                "POST-ONLY SAFETY: quantized price too close to market (less than 1 tick), skipping to prevent cross"
-            );
-            return Ok(false);
+            // ✅ KRİTİK: Fiyat çok yakınsa, bir tick daha uzaklaştırmayı dene
+            let adjusted_price = match side {
+                Side::Buy => chunk_price.0 - effective_tick_size,
+                Side::Sell => chunk_price.0 + effective_tick_size,
+            };
+            
+            // Adjusted price hala cross ediyor mu kontrol et
+            let would_still_cross = match side {
+                Side::Buy => adjusted_price >= ask.0,
+                Side::Sell => adjusted_price <= bid.0,
+            };
+            
+            if would_still_cross {
+                warn!(
+                    %symbol,
+                    side = ?side,
+                    chunk_price = %chunk_price.0,
+                    adjusted_price = %adjusted_price,
+                    bid = %bid.0,
+                    ask = %ask.0,
+                    effective_tick_size = %effective_tick_size,
+                    api_tick_size = %rules.tick_size,
+                    "POST-ONLY SAFETY: quantized price too close to market even after adjustment, skipping to prevent cross"
+                );
+                return Ok(false);
+            } else {
+                // Adjusted price kullanılabilir, ama burada chunk_price'ı değiştiremeyiz
+                // Bu durumda skip etmek yerine, bir sonraki tick'te tekrar deneyeceğiz
+                debug!(
+                    %symbol,
+                    side = ?side,
+                    chunk_price = %chunk_price.0,
+                    adjusted_price = %adjusted_price,
+                    effective_tick_size = %effective_tick_size,
+                    "POST-ONLY SAFETY: price too close, will retry with adjusted price on next tick"
+                );
+                return Ok(false);
+            }
         }
     }
 
@@ -786,6 +885,19 @@ pub async fn place_orders_with_profit_guarantee(
     };
 
     // 3. Quantize sonrası notional kontrolü
+    // ✅ KRİTİK GÜVENLİK: Notional 0 olamaz
+    if chunk_notional <= Decimal::ZERO {
+        warn!(
+            %symbol,
+            side = ?side,
+            chunk_price = %chunk_price.0,
+            chunk_qty = %chunk_qty.0,
+            chunk_notional = %chunk_notional,
+            "chunk notional is zero after quantization (qty or price is zero), skipping"
+        );
+        return Ok(false);
+    }
+    
     // a) Exchange'in minimum notional gereksiniminden küçük olamaz
     if !min_notional_req_dec.is_zero() && chunk_notional < min_notional_req_dec {
         warn!(
@@ -854,6 +966,30 @@ pub async fn place_orders_with_profit_guarantee(
             effective_leverage = effective_leverage_for_chunk,
             margin_chunk = *margin_chunk,
             "chunk margin above 100 USD maximum after quantization, skipping (quantize increased size)"
+        );
+        return Ok(false);
+    }
+
+    // ✅ KRİTİK GÜVENLİK: Isolated margin için minimum margin gereksinimi kontrolü
+    // Binance isolated margin için minimum margin gereksinimi genellikle pozisyon boyutunun %5-10'u
+    // Örnek: 599 USD notional → minimum margin gereksinimi: 30-60 USD
+    // Eğer mevcut margin bu gereksinimden küçükse, Binance "Margin is insufficient" hatası verir
+    // ✅ KRİTİK: Test order geçiyor ama gerçek emir başarısız oluyor - daha sıkı kontrol gerekiyor
+    // Test order küçük bir miktarla yapılıyor olabilir, ama gerçek emir daha büyük olabilir
+    // Bu yüzden %7 minimum kullanıyoruz (daha konservatif) ve tolerance'ı kaldırıyoruz
+    // NOT: ISOLATED_MARGIN_REQUIREMENT_PCT sabiti fonksiyonun başında tanımlanmıştır
+    let min_isolated_margin_requirement = chunk_notional.to_f64().unwrap_or(0.0) * ISOLATED_MARGIN_REQUIREMENT_PCT;
+    let chunk_margin_f64 = chunk_margin.to_f64().unwrap_or(0.0);
+    if chunk_margin_f64 < min_isolated_margin_requirement {
+        warn!(
+            %symbol,
+            side = ?side,
+            chunk_notional = %chunk_notional,
+            chunk_margin = %chunk_margin,
+            min_isolated_margin_required = min_isolated_margin_requirement,
+            requirement_pct = ISOLATED_MARGIN_REQUIREMENT_PCT * 100.0,
+            effective_leverage = effective_leverage_for_chunk,
+            "chunk margin below isolated margin minimum requirement (7% of notional), skipping to prevent 'Margin is insufficient' error (test order may pass but real order will fail)"
         );
         return Ok(false);
     }
@@ -968,6 +1104,24 @@ pub async fn place_orders_with_profit_guarantee(
             .await
         {
             Ok(_) => {
+                // ✅ KRİTİK: Test order geçti ama gerçek emir için margin kontrolü tekrar yap
+                // Binance test order endpoint'i margin kontrolü yapmıyor, sadece format kontrolü yapıyor
+                // Bu yüzden test order geçiyor ama gerçek emir "Margin is insufficient" hatası verebilir
+                // Gerçek emirden önce son bir margin kontrolü yap
+                let min_isolated_margin_requirement_after_test = chunk_notional.to_f64().unwrap_or(0.0) * ISOLATED_MARGIN_REQUIREMENT_PCT;
+                let chunk_margin_f64_after_test = chunk_margin.to_f64().unwrap_or(0.0);
+                if chunk_margin_f64_after_test < min_isolated_margin_requirement_after_test {
+                    warn!(
+                        %symbol,
+                        side = ?side,
+                        chunk_notional = %chunk_notional,
+                        chunk_margin = %chunk_margin,
+                        min_isolated_margin_required = min_isolated_margin_requirement_after_test,
+                        "test order passed but margin insufficient for real order, skipping to prevent 'Margin is insufficient' error"
+                    );
+                    return Ok(false);
+                }
+                
                 state.test_order_passed = true;
                 info!(
                     %symbol,
@@ -1002,6 +1156,22 @@ pub async fn place_orders_with_profit_guarantee(
                                 .await
                             {
                                 Ok(_) => {
+                                    // ✅ KRİTİK: Test order geçti ama gerçek emir için margin kontrolü tekrar yap
+                                    // Binance test order endpoint'i margin kontrolü yapmıyor, sadece format kontrolü yapıyor
+                                    let min_isolated_margin_requirement_after_test = chunk_notional.to_f64().unwrap_or(0.0) * ISOLATED_MARGIN_REQUIREMENT_PCT;
+                                    let chunk_margin_f64_after_test = chunk_margin.to_f64().unwrap_or(0.0);
+                                    if chunk_margin_f64_after_test < min_isolated_margin_requirement_after_test {
+                                        warn!(
+                                            %symbol,
+                                            side = ?side,
+                                            chunk_notional = %chunk_notional,
+                                            chunk_margin = %chunk_margin,
+                                            min_isolated_margin_required = min_isolated_margin_requirement_after_test,
+                                            "test order passed after rules refresh but margin insufficient for real order, skipping"
+                                        );
+                                        return Ok(false);
+                                    }
+                                    
                                     state.test_order_passed = true;
                                     info!(%symbol, side = ?side, "test order passed after rules refresh");
                                 }

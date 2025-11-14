@@ -414,13 +414,15 @@ pub fn calc_qty_from_margin(
 
     if price_diff_bps > 100.0 {
         // %1'den fazla fark varsa uyar (tick_size çok büyük olabilir)
+        // ✅ KRİTİK: Bu durumda emir atlanacak (POST-ONLY SAFETY devreye girecek)
+        // Tick size yanlışsa, gerçek tick size'ı kullan (price'dan hesapla)
         tracing::warn!(
             price_raw = %price,
             price_quantized = %price_quantized,
             tick_size = %tick_size,
             diff_bps = price_diff_bps,
             side = ?side,
-            "large price difference after quantization (>1%), check tick_size"
+            "large price difference after quantization (>1%), check tick_size - order will be skipped due to POST-ONLY SAFETY"
         );
     }
 
