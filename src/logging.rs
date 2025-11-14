@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 // ============================================================================
 // JsonLogger Implementation (from logger.rs)
@@ -439,6 +440,31 @@ pub struct Logging {
 }
 
 impl Logging {
+    /// Create a new Logging module instance.
+    ///
+    /// The Logging module subscribes to all events from the event bus and logs them using
+    /// structured JSON logging. It runs in the background and does not block other modules.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_bus` - Event bus for subscribing to all event types
+    /// * `json_logger` - Shared JSON logger instance for structured logging
+    /// * `shutdown_flag` - Shared flag to signal graceful shutdown
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `Logging` instance. Call `start()` to begin logging events.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # let event_bus = Arc::new(crate::event_bus::EventBus::new());
+    /// # let (json_logger, _) = crate::logging::create_logger("logs/events.json")?;
+    /// # let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    /// let logging = Logging::new(event_bus, json_logger, shutdown_flag);
+    /// logging.start().await?;
+    /// ```
     pub fn new(
         event_bus: Arc<EventBus>,
         json_logger: SharedLogger,
@@ -451,8 +477,34 @@ impl Logging {
         }
     }
 
-    /// Start logging service
-    /// Listens to all events and logs them
+    /// Start the logging service and begin logging all events.
+    ///
+    /// This method spawns background tasks that subscribe to all event types and log them:
+    /// - TradeSignal events
+    /// - OrderUpdate events (with structured JSON logging)
+    /// - PositionUpdate events
+    /// - CloseRequest events
+    /// - BalanceUpdate events
+    /// - MarketTick events (throttled to reduce log volume)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` immediately after spawning background tasks. Tasks will continue
+    /// running until `shutdown_flag` is set to true.
+    ///
+    /// # Behavior
+    ///
+    /// - All events are logged with structured JSON format
+    /// - MarketTick events are throttled (logged every 1000 ticks per symbol) to reduce volume
+    /// - Handles broadcast channel lagging gracefully (logs warnings when events are missed)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # let logging = crate::logging::Logging::new(todo!(), todo!(), todo!());
+    /// logging.start().await?;
+    /// // Logging service is now active
+    /// ```
     pub async fn start(&self) -> Result<()> {
         let event_bus = self.event_bus.clone();
         let json_logger = self.json_logger.clone();
@@ -482,7 +534,18 @@ impl Logging {
                             "LOGGING: TradeSignal received"
                         );
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(
+                            missed_events = missed,
+                            "LOGGING: TradeSignal receiver lagged, {} events missed",
+                            missed
+                        );
+                        // Continue processing - don't break on lag
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("LOGGING: TradeSignal channel closed");
+                        break;
+                    }
                 }
             }
         });
@@ -505,14 +568,18 @@ impl Logging {
                         
                         match update.status {
                             crate::event_bus::OrderStatus::Filled => {
+                                // log_order_filled parameters:
+                                // - qty: filled quantity (cumulative filled qty)
+                                // - new_inventory: remaining quantity (remaining_qty)
+                                // - price: average fill price (weighted average of all fills)
                                 json_logger_order.log_order_filled(
                                     &update.symbol,
                                     &update.order_id,
                                     update.side,
-                                    update.price,
-                                    update.filled_qty,
+                                    update.average_fill_price, // Average fill price (weighted average)
+                                    update.filled_qty, // Cumulative filled qty
                                     false,
-                                    update.qty,
+                                    update.remaining_qty, // Remaining qty (not order_qty)
                                     1.0,
                                 );
                             }
@@ -521,6 +588,22 @@ impl Logging {
                                     &update.symbol,
                                     &update.order_id,
                                     "Order canceled",
+                                    1.0,
+                                );
+                            }
+                            crate::event_bus::OrderStatus::Expired | crate::event_bus::OrderStatus::ExpiredInMatch => {
+                                json_logger_order.log_order_canceled(
+                                    &update.symbol,
+                                    &update.order_id,
+                                    "Order expired",
+                                    1.0,
+                                );
+                            }
+                            crate::event_bus::OrderStatus::Rejected => {
+                                json_logger_order.log_order_canceled(
+                                    &update.symbol,
+                                    &update.order_id,
+                                    "Order rejected",
                                     1.0,
                                 );
                             }
@@ -534,7 +617,18 @@ impl Logging {
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(
+                            missed_events = missed,
+                            "LOGGING: OrderUpdate receiver lagged, {} events missed (log gap possible)",
+                            missed
+                        );
+                        // Continue processing - don't break on lag
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("LOGGING: OrderUpdate channel closed");
+                        break;
+                    }
                 }
             }
         });
@@ -577,7 +671,18 @@ impl Logging {
                             );
                         }
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(
+                            missed_events = missed,
+                            "LOGGING: PositionUpdate receiver lagged, {} events missed (log gap possible)",
+                            missed
+                        );
+                        // Continue processing - don't break on lag
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("LOGGING: PositionUpdate channel closed");
+                        break;
+                    }
                 }
             }
         });
@@ -603,7 +708,18 @@ impl Logging {
                             "LOGGING: CloseRequest received"
                         );
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(
+                            missed_events = missed,
+                            "LOGGING: CloseRequest receiver lagged, {} events missed",
+                            missed
+                        );
+                        // Continue processing - don't break on lag
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("LOGGING: CloseRequest channel closed");
+                        break;
+                    }
                 }
             }
         });
@@ -629,17 +745,33 @@ impl Logging {
                             "LOGGING: BalanceUpdate received"
                         );
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(
+                            missed_events = missed,
+                            "LOGGING: BalanceUpdate receiver lagged, {} events missed",
+                            missed
+                        );
+                        // Continue processing - don't break on lag
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("LOGGING: BalanceUpdate channel closed");
+                        break;
+                    }
                 }
             }
         });
         
-        // Spawn task for MarketTick events (optional - can be verbose)
+        // Spawn task for MarketTick events
+        // NOTE: MarketTick events are very frequent (hundreds per second per symbol)
+        // We use per-symbol counters and higher threshold to reduce log pollution
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
         tokio::spawn(async move {
             let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
-            let mut tick_count = 0u64;
+            use std::collections::HashMap;
+            use tokio::sync::RwLock;
+            let tick_counts: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+            const LOG_INTERVAL: u64 = 1000; // Log every 1000 ticks per symbol (much less frequent)
             
             loop {
                 match market_tick_rx.recv().await {
@@ -648,17 +780,42 @@ impl Logging {
                             break;
                         }
                         
-                        tick_count += 1;
-                        if tick_count % 100 == 0 {
+                        // Per-symbol counter to avoid log spam with multiple symbols
+                        let should_log = {
+                            let mut counts = tick_counts.write().await;
+                            let count = counts.entry(tick.symbol.clone()).or_insert(0);
+                            *count += 1;
+                            if *count >= LOG_INTERVAL {
+                                *count = 0; // Reset counter
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        
+                        if should_log {
                             info!(
                                 symbol = %tick.symbol,
                                 bid = %tick.bid.0,
                                 ask = %tick.ask.0,
-                                "LOGGING: MarketTick (logged every 100th tick)"
+                                "LOGGING: MarketTick (logged every {} ticks per symbol)",
+                                LOG_INTERVAL
                             );
                         }
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(
+                            missed_events = missed,
+                            "LOGGING: MarketTick receiver lagged, {} events missed (log gap possible)",
+                            missed
+                        );
+                        // Continue processing - don't break on lag
+                        // MarketTick events are very frequent, so lagging is more common
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("LOGGING: MarketTick channel closed");
+                        break;
+                    }
                 }
             }
         });

@@ -10,6 +10,8 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RiskCfg {
+    /// Maximum allowed leverage (validation only, not used as default)
+    /// Used to validate that leverage and exec.default_leverage don't exceed this limit
     #[serde(default = "default_max_leverage")]
     pub max_leverage: u32,
     #[serde(default = "default_use_isolated_margin")]
@@ -24,12 +26,16 @@ pub struct TrendingCfg {
     pub min_spread_bps: f64,
     #[serde(default = "default_max_spread_bps")]
     pub max_spread_bps: f64,
+    #[serde(default = "default_signal_cooldown_seconds")]
+    pub signal_cooldown_seconds: u64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ExecCfg {
     #[serde(default = "default_tif")]
     pub tif: String,
+    /// Default leverage to use when leverage (top-level) is not set
+    /// Used as fallback: cfg.leverage.unwrap_or(cfg.exec.default_leverage)
     #[serde(default = "default_default_leverage")]
     pub default_leverage: u32,
 }
@@ -42,6 +48,29 @@ pub struct WebsocketCfg {
     pub reconnect_delay_ms: u64,
     #[serde(default = "default_ws_ping_interval")]
     pub ping_interval_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct EventBusCfg {
+    /// Buffer size for MarketTick events (high frequency, needs larger buffer)
+    /// With 100 symbols at 1 tick/sec = 100 ticks/sec, 10000 buffer = ~100 seconds
+    #[serde(default = "default_market_tick_buffer")]
+    pub market_tick_buffer: usize,
+    /// Buffer size for TradeSignal events
+    #[serde(default = "default_trade_signal_buffer")]
+    pub trade_signal_buffer: usize,
+    /// Buffer size for CloseRequest events
+    #[serde(default = "default_default_event_buffer")]
+    pub close_request_buffer: usize,
+    /// Buffer size for OrderUpdate events
+    #[serde(default = "default_default_event_buffer")]
+    pub order_update_buffer: usize,
+    /// Buffer size for PositionUpdate events
+    #[serde(default = "default_default_event_buffer")]
+    pub position_update_buffer: usize,
+    /// Buffer size for BalanceUpdate events
+    #[serde(default = "default_default_event_buffer")]
+    pub balance_update_buffer: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -75,6 +104,9 @@ pub struct AppCfg {
     pub min_usd_per_order: f64,
     #[serde(default = "default_min_quote_balance_usd")]
     pub min_quote_balance_usd: f64,
+    /// Explicit leverage setting (optional)
+    /// If set, this value is used. Otherwise, exec.default_leverage is used.
+    /// Must not exceed risk.max_leverage (validated in validate_config)
     #[serde(default)]
     pub leverage: Option<u32>,
     #[serde(default = "default_price_tick")]
@@ -94,6 +126,8 @@ pub struct AppCfg {
     pub exec: ExecCfg,
     #[serde(default)]
     pub websocket: WebsocketCfg,
+    #[serde(default)]
+    pub event_bus: EventBusCfg,
 }
 
 // ============================================================================
@@ -118,6 +152,10 @@ fn default_min_spread_bps() -> f64 {
 
 fn default_max_spread_bps() -> f64 {
     200.0
+}
+
+fn default_signal_cooldown_seconds() -> u64 {
+    60 // Default: 60 seconds cooldown between signals for same symbol
 }
 
 fn default_tif() -> String {
@@ -192,11 +230,63 @@ fn default_stop_loss_pct() -> f64 {
     2.0
 }
 
+fn default_market_tick_buffer() -> usize {
+    10000
+}
+
+fn default_trade_signal_buffer() -> usize {
+    1000
+}
+
+fn default_default_event_buffer() -> usize {
+    1000
+}
+
 // ============================================================================
 // Configuration Loading
 // ============================================================================
 
-/// Load configuration from file or command line arguments
+/// Load application configuration from file or command line arguments.
+///
+/// This function loads the configuration from a YAML file. The file path can be specified
+/// via command line argument `--config <path>`, or it defaults to `./config.yaml`.
+///
+/// # Returns
+///
+/// Returns `Ok(AppCfg)` if the configuration file is found and valid, or `Err` if:
+/// - The file cannot be read
+/// - The YAML is invalid or cannot be deserialized
+/// - Configuration validation fails (see `validate_config`)
+///
+/// # Configuration File Format
+///
+/// The configuration file should be in YAML format and include:
+/// - `binance`: API keys and exchange settings
+/// - `symbols` or `symbol`: Trading symbols
+/// - `risk`: Risk management parameters (leverage, margin type)
+/// - `trending`: Trend analysis parameters
+/// - `exec`: Execution parameters (TIF, leverage)
+/// - `event_bus`: Event bus buffer sizes
+///
+/// # Example
+///
+/// ```no_run
+/// use crate::config::load_config;
+///
+/// // Load from default path (./config.yaml)
+/// let cfg = load_config()?;
+///
+/// // Or specify path via command line:
+/// // cargo run -- --config /path/to/config.yaml
+/// ```
+///
+/// # Errors
+///
+/// Common errors include:
+/// - Missing or invalid API keys
+/// - Invalid leverage settings
+/// - Missing required fields
+/// - File I/O errors
 pub fn load_config() -> Result<AppCfg> {
     let args: Vec<String> = std::env::args().collect();
     let path = args
@@ -260,6 +350,68 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         return Err(anyhow!(
             "binance.secret_key appears to be invalid (too short). Binance secret keys are typically 64 characters long"
         ));
+    }
+
+    // Leverage validation
+    if let Some(leverage) = cfg.leverage {
+        if leverage == 0 {
+            return Err(anyhow!("leverage must be greater than 0"));
+        }
+        if leverage > cfg.risk.max_leverage {
+            return Err(anyhow!(
+                "leverage ({}) exceeds max_leverage ({})",
+                leverage,
+                cfg.risk.max_leverage
+            ));
+        }
+    }
+    // Also validate exec.default_leverage
+    if cfg.exec.default_leverage == 0 {
+        return Err(anyhow!("exec.default_leverage must be greater than 0"));
+    }
+    if cfg.exec.default_leverage > cfg.risk.max_leverage {
+        return Err(anyhow!(
+            "exec.default_leverage ({}) exceeds risk.max_leverage ({})",
+            cfg.exec.default_leverage,
+            cfg.risk.max_leverage
+        ));
+    }
+
+    // Take profit percentage validation
+    if cfg.take_profit_pct <= 0.0 {
+        return Err(anyhow!("take_profit_pct must be greater than 0"));
+    }
+    if cfg.take_profit_pct >= 100.0 {
+        return Err(anyhow!("take_profit_pct must be less than 100"));
+    }
+
+    // Stop loss percentage validation
+    if cfg.stop_loss_pct <= 0.0 {
+        return Err(anyhow!("stop_loss_pct must be greater than 0"));
+    }
+    if cfg.stop_loss_pct >= cfg.take_profit_pct {
+        return Err(anyhow!(
+            "stop_loss_pct ({}) must be less than take_profit_pct ({})",
+            cfg.stop_loss_pct,
+            cfg.take_profit_pct
+        ));
+    }
+
+    // Order size validation
+    if cfg.max_usd_per_order <= cfg.min_usd_per_order {
+        return Err(anyhow!(
+            "max_usd_per_order ({}) must be greater than min_usd_per_order ({})",
+            cfg.max_usd_per_order,
+            cfg.min_usd_per_order
+        ));
+    }
+    if cfg.min_usd_per_order <= 0.0 {
+        return Err(anyhow!("min_usd_per_order must be greater than 0"));
+    }
+
+    // Minimum quote balance validation
+    if cfg.min_quote_balance_usd <= 0.0 {
+        return Err(anyhow!("min_quote_balance_usd must be greater than 0"));
     }
 
     Ok(())
