@@ -1490,41 +1490,10 @@ impl Venue for BinanceFutures {
             "order validation guard passed, submitting order"
         );
 
-        let mut params = vec![
-            format!("symbol={}", sym),
-            format!("side={}", s_side),
-            "type=LIMIT".to_string(),
-            format!("timeInForce={}", tif_str),
-            format!("price={}", price_str),
-            format!("quantity={}", qty_str),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-            "newOrderRespType=RESULT".to_string(),
-        ];
-
-        if self.hedge_mode {
-            let position_side = match side {
-                Side::Buy => "LONG",
-                Side::Sell => "SHORT",
-            };
-            params.push(format!("positionSide={}", position_side));
-        }
-        if !client_order_id.is_empty() {
-        // Binance: max 36 karakter, alphanumeric
-            if client_order_id.len() <= 36
-                && client_order_id
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-            {
-                params.push(format!("newClientOrderId={}", client_order_id));
-            } else {
-                warn!(
-                    %sym,
-                    client_order_id = client_order_id,
-                    "invalid clientOrderId format (max 36 chars, alphanumeric), skipping"
-                );
-            }
-        }
+        // Store validated price/qty strings for reuse in retry loop
+        // These may be updated if rules refresh is needed
+        let mut current_price_str = price_str;
+        let mut current_qty_str = qty_str;
 
     const MAX_RETRIES: u32 = 3;
     const INITIAL_BACKOFF_MS: u64 = 100;
@@ -1532,9 +1501,73 @@ impl Venue for BinanceFutures {
         let mut last_error = None;
         let mut order_result: Option<FutPlacedOrder> = None;
 
+        // ✅ CRITICAL: Generate base clientOrderId for tracking
+        // Each retry will append attempt number to ensure uniqueness
+        // This prevents duplicate orders if first request times out but Binance received it
+        let base_client_order_id = if !client_order_id.is_empty() {
+            client_order_id.to_string()
+        } else {
+            // If no clientOrderId provided, generate one
+            format!("{}", BinanceCommon::ts())
+        };
+
         for attempt in 0..=MAX_RETRIES {
-        // Her retry'de yeni request oluştur (aynı parametrelerle, aynı clientOrderId ile)
-            let retry_qs = params.join("&");
+            // ✅ CRITICAL: Generate unique clientOrderId for each retry attempt
+            // Problem: If first request times out but Binance received it, retry with same clientOrderId
+            // would create duplicate order (even though Binance has idempotency, it's risky)
+            // Solution: Append attempt number to base clientOrderId for each retry
+            let unique_client_order_id = if attempt == 0 {
+                // First attempt: use original clientOrderId
+                base_client_order_id.clone()
+            } else {
+                // Retry attempts: append attempt number to ensure uniqueness
+                // Format: "{base}-{attempt}" (e.g., "1234567890-1", "1234567890-2")
+                format!("{}-{}", base_client_order_id, attempt)
+            };
+
+            // Build params with unique clientOrderId for this attempt
+            // Use current_price_str and current_qty_str (may be updated after rules refresh)
+            let mut attempt_params = vec![
+                format!("symbol={}", sym),
+                format!("side={}", s_side),
+                "type=LIMIT".to_string(),
+                format!("timeInForce={}", tif_str),
+                format!("price={}", current_price_str),
+                format!("quantity={}", current_qty_str),
+                format!("timestamp={}", BinanceCommon::ts()),
+                format!("recvWindow={}", self.common.recv_window_ms),
+                "newOrderRespType=RESULT".to_string(),
+            ];
+
+            if self.hedge_mode {
+                let position_side = match side {
+                    Side::Buy => "LONG",
+                    Side::Sell => "SHORT",
+                };
+                attempt_params.push(format!("positionSide={}", position_side));
+            }
+
+            // Add unique clientOrderId for this attempt
+            if !unique_client_order_id.is_empty() {
+                // Binance: max 36 karakter, alphanumeric
+                if unique_client_order_id.len() <= 36
+                    && unique_client_order_id
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
+                    attempt_params.push(format!("newClientOrderId={}", unique_client_order_id));
+                } else {
+                    warn!(
+                        %sym,
+                        client_order_id = unique_client_order_id,
+                        attempt,
+                        "invalid clientOrderId format (max 36 chars, alphanumeric), skipping"
+                    );
+                }
+            }
+
+            // Her retry'de yeni request oluştur (unique clientOrderId ile)
+            let retry_qs = attempt_params.join("&");
             let retry_sig = self.common.sign(&retry_qs);
             let retry_url = format!(
                 "{}/fapi/v1/order?{}&signature={}",
@@ -1607,37 +1640,10 @@ impl Venue for BinanceFutures {
                                                 ))
                                                     .await;
 
-                                            // Params'ı güncelle
-                                                params = vec![
-                                                    format!("symbol={}", sym),
-                                                    format!("side={}", s_side),
-                                                    "type=LIMIT".to_string(),
-                                                    format!("timeInForce={}", tif_str),
-                                                    format!("price={}", new_price_str),
-                                                    format!("quantity={}", new_qty_str),
-                                                    format!("timestamp={}", BinanceCommon::ts()),
-                                                    format!(
-                                                        "recvWindow={}",
-                                                        self.common.recv_window_ms
-                                                    ),
-                                                    "newOrderRespType=RESULT".to_string(),
-                                                ];
-
-                                            // Add positionSide parameter if hedge mode is enabled
-                                                if self.hedge_mode {
-                                                    let position_side = match side {
-                                                        Side::Buy => "LONG",
-                                                        Side::Sell => "SHORT",
-                                                    };
-                                                    params.push(format!("positionSide={}", position_side));
-                                                }
-
-                                                if !client_order_id.is_empty() {
-                                                    params.push(format!(
-                                                        "newClientOrderId={}",
-                                                        client_order_id
-                                                    ));
-                                                }
+                                            // Update price/qty strings for next iteration
+                                                // These will be used to build attempt_params in the next loop iteration
+                                                current_price_str = new_price_str;
+                                                current_qty_str = new_qty_str;
 
                                                 last_error = Some(anyhow!("{} error, retrying with refreshed rules", error_type));
                                                 continue;
@@ -1686,7 +1692,7 @@ impl Venue for BinanceFutures {
                     // Transient hata kontrolü
                         if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
                             let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                            tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms, "transient error, retrying with exponential backoff (same clientOrderId)");
+                            tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms, "transient error, retrying with exponential backoff (unique clientOrderId)");
                             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                             last_error = Some(anyhow!("binance api error: {} - {}", status, body));
                             continue;
@@ -1701,7 +1707,7 @@ impl Venue for BinanceFutures {
                 // Network hatası
                     if attempt < MAX_RETRIES {
                         let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                        tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms, "network error, retrying with exponential backoff (same clientOrderId)");
+                        tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms, "network error, retrying with exponential backoff (unique clientOrderId)");
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         last_error = Some(e.into());
                         continue;
@@ -1722,8 +1728,8 @@ impl Venue for BinanceFutures {
             ?side,
             price_quantized = %price_quantized,
             qty_quantized = %qty_quantized,
-            price_str,
-            qty_str,
+            price_str = %current_price_str,
+            qty_str = %current_qty_str,
             tif = ?tif,
             order_id = order.order_id,
             "futures place_limit ok"

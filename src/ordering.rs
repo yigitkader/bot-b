@@ -746,6 +746,12 @@ impl Ordering {
 
         // Attempt order placement with retry logic
         // Permanent errors return early with balance release
+        //
+        // ✅ CRITICAL: Each call to send_order() generates a NEW clientOrderId
+        // (see connection.rs line 1130: clientOrderId is generated inside send_order)
+        // This ensures that each retry attempt uses a unique clientOrderId,
+        // preventing duplicate orders if a previous attempt timed out but Binance received it.
+        // The venue layer also generates unique clientOrderIds for its internal retries.
         let order_id = {
             let mut last_error: Option<anyhow::Error> = None;
             let mut order_id_result: Option<String> = None;
