@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Price point for trend analysis
 #[derive(Clone, Debug)]
@@ -216,7 +216,6 @@ impl Trending {
                             // Determine direction from qty sign:
                             // - Long position: qty > 0 (was opened with BUY order)
                             // - Short position: qty < 0 (was opened with SELL order)
-                            // Note: When position closes, qty might be 0, so we check sign before close
                             let direction = if !update.qty.0.is_zero() {
                                 // Qty is non-zero, determine direction from sign
                                 Some(PositionDirection::from_qty_sign(update.qty.0))
@@ -277,16 +276,12 @@ impl Trending {
     /// Example: period=5 means compare price from 6 prices ago to current price
     /// This gives us the momentum over the last 5 price movements
     fn calculate_momentum(prices: &VecDeque<PricePoint>, period: usize) -> Option<f64> {
-        // ✅ CRITICAL: Need at least (period + 1) prices to calculate momentum
-        // period=5 means we need 6 prices: 5 prices ago, 4 prices ago, ..., 1 price ago, current
-        // This is safer than checking < period + 1 (avoids off-by-one errors)
+        // Need at least (period + 1) prices to calculate momentum
         if prices.len() <= period {
             return None;
         }
         
-        // ✅ SAFER: Use iterator instead of index calculation to avoid off-by-one errors
-        // Take the last (period + 1) prices in reverse order (newest first)
-        // This gives us: [current, 1 ago, 2 ago, ..., period ago]
+        // Use iterator instead of index calculation to avoid off-by-one errors
         let iter: Vec<_> = prices.iter().rev().take(period + 1).collect();
         
         // Get first and last prices from the collected iterator
@@ -474,9 +469,7 @@ impl Trending {
     ) -> Result<()> {
         let now = Instant::now();
         
-        // CRITICAL: Sampling to prevent event flood
-        // Process only 1/10 of ticks (10% sampling rate)
-        // This reduces CPU usage and event bus congestion by 90%
+        // Sampling to prevent event flood - process only 1/10 of ticks
         // Trend analysis doesn't need every single tick - 10% is sufficient for signal quality
         // Uses per-symbol counter for even distribution across symbols
         // Each symbol gets processed at different rates, ensuring all symbols are eventually processed
@@ -507,9 +500,7 @@ impl Trending {
             return Ok(());
         }
         
-        // CRITICAL: Check if ANY position or order is already open
-        // Don't generate signals if we already have an open position or pending order
-        // This prevents signal collision where:
+        // Check if ANY position or order is already open
         // 1. TRENDING generates BUY signal
         // 2. ORDERING places order
         // 3. Position opens
@@ -528,14 +519,7 @@ impl Trending {
             }
         }
         
-        // ✅ CRITICAL FIX: Symbol bazlı cooldown after position close (direction-aware)
-        // Position close sonrası minimum 5 saniye bekle (signal spam önleme)
-        // TP trigger → position close → lock release → yeni signal → aynı sembol için yeni order!
-        // Bu cooldown aynı sembol için hemen yeni signal üretilmesini önler
-        // ✅ IMPROVEMENT: Cooldown sadece aynı yön için uygulanır
-        // - Long position close → Short signal hemen üretilebilir (trend reversal)
-        // - Long position close → Long signal cooldown'a tabi (aynı yön)
-        // Note: Direction check happens after trend analysis (see below)
+        // Symbol-based cooldown after position close (direction-aware)
         const POSITION_CLOSE_COOLDOWN_SECS: u64 = 5;
         
         // Store last position close info for direction check after trend analysis
@@ -558,9 +542,7 @@ impl Trending {
             }
         };
         
-        // ✅ PERFORMANCE OPTIMIZATION: Cooldown check BEFORE expensive trend analysis
-        // This prevents unnecessary CPU usage when cooldown is still active
-        // Check cooldown period first (cheap operation)
+        // Cooldown check BEFORE expensive trend analysis
         let cooldown_seconds = cfg.trending.signal_cooldown_seconds;
         let last_signal_side = {
             let last_signals_map = last_signals.lock().await;
@@ -585,9 +567,7 @@ impl Trending {
         let spread_bps = ((tick.ask.0 - tick.bid.0) / tick.bid.0) * Decimal::from(10000);
         let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
         
-        // CRITICAL: Only trade when spread is within acceptable range
-        // Too wide spread = low liquidity = high slippage = bad for trading
-        // Too narrow spread = potential flash crash, liquidity trap, or stale data = bad for trading
+        // Only trade when spread is within acceptable range
         // Acceptable range: min_spread_bps <= spread <= max_spread_bps
         let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
         let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
@@ -600,9 +580,7 @@ impl Trending {
             return Ok(());
         }
         
-        // ✅ CRITICAL: Store spread information and timestamp for validation at order placement
-        // Spread may change between signal generation and order placement (50-100ms delay)
-        // ORDERING module will re-validate spread before placing order
+        // Store spread information and timestamp for validation at order placement
         let spread_timestamp = now;
         
         // Calculate mid price for trend analysis
@@ -610,7 +588,7 @@ impl Trending {
         let current_price = mid_price;
         
         // Update symbol state with new price point
-        // ✅ Now we do expensive trend analysis only after cooldown check passed
+        // Expensive trend analysis only after cooldown check passed
         let trend_signal = {
             let mut states = symbol_states.lock().await;
             let state = states.entry(tick.symbol.clone()).or_insert_with(|| {
@@ -653,18 +631,14 @@ impl Trending {
             }
         };
         
-        // ✅ CRITICAL: Check position close cooldown with direction awareness (after trend analysis)
-        // Only apply cooldown if:
-        // 1. Cooldown period hasn't passed (time check)
+        // Check position close cooldown with direction awareness (after trend analysis)
         // 2. Signal direction matches last closed position direction (direction check)
         // This allows opposite-direction signals immediately (trend reversal)
         if let Some((last_direction, elapsed)) = last_position_close_info {
             // Convert signal side to position direction for comparison
             let signal_direction = PositionDirection::from_order_side(side);
             
-            // ✅ CRITICAL FIX: Extended cooldown for unknown direction
-            // When direction is unknown, apply longer cooldown to prevent aggressive trading
-            // This is more conservative and prevents trading when we're uncertain about last position
+            // Extended cooldown for unknown direction
             if last_direction.is_none() {
                 // Direction unknown - apply extended cooldown (2x normal cooldown)
                 const EXTENDED_COOLDOWN_SECS: u64 = POSITION_CLOSE_COOLDOWN_SECS * 2; // 10 seconds
@@ -710,9 +684,7 @@ impl Trending {
             }
         }
         
-        // ✅ CRITICAL: Check same-direction signals (after trend analysis)
-        // This prevents BUY-BUY-BUY or SELL-SELL-SELL spam
-        // Only generate signal if direction changed (trend reversal)
+        // Check same-direction signals (after trend analysis)
         if let Some(last_side) = last_signal_side {
             if last_side == side {
                 // Same direction as last signal - skip to prevent spam
@@ -773,9 +745,7 @@ impl Trending {
         }
         
         // 2. Get leverage and calculate notional
-        // CRITICAL: max_usd_per_order is margin amount, not notional value
-        // In futures: notional = margin × leverage, position_size = notional / price
-        // Use cfg.leverage if set, otherwise use cfg.exec.default_leverage
+        // max_usd_per_order is margin amount, not notional value
         let leverage = cfg.leverage.unwrap_or(cfg.exec.default_leverage) as u32;
         
         // Calculate notional value: margin × leverage
@@ -824,9 +794,7 @@ impl Trending {
         let symbol = tick.symbol.clone();
         
         // Generate trade signal
-        // ✅ CRITICAL: Include spread information for validation at order placement
-        // Spread may have changed between signal generation and order placement
-        // ORDERING module will re-validate spread before placing order
+        // Include spread information for validation at order placement
         let signal = TradeSignal {
             symbol: symbol.clone(),
             side,
@@ -840,9 +808,7 @@ impl Trending {
             timestamp: now,
         };
         
-        // CRITICAL: Double-check position/order state right before sending signal
-        // This prevents race condition where:
-        // 1. Early check passes (no position/order)
+        // Double-check position/order state right before sending signal
         // 2. Signal generation takes time (spread check, momentum, balance, rules, etc.)
         // 3. During signal generation, another thread opens position/order
         // 4. Without this check, signal would be sent anyway
