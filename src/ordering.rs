@@ -14,7 +14,106 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+// ============================================================================
+// Balance Reservation Guard (RAII Pattern)
+// ============================================================================
+
+/// RAII guard for balance reservation
+/// Automatically releases balance when dropped (if not explicitly released)
+/// Prevents memory leaks from forgotten balance releases
+/// 
+/// CRITICAL: Always call release() explicitly before returning from function
+/// Drop trait will warn if balance is dropped without explicit release
+struct BalanceReservation {
+    balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
+    asset: String,
+    amount: Decimal,
+    released: bool,
+}
+
+impl BalanceReservation {
+    /// Create a new balance reservation
+    /// Returns Some(reservation) if reservation successful, None if insufficient balance
+    async fn new(
+        balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
+        asset: &str,
+        amount: Decimal,
+    ) -> Option<Self> {
+        let mut store = balance_store.write().await;
+        let available = store.available(asset);
+        
+        if available >= amount {
+            if store.try_reserve(asset, amount) {
+                Some(Self {
+                    balance_store,
+                    asset: asset.to_string(),
+                    amount,
+                    released: false,
+                })
+            } else {
+                // This should not happen if available >= amount, but handle it anyway
+                None
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// Explicitly release the balance reservation
+    /// Should be called before returning from function
+    /// Safe to call multiple times (idempotent)
+    async fn release(&mut self) {
+        if !self.released {
+            let mut store = self.balance_store.write().await;
+            store.release(&self.asset, self.amount);
+            self.released = true;
+            
+            debug!(
+                asset = %self.asset,
+                amount = %self.amount,
+                "ORDERING: Balance reservation released"
+            );
+        }
+    }
+    
+    /// Check if reservation is still active (not released)
+    fn is_active(&self) -> bool {
+        !self.released
+    }
+}
+
+impl Drop for BalanceReservation {
+    fn drop(&mut self) {
+        // ⚠️ CRITICAL: Drop cannot be async, so we cannot release balance here
+        // However, we can warn if balance was not explicitly released
+        // This helps catch bugs where release() was forgotten
+        if !self.released {
+            warn!(
+                asset = %self.asset,
+                amount = %self.amount,
+                "ORDERING: Balance reservation dropped without explicit release! This may cause a memory leak. Always call release() before returning."
+            );
+            
+            // Attempt to release in background (best effort, not guaranteed)
+            // This is a safety net, but explicit release() should always be called
+            let balance_store = self.balance_store.clone();
+            let asset = self.asset.clone();
+            let amount = self.amount;
+            
+            tokio::spawn(async move {
+                let mut store = balance_store.write().await;
+                store.release(&asset, amount);
+                warn!(
+                    asset = %asset,
+                    amount = %amount,
+                    "ORDERING: Balance reservation released in background (Drop fallback)"
+                );
+            });
+        }
+    }
+}
 
 /// Maximum number of retry attempts for order placement
 const MAX_RETRIES: u32 = 3;
@@ -301,50 +400,36 @@ impl Ordering {
         let notional = signal.entry_price.0 * signal.size.0;
         let required_margin = notional / Decimal::from(leverage);
         
-        // CRITICAL: Reserve balance atomically to prevent double-spending race condition
-        // Without reservation, two threads could both check balance (sufficient) and both send orders
-        // With reservation, only one thread can reserve the balance, others will see insufficient balance
-        let balance_reserved = {
-            let mut balance_store = shared_state.balance_store.write().await;
-            let available = balance_store.available(&cfg.quote_asset);
-            
-            if available < required_margin {
+        // ✅ CRITICAL: Use RAII guard for balance reservation to prevent memory leaks
+        // BalanceReservation automatically releases balance when dropped (if not explicitly released)
+        // This ensures balance is always released, even if function returns early due to errors
+        let mut balance_reservation = match BalanceReservation::new(
+            shared_state.balance_store.clone(),
+            &cfg.quote_asset,
+            required_margin,
+        ).await {
+            Some(reservation) => reservation,
+            None => {
+                // Insufficient balance or reservation failed
                 warn!(
                     symbol = %signal.symbol,
                     required_margin = %required_margin,
-                    available_balance = %available,
-                    "ORDERING: Ignoring TradeSignal - insufficient balance"
+                    "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
                 );
                 return Ok(());
             }
-            
-            // Atomically reserve balance (prevents other threads from using it)
-            balance_store.try_reserve(&cfg.quote_asset, required_margin)
         };
         
-        if !balance_reserved {
-            // This should not happen if available >= required_margin, but handle it anyway
-            warn!(
-                symbol = %signal.symbol,
-                required_margin = %required_margin,
-                "ORDERING: Failed to reserve balance (race condition detected)"
-            );
-            return Ok(());
-        }
-        
-        // Balance reserved - will be released after order placement (success or failure)
-        // If any check fails after reservation, balance must be released
+        // Balance reserved - will be released automatically when balance_reservation is dropped
+        // Explicit release() should be called before returning (Drop will warn if forgotten)
         
         // 4. Risk control check - max position notional
         let max_position_notional = Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
             .unwrap_or(Decimal::from(10000)); // Default to 10000 USD if conversion fails
         
         if notional > max_position_notional {
-            // Release balance reservation before returning
-            {
-                let mut balance_store = shared_state.balance_store.write().await;
-                balance_store.release(&cfg.quote_asset, required_margin);
-            }
+            // ✅ CRITICAL: Release balance reservation before returning
+            balance_reservation.release().await;
             warn!(
                 symbol = %signal.symbol,
                 notional = %notional,
@@ -361,12 +446,9 @@ impl Ordering {
             
             // Check if we already have an open position or order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
-                // Release balance reservation before returning
                 drop(state_guard);
-                {
-                    let mut balance_store = shared_state.balance_store.write().await;
-                    balance_store.release(&cfg.quote_asset, required_margin);
-                }
+                // ✅ CRITICAL: Release balance reservation before returning
+                balance_reservation.release().await;
                 warn!(
                     symbol = %signal.symbol,
                     "ORDERING: Ignoring TradeSignal - already have open position/order"
@@ -452,14 +534,11 @@ impl Ordering {
             })
         };
         
-        // CRITICAL: Release balance reservation after order placement attempt
+        // ✅ CRITICAL: Release balance reservation after order placement attempt
         // Balance is released regardless of success/failure:
         // - On success: Balance is actually used by the order, reservation can be released
         // - On failure: Balance was not used, reservation must be released
-        {
-            let mut balance_store = shared_state.balance_store.write().await;
-            balance_store.release(&cfg.quote_asset, required_margin);
-        }
+        balance_reservation.release().await;
         
         // Handle order result
         let order_id = match order_result {
@@ -532,26 +611,36 @@ impl Ordering {
 
     /// Handle CloseRequest event
     /// If position is open, close it via CONNECTION
+    /// 
+    /// CRITICAL: Race condition prevention
+    /// - Early check is only for logging, not for decision making
+    /// - flatten_position already handles position verification and "position not found" errors
+    /// - Multiple threads can call flatten_position simultaneously - it's safe and idempotent
+    /// - If position is already closed by another thread, flatten_position returns Ok(())
     async fn handle_close_request(
         request: &CloseRequest,
         connection: &Arc<Connection>,
         shared_state: &Arc<SharedState>,
         cfg: &Arc<AppCfg>,
     ) -> Result<()> {
-        // CRITICAL: Check if position exists before closing
-        // This prevents unnecessary API calls if position was already closed
-        // Note: flatten_position also checks position, but this early check saves API calls
-        {
+        // ✅ Early check is only for logging/debugging, not for decision making
+        // flatten_position will handle the actual position check atomically
+        let has_position = {
             let state_guard = shared_state.ordering_state.lock().await;
-            if state_guard.open_position.is_none() || 
-               state_guard.open_position.as_ref().map(|p| p.symbol != request.symbol).unwrap_or(true) {
-                warn!(
-                    symbol = %request.symbol,
-                    "ORDERING: Ignoring CloseRequest - no open position for symbol"
-                );
-                return Ok(());
-            }
-        } // Lock released
+            state_guard.open_position.as_ref()
+                .map(|p| p.symbol == request.symbol)
+                .unwrap_or(false)
+        };
+        
+        if !has_position {
+            // Position not in our state - might be already closed by another thread
+            // Still call flatten_position to be safe (it handles "position not found" gracefully)
+            debug!(
+                symbol = %request.symbol,
+                reason = ?request.reason,
+                "ORDERING: Position not in state (may be already closed), calling flatten_position to verify"
+            );
+        }
         
         // CRITICAL: Use MARKET order with reduceOnly=true for closing positions
         // LIMIT orders are risky for close orders because:
@@ -566,22 +655,40 @@ impl Ordering {
         use crate::event_bus::CloseReason;
         let use_market_only = matches!(request.reason, CloseReason::TakeProfit | CloseReason::StopLoss);
         
-        // Close position using MARKET order with reduceOnly=true
-        // flatten_position handles:
-        // - Position verification
+        // ✅ CRITICAL: flatten_position handles all position checks atomically
+        // - Position verification (fetch_position)
+        // - "Position not found" errors (returns Ok(()))
+        // - Zero quantity positions (returns Ok(()))
         // - Retry logic for partial fills
-        // - Edge case handling (position already closed, etc.)
-        // - MARKET order with reduceOnly=true guarantee
+        // - Multiple threads can call this simultaneously - it's safe
         match connection.flatten_position(&request.symbol, use_market_only).await {
             Ok(()) => {
+                // Success - position closed (or was already closed)
                 info!(
                     symbol = %request.symbol,
                     reason = ?request.reason,
                     use_market_only,
-                    "ORDERING: Position closed successfully using MARKET order (reduceOnly=true)"
+                    "ORDERING: Position closed successfully (or was already closed)"
                 );
+                Ok(())
             }
             Err(e) => {
+                let error_str = e.to_string().to_lowercase();
+                
+                // ✅ CRITICAL: Handle "position not found" errors gracefully
+                // These are OK - position was already closed by another thread (TP/SL race condition)
+                // flatten_position should handle this, but we double-check here for safety
+                if error_str.contains("position not found") 
+                    || error_str.contains("no position")
+                    || error_str.contains("-2011") {  // Binance: Unknown order (position not found)
+                    info!(
+                        symbol = %request.symbol,
+                        reason = ?request.reason,
+                        "ORDERING: Position already closed by another thread (race condition handled)"
+                    );
+                    return Ok(());
+                }
+                
                 // Check if error is permanent (don't retry)
                 if Self::is_permanent_error(&e) {
                     warn!(
@@ -601,11 +708,9 @@ impl Ordering {
                     reason = ?request.reason,
                     "ORDERING: Error closing position (flatten_position handles retries internally)"
                 );
-                return Err(e);
+                Err(e)
             }
         }
-        
-        Ok(())
     }
 
     /// Handle OrderUpdate event (state sync)
@@ -783,12 +888,38 @@ impl Ordering {
                     return;
                 }
                 
-                // Position is open - check if there are significant changes
-                // Calculate differences for logging, but use timestamp as primary decision factor
-                let qty_diff = (update.qty.0 - existing_pos.qty.0).abs();
+                // ✅ CRITICAL: Race condition prevention - check if qty is unchanged
+                // If OrderUpdate::Filled already created position with same qty, skip redundant update
+                // This prevents duplicate position creation when:
+                // 1. OrderUpdate::Filled creates position (qty=1.5)
+                // 2. PositionUpdate arrives immediately after (qty=1.5)
+                // 3. Both have valid timestamps, but qty is same - skip redundant update
+                let qty_abs_update = update.qty.0.abs();
+                let qty_abs_existing = existing_pos.qty.0;
+                
+                // If qty's are the same (or very small difference), skip redundant update
+                // Use small epsilon (0.000001) to handle floating point precision issues
+                let qty_diff = (qty_abs_update - qty_abs_existing).abs();
+                if qty_diff < Decimal::new(1, 6) {
+                    // Qty unchanged - this is likely a redundant update from race condition
+                    // Only update timestamp to acknowledge we received this update
+                    state_guard.last_position_update_timestamp = Some(update.timestamp);
+                    
+                    tracing::debug!(
+                        symbol = %update.symbol,
+                        existing_qty = %qty_abs_existing,
+                        update_qty = %qty_abs_update,
+                        qty_diff = %qty_diff,
+                        "ORDERING: Position qty unchanged, skipping redundant update (race condition prevention)"
+                    );
+                    return;
+                }
+                
+                // Position is open and qty changed - update position
+                // Calculate differences for logging
                 let price_diff = (update.entry_price.0 - existing_pos.entry_price.0).abs();
                 
-                // Update position (timestamp check already passed)
+                // Update position (timestamp check already passed, qty changed)
                 // Determine direction from qty sign and ensure qty is positive
                 let direction = PositionDirection::from_qty_sign(update.qty.0);
                 let qty_abs = if update.qty.0.is_sign_negative() {
@@ -809,7 +940,7 @@ impl Ordering {
                     symbol = %update.symbol,
                     qty_diff = %qty_diff,
                     price_diff = %price_diff,
-                    "ORDERING: Position updated from PositionUpdate (timestamp verified)"
+                    "ORDERING: Position updated from PositionUpdate (qty changed, timestamp verified)"
                 );
                 return;
             }

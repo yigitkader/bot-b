@@ -172,13 +172,17 @@ impl Balance {
                     
                     if attempt < MAX_RETRIES - 1 {
                         let delay_secs = INITIAL_DELAY_SECS * (1 << attempt); // Exponential backoff
-                        warn!(
-                            error = %last_error.as_ref().unwrap(),
-                            attempt = attempt + 1,
-                            max_retries = MAX_RETRIES,
-                            retry_in_secs = delay_secs,
-                            "BALANCE: Failed to fetch balance, retrying..."
-                        );
+                        // ✅ CRITICAL: Safe unwrap - last_error was just set to Some(e) above
+                        // But use if let for extra safety
+                        if let Some(ref err) = last_error {
+                            warn!(
+                                error = %err,
+                                attempt = attempt + 1,
+                                max_retries = MAX_RETRIES,
+                                retry_in_secs = delay_secs,
+                                "BALANCE: Failed to fetch balance, retrying..."
+                            );
+                        }
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                     }
                 }

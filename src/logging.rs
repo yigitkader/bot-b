@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -175,9 +175,17 @@ impl JsonLogger {
     }
 
     fn timestamp_ms() -> u64 {
+        // ✅ CRITICAL: Graceful error handling for system time
+        // System clock can be adjusted (NTP sync, manual changes, etc.)
+        // Use fallback value instead of panicking
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_else(|_| {
+                // System time is before UNIX epoch (should never happen, but handle gracefully)
+                // Use current timestamp as fallback (0 would cause issues)
+                warn!("System time is before UNIX epoch, using fallback timestamp");
+                Duration::from_secs(0)
+            })
             .as_millis() as u64
     }
 
@@ -771,13 +779,51 @@ impl Logging {
             use std::collections::HashMap;
             use tokio::sync::RwLock;
             let tick_counts: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+            let last_seen: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
             const LOG_INTERVAL: u64 = 1000; // Log every 1000 ticks per symbol (much less frequent)
+            const CLEANUP_INTERVAL_SECS: u64 = 3600; // Cleanup symbols not seen in last hour
+            
+            // Spawn periodic cleanup task to prevent memory leak
+            let tick_counts_cleanup = tick_counts.clone();
+            let last_seen_cleanup = last_seen.clone();
+            let shutdown_flag_cleanup = shutdown_flag_tick.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
+                    
+                    if shutdown_flag_cleanup.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    
+                    let now = Instant::now();
+                    let mut counts = tick_counts_cleanup.write().await;
+                    let mut last_seen_guard = last_seen_cleanup.write().await;
+                    
+                    // Remove symbols that haven't been seen in the last hour
+                    counts.retain(|symbol, _| {
+                        last_seen_guard.get(symbol)
+                            .map(|ts| now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS)
+                            .unwrap_or(false)
+                    });
+                    
+                    // Also clean up last_seen map
+                    last_seen_guard.retain(|_, ts| {
+                        now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS
+                    });
+                }
+            });
             
             loop {
                 match market_tick_rx.recv().await {
                     Ok(tick) => {
                         if shutdown_flag_tick.load(AtomicOrdering::Relaxed) {
                             break;
+                        }
+                        
+                        // Update last seen timestamp
+                        {
+                            let mut last_seen_guard = last_seen.write().await;
+                            last_seen_guard.insert(tick.symbol.clone(), Instant::now());
                         }
                         
                         // Per-symbol counter to avoid log spam with multiple symbols

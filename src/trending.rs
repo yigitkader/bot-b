@@ -197,15 +197,30 @@ impl Trending {
     }
     
     /// Calculate momentum (price change over last N periods)
+    /// Returns the percentage change from (period + 1) prices ago to now
+    /// 
+    /// Example: period=5 means compare price from 6 prices ago to current price
+    /// This gives us the momentum over the last 5 price movements
     fn calculate_momentum(prices: &VecDeque<PricePoint>, period: usize) -> Option<f64> {
-        if prices.len() < period + 1 {
+        // ✅ CRITICAL: Need at least (period + 1) prices to calculate momentum
+        // period=5 means we need 6 prices: 5 prices ago, 4 prices ago, ..., 1 price ago, current
+        // This is safer than checking < period + 1 (avoids off-by-one errors)
+        if prices.len() <= period {
             return None;
         }
         
-        let first_idx = prices.len() - period - 1;
-        let first_price = prices.get(first_idx)?.price;
-        let last_price = prices.back()?.price;
+        // ✅ SAFER: Use iterator instead of index calculation to avoid off-by-one errors
+        // Take the last (period + 1) prices in reverse order (newest first)
+        // This gives us: [current, 1 ago, 2 ago, ..., period ago]
+        let iter: Vec<_> = prices.iter().rev().take(period + 1).collect();
         
+        // Get first and last prices from the collected iterator
+        // iter.first() = current price (newest, most recent)
+        // iter.last() = price from (period + 1) prices ago (oldest in our window)
+        let first_price = iter.last()?.price; // En eski (period + 1 önceki)
+        let last_price = iter.first()?.price;  // En yeni (current)
+        
+        // Calculate percentage change: (new - old) / old * 100
         let change_pct = ((last_price - first_price) / first_price) * Decimal::from(100);
         change_pct.to_f64()
     }

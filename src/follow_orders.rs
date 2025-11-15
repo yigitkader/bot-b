@@ -6,7 +6,7 @@
 use crate::config::AppCfg;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
 use crate::types::{Px, Qty, PositionDirection};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -385,8 +385,9 @@ impl FollowOrders {
         // Check take profit (using net PnL - commission included)
         if let Some(tp_pct) = position.take_profit_pct {
             if net_pnl_pct_f64 >= tp_pct {
-                // Take profit triggered - send close request and remove position from tracking
-                // This prevents multiple close requests for the same trigger
+                // ✅ CRITICAL: Take profit triggered - send close request FIRST, then remove position
+                // Order matters: If CloseRequest fails, position should remain in tracking
+                // This prevents position from being removed without sending close request
                 // Include current bid/ask prices to reduce slippage (avoid price fetch delay)
                 let close_request = CloseRequest {
                     symbol: tick.symbol.clone(),
@@ -397,29 +398,40 @@ impl FollowOrders {
                     timestamp: Instant::now(),
                 };
                 
-                // Remove position from tracking immediately to prevent duplicate triggers
-                {
-                    let mut positions_guard = positions.write().await;
-                    positions_guard.remove(&tick.symbol);
-                }
-                
-                if let Err(e) = event_bus.close_request_tx.send(close_request) {
-                    error!(
-                        error = ?e,
-                        symbol = %tick.symbol,
-                        "FOLLOW_ORDERS: Failed to send CloseRequest event for take profit (no subscribers or channel closed)"
-                    );
-                } else {
-                    info!(
-                        symbol = %tick.symbol,
-                        net_pnl_pct = net_pnl_pct_f64,
-                        gross_pnl_pct = gross_pnl_pct_f64,
-                        commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
-                        tp_pct,
-                        leverage = position.leverage,
-                        price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
-                        "FOLLOW_ORDERS: Take profit triggered (net PnL), position removed from tracking"
-                    );
+                // ✅ CRITICAL: Send CloseRequest FIRST, only remove position if successful
+                match event_bus.close_request_tx.send(close_request) {
+                    Ok(()) => {
+                        // CloseRequest sent successfully - now safe to remove position from tracking
+                        // This prevents duplicate triggers while ensuring close request is sent
+                        {
+                            let mut positions_guard = positions.write().await;
+                            positions_guard.remove(&tick.symbol);
+                        }
+                        
+                        info!(
+                            symbol = %tick.symbol,
+                            net_pnl_pct = net_pnl_pct_f64,
+                            gross_pnl_pct = gross_pnl_pct_f64,
+                            commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
+                            tp_pct,
+                            leverage = position.leverage,
+                            price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
+                            "FOLLOW_ORDERS: Take profit triggered (net PnL), CloseRequest sent, position removed from tracking"
+                        );
+                    }
+                    Err(e) => {
+                        // ❌ CRITICAL: CloseRequest failed - DO NOT remove position
+                        // Position remains in tracking so it can be retried on next tick
+                        error!(
+                            error = ?e,
+                            symbol = %tick.symbol,
+                            net_pnl_pct = net_pnl_pct_f64,
+                            tp_pct,
+                            "FOLLOW_ORDERS: Failed to send CloseRequest event for take profit (no subscribers or channel closed). Position remains in tracking for retry."
+                        );
+                        // Return error so caller can handle it
+                        return Err(anyhow::anyhow!("Failed to send CloseRequest for take profit: {}", e));
+                    }
                 }
                 return Ok(());
             }
@@ -428,8 +440,9 @@ impl FollowOrders {
         // Check stop loss (using net PnL - commission included)
         if let Some(sl_pct) = position.stop_loss_pct {
             if net_pnl_pct_f64 <= -sl_pct {
-                // Stop loss triggered - send close request and remove position from tracking
-                // This prevents multiple close requests for the same trigger
+                // ✅ CRITICAL: Stop loss triggered - send close request FIRST, then remove position
+                // Order matters: If CloseRequest fails, position should remain in tracking
+                // This prevents position from being removed without sending close request
                 // Include current bid/ask prices to reduce slippage (avoid price fetch delay)
                 let close_request = CloseRequest {
                     symbol: tick.symbol.clone(),
@@ -440,29 +453,40 @@ impl FollowOrders {
                     timestamp: Instant::now(),
                 };
                 
-                // Remove position from tracking immediately to prevent duplicate triggers
-                {
-                    let mut positions_guard = positions.write().await;
-                    positions_guard.remove(&tick.symbol);
-                }
-                
-                if let Err(e) = event_bus.close_request_tx.send(close_request) {
-                    error!(
-                        error = ?e,
-                        symbol = %tick.symbol,
-                        "FOLLOW_ORDERS: Failed to send CloseRequest event for stop loss (no subscribers or channel closed)"
-                    );
-                } else {
-                    info!(
-                        symbol = %tick.symbol,
-                        net_pnl_pct = net_pnl_pct_f64,
-                        gross_pnl_pct = gross_pnl_pct_f64,
-                        commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
-                        sl_pct,
-                        leverage = position.leverage,
-                        price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
-                        "FOLLOW_ORDERS: Stop loss triggered (net PnL), position removed from tracking"
-                    );
+                // ✅ CRITICAL: Send CloseRequest FIRST, only remove position if successful
+                match event_bus.close_request_tx.send(close_request) {
+                    Ok(()) => {
+                        // CloseRequest sent successfully - now safe to remove position from tracking
+                        // This prevents duplicate triggers while ensuring close request is sent
+                        {
+                            let mut positions_guard = positions.write().await;
+                            positions_guard.remove(&tick.symbol);
+                        }
+                        
+                        info!(
+                            symbol = %tick.symbol,
+                            net_pnl_pct = net_pnl_pct_f64,
+                            gross_pnl_pct = gross_pnl_pct_f64,
+                            commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
+                            sl_pct,
+                            leverage = position.leverage,
+                            price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
+                            "FOLLOW_ORDERS: Stop loss triggered (net PnL), CloseRequest sent, position removed from tracking"
+                        );
+                    }
+                    Err(e) => {
+                        // ❌ CRITICAL: CloseRequest failed - DO NOT remove position
+                        // Position remains in tracking so it can be retried on next tick
+                        error!(
+                            error = ?e,
+                            symbol = %tick.symbol,
+                            net_pnl_pct = net_pnl_pct_f64,
+                            sl_pct,
+                            "FOLLOW_ORDERS: Failed to send CloseRequest event for stop loss (no subscribers or channel closed). Position remains in tracking for retry."
+                        );
+                        // Return error so caller can handle it
+                        return Err(anyhow::anyhow!("Failed to send CloseRequest for stop loss: {}", e));
+                    }
                 }
                 return Ok(());
             }
