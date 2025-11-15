@@ -789,9 +789,22 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 Ok(position)
             }
         } else {
-            warn!(
+            // ✅ CRITICAL: Hedge mode is NOT supported (config validation should prevent this)
+            // This code should never execute if config validation is working correctly
+            // But we keep it for defensive programming and clear error messages
+            //
+            // Problem: Position struct only supports single position per symbol
+            // If both LONG and SHORT positions exist, only one can be returned
+            // This causes:
+            // - SHORT position loss (not tracked)
+            // - TP/SL won't work for untracked position
+            // - System instability and potential financial losses
+            //
+            // NOTE: Config validation (config.rs line 548) should prevent hedge_mode=true
+            // If this code executes, it means config validation was bypassed or config changed at runtime
+            error!(
                 symbol = %sym,
-                "CONNECTION: Hedge mode enabled but support is incomplete. Position tracking, TP/SL, and closing may not work correctly for multiple positions per symbol."
+                "CRITICAL: Hedge mode detected but NOT supported! Config validation should have prevented this. This indicates a configuration error or runtime config change."
             );
 
             let mut long_qty = Decimal::ZERO;
@@ -859,16 +872,31 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 }
             }
 
+            // ✅ CRITICAL: If both LONG and SHORT positions exist, return error
+            // This prevents silent data loss where SHORT position is ignored
+            // SHORT position loss would cause TP/SL to fail for that position
+            if long_qty > Decimal::ZERO && short_qty > Decimal::ZERO {
+                return Err(anyhow!(
+                    "CRITICAL: Both LONG and SHORT positions exist for symbol {} in hedge mode. \
+                     Current implementation cannot handle multiple positions per symbol. \
+                     SHORT position (qty={}, entry={}) will be lost if we return LONG position. \
+                     This would cause TP/SL to fail for the untracked SHORT position. \
+                     \
+                     Hedge mode is NOT supported. Please set binance.hedge_mode: false in config.yaml. \
+                     \
+                     If you need hedge mode, full support requires: \
+                     - Position struct redesign to support multiple positions per symbol \
+                     - Separate TP/SL tracking for LONG and SHORT \
+                     - position_id-based closing \
+                     - Separate position tracking in ORDERING state",
+                    sym,
+                    short_qty,
+                    short_entry
+                ));
+            }
+
             let (final_qty, final_entry, final_leverage, final_liq_px) = if long_qty > Decimal::ZERO {
-            // LONG position exists - prioritize LONG
-                if short_qty > Decimal::ZERO {
-                    warn!(
-                        symbol = %sym,
-                        long_qty = %long_qty,
-                        short_qty = %short_qty,
-                        "CONNECTION: Both LONG and SHORT positions exist in hedge mode. Returning LONG position. SHORT should be tracked separately."
-                    );
-                }
+            // Only LONG position exists
                 (long_qty, long_entry, long_leverage, long_liq_px)
             } else if short_qty > Decimal::ZERO {
             // Only SHORT position exists
@@ -926,7 +954,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
         let max_attempts = 3;
         let mut limit_fallback_attempted = false;
         let mut growth_event_count = 0u32;
-    const MAX_RETRIES_ON_GROWTH: u32 = 2; // Max retries allowed when position grows
+    const MAX_RETRIES_ON_GROWTH: u32 = 8; // Max retries allowed when position grows (increased from 2 to 8 to handle volatile markets with multiple simultaneous fills)
 
         for attempt in 0..max_attempts {
             if limit_fallback_attempted {

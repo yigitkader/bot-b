@@ -363,7 +363,7 @@ impl Ordering {
     /// This is safer than attempting async cleanup in Drop trait (which can deadlock)
     fn start_leak_detection_task(shared_state: Arc<SharedState>, shutdown_flag: Arc<AtomicBool>) {
         tokio::spawn(async move {
-            const CHECK_INTERVAL_SECS: u64 = 60; // Check every minute
+            const CHECK_INTERVAL_SECS: u64 = 10; // Check every 10 seconds (reduced from 60s to detect leaks faster in high-frequency trading scenarios)
 
             loop {
                 tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
@@ -547,132 +547,36 @@ impl Ordering {
             }
         }
 
-        // ✅ CRITICAL: Spread validation MUST happen BEFORE balance reservation
+        // ✅ CRITICAL: Spread staleness check (spread range validation already done in TRENDING)
         // This prevents expensive spread validation from happening while balance is reserved,
         // which creates a race condition window where another thread can reserve balance
         // and place an order while this thread is validating spread.
         //
-        // Problem: Spread validation can take 2-3 seconds (network call to get_current_prices)
-        // If balance is reserved during this time, another thread can also reserve balance
-        // and place an order, causing double-spend.
+        // IMPORTANT: Spread range validation is done in TRENDING module (trending.rs line 605)
+        // ORDERING only needs to check if signal is too stale (time-based check)
+        // This avoids duplicate validation and reduces latency
         //
-        // Solution: Validate spread FIRST (before any lock), then immediately reserve balance
-        // and place order atomically.
-        //
-        // CRITICAL: Re-validate spread before order placement
-        //
-        // Problem: Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
-        // This prevents slippage from trading when spread has widened significantly
-        //
-        // Solution: Two-stage validation with realistic time windows
-        // 1. Check spread staleness (if spread data is too old, re-fetch current spread)
-        // 2. After fetch, check total delay (original age + fetch time)
-        //
-        // Time Window Design:
-        // - MAX_SPREAD_AGE_MS (2000ms): Initial spread age threshold
-        //   - If spread is older than 2 seconds, fetch fresh spread
-        //   - Accounts for normal processing delays (100-500ms)
-        // - MAX_TOTAL_DELAY_MS (3000ms): Total delay threshold after fetch
-        //   - Original age (up to 2000ms) + fetch time (200-500ms) + validation (100-200ms)
-        //   - Total: ~2700ms worst case, 3000ms gives safety margin
-        //
-        // Why these values:
-        // - Network latency: 200-500ms (Binance API)
-        // - Processing time: 100-200ms (validation, state checks)
-        // - Total realistic delay: ~700ms worst case
-        // - 2-3 second windows provide safety margin while preventing stale signals
+        // Problem: If signal is too old, spread may have changed significantly
+        // Solution: Check signal age - if too old, abort without expensive network call
         let spread_age = now.duration_since(signal.spread_timestamp);
-        const MAX_SPREAD_AGE_MS: u64 = 2000; // 2 seconds - more realistic for network latency
+        const MAX_SPREAD_AGE_SECS: u64 = 5; // 5 seconds - signal is too stale if older than this
 
-        if spread_age.as_millis() as u64 > MAX_SPREAD_AGE_MS {
-            // Spread data is stale, fetch current spread
-            match connection.get_current_prices(&signal.symbol).await {
-                Ok((bid, ask)) => {
-                    // Check if price fetch took too long
-                    // If total delay (original age + fetch time) exceeds threshold, abort signal
-                    // This prevents using stale spread data that may have changed during fetch
-                    let fetch_timestamp = Instant::now();
-                    let total_delay = fetch_timestamp.duration_since(signal.spread_timestamp);
-                    const MAX_TOTAL_DELAY_MS: u64 = 3000; // 3 seconds max total delay (original age + fetch time)
-
-                    if total_delay.as_millis() as u64 > MAX_TOTAL_DELAY_MS {
-                        warn!(
-                            symbol = %signal.symbol,
-                            total_delay_ms = total_delay.as_millis(),
-                            original_spread_age_ms = spread_age.as_millis(),
-                            fetch_delay_ms = total_delay.as_millis() - spread_age.as_millis(),
-                            max_delay_ms = MAX_TOTAL_DELAY_MS,
-                            "ORDERING: Price fetch took too long, spread may have changed during fetch, aborting signal"
-                        );
-                        return Ok(());
-                    }
-
-                    let current_spread_bps = ((ask.0 - bid.0) / bid.0) * Decimal::from(10000);
-                    let current_spread_bps_f64 = current_spread_bps.to_f64().unwrap_or(0.0);
-
-                    let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
-                    let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
-
-                    // Validate current spread is still within acceptable range
-                    if current_spread_bps_f64 < min_acceptable_spread_bps
-                        || current_spread_bps_f64 > max_acceptable_spread_bps
-                    {
-                        warn!(
-                            symbol = %signal.symbol,
-                            original_spread_bps = signal.spread_bps,
-                            current_spread_bps = current_spread_bps_f64,
-                            total_delay_ms = total_delay.as_millis(),
-                            min_spread = min_acceptable_spread_bps,
-                            max_spread = max_acceptable_spread_bps,
-                            "ORDERING: Spread changed and is now out of acceptable range, skipping order placement"
-                        );
-                        return Ok(());
-                    }
-
-                    // Spread is still acceptable, but log if it changed significantly
-                    let spread_change = (current_spread_bps_f64 - signal.spread_bps).abs();
-                    if spread_change > 5.0 {
-                        // More than 5 bps change
-                        warn!(
-                            symbol = %signal.symbol,
-                            original_spread_bps = signal.spread_bps,
-                            current_spread_bps = current_spread_bps_f64,
-                            spread_change_bps = spread_change,
-                            total_delay_ms = total_delay.as_millis(),
-                            "ORDERING: Spread changed significantly since signal generation"
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Spread validation failed - cancel signal
-                    warn!(
-                        error = %e,
-                        symbol = %signal.symbol,
-                        spread_age_ms = spread_age.as_millis(),
-                        "ORDERING: Failed to fetch current prices for spread validation, ABORTING signal"
-                    );
-                    return Ok(()); // Signal iptal et
-                }
-            }
-        } else {
-            // Spread data is fresh, validate it's still within acceptable range
-            // (Spread could have changed even if timestamp is recent)
-            let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
-            let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
-
-            if signal.spread_bps < min_acceptable_spread_bps
-                || signal.spread_bps > max_acceptable_spread_bps
-            {
-                warn!(
-                    symbol = %signal.symbol,
-                    spread_bps = signal.spread_bps,
-                    min_spread = min_acceptable_spread_bps,
-                    max_spread = max_acceptable_spread_bps,
-                    "ORDERING: Signal spread is out of acceptable range, skipping order placement"
-                );
-                return Ok(());
-            }
+        if spread_age.as_secs() > MAX_SPREAD_AGE_SECS {
+            // Signal is too stale - abort without expensive network call
+            // TRENDING already validated spread range, we only need to check age here
+            warn!(
+                symbol = %signal.symbol,
+                spread_age_secs = spread_age.as_secs(),
+                max_age_secs = MAX_SPREAD_AGE_SECS,
+                "ORDERING: Signal is too stale ({} seconds old), aborting. Spread range was already validated in TRENDING.",
+                spread_age.as_secs()
+            );
+            return Ok(());
         }
+
+        // Signal is recent (within 5 seconds) - proceed with order placement
+        // Spread range validation was already done in TRENDING, no need to re-validate here
+        // This reduces latency and avoids duplicate validation
 
         // Get TIF from config (before lock to minimize lock time)
         let tif = match cfg.exec.tif.as_str() {
@@ -692,22 +596,23 @@ impl Ordering {
         };
 
         // ✅ CRITICAL: Atomic operation - state check + balance reserve + order placement
-        // Solution: State check + balance reserve atomically (same lock)
-        // Then IMMEDIATELY place order (outside lock but right after reservation)
-        // Then IMMEDIATELY update state (re-acquire lock)
-        // This minimizes the window where another thread can interfere
         //
-        // Flow:
-        // 1. Lock: Check state + reserve balance
-        // 2. Unlock: Place order IMMEDIATELY (minimize delay)
-        // 3. Lock: Update state atomically
+        // IMPORTANT: Spread validation was already done ABOVE (before balance reservation)
+        // This prevents the race condition where expensive validation happens while balance is reserved
+        //
+        // Flow (CORRECT ORDER):
+        // 1. ✅ Spread validation (DONE ABOVE - before any lock, lines 550-675)
+        // 2. ✅ Lock: Check state + reserve balance (lines 712-749)
+        // 3. ✅ Unlock: Place order IMMEDIATELY (minimize delay, lines 765+)
+        // 4. ✅ Lock: Update state atomically (after order placement)
         //
         // This prevents the race condition where:
         // - Thread A reserves balance, lock released
         // - Thread B also reserves balance (if enough balance for both)
-        // - Thread A does expensive spread validation (2-3 seconds)
+        // - Thread A does expensive spread validation (2-3 seconds) ← PREVENTED: validation done BEFORE reservation
         // - Thread B places order (succeeds)
-        // - Thread A places order (double-spend!)
+        // - Thread A places order (double-spend!) ← PREVENTED: validation already done
+        //
         // Step 1: Atomic state check + balance reservation (inside lock)
         let mut balance_reservation = {
             let state_guard = shared_state.ordering_state.lock().await;

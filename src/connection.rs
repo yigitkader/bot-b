@@ -325,50 +325,49 @@ impl Connection {
             let now = Instant::now();
             let initial_count = order_fill_history.len();
             order_fill_history.retain(|order_id, history| {
-                // ✅ CRITICAL: Always check age FIRST to prevent memory leaks
+                // ✅ CRITICAL: Age check FIRST to prevent memory leaks
                 // Problem: If cache is stale (WebSocket lag), order may appear "open" in cache
-                // but history is very old. Without age check first, these entries never get cleaned up.
+                // but history is very old. If we check cache first, we might keep stale entries forever.
                 //
-                // Solution: Check age first, then cache status. If age > MAX_AGE_SECS,
-                // force remove even if in cache (cache is likely stale).
+                // Solution: Check age FIRST. If very old, force remove regardless of cache status.
+                // Only check cache for recent entries (to protect active orders).
                 let age = now.duration_since(history.last_update);
 
-                // First check: Is order in OPEN_ORDERS_CACHE?
+                // Step 1: AGE CHECK FIRST (prevents leak even if cache is stale)
+                // If entry is very old (24+ hours), force remove to prevent memory leak
+                // This handles cases where:
+                // - Order was filled/cancelled but WebSocket update delayed
+                // - Cache still shows order as "open" but history is very old
+                // - Order has been open for more than 24 hours (unlikely but possible)
+                if age.as_secs() > MAX_AGE_SECS {
+                    // Very old entry - force remove regardless of cache status
+                    // This prevents memory leaks from stale cache or very long-lived orders
+                    warn!(
+                        order_id = %order_id,
+                        history_age_secs = age.as_secs(),
+                        history_age_hours = age.as_secs() / 3600,
+                        "CONNECTION: Order fill history is very old ({} hours), force removing to prevent memory leak (cache check skipped for old entries)",
+                        age.as_secs() / 3600
+                    );
+                    false // FORCE REMOVE - prevent memory leak
+                } else {
+
+                // Step 2: CACHE CHECK (only for recent entries)
+                // If entry is recent, check if order is still active in cache
+                // This protects active orders from being cleaned up prematurely
                 let is_in_cache = OPEN_ORDERS_CACHE.iter().any(|entry| {
                     entry.value().iter().any(|o| o.order_id == *order_id)
                 });
 
                 if is_in_cache {
-                    // Order is in cache - but check age first to prevent memory leak
-                    if age.as_secs() > MAX_AGE_SECS {
-                        // Cache is stale - force remove to prevent leak
-                        // This handles the case where:
-                        // - Order was filled/cancelled but WebSocket update delayed
-                        // - Cache still shows order as "open" but history is very old
-                        // - Without this check, entry would never be cleaned up
-                        warn!(
-                            order_id = %order_id,
-                            history_age_secs = age.as_secs(),
-                            history_age_hours = age.as_secs() / 3600,
-                            "CONNECTION: Order in cache but history is very old ({} hours), cache likely stale. Force removing to prevent memory leak.",
-                            age.as_secs() / 3600
-                        );
-                        false // FORCE REMOVE - prevent memory leak
-                    } else {
-                        // Order in cache and history is recent - keep it
-                        true // Keep
-                    }
+                    // Order is in cache and history is recent - keep it (active order)
+                    true // Keep
                 } else {
-                    // Not in cache - normal age check
-                    if age.as_secs() > MAX_AGE_SECS {
-                        // Very old entry (24+ hours) - safe to remove (memory leak prevention)
-                        // Normal cleanup should have removed this already when order closed,
-                        // but this catches edge cases where cleanup didn't happen
-                        false
-                    } else {
-                        // Recent entry - keep (may receive late-arriving fill events)
-                        true
-                    }
+                    // Not in cache and history is recent - keep for now
+                    // May receive late-arriving fill events or order may be closing
+                    // Will be cleaned up on next cleanup cycle if still inactive
+                    true // Keep (recent entry, may receive late events)
+                }
                 }
             });
 

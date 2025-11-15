@@ -248,6 +248,75 @@ impl Trending {
             }
         });
         
+        // Spawn cleanup task for symbol_states to prevent memory leak
+        // Cleanup symbols that haven't received ticks in the last hour
+        let symbol_states_cleanup = symbol_states.clone();
+        let shutdown_flag_cleanup = shutdown_flag.clone();
+        tokio::spawn(async move {
+            const CLEANUP_INTERVAL_SECS: u64 = 3600; // Cleanup every hour
+            const MAX_AGE_SECS: u64 = 3600; // Remove symbols not seen in last hour
+            
+            loop {
+                tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
+                
+                if shutdown_flag_cleanup.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                
+                let now = Instant::now();
+                let mut states = symbol_states_cleanup.lock().await;
+                let initial_count = states.len();
+                
+                // Remove symbols that haven't received ticks in the last hour
+                // Use last price timestamp from prices VecDeque, or fallback to last_signal_time/last_position_close_time
+                states.retain(|symbol, state| {
+                    // Get last activity timestamp from price history (most recent price point)
+                    let last_activity = state.prices
+                        .back()
+                        .map(|p| p.timestamp)
+                        .or_else(|| state.last_signal_time)
+                        .or_else(|| state.last_position_close_time);
+                    
+                    if let Some(last_ts) = last_activity {
+                        let age = now.duration_since(last_ts);
+                        if age.as_secs() > MAX_AGE_SECS {
+                            // Symbol hasn't been active in the last hour - remove to prevent memory leak
+                            debug!(
+                                symbol = %symbol,
+                                age_secs = age.as_secs(),
+                                age_hours = age.as_secs() / 3600,
+                                "TRENDING: Cleaning up stale symbol state (no ticks in {} hours)",
+                                age.as_secs() / 3600
+                            );
+                            false // Remove
+                        } else {
+                            true // Keep (recent activity)
+                        }
+                    } else {
+                        // No activity timestamp at all - remove empty state
+                        debug!(
+                            symbol = %symbol,
+                            "TRENDING: Cleaning up empty symbol state (no activity recorded)"
+                        );
+                        false // Remove
+                    }
+                });
+                
+                let final_count = states.len();
+                let removed_count = initial_count.saturating_sub(final_count);
+                
+                if removed_count > 0 {
+                    info!(
+                        initial_count,
+                        final_count,
+                        removed_count,
+                        "TRENDING: Cleaned up {} stale symbol states (memory leak prevention)",
+                        removed_count
+                    );
+                }
+            }
+        });
+        
         Ok(())
     }
 
