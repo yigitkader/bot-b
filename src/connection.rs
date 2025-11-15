@@ -392,34 +392,47 @@ impl Connection {
                 }
                 
                 let now = Instant::now();
-                let mut removed_count = 0;
-                let mut protected_count = 0;
+                let initial_count = order_fill_history.len();
                 
-                // ✅ CRITICAL: Only remove entries for closed orders (not in OPEN_ORDERS_CACHE)
-                // This prevents race condition where cleanup task removes entry while OrderFill event handler is using it
-                // Active orders are protected from cleanup
+                // ✅ DOĞRU: Active order kontrolü önce yapılmalı (race condition önleme)
+                // ✅ OPTIMIZE: Active order'ları önce kontrol et, sonra age kontrolü yap
+                // Bu şekilde active order'lar her zaman korunur (age'den bağımsız)
+                // Race condition window'u küçültür: OrderFill event gelirken history silinmez
                 order_fill_history.retain(|order_id, history| {
-                    let age = now.duration_since(history.last_update);
-                    if age.as_secs() > MAX_AGE_SECS {
-                        // Check if order is still active (in OPEN_ORDERS_CACHE)
-                        // If order is active, protect it from cleanup even if it's old
-                        let is_active = OPEN_ORDERS_CACHE.iter().any(|entry| {
-                            entry.value().iter().any(|o| o.order_id == *order_id)
-                        });
-                        
-                        if is_active {
-                            // Order is still active - protect from cleanup
-                            protected_count += 1;
-                            true // Keep this entry (active order)
-                        } else {
-                            // Order is closed and old - safe to remove
-                            removed_count += 1;
-                            false // Remove this entry (closed order)
-                        }
+                    // ✅ KRİTİK: Önce active order kontrolü yap (age'den önce)
+                    // Active order'lar her zaman korunmalı (OrderFill event gelebilir)
+                    let is_active = OPEN_ORDERS_CACHE.iter().any(|entry| {
+                        entry.value().iter().any(|o| o.order_id == *order_id)
+                    });
+                    
+                    if is_active {
+                        // Order is still active - protect from cleanup (regardless of age)
+                        // This prevents race condition where OrderFill event arrives during cleanup
+                        true // Keep this entry (active order)
                     } else {
-                        true // Keep recent entries (regardless of status)
+                        // Order is closed - check age to determine if safe to remove
+                        let age = now.duration_since(history.last_update);
+                        if age.as_secs() > MAX_AGE_SECS {
+                            // Order is closed and old - safe to remove
+                            false // Remove this entry (closed order, old)
+                        } else {
+                            // Order is closed but recent - keep for now
+                            true // Keep recent entries (closed but recent)
+                        }
                     }
                 });
+                
+                let final_count = order_fill_history.len();
+                let removed_count = initial_count.saturating_sub(final_count);
+                
+                // Count protected orders (active orders that were kept)
+                let protected_count = order_fill_history.iter()
+                    .filter(|entry| {
+                        OPEN_ORDERS_CACHE.iter().any(|cache_entry| {
+                            cache_entry.value().iter().any(|o| o.order_id == *entry.key())
+                        })
+                    })
+                    .count();
                 
                 if removed_count > 0 {
                     info!(
@@ -642,11 +655,160 @@ impl Connection {
                     Ok(mut stream) => {
                         info!(?kind, "CONNECTION: connected to Binance user data stream");
                         
-                        // Set reconnect callback - Binance WebSocket automatically sends
-                        // ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events after reconnect
-                        // which contain current state. No REST API sync needed.
+                        // ✅ İYİLEŞTİRME: Reconnect sonrası REST API ile doğrula
+                        // Binance WebSocket otomatik olarak ACCOUNT_UPDATE ve ORDER_TRADE_UPDATE gönderir
+                        // Ama ekstra validation ekleyerek missed events'i yakalayabiliriz
+                        let venue_for_validation = venue.clone();
+                        let symbols_for_validation = symbols.clone();
                         stream.set_on_reconnect(move || {
                             info!("CONNECTION: WebSocket reconnected - Binance will automatically send state updates via ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events");
+                            
+                            // Spawn background validation task
+                            let venue_clone = venue_for_validation.clone();
+                            let symbols_clone = symbols_for_validation.clone();
+                            tokio::spawn(async move {
+                                // Wait a bit for ACCOUNT_UPDATE events to arrive (Binance sends them after reconnect)
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                
+                                info!("CONNECTION: Validating state after WebSocket reconnect (comparing REST API with WebSocket cache)");
+                                
+                                // Validate positions for each symbol
+                                for symbol in &symbols_clone {
+                                    // Fetch position from REST API
+                                    match venue_clone.get_position(symbol).await {
+                                        Ok(rest_position) => {
+                                            // Compare with WebSocket cache
+                                            if let Some(ws_position) = POSITION_CACHE.get(symbol) {
+                                                let ws_pos = ws_position.value();
+                                                
+                                                // Check if quantities match (with small tolerance for floating point)
+                                                let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
+                                                let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
+                                                
+                                                if qty_diff > Decimal::from_str("0.0001").unwrap() {
+                                                    warn!(
+                                                        symbol = %symbol,
+                                                        rest_qty = %rest_position.qty.0,
+                                                        ws_qty = %ws_pos.qty.0,
+                                                        qty_diff = %qty_diff,
+                                                        "CONNECTION: Position quantity mismatch after reconnect (REST vs WebSocket)"
+                                                    );
+                                                }
+                                                
+                                                if entry_diff > Decimal::from_str("0.01").unwrap() {
+                                                    warn!(
+                                                        symbol = %symbol,
+                                                        rest_entry = %rest_position.entry.0,
+                                                        ws_entry = %ws_pos.entry.0,
+                                                        entry_diff = %entry_diff,
+                                                        "CONNECTION: Position entry price mismatch after reconnect (REST vs WebSocket)"
+                                                    );
+                                                }
+                                            } else if !rest_position.qty.0.is_zero() {
+                                                // REST API shows position but WebSocket cache doesn't
+                                                warn!(
+                                                    symbol = %symbol,
+                                                    rest_qty = %rest_position.qty.0,
+                                                    "CONNECTION: Position exists in REST API but missing from WebSocket cache after reconnect"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Failed to fetch position - log but don't fail
+                                            debug!(
+                                                symbol = %symbol,
+                                                error = %e,
+                                                "CONNECTION: Failed to fetch position for validation after reconnect"
+                                            );
+                                        }
+                                    }
+                                    
+                                    // Validate open orders
+                                    match venue_clone.get_open_orders(symbol).await {
+                                        Ok(rest_orders) => {
+                                            // Compare with WebSocket cache
+                                            if let Some(ws_orders) = OPEN_ORDERS_CACHE.get(symbol) {
+                                                let ws_orders_vec = ws_orders.value();
+                                                
+                                                // Check if order counts match
+                                                if rest_orders.len() != ws_orders_vec.len() {
+                                                    warn!(
+                                                        symbol = %symbol,
+                                                        rest_order_count = rest_orders.len(),
+                                                        ws_order_count = ws_orders_vec.len(),
+                                                        "CONNECTION: Open orders count mismatch after reconnect (REST vs WebSocket)"
+                                                    );
+                                                }
+                                                
+                                                // Check for missing orders in WebSocket cache
+                                                for rest_order in &rest_orders {
+                                                    if !ws_orders_vec.iter().any(|o| o.order_id == rest_order.order_id) {
+                                                        warn!(
+                                                            symbol = %symbol,
+                                                            order_id = %rest_order.order_id,
+                                                            "CONNECTION: Order exists in REST API but missing from WebSocket cache after reconnect"
+                                                        );
+                                                    }
+                                                }
+                                            } else if !rest_orders.is_empty() {
+                                                // REST API shows orders but WebSocket cache doesn't
+                                                warn!(
+                                                    symbol = %symbol,
+                                                    rest_order_count = rest_orders.len(),
+                                                    "CONNECTION: Open orders exist in REST API but missing from WebSocket cache after reconnect"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Failed to fetch orders - log but don't fail
+                                            debug!(
+                                                symbol = %symbol,
+                                                error = %e,
+                                                "CONNECTION: Failed to fetch open orders for validation after reconnect"
+                                            );
+                                        }
+                                    }
+                                }
+                                
+                                // Validate balance (USDT/USDC)
+                                for asset in &["USDT", "USDC"] {
+                                    match venue_clone.available_balance(asset).await {
+                                        Ok(rest_balance) => {
+                                            // Compare with WebSocket cache
+                                            if let Some(ws_balance) = BALANCE_CACHE.get(*asset) {
+                                                let balance_diff = (rest_balance - *ws_balance.value()).abs();
+                                                
+                                                if balance_diff > Decimal::from_str("0.01").unwrap() {
+                                                    warn!(
+                                                        asset = %asset,
+                                                        rest_balance = %rest_balance,
+                                                        ws_balance = %ws_balance.value(),
+                                                        balance_diff = %balance_diff,
+                                                        "CONNECTION: Balance mismatch after reconnect (REST vs WebSocket)"
+                                                    );
+                                                }
+                                            } else if !rest_balance.is_zero() {
+                                                // REST API shows balance but WebSocket cache doesn't
+                                                warn!(
+                                                    asset = %asset,
+                                                    rest_balance = %rest_balance,
+                                                    "CONNECTION: Balance exists in REST API but missing from WebSocket cache after reconnect"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Failed to fetch balance - log but don't fail
+                                            debug!(
+                                                asset = %asset,
+                                                error = %e,
+                                                "CONNECTION: Failed to fetch balance for validation after reconnect"
+                                            );
+                                        }
+                                    }
+                                }
+                                
+                                info!("CONNECTION: State validation after reconnect completed");
+                            });
                         });
                         
                         let mut first_event_after_reconnect = true;
@@ -2636,6 +2798,20 @@ impl BinanceFutures {
                         || error_lower.contains("min_notional"))
                         && !limit_fallback_attempted
                     {
+                        // ✅ KRİTİK: MIN_NOTIONAL hatası önce dust kontrolü yap
+                        // Eğer remaining_qty çok küçükse, LIMIT fallback denemeden pozisyonu kapalı kabul et
+                        let dust_threshold = rules.min_notional / Decimal::from(1000);
+                        if remaining_qty < dust_threshold {
+                            info!(
+                                symbol = %sym,
+                                remaining_qty = %remaining_qty,
+                                dust_threshold = %dust_threshold,
+                                min_notional = %rules.min_notional,
+                                "MIN_NOTIONAL error: remaining qty is dust (below threshold), considering position closed without LIMIT fallback"
+                            );
+                            return Ok(());
+                        }
+                        
                         limit_fallback_attempted = true; // LIMIT fallback'i işaretle (tekrar denenmeyecek)
                         warn!(
                             symbol = %sym,
@@ -2728,24 +2904,27 @@ impl BinanceFutures {
                                     error = %e2,
                                     "MIN_NOTIONAL fallback: limit reduce-only order also failed"
                                 );
+                                
                                 // ✅ KRİTİK GÜVENLİK: LIMIT fallback başarısız, dust kontrolü yap
-                                // Eğer dust ise (çok küçük miktar), pozisyonu kapalı kabul et
-                                if remaining_qty < rules.min_notional / Decimal::from(1000) {
-                                    // Çok küçük miktar, quantize et ve sıfırla
-                                    let dust_qty = quantize_decimal(remaining_qty, rules.step_size);
-                                    if dust_qty <= Decimal::ZERO {
-                                        info!(
-                                            symbol = %sym,
-                                            "MIN_NOTIONAL: remaining qty is dust, considering position closed"
-                                        );
-                                        return Ok(());
-                                    }
+                                // Eğer remaining_qty çok küçükse (dust), pozisyonu kapalı kabul et
+                                // Bu, MIN_NOTIONAL hatası olan çok küçük pozisyonlar için güvenli bir çıkış yolu sağlar
+                                let dust_threshold = rules.min_notional / Decimal::from(1000);
+                                if remaining_qty < dust_threshold {
+                                    info!(
+                                        symbol = %sym,
+                                        remaining_qty = %remaining_qty,
+                                        dust_threshold = %dust_threshold,
+                                        min_notional = %rules.min_notional,
+                                        "MIN_NOTIONAL: remaining qty is dust (below threshold), considering position closed"
+                                    );
+                                    return Ok(());
                                 }
-                                // ✅ KRİTİK: LIMIT fallback başarısız, tekrar MARKET denenmemeli (sonsuz loop önleme)
+                                
+                                // ✅ KRİTİK: LIMIT fallback başarısız ve dust değil, tekrar MARKET denenmemeli (sonsuz loop önleme)
                                 // Direkt hata döndür - retry loop'a girmemeli
                                 return Err(anyhow!(
-                                    "MIN_NOTIONAL error: market and limit reduce-only both failed (market: {}, limit: {})",
-                                    e, e2
+                                    "MIN_NOTIONAL error: market and limit reduce-only both failed (market: {}, limit: {}). Remaining qty: {}, min_notional: {}",
+                                    e, e2, remaining_qty, rules.min_notional
                                 ));
                             }
                         }
@@ -2916,12 +3095,33 @@ impl Venue for BinanceFutures {
                         let body = resp.text().await.unwrap_or_default();
                         let body_lower = body.to_lowercase();
 
-                        // KRİTİK DÜZELTME: -1111 (precision) hatası - rules'ı yeniden çek ve retry
-                        if body_lower.contains("precision is over") || body_lower.contains("-1111")
-                        {
+                        // ✅ DOĞRU: -1111 (precision) hatası - rules cache'i invalidate et ve yeniden çek
+                        // ✅ DOĞRU: MIN_NOTIONAL hatası (-1013) - rules cache'i invalidate et ve yeniden çek
+                        // Rules cache 1 saatte bir refresh ediliyor ama Binance rules gerçek zamanlı değişebilir:
+                        // - Maintenance sırasında
+                        // - Symbol delist edilirse
+                        // - Min notional değişirse
+                        let should_refresh_rules = body_lower.contains("precision is over")
+                            || body_lower.contains("-1111")
+                            || body_lower.contains("-1013")
+                            || body_lower.contains("min notional")
+                            || body_lower.contains("min_notional")
+                            || body_lower.contains("below min notional");
+
+                        if should_refresh_rules {
                             if attempt < MAX_RETRIES {
-                                // Rules'ı yeniden çek
-                                warn!(%sym, attempt = attempt + 1, "precision error (-1111), refreshing rules and retrying");
+                                // ✅ KRİTİK: Önce cache'i invalidate et, sonra fresh rules çek
+                                let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
+                                    "precision error (-1111)"
+                                } else {
+                                    "MIN_NOTIONAL error (-1013)"
+                                };
+                                warn!(%sym, attempt = attempt + 1, error_type, "rules cache invalidated, refreshing rules and retrying");
+                                
+                                // Cache'i invalidate et
+                                self.refresh_rules_for(sym);
+                                
+                                // Fresh rules çek
                                 match self.rules_for(sym).await {
                                     Ok(new_rules) => {
                                         // Yeni rules ile yeniden validate et
@@ -2969,29 +3169,36 @@ impl Venue for BinanceFutures {
                                                     ));
                                                 }
 
-                                                last_error = Some(anyhow!("precision error, retrying with refreshed rules"));
+                                                last_error = Some(anyhow!("{} error, retrying with refreshed rules", error_type));
                                                 continue;
                                             }
                                             Err(e) => {
                                                 error!(%sym, error = %e, "validation failed after rules refresh, giving up");
-                                                return Err(anyhow!("precision error, validation failed after rules refresh: {}", e));
+                                                return Err(anyhow!("{} error, validation failed after rules refresh: {}", error_type, e));
                                             }
                                         }
                                     }
                                     Err(e) => {
                                         error!(%sym, error = %e, "failed to refresh rules, giving up");
                                         return Err(anyhow!(
-                                            "precision error, failed to refresh rules: {}",
+                                            "{} error, failed to refresh rules: {}",
+                                            error_type,
                                             e
                                         ));
                                     }
                                 }
                             } else {
-                                error!(%sym, attempt, "precision error (-1111) after max retries, symbol should be quarantined");
+                                let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
+                                    "precision error (-1111)"
+                                } else {
+                                    "MIN_NOTIONAL error (-1013)"
+                                };
+                                error!(%sym, attempt, error_type, "after max retries, symbol should be quarantined");
                                 return Err(anyhow!(
-                                    "binance api error: {} - {} (precision error, max retries)",
+                                    "binance api error: {} - {} ({}, max retries)",
                                     status,
-                                    body
+                                    body,
+                                    error_type
                                 ));
                             }
                         }
@@ -3402,16 +3609,23 @@ fn is_transient_error(status: u16, _body: &str) -> bool {
 fn is_permanent_error(status: u16, body: &str) -> bool {
     if status == 400 {
         let body_lower = body.to_lowercase();
-        // KRİTİK DÜZELTME: -1111 (precision) hatası permanent değil, retry edilebilir
+        // ✅ DOĞRU: -1111 (precision) hatası permanent değil, retry edilebilir
         // Çünkü girdiyi düzelterek geçilebilir
         if body_lower.contains("precision is over") || body_lower.contains("-1111") {
             return false; // Precision hatası retry edilebilir
         }
+        // ✅ DOĞRU: MIN_NOTIONAL hatası (-1013) permanent değil, retry edilebilir
+        // Çünkü rules refresh ile yeni min_notional değeri alınabilir ve retry yapılabilir
+        if body_lower.contains("-1013")
+            || body_lower.contains("min notional")
+            || body_lower.contains("min_notional")
+            || body_lower.contains("below min notional")
+        {
+            return false; // MIN_NOTIONAL hatası retry edilebilir (rules refresh ile)
+        }
         body_lower.contains("invalid")
             || body_lower.contains("margin")
             || body_lower.contains("insufficient balance")
-            || body_lower.contains("min notional")
-            || body_lower.contains("below min notional")
     } else {
         false
     }

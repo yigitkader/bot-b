@@ -365,15 +365,30 @@ impl FollowOrders {
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         
-        // CRITICAL: Calculate commission from config
-        // Commission applies to both open and close trades (2x commission)
-        // Commission reduces the actual PnL
-        // Note: Currently using taker rate (more conservative). In the future, we can use
-        // actual maker/taker status from OrderUpdate events if available.
-        // For now, using taker rate ensures we don't overestimate PnL.
-        let taker_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+        // ✅ CRITICAL: Calculate commission correctly based on order type
+        // Entry commission depends on TIF (Time In Force):
+        // - Post-only order → Maker commission (0.02%)
+        // - Market/IOC order → Taker commission (0.04%)
+        // Exit commission (TP/SL) is always Taker (market order with reduceOnly)
+        let entry_commission_pct = {
+            let tif_lower = cfg.exec.tif.to_lowercase();
+            if tif_lower == "post_only" || tif_lower == "gtx" {
+                // Post-only order → Maker commission
+                Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+            } else {
+                // Market/IOC order → Taker commission
+                Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+            }
+        };
+        
+        // Exit commission (TP/SL close orders) is always Taker (market order)
+        let exit_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
             .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
-        let total_commission_pct = taker_commission_pct * Decimal::from(2); // Open + close
+        
+        // Total commission = Entry + Exit
+        let total_commission_pct = entry_commission_pct + exit_commission_pct;
         
         // Calculate net PnL percentage (gross PnL - commission)
         // Net PnL% = Gross PnL% - (Commission% * 2)
@@ -412,7 +427,9 @@ impl FollowOrders {
                             symbol = %tick.symbol,
                             net_pnl_pct = net_pnl_pct_f64,
                             gross_pnl_pct = gross_pnl_pct_f64,
-                            commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
+                            entry_commission_pct = entry_commission_pct.to_f64().unwrap_or(0.0),
+                            exit_commission_pct = exit_commission_pct.to_f64().unwrap_or(0.0),
+                            total_commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
                             tp_pct,
                             leverage = position.leverage,
                             price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
@@ -467,7 +484,9 @@ impl FollowOrders {
                             symbol = %tick.symbol,
                             net_pnl_pct = net_pnl_pct_f64,
                             gross_pnl_pct = gross_pnl_pct_f64,
-                            commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
+                            entry_commission_pct = entry_commission_pct.to_f64().unwrap_or(0.0),
+                            exit_commission_pct = exit_commission_pct.to_f64().unwrap_or(0.0),
+                            total_commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
                             sl_pct,
                             leverage = position.leverage,
                             price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),

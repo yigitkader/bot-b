@@ -407,6 +407,29 @@ impl Trending {
             }
         }
         
+        // ✅ PERFORMANCE OPTIMIZATION: Cooldown check BEFORE expensive trend analysis
+        // This prevents unnecessary CPU usage when cooldown is still active
+        // Check cooldown period first (cheap operation)
+        let cooldown_seconds = cfg.trending.signal_cooldown_seconds;
+        let last_signal_side = {
+            let last_signals_map = last_signals.lock().await;
+            if let Some(last_signal) = last_signals_map.get(&tick.symbol) {
+                let elapsed = now.duration_since(last_signal.timestamp);
+                
+                // Check cooldown period - if still in cooldown, skip expensive trend analysis
+                if elapsed < Duration::from_secs(cooldown_seconds) {
+                    // Still in cooldown, skip signal generation (early exit, no trend analysis)
+                    return Ok(());
+                }
+                
+                // Cooldown passed, return last signal side for later direction check
+                Some(last_signal.side)
+            } else {
+                // No previous signal, cooldown check passed
+                None
+            }
+        };
+        
         // Calculate spread (bid-ask spread in basis points)
         let spread_bps = ((tick.ask.0 - tick.bid.0) / tick.bid.0) * Decimal::from(10000);
         let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
@@ -431,6 +454,7 @@ impl Trending {
         let current_price = mid_price;
         
         // Update symbol state with new price point
+        // ✅ Now we do expensive trend analysis only after cooldown check passed
         let trend_signal = {
             let mut states = symbol_states.lock().await;
             let state = states.entry(tick.symbol.clone()).or_insert_with(|| {
@@ -470,28 +494,13 @@ impl Trending {
             }
         };
         
-        // CRITICAL: Check cooldown and prevent same-direction signals
+        // ✅ CRITICAL: Check same-direction signals (after trend analysis)
         // This prevents BUY-BUY-BUY or SELL-SELL-SELL spam
-        let cooldown_seconds = cfg.trending.signal_cooldown_seconds;
-        {
-            let mut last_signals_map = last_signals.lock().await;
-            if let Some(last_signal) = last_signals_map.get(&tick.symbol) {
-                let elapsed = now.duration_since(last_signal.timestamp);
-                
-                // Check cooldown period
-                if elapsed < Duration::from_secs(cooldown_seconds) {
-                    // Still in cooldown, skip signal generation
-                    return Ok(());
-                }
-                
-                // CRITICAL: Prevent same-direction signals
-                // If last signal was in the same direction, don't generate another one
-                // This prevents BUY-BUY-BUY or SELL-SELL-SELL spam
-                // Only generate signal if direction changed (trend reversal)
-                if last_signal.side == side {
-                    // Same direction as last signal - skip to prevent spam
-                    return Ok(());
-                }
+        // Only generate signal if direction changed (trend reversal)
+        if let Some(last_side) = last_signal_side {
+            if last_side == side {
+                // Same direction as last signal - skip to prevent spam
+                return Ok(());
             }
         }
         

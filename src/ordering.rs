@@ -395,41 +395,16 @@ impl Ordering {
             return Ok(());
         }
         
-        // 3. Balance pre-check and reservation - calculate required margin
+        // 3. Calculate required margin
         let leverage = signal.leverage;
         let notional = signal.entry_price.0 * signal.size.0;
         let required_margin = notional / Decimal::from(leverage);
         
-        // ✅ CRITICAL: Use RAII guard for balance reservation to prevent memory leaks
-        // BalanceReservation automatically releases balance when dropped (if not explicitly released)
-        // This ensures balance is always released, even if function returns early due to errors
-        let mut balance_reservation = match BalanceReservation::new(
-            shared_state.balance_store.clone(),
-            &cfg.quote_asset,
-            required_margin,
-        ).await {
-            Some(reservation) => reservation,
-            None => {
-                // Insufficient balance or reservation failed
-                warn!(
-                    symbol = %signal.symbol,
-                    required_margin = %required_margin,
-                    "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
-                );
-                return Ok(());
-            }
-        };
-        
-        // Balance reserved - will be released automatically when balance_reservation is dropped
-        // Explicit release() should be called before returning (Drop will warn if forgotten)
-        
-        // 4. Risk control check - max position notional
+        // 4. Risk control check - max position notional (before lock)
         let max_position_notional = Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
             .unwrap_or(Decimal::from(10000)); // Default to 10000 USD if conversion fails
         
         if notional > max_position_notional {
-            // ✅ CRITICAL: Release balance reservation before returning
-            balance_reservation.release().await;
             warn!(
                 symbol = %signal.symbol,
                 notional = %notional,
@@ -439,23 +414,54 @@ impl Ordering {
             return Ok(());
         }
         
-        // 5. Position check - ensure no open position/order
-        // CRITICAL: Lock scope minimized - only for state check
-        {
+        // ✅ CRITICAL: Atomic operation - state check + balance reserve in same lock
+        // This prevents race condition where:
+        // - Thread A: Balance reserve eder, lock release eder
+        // - Thread B: State check geçer, balance reserve eder (double-spend!)
+        // - Thread A: Network call yapar, order place eder
+        // - Thread B: Network call yapar, duplicate order!
+        // 
+        // Solution: State check + balance reserve atomically (same lock)
+        // Then release lock, do network call, re-acquire lock for state update
+        let mut balance_reservation = {
             let state_guard = shared_state.ordering_state.lock().await;
             
-            // Check if we already have an open position or order
+            // 5. Position check - ensure no open position/order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
-                drop(state_guard);
-                // ✅ CRITICAL: Release balance reservation before returning
-                balance_reservation.release().await;
                 warn!(
                     symbol = %signal.symbol,
                     "ORDERING: Ignoring TradeSignal - already have open position/order"
                 );
                 return Ok(());
             }
-        } // Lock released here, before async network call
+            
+            // 6. Balance reservation (inside lock to prevent race condition)
+            // ✅ CRITICAL: Balance reserve must happen AFTER state check, INSIDE the same lock
+            // This ensures no other thread can reserve balance for same symbol simultaneously
+            match BalanceReservation::new(
+                shared_state.balance_store.clone(),
+                &cfg.quote_asset,
+                required_margin,
+            ).await {
+                Some(reservation) => {
+                    // Balance reserved successfully - lock will be released after this block
+                    // Network call will happen outside lock (no deadlock risk)
+                    reservation
+                }
+                None => {
+                    // Insufficient balance or reservation failed
+                    warn!(
+                        symbol = %signal.symbol,
+                        required_margin = %required_margin,
+                        "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
+                    );
+                    return Ok(());
+                }
+            }
+        }; // Lock released here, but balance is already reserved
+        
+        // Balance reserved - will be released automatically when balance_reservation is dropped
+        // Explicit release() should be called before returning (Drop will warn if forgotten)
         
         // Get TIF from config
         let tif = match cfg.exec.tif.as_str() {
