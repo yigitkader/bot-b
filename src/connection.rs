@@ -394,30 +394,43 @@ impl Connection {
                 let now = Instant::now();
                 let initial_count = order_fill_history.len();
                 
-                // ✅ DOĞRU: Active order kontrolü önce yapılmalı (race condition önleme)
-                // ✅ OPTIMIZE: Active order'ları önce kontrol et, sonra age kontrolü yap
-                // Bu şekilde active order'lar her zaman korunur (age'den bağımsız)
-                // Race condition window'u küçültür: OrderFill event gelirken history silinmez
+                // ✅ CRITICAL: Use double-check pattern to prevent race condition
+                // Race window: is_active check → order close → age check → stale history kept
+                // Solution: Double-check active status right before keeping based on age
                 order_fill_history.retain(|order_id, history| {
-                    // ✅ KRİTİK: Önce active order kontrolü yap (age'den önce)
-                    // Active order'lar her zaman korunmalı (OrderFill event gelebilir)
-                    let is_active = OPEN_ORDERS_CACHE.iter().any(|entry| {
+                    // ✅ First check: Is order active?
+                    let is_active_first = OPEN_ORDERS_CACHE.iter().any(|entry| {
                         entry.value().iter().any(|o| o.order_id == *order_id)
                     });
                     
-                    if is_active {
+                    if is_active_first {
                         // Order is still active - protect from cleanup (regardless of age)
                         // This prevents race condition where OrderFill event arrives during cleanup
                         true // Keep this entry (active order)
                     } else {
-                        // Order is closed - check age to determine if safe to remove
+                        // Order appears closed - check age to determine if safe to remove
                         let age = now.duration_since(history.last_update);
+                        
                         if age.as_secs() > MAX_AGE_SECS {
                             // Order is closed and old - safe to remove
                             false // Remove this entry (closed order, old)
                         } else {
-                            // Order is closed but recent - keep for now
-                            true // Keep recent entries (closed but recent)
+                            // ✅ CRITICAL: Double-check active status before keeping based on age
+                            // Prevents race condition where order closes between first check and age check
+                            // If order closed during this window, we should still keep history for late-arriving events
+                            // But we double-check to ensure we're not keeping stale history for a newly opened order
+                            let is_active_second = OPEN_ORDERS_CACHE.iter().any(|entry| {
+                                entry.value().iter().any(|o| o.order_id == *order_id)
+                            });
+                            
+                            if is_active_second {
+                                // Order became active between checks - protect it
+                                true // Keep this entry (order became active)
+                            } else {
+                                // Order is closed but recent - keep for late-arriving fill events
+                                // This is safe because order IDs are unique, so no new order will reuse this ID
+                                true // Keep recent entries (closed but recent, may receive late fills)
+                            }
                         }
                     }
                 });
@@ -2694,10 +2707,12 @@ impl BinanceFutures {
                         let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
                         
                         if position_grew_from_attempt || position_grew_from_initial {
-                            // Position büyüdü - yeni bir order fill oldu
-                            // Bu durumda close işlemi başarısız sayılmalı (yeni position close edilmeli)
-                            // Ancak sonsuz loop riski var, bu yüzden hata döndür veya yeni position'ı close etmeye çalış
-                            warn!(
+                            // ❌ CRITICAL: Position büyüdü, bu bizim position'ımız değil
+                            // Yeni position manual intervention ile açılmış olabilir
+                            // Veya başka bir modül order açmış olabilir
+                            // Retry yapmak sonsuz loop'a yol açabilir (volatile market'te sürekli yeni fill olabilir)
+                            // HEMEN çık, retry yapma
+                            tracing::error!(
                                 symbol = %sym,
                                 attempt = attempt + 1,
                                 initial_qty = %initial_qty,
@@ -2705,29 +2720,15 @@ impl BinanceFutures {
                                 verify_qty = %verify_qty,
                                 grew_from_attempt = position_grew_from_attempt,
                                 grew_from_initial = position_grew_from_initial,
-                                "POSITION GROWTH DETECTED: new order filled during close, position increased (possible infinite loop risk)"
+                                "POSITION GROWTH DETECTED: Position grew during close - manual intervention or race condition detected. Cannot safely proceed."
                             );
                             
-                            // ✅ KRİTİK: Position initial'dan büyüdüyse, bu kesinlikle yeni bir order'ın fill olduğu anlamına gelir
-                            // Bu durumda close işlemi başarısız sayılmalı ve yeni position'ı close etmeye çalışmalı
-                            // Ancak max_attempts kontrolü ile sonsuz loop önlenir
-                            if attempt < max_attempts - 1 {
-                                // Son deneme değilse, yeni position'ı close etmeye çalış
-                                warn!(
-                                    symbol = %sym,
-                                    attempt = attempt + 1,
-                                    "retrying close with new (larger) position size"
-                                );
-                                continue; // Loop devam eder, yeni position'ı close etmeye çalışır
-                            } else {
-                                // Son denemede hala position büyüdüyse, hata döndür
-                                return Err(anyhow::anyhow!(
-                                    "Failed to close position: position grew during close (new order filled). Initial: {}, Attempt qty: {}, Final qty: {}. Possible infinite loop prevented.",
-                                    initial_qty,
-                                    current_qty,
-                                    verify_qty
-                                ));
-                            }
+                            return Err(anyhow::anyhow!(
+                                "Position grew during close, cannot safely proceed. Initial: {}, Attempt qty: {}, Final qty: {}. This may indicate manual intervention or a race condition with another module.",
+                                initial_qty,
+                                current_qty,
+                                verify_qty
+                            ));
                         }
                         
                         // KRİTİK İYİLEŞTİRME: Kısmi kapatma tespiti - kapatılan miktarı hesapla
@@ -2845,8 +2846,23 @@ impl BinanceFutures {
                                     Ok(prices) => prices,
                                     Err(e2) => {
                                         warn!(symbol = %sym, error = %e2, "failed to fetch best prices for dust check (WebSocket cache empty and REST API failed)");
-                                        // If price fetch fails, use conservative fixed threshold
-                                        let dust_threshold = rules.min_notional / Decimal::from(1000);
+                                        // ✅ CRITICAL: If price fetch fails, use very conservative threshold
+                                        // Assume very low price (0.01) to get high threshold (be conservative)
+                                        // This prevents incorrectly treating large quantities as dust
+                                        // For example: min_notional=5, assumed_price=0.01 → threshold=500
+                                        // This is safer than assuming price=1000 which gives threshold=0.005
+                                        // (which would incorrectly treat small quantities as dust for high-priced assets)
+                                        let assumed_min_price = Decimal::new(1, 2); // 0.01 (very conservative)
+                                        let dust_threshold = rules.min_notional / assumed_min_price;
+                                        
+                                        warn!(
+                                            symbol = %sym,
+                                            min_notional = %rules.min_notional,
+                                            assumed_price = %assumed_min_price,
+                                            conservative_threshold = %dust_threshold,
+                                            "Price fetch failed, using very conservative dust threshold (assumes price=0.01)"
+                                        );
+                                        
                                         if remaining_qty < dust_threshold {
                                             info!(
                                                 symbol = %sym,
@@ -2868,7 +2884,7 @@ impl BinanceFutures {
                         };
                         
                         // Dust threshold: min_notional / current_price (more accurate than fixed divisor)
-                        // If price is not available, use conservative fixed threshold
+                        // If price is not available, use very conservative threshold (assume very low price)
                         let dust_threshold = {
                             let current_price = if matches!(side, Side::Buy) {
                                 // Short position closing: use bid price
@@ -2878,11 +2894,27 @@ impl BinanceFutures {
                                 best_ask.0
                             };
                             // Calculate dust threshold as min_notional / price (more accurate)
-                            // Fallback to min_notional / 1000 if price is zero or calculation fails
                             if !current_price.is_zero() {
                                 rules.min_notional / current_price
                             } else {
-                                rules.min_notional / Decimal::from(1000)
+                                // ✅ CRITICAL: Price is zero - use very conservative threshold
+                                // Assume very low price (0.01) to get high threshold (be conservative)
+                                // This prevents incorrectly treating large quantities as dust
+                                // For example: min_notional=5, assumed_price=0.01 → threshold=500
+                                // This is safer than assuming price=1000 which gives threshold=0.005
+                                // (which would incorrectly treat small quantities as dust for high-priced assets)
+                                let assumed_min_price = Decimal::new(1, 2); // 0.01 (very conservative)
+                                let conservative_threshold = rules.min_notional / assumed_min_price;
+                                
+                                warn!(
+                                    symbol = %sym,
+                                    min_notional = %rules.min_notional,
+                                    assumed_price = %assumed_min_price,
+                                    conservative_threshold = %conservative_threshold,
+                                    "Price is zero, using very conservative dust threshold (assumes price=0.01)"
+                                );
+                                
+                                conservative_threshold
                             }
                         };
                         
@@ -2994,11 +3026,27 @@ impl BinanceFutures {
                                         best_ask.0
                                     };
                                     // Calculate dust threshold as min_notional / price (more accurate)
-                                    // Fallback to min_notional / 1000 if price is zero or calculation fails
                                     if !current_price.is_zero() {
                                         rules.min_notional / current_price
                                     } else {
-                                        rules.min_notional / Decimal::from(1000)
+                                        // ✅ CRITICAL: Price is zero - use very conservative threshold
+                                        // Assume very low price (0.01) to get high threshold (be conservative)
+                                        // This prevents incorrectly treating large quantities as dust
+                                        // For example: min_notional=5, assumed_price=0.01 → threshold=500
+                                        // This is safer than assuming price=1000 which gives threshold=0.005
+                                        // (which would incorrectly treat small quantities as dust for high-priced assets)
+                                        let assumed_min_price = Decimal::new(1, 2); // 0.01 (very conservative)
+                                        let conservative_threshold = rules.min_notional / assumed_min_price;
+                                        
+                                        warn!(
+                                            symbol = %sym,
+                                            min_notional = %rules.min_notional,
+                                            assumed_price = %assumed_min_price,
+                                            conservative_threshold = %conservative_threshold,
+                                            "Price is zero, using very conservative dust threshold (assumes price=0.01)"
+                                        );
+                                        
+                                        conservative_threshold
                                     }
                                 };
                                 

@@ -32,6 +32,11 @@ pub struct TradeSignal {
     pub size: Qty,
     pub stop_loss_pct: Option<f64>, // Optional stop loss percentage
     pub take_profit_pct: Option<f64>, // Optional take profit percentage
+    /// Spread in basis points when signal was generated (for validation at order placement)
+    pub spread_bps: f64,
+    /// Timestamp when spread was measured (for staleness check)
+    #[serde(skip)]
+    pub spread_timestamp: Instant, // Not serialized, only for runtime use
     #[serde(skip)]
     pub timestamp: Instant, // Not serialized, only for runtime use
 }

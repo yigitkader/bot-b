@@ -225,10 +225,13 @@ impl Balance {
         // ✅ CRITICAL: Update shared state AFTER event is sent, but check timestamp first
         // WebSocket updates are prioritized - if WebSocket already updated balance with newer timestamp,
         // don't overwrite it with stale REST API data
+        // ✅ CRITICAL: Use double-check pattern to prevent race condition
+        // Race window: Lock acquire → timestamp check → WebSocket update → overwrite
+        // Solution: Check timestamp twice - once after lock acquire, once right before write
         {
             let mut store = self.shared_state.balance_store.write().await;
             
-            // ✅ CRITICAL: Check if WebSocket already updated balance with newer timestamp
+            // ✅ First check: Check if WebSocket already updated balance with newer timestamp
             // WebSocket updates are prioritized (real-time, more accurate)
             // If WebSocket update is newer, ignore REST API result (stale data)
             if store.last_updated > timestamp {
@@ -245,7 +248,25 @@ impl Balance {
                 return Ok(()); // Don't overwrite with stale REST API data
             }
             
+            // ✅ CRITICAL: Second check right before writing (double-check pattern)
+            // Prevents race condition where WebSocket update arrives between first check and write
+            // This ensures we don't overwrite newer WebSocket data with stale REST API data
+            if store.last_updated > timestamp {
+                // Race detected: WebSocket updated balance between first check and write
+                warn!(
+                    usdt_rest = %usdt_balance,
+                    usdc_rest = %usdc_balance,
+                    usdt_ws = %store.usdt,
+                    usdc_ws = %store.usdc,
+                    rest_timestamp = ?timestamp,
+                    ws_timestamp = ?store.last_updated,
+                    "BALANCE: Race detected - WebSocket updated balance during REST API fetch, ignoring REST API data"
+                );
+                return Ok(()); // Don't overwrite with stale REST API data
+            }
+            
             // REST API timestamp is newer or equal - safe to update
+            // Both checks passed, no WebSocket update arrived during this critical section
             store.usdt = usdt_balance;
             store.usdc = usdc_balance;
             store.last_updated = timestamp;

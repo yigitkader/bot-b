@@ -449,6 +449,11 @@ impl Trending {
             return Ok(());
         }
         
+        // ✅ CRITICAL: Store spread information and timestamp for validation at order placement
+        // Spread may change between signal generation and order placement (50-100ms delay)
+        // ORDERING module will re-validate spread before placing order
+        let spread_timestamp = now;
+        
         // Calculate mid price for trend analysis
         let mid_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
         let current_price = mid_price;
@@ -608,6 +613,9 @@ impl Trending {
         let symbol = tick.symbol.clone();
         
         // Generate trade signal
+        // ✅ CRITICAL: Include spread information for validation at order placement
+        // Spread may have changed between signal generation and order placement
+        // ORDERING module will re-validate spread before placing order
         let signal = TradeSignal {
             symbol: symbol.clone(),
             side,
@@ -616,6 +624,8 @@ impl Trending {
             size,
             stop_loss_pct,
             take_profit_pct,
+            spread_bps: spread_bps_f64,
+            spread_timestamp,
             timestamp: now,
         };
         

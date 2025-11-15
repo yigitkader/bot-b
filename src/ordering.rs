@@ -467,6 +467,83 @@ impl Ordering {
         // Balance reserved - will be released automatically when balance_reservation is dropped
         // Explicit release() should be called before returning (Drop will warn if forgotten)
         
+        // ✅ CRITICAL: Re-validate spread before order placement
+        // Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
+        // This prevents slippage from trading when spread has widened significantly
+        // Check spread staleness first (if spread data is too old, re-fetch current spread)
+        let spread_age = now.duration_since(signal.spread_timestamp);
+        const MAX_SPREAD_AGE_MS: u64 = 200; // 200ms max age for spread data
+        
+        if spread_age.as_millis() as u64 > MAX_SPREAD_AGE_MS {
+            // Spread data is stale, fetch current spread
+            match connection.get_current_prices(&signal.symbol).await {
+                Ok((bid, ask)) => {
+                    use rust_decimal::Decimal;
+                    let current_spread_bps = ((ask.0 - bid.0) / bid.0) * Decimal::from(10000);
+                    let current_spread_bps_f64 = current_spread_bps.to_f64().unwrap_or(0.0);
+                    
+                    let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
+                    let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
+                    
+                    // Validate current spread is still within acceptable range
+                    if current_spread_bps_f64 < min_acceptable_spread_bps || current_spread_bps_f64 > max_acceptable_spread_bps {
+                        warn!(
+                            symbol = %signal.symbol,
+                            original_spread_bps = signal.spread_bps,
+                            current_spread_bps = current_spread_bps_f64,
+                            spread_age_ms = spread_age.as_millis(),
+                            min_spread = min_acceptable_spread_bps,
+                            max_spread = max_acceptable_spread_bps,
+                            "ORDERING: Spread changed and is now out of acceptable range, skipping order placement"
+                        );
+                        // Release balance reservation before returning
+                        balance_reservation.release().await;
+                        return Ok(());
+                    }
+                    
+                    // Spread is still acceptable, but log if it changed significantly
+                    let spread_change = (current_spread_bps_f64 - signal.spread_bps).abs();
+                    if spread_change > 5.0 { // More than 5 bps change
+                        warn!(
+                            symbol = %signal.symbol,
+                            original_spread_bps = signal.spread_bps,
+                            current_spread_bps = current_spread_bps_f64,
+                            spread_change_bps = spread_change,
+                            "ORDERING: Spread changed significantly since signal generation"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Failed to fetch current prices, but spread was valid when signal was generated
+                    // Proceed with order placement but log the warning
+                    warn!(
+                        error = %e,
+                        symbol = %signal.symbol,
+                        spread_age_ms = spread_age.as_millis(),
+                        "ORDERING: Failed to fetch current prices for spread validation, proceeding with order placement"
+                    );
+                }
+            }
+        } else {
+            // Spread data is fresh, validate it's still within acceptable range
+            // (Spread could have changed even if timestamp is recent)
+            let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
+            let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
+            
+            if signal.spread_bps < min_acceptable_spread_bps || signal.spread_bps > max_acceptable_spread_bps {
+                warn!(
+                    symbol = %signal.symbol,
+                    spread_bps = signal.spread_bps,
+                    min_spread = min_acceptable_spread_bps,
+                    max_spread = max_acceptable_spread_bps,
+                    "ORDERING: Signal spread is out of acceptable range, skipping order placement"
+                );
+                // Release balance reservation before returning
+                balance_reservation.release().await;
+                return Ok(());
+            }
+        }
+        
         // Get TIF from config
         let tif = match cfg.exec.tif.as_str() {
             "post_only" | "GTX" => Tif::PostOnly,
@@ -544,17 +621,17 @@ impl Ordering {
             })
         };
         
-        // ✅ CRITICAL: Release balance reservation after order placement attempt
-        // Balance is released regardless of success/failure:
-        // - On success: Balance is actually used by the order, reservation can be released
-        // - On failure: Balance was not used, reservation must be released
-        balance_reservation.release().await;
-        
-        // Handle order result
+        // Handle order result - ensure balance is released in ALL paths (success and failure)
         let order_id = match order_result {
-            Ok(id) => id,
+            Ok(id) => {
+                // ✅ Success: Balance was used by the order, release reservation
+                balance_reservation.release().await;
+                id
+            }
             Err(e) => {
-                // Balance already released above
+                // ✅ CRITICAL: Failure: Balance was NOT used, MUST release reservation
+                // This prevents memory leak where reserved balance accumulates
+                balance_reservation.release().await;
                 return Err(e);
             }
         };
@@ -756,6 +833,35 @@ impl Ordering {
             if order.order_id == update.order_id {
                 match update.status {
                     crate::event_bus::OrderStatus::Filled => {
+                        // ✅ CRITICAL: Check if OrderUpdate is newer than existing position
+                        // Prevents stale OrderUpdate from overwriting newer position created from PositionUpdate
+                        // PositionUpdate events may arrive before OrderUpdate events (out of order delivery)
+                        if let Some(ref existing_pos) = state_guard.open_position {
+                            if existing_pos.symbol == update.symbol {
+                                // Position already exists - check if OrderUpdate is newer
+                                let position_is_newer = state_guard.last_position_update_timestamp
+                                    .map(|pos_ts| pos_ts > update.timestamp)
+                                    .unwrap_or(false);
+                                
+                                if position_is_newer {
+                                    // Position is newer than this OrderUpdate - ignore stale OrderUpdate
+                                    // But still clear the order since it's filled
+                                    tracing::debug!(
+                                        symbol = %update.symbol,
+                                        order_id = %update.order_id,
+                                        order_timestamp = ?update.timestamp,
+                                        position_timestamp = ?state_guard.last_position_update_timestamp,
+                                        "ORDERING: Ignoring stale OrderUpdate - position is newer, but clearing order since it's filled"
+                                    );
+                                    // Clear the order since it's filled (even though we're not updating position)
+                                    state_guard.open_order = None;
+                                    // Update order timestamp to acknowledge we received this update
+                                    state_guard.last_order_update_timestamp = Some(update.timestamp);
+                                    return;
+                                }
+                            }
+                        }
+                        
                         // Order filled, convert to position
                         // Convert order side to position direction and ensure qty is positive
                         let direction = PositionDirection::from_order_side(update.side);
