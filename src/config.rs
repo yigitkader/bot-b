@@ -51,8 +51,6 @@ pub struct ExecCfg {
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct WebsocketCfg {
-    #[serde(default = "default_ws_enabled")]
-    pub enabled: bool,
     #[serde(default = "default_ws_reconnect_delay")]
     pub reconnect_delay_ms: u64,
     #[serde(default = "default_ws_ping_interval")]
@@ -117,8 +115,6 @@ pub struct AppCfg {
     pub quote_asset: String,
     #[serde(default = "default_allow_usdt_quote")]
     pub allow_usdt_quote: bool,
-    #[serde(default = "default_mode")]
-    pub mode: String,
     #[serde(default = "default_max_usd_per_order")]
     pub max_usd_per_order: f64,
     #[serde(default = "default_min_usd_per_order")]
@@ -159,7 +155,6 @@ impl Default for AppCfg {
             auto_discover_quote: default_auto_discover_quote(),
             quote_asset: default_quote_asset(),
             allow_usdt_quote: default_allow_usdt_quote(),
-            mode: default_mode(),
             max_usd_per_order: default_max_usd_per_order(),
             min_usd_per_order: default_min_usd_per_order(),
             min_quote_balance_usd: default_min_quote_balance_usd(),
@@ -222,10 +217,6 @@ fn default_default_leverage() -> u32 {
     20
 }
 
-fn default_ws_enabled() -> bool {
-    true
-}
-
 fn default_ws_reconnect_delay() -> u64 {
     5_000
 }
@@ -252,10 +243,6 @@ fn default_quote_asset() -> String {
 
 fn default_allow_usdt_quote() -> bool {
     true
-}
-
-fn default_mode() -> String {
-    "futures".to_string()
 }
 
 fn default_max_usd_per_order() -> f64 {

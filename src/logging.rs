@@ -24,18 +24,6 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event_type")]
 pub enum LogEvent {
-    #[serde(rename = "order_created")]
-    OrderCreated {
-        timestamp: u64,
-        symbol: String,
-        order_id: String,
-        side: String,
-        price: f64,
-        quantity: f64,
-        notional_usd: f64,
-        reason: String,
-        tif: String,
-    },
     #[serde(rename = "order_filled")]
     OrderFilled {
         timestamp: u64,
@@ -69,58 +57,6 @@ pub enum LogEvent {
         unrealized_pnl: f64,
         unrealized_pnl_pct: f64,
         leverage: u32,
-    },
-    #[serde(rename = "position_closed")]
-    PositionClosed {
-        timestamp: u64,
-        symbol: String,
-        side: String,
-        entry_price: f64,
-        exit_price: f64,
-        quantity: f64,
-        realized_pnl: f64,
-        realized_pnl_pct: f64,
-        leverage: u32,
-        reason: String,
-    },
-    #[serde(rename = "pnl_summary")]
-    PnlSummary {
-        timestamp: u64,
-        period: String,
-        trade_count: u32,
-        profitable_trade_count: u32,
-        losing_trade_count: u32,
-        total_profit: f64,
-        total_loss: f64,
-        net_pnl: f64,
-        largest_win: f64,
-        largest_loss: f64,
-        total_fees: f64,
-    },
-    #[serde(rename = "trade_completed")]
-    TradeCompleted {
-        timestamp: u64,
-        symbol: String,
-        side: String,
-        entry_price: f64,
-        exit_price: f64,
-        quantity: f64,
-        notional_usd: f64,
-        realized_pnl: f64,
-        realized_pnl_pct: f64,
-        fees: f64,
-        net_profit: f64,
-        is_profitable: bool,
-        leverage: u32,
-    },
-    #[serde(rename = "trade_rejected")]
-    TradeRejected {
-        timestamp: u64,
-        symbol: String,
-        reason: String,
-        spread_bps: f64,
-        position_size_usd: f64,
-        min_spread_bps: f64,
     },
 }
 
@@ -199,31 +135,6 @@ impl JsonLogger {
         }
     }
 
-    pub fn log_order_created(
-        &self,
-        symbol: &str,
-        order_id: &str,
-        side: Side,
-        price: Px,
-        qty: Qty,
-        reason: &str,
-        tif: &str,
-    ) {
-        let notional = price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0);
-        let event = LogEvent::OrderCreated {
-            timestamp: Self::timestamp_ms(),
-            symbol: symbol.to_string(),
-            order_id: order_id.to_string(),
-            side: format!("{:?}", side),
-            price: price.0.to_f64().unwrap_or(0.0),
-            quantity: qty.0.to_f64().unwrap_or(0.0),
-            notional_usd: notional,
-            reason: reason.to_string(),
-            tif: tif.to_string(),
-        };
-        self.send_event(event);
-    }
-
     pub fn log_order_filled(
         &self,
         symbol: &str,
@@ -298,132 +209,6 @@ impl JsonLogger {
         self.send_event(event);
     }
 
-    pub fn log_position_closed(
-        &self,
-        symbol: &str,
-        side: &str,
-        entry_price: Px,
-        exit_price: Px,
-        qty: Qty,
-        leverage: u32,
-        reason: &str,
-    ) {
-        let qty_f = qty.0.to_f64().unwrap_or(0.0);
-        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
-        let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-
-        let realized_pnl = (exit_f - entry_f) * qty_f;
-        let realized_pnl_pct = if entry_f > 0.0 {
-            ((exit_f - entry_f) / entry_f) * 100.0
-        } else {
-            0.0
-        };
-
-        let event = LogEvent::PositionClosed {
-            timestamp: Self::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_f,
-            exit_price: exit_f,
-            quantity: qty_f,
-            realized_pnl,
-            realized_pnl_pct,
-            leverage,
-            reason: reason.to_string(),
-        };
-        self.send_event(event);
-    }
-
-    pub fn log_trade_completed(
-        &self,
-        symbol: &str,
-        side: &str,
-        entry_price: Px,
-        exit_price: Px,
-        qty: Qty,
-        fees: f64,
-        leverage: u32,
-    ) {
-        let qty_f = qty.0.to_f64().unwrap_or(0.0);
-        let entry_f = entry_price.0.to_f64().unwrap_or(0.0);
-        let exit_f = exit_price.0.to_f64().unwrap_or(0.0);
-
-        let notional = entry_f * qty_f.abs();
-        let realized_pnl = (exit_f - entry_f) * qty_f;
-        let realized_pnl_pct = if entry_f > 0.0 {
-            ((exit_f - entry_f) / entry_f) * 100.0
-        } else {
-            0.0
-        };
-
-        let net_profit = realized_pnl - fees;
-        let is_profitable = net_profit > 0.0;
-
-        let event = LogEvent::TradeCompleted {
-            timestamp: Self::timestamp_ms(),
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            entry_price: entry_f,
-            exit_price: exit_f,
-            quantity: qty_f,
-            notional_usd: notional,
-            realized_pnl,
-            realized_pnl_pct,
-            fees,
-            net_profit,
-            is_profitable,
-            leverage,
-        };
-        self.send_event(event);
-    }
-
-    pub fn log_trade_rejected(
-        &self,
-        symbol: &str,
-        reason: &str,
-        spread_bps: f64,
-        position_size_usd: f64,
-        min_spread_bps: f64,
-    ) {
-        let event = LogEvent::TradeRejected {
-            timestamp: Self::timestamp_ms(),
-            symbol: symbol.to_string(),
-            reason: reason.to_string(),
-            spread_bps,
-            position_size_usd,
-            min_spread_bps,
-        };
-        self.send_event(event);
-    }
-
-    pub fn log_pnl_summary(
-        &self,
-        period: &str,
-        trade_count: u32,
-        profitable_trade_count: u32,
-        losing_trade_count: u32,
-        total_profit: f64,
-        total_loss: f64,
-        net_pnl: f64,
-        largest_win: f64,
-        largest_loss: f64,
-        total_fees: f64,
-    ) {
-        let event = LogEvent::PnlSummary {
-            timestamp: Self::timestamp_ms(),
-            period: period.to_string(),
-            trade_count,
-            profitable_trade_count,
-            losing_trade_count,
-            total_profit,
-            total_loss,
-            net_pnl,
-            largest_win,
-            largest_loss,
-            total_fees,
-        };
-        self.send_event(event);
-    }
 }
 
 pub type SharedLogger = Arc<JsonLogger>;

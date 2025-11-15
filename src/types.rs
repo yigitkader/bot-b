@@ -52,15 +52,6 @@ impl PositionDirection {
         }
     }
     
-    /// Convert to order side for closing
-    /// Long position closes with Sell order, Short position closes with Buy order
-    pub fn to_close_side(self) -> Side {
-        match self {
-            PositionDirection::Long => Side::Sell,
-            PositionDirection::Short => Side::Buy,
-        }
-    }
-    
     /// Determine position direction from quantity sign
     /// Positive qty = Long, Negative qty = Short
     pub fn from_qty_sign(qty: Decimal) -> Self {

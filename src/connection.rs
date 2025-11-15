@@ -119,8 +119,6 @@ impl Connection {
     ) -> Result<Self> {
         let venue = Arc::new(BinanceFutures::from_config(
             &cfg.binance,
-            cfg.price_tick,
-            cfg.qty_step,
         )?);
 
         Ok(Self {
@@ -459,9 +457,8 @@ impl Connection {
 
                     match MarketDataStream::connect(&symbols_chunk).await {
                         Ok(mut stream) => {
-                            // Connection successful - reset retry delays
+                            // Connection successful - reset connection retry delay
                             connection_retry_delay = INITIAL_DELAY_SECS;
-                            stream_retry_delay = INITIAL_DELAY_SECS;
 
                             info!(
                                 symbol_count = symbols_chunk.len(),
@@ -511,9 +508,6 @@ impl Connection {
                                                 );
                                             }
                                         }
-
-                                        // Reset stream retry delay on successful message
-                                        stream_retry_delay = INITIAL_DELAY_SECS;
                                     }
                                     Err(e) => {
                                         warn!(
@@ -962,8 +956,8 @@ impl Connection {
                                             filled_qty: cumulative_filled_qty, // Cumulative filled qty (total filled so far)
                                             remaining_qty, // Remaining qty = order_qty - cumulative_filled_qty
                                             status,
-                                            /// True if all fills were maker orders, false if any fill was taker
-                                            /// Used for commission calculation: if all maker, use maker commission; otherwise taker
+                                            // True if all fills were maker orders, false if any fill was taker
+                                            // Used for commission calculation: if all maker, use maker commission; otherwise taker
                                             is_maker: Some(is_all_maker),
                                             timestamp: Instant::now(),
                                         };
@@ -1322,13 +1316,6 @@ impl Connection {
             "PRICE_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
         );
         self.venue.best_prices(symbol).await
-    }
-
-    /// Get cached market prices (bid, ask) for a symbol synchronously
-    /// Returns None if price is not in cache (no async fallback)
-    /// Use this when you need prices atomically without async operations
-    pub fn get_cached_prices(symbol: &str) -> Option<(Px, Px)> {
-        PRICE_CACHE.get(symbol).map(|price_update| (price_update.bid, price_update.ask))
     }
 
     /// Get per-symbol metadata (tick_size, step_size)

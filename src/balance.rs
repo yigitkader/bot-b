@@ -4,8 +4,8 @@
 
 use crate::connection::Connection;
 use crate::event_bus::{BalanceUpdate, EventBus};
-use crate::state::{BalanceStore, SharedState};
-use anyhow::{anyhow, Result};
+use crate::state::SharedState;
+use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -60,11 +60,6 @@ impl Balance {
             shutdown_flag,
             shared_state,
         }
-    }
-
-    /// Get shared balance store
-    pub fn balance_store(&self) -> Arc<tokio::sync::RwLock<BalanceStore>> {
-        self.shared_state.balance_store.clone()
     }
 
     /// Start the balance tracking service.

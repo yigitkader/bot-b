@@ -76,10 +76,6 @@ impl BalanceReservation {
         }
     }
 
-    /// Check if reservation is still active (not released)
-    fn is_active(&self) -> bool {
-        !self.released
-    }
 }
 
 impl Drop for BalanceReservation {
@@ -158,15 +154,6 @@ impl Ordering {
             event_bus,
             shutdown_flag,
             shared_state,
-        }
-    }
-
-    /// Convert config TIF string to Tif enum
-    fn tif_from_config(&self) -> Tif {
-        match self.cfg.exec.tif.as_str() {
-            "post_only" | "GTX" => Tif::PostOnly,
-            "ioc" | "IOC" => Tif::Ioc,
-            _ => Tif::Gtc,
         }
     }
 
