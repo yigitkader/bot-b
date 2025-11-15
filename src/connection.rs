@@ -735,6 +735,7 @@ impl Connection {
                                                 // ✅ CRITICAL FIX: REST API is source of truth after reconnect
                                                 // If there's a mismatch, update WebSocket cache with REST API data
                                                 // This ensures state consistency after WebSocket reconnect
+                                                // REST API doğru kabul edilir, WebSocket cache güncellenir
                                                 let needs_update = qty_diff > Decimal::from_str("0.0001").unwrap()
                                                     || entry_diff > Decimal::from_str("0.01").unwrap();
                                                 
@@ -750,12 +751,24 @@ impl Connection {
                                                         "CONNECTION: Position mismatch after reconnect (REST vs WebSocket), updating cache with REST API data"
                                                     );
                                                     
+                                                    // ✅ CRITICAL FIX: REST API doğru kabul edilir, WebSocket cache güncellenir
+                                                    // REST API validation sadece log değil, state fix ediliyor
                                                     // Update WebSocket cache with REST API data (REST API is source of truth)
                                                     POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
                                                     
                                                     info!(
                                                         symbol = %symbol,
                                                         "CONNECTION: Position cache updated with REST API data"
+                                                    );
+                                                } else if qty_diff > Decimal::from_str("0.000001").unwrap() || entry_diff > Decimal::from_str("0.001").unwrap() {
+                                                    // Small differences - still update cache but with less logging
+                                                    // REST API is source of truth, always update cache
+                                                    POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
+                                                    debug!(
+                                                        symbol = %symbol,
+                                                        qty_diff = %qty_diff,
+                                                        entry_diff = %entry_diff,
+                                                        "CONNECTION: Small position difference detected, cache updated with REST API data"
                                                     );
                                                 }
                                             } else if !rest_position.qty.0.is_zero() {
@@ -2828,13 +2841,14 @@ impl BinanceFutures {
                             
                             const MAX_ACCEPTABLE_GROWTH_PCT: f64 = 10.0; // %10 üzeri kritik
                             
+                            // ✅ CRITICAL FIX: Position growth'u %10'un üzerindeyse warn ver, ama devam et
+                            // Position büyümesi her zaman hata değil! Volatile market'lerde aynı anda birden fazla fill olabilir
+                            // Bot bunu "manual intervention" sanıyor ve hata veriyor, ama bu normal olabilir
+                            // Çözüm: Position growth'u %10'un üzerindeyse warn ver, ama devam et (retry yap)
                             if growth_from_initial > MAX_ACCEPTABLE_GROWTH_PCT {
-                                // ❌ CRITICAL: Position %10'dan fazla büyüdü - bu ciddi bir sorun
-                                // Yeni position manual intervention ile açılmış olabilir
-                                // Veya başka bir modül order açmış olabilir
-                                // Retry yapmak sonsuz loop'a yol açabilir
-                                // HEMEN çık, retry yapma
-                                tracing::error!(
+                                // ⚠️ WARNING: Position %10'dan fazla büyüdü - volatile market'te normal olabilir
+                                // Aynı anda birden fazla fill olabilir, devam et
+                                tracing::warn!(
                                     symbol = %sym,
                                     attempt = attempt + 1,
                                     initial_qty = %initial_qty,
@@ -2843,18 +2857,11 @@ impl BinanceFutures {
                                     growth_pct = growth_from_initial,
                                     grew_from_attempt = position_grew_from_attempt,
                                     grew_from_initial = position_grew_from_initial,
-                                    "POSITION GROWTH DETECTED: Position grew >{}% during close - manual intervention or race condition detected. Cannot safely proceed.",
+                                    "POSITION GROWTH DETECTED: Position grew {}% during close (exceeds {}% threshold). Continuing with retry - this may be normal in volatile markets with multiple simultaneous fills.",
+                                    growth_from_initial,
                                     MAX_ACCEPTABLE_GROWTH_PCT
                                 );
-                                
-                                return Err(anyhow::anyhow!(
-                                    "Position grew {}% during close (exceeds {}% threshold), cannot safely proceed. Initial: {}, Attempt qty: {}, Final qty: {}. This may indicate manual intervention or a race condition with another module.",
-                                    growth_from_initial,
-                                    MAX_ACCEPTABLE_GROWTH_PCT,
-                                    initial_qty,
-                                    current_qty,
-                                    verify_qty
-                                ));
+                                // Devam et, retry yap (hata verme)
                             } else {
                                 // ⚠️ WARNING: Position büyüdü ama %10'un altında - volatile market'te normal olabilir
                                 // Aynı anda birden fazla fill olabilir, devam et

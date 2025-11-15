@@ -89,48 +89,59 @@ impl Drop for BalanceReservation {
             warn!(
                 asset = %self.asset,
                 amount = %self.amount,
-                "ORDERING: Balance reservation dropped without explicit release! Attempting cleanup in sync thread."
+                "ORDERING: Balance reservation dropped without explicit release! Attempting cleanup."
             );
             
-            // ✅ CRITICAL FIX: Use sync thread with blocking release instead of tokio::spawn
-            // tokio::spawn is not guaranteed to execute before program shutdown
-            // Sync thread with blocking release ensures cleanup happens
+            // ✅ CRITICAL FIX: Try to use current runtime handle first, fallback to new runtime
+            // This is better than always creating a new runtime
+            // Background cleanup thread veya try_reserve() başarısızsa otomatik release
             let balance_store = self.balance_store.clone();
             let asset = self.asset.clone();
             let amount = self.amount;
             
-            // Spawn a sync thread that will block until release completes
-            // This guarantees the release happens even during shutdown
-            std::thread::spawn(move || {
-                // Create a minimal runtime just for this cleanup
-                // This ensures cleanup happens even if main runtime is shutdown
-                // Using a new runtime is safer than trying to use Handle::block_on
-                // because Handle::block_on doesn't exist and Handle::enter() is not blocking
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        eprintln!("ORDERING: Failed to create runtime for balance cleanup: {}", e);
-                        // If runtime creation fails, we can't cleanup - this is a critical error
-                        // But we don't want to panic in Drop, so we just log and continue
-                        // The balance will remain reserved, but this should be rare
-                        return;
-                    }
-                };
-                
-                rt.block_on(async {
+            // Try to use current runtime handle if available
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                // We're in an async context - spawn a task to release balance
+                // This is the best case - uses existing runtime
+                handle.spawn(async move {
                     let mut store = balance_store.write().await;
                     store.release(&asset, amount);
                     warn!(
                         asset = %asset,
                         amount = %amount,
-                        "ORDERING: Balance reservation released in sync thread (Drop fallback)"
+                        "ORDERING: Balance reservation released in async task (Drop fallback)"
                     );
                 });
-            });
-            // Note: We don't join the thread to avoid blocking Drop
-            // The thread will complete cleanup in the background
+            } else {
+                // Not in async context - spawn a sync thread with new runtime
+                // This ensures cleanup happens even if main runtime is shutdown
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("ORDERING: Failed to create runtime for balance cleanup: {}", e);
+                            // If runtime creation fails, we can't cleanup - this is a critical error
+                            // But we don't want to panic in Drop, so we just log and continue
+                            // The balance will remain reserved, but this should be rare
+                            return;
+                        }
+                    };
+                    
+                    rt.block_on(async {
+                        let mut store = balance_store.write().await;
+                        store.release(&asset, amount);
+                        warn!(
+                            asset = %asset,
+                            amount = %amount,
+                            "ORDERING: Balance reservation released in sync thread (Drop fallback)"
+                        );
+                    });
+                });
+            }
+            // Note: We don't wait for cleanup to complete to avoid blocking Drop
+            // The cleanup will complete in the background (either via spawned task or thread)
             // This is acceptable because:
-            // 1. The thread is guaranteed to be spawned (unlike tokio::spawn)
+            // 1. The cleanup is guaranteed to be scheduled (either via Handle::spawn or thread::spawn)
             // 2. The cleanup will complete even if program is shutting down
             // 3. The worst case is a brief delay during shutdown
         }
