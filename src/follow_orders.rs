@@ -5,7 +5,7 @@
 
 use crate::config::AppCfg;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
-use crate::types::{Px, Qty, PositionDirection};
+use crate::types::{PositionDirection, PositionInfo, Px, Qty};
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// FOLLOW_ORDERS module - position tracking and TP/SL control
 pub struct FollowOrders {
@@ -24,20 +24,6 @@ pub struct FollowOrders {
     shutdown_flag: Arc<AtomicBool>,
     positions: Arc<RwLock<HashMap<String, PositionInfo>>>,
     tp_sl_from_signals: Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
-}
-
-#[derive(Clone, Debug)]
-struct PositionInfo {
-    symbol: String,
-    qty: Qty,
-    entry_price: Px,
-    /// Position direction (Long or Short) - clearer than using Side
-    direction: PositionDirection,
-    leverage: u32,
-    stop_loss_pct: Option<f64>,
-    take_profit_pct: Option<f64>,
-    opened_at: Instant,
-    is_maker: Option<bool>,
 }
 
 impl FollowOrders {
@@ -123,9 +109,10 @@ impl FollowOrders {
         
         // Spawn task for OrderUpdate events (to capture is_maker for commission calculation)
         let positions_order = positions.clone();
+        let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
         tokio::spawn(async move {
-            let mut order_update_rx = event_bus.subscribe_order_update();
+            let mut order_update_rx = event_bus_order.subscribe_order_update();
             
             info!("FOLLOW_ORDERS: Started, listening to OrderUpdate events for is_maker info");
             
@@ -372,8 +359,7 @@ impl FollowOrders {
                 };
 
                 match event_bus.close_request_tx.send(close_request) {
-                    Ok(()) => {
-                        let receiver_count = event_bus.close_request_tx.receiver_count();
+                    Ok(receiver_count) => {
                         if receiver_count == 0 {
                             warn!(
                                 symbol = %tick.symbol,
@@ -431,8 +417,7 @@ impl FollowOrders {
                 };
 
                 match event_bus.close_request_tx.send(close_request) {
-                    Ok(()) => {
-                        let receiver_count = event_bus.close_request_tx.receiver_count();
+                    Ok(receiver_count) => {
                         if receiver_count == 0 {
                             warn!(
                                 symbol = %tick.symbol,

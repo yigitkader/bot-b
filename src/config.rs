@@ -93,6 +93,18 @@ pub struct BinanceCfg {
     pub hedge_mode: bool,
 }
 
+impl Default for BinanceCfg {
+    fn default() -> Self {
+        Self {
+            api_key: "test_api_key".to_string(),
+            secret_key: "test_secret_key".to_string(),
+            recv_window_ms: default_recv_window(),
+            futures_base: "https://fapi.binance.com".to_string(),
+            hedge_mode: default_hedge_mode(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppCfg {
     #[serde(default)]
@@ -137,6 +149,33 @@ pub struct AppCfg {
     pub websocket: WebsocketCfg,
     #[serde(default)]
     pub event_bus: EventBusCfg,
+}
+
+impl Default for AppCfg {
+    fn default() -> Self {
+        Self {
+            symbol: None,
+            symbols: Vec::new(),
+            auto_discover_quote: default_auto_discover_quote(),
+            quote_asset: default_quote_asset(),
+            allow_usdt_quote: default_allow_usdt_quote(),
+            mode: default_mode(),
+            max_usd_per_order: default_max_usd_per_order(),
+            min_usd_per_order: default_min_usd_per_order(),
+            min_quote_balance_usd: default_min_quote_balance_usd(),
+            leverage: None,
+            price_tick: default_price_tick(),
+            qty_step: default_qty_step(),
+            take_profit_pct: default_take_profit_pct(),
+            stop_loss_pct: default_stop_loss_pct(),
+            binance: BinanceCfg::default(),
+            risk: RiskCfg::default(),
+            trending: TrendingCfg::default(),
+            exec: ExecCfg::default(),
+            websocket: WebsocketCfg::default(),
+            event_bus: EventBusCfg::default(),
+        }
+    }
 }
 
 // ============================================================================

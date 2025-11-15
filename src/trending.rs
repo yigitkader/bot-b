@@ -5,10 +5,10 @@
 
 use crate::config::AppCfg;
 use crate::connection::Connection;
-use crate::connection::quantize_decimal;
-use crate::event_bus::{EventBus, MarketTick, PositionUpdate, TradeSignal};
+use crate::utils::quantize_decimal;
+use crate::event_bus::{EventBus, MarketTick, TradeSignal};
 use crate::state::SharedState;
-use crate::types::{Px, Qty, Side, PositionDirection};
+use crate::types::{LastSignal, PositionDirection, PricePoint, Px, Qty, Side, SymbolState, TrendSignal};
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -19,46 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-
-/// Price point for trend analysis
-#[derive(Clone, Debug)]
-struct PricePoint {
-    timestamp: Instant,
-    price: Decimal,
-    volume: Option<Decimal>,
-}
-
-/// Symbol state for trend analysis
-#[derive(Clone, Debug)]
-struct SymbolState {
-    symbol: String,
-    prices: VecDeque<PricePoint>,
-    last_signal_time: Option<Instant>,
-    /// Timestamp of last position close for this symbol
-    /// Used to enforce cooldown after position close to prevent signal spam
-    last_position_close_time: Option<Instant>,
-    /// Direction of last closed position for this symbol
-    /// Used to apply cooldown only for same-direction signals
-    /// Allows opposite-direction signals immediately (trend reversal)
-    last_position_direction: Option<PositionDirection>,
-    /// Tick counter for sampling (event flood prevention)
-    /// Incremented on every tick, used to determine if tick should be processed
-    tick_counter: u32,
-}
-
-/// Trend signal direction
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TrendSignal {
-    Long,   // Uptrend - buy signal
-    Short,  // Downtrend - sell signal
-}
-
-/// Last signal information for cooldown and direction checking
-#[derive(Clone, Debug)]
-struct LastSignal {
-    side: Side,
-    timestamp: Instant,
-}
 
 /// TRENDING module - trend analysis and signal generation
 pub struct Trending {

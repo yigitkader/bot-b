@@ -539,15 +539,8 @@ impl StateStorage {
     }
 }
 
-/// OrderFillHistory structure (matches connection.rs)
-#[derive(Clone, Debug)]
-pub struct OrderFillHistory {
-    pub total_filled_qty: Qty,
-    pub weighted_price_sum: Decimal,
-    pub last_update: std::time::Instant,
-    pub maker_fill_count: u32,
-    pub total_fill_count: u32,
-}
+// Re-export for backward compatibility
+pub use crate::types::StorageOrderFillHistory as OrderFillHistory;
 
 // ============================================================================
 // STORAGE Module (Event-Driven)
