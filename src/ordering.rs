@@ -423,6 +423,8 @@ impl Ordering {
         // 
         // Solution: State check + balance reserve atomically (same lock)
         // Then release lock, do network call, re-acquire lock for state update
+        // ✅ IMPROVEMENT: Balance reservation is held until order is placed and state is updated
+        // This ensures that even if network call takes time, no other thread can reserve balance
         let mut balance_reservation = {
             let state_guard = shared_state.ordering_state.lock().await;
             
@@ -438,6 +440,7 @@ impl Ordering {
             // 6. Balance reservation (inside lock to prevent race condition)
             // ✅ CRITICAL: Balance reserve must happen AFTER state check, INSIDE the same lock
             // This ensures no other thread can reserve balance for same symbol simultaneously
+            // Balance will be held until order is placed and state is updated (or order fails)
             match BalanceReservation::new(
                 shared_state.balance_store.clone(),
                 &cfg.quote_asset,
@@ -446,6 +449,7 @@ impl Ordering {
                 Some(reservation) => {
                     // Balance reserved successfully - lock will be released after this block
                     // Network call will happen outside lock (no deadlock risk)
+                    // Balance reservation prevents other threads from placing orders (insufficient balance)
                     reservation
                 }
                 None => {
@@ -458,7 +462,7 @@ impl Ordering {
                     return Ok(());
                 }
             }
-        }; // Lock released here, but balance is already reserved
+        }; // Lock released here, but balance is already reserved (prevents other threads from placing orders)
         
         // Balance reserved - will be released automatically when balance_reservation is dropped
         // Explicit release() should be called before returning (Drop will warn if forgotten)

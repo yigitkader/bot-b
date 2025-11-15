@@ -367,27 +367,40 @@ impl FollowOrders {
         
         // ✅ CRITICAL: Calculate commission correctly based on order type
         // Entry commission depends on TIF (Time In Force):
-        // - Post-only order → Maker commission (0.02%)
+        // - Post-only order (GTX) → Expected Maker commission (0.02%)
+        //   NOTE: Post-only orders can become Taker if they cross the spread, but we don't have
+        //   this information in OrderUpdate. We assume Maker commission for post-only orders.
+        //   This is an approximation - actual commission may be higher if order crossed.
         // - Market/IOC order → Taker commission (0.04%)
         // Exit commission (TP/SL) is always Taker (market order with reduceOnly)
+        // 
+        // LIMITATION: We cannot determine actual maker/taker status from OrderUpdate events.
+        // Binance's OrderUpdate events don't include maker/taker information. We approximate
+        // based on TIF configuration. For accurate commission tracking, consider:
+        // 1. Using Binance's account trade history API to get actual maker/taker status
+        // 2. Tracking commission from account balance changes
+        // 3. Using a conservative estimate (always assume Taker for worst-case scenario)
         let entry_commission_pct = {
             let tif_lower = cfg.exec.tif.to_lowercase();
             if tif_lower == "post_only" || tif_lower == "gtx" {
-                // Post-only order → Maker commission
+                // Post-only order → Expected Maker commission (approximation)
+                // NOTE: If order crossed, actual commission would be Taker (higher)
                 Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
                     .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
             } else {
-                // Market/IOC order → Taker commission
+                // Market/IOC order → Taker commission (guaranteed)
                 Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
                     .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
             }
         };
         
-        // Exit commission (TP/SL close orders) is always Taker (market order)
+        // Exit commission (TP/SL close orders) is always Taker (market order with reduceOnly)
+        // This is guaranteed because TP/SL orders are always market orders
         let exit_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
             .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
         
         // Total commission = Entry + Exit
+        // NOTE: This is an approximation. Actual commission may be higher if entry order crossed.
         let total_commission_pct = entry_commission_pct + exit_commission_pct;
         
         // Calculate net PnL percentage (gross PnL - commission)

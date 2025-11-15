@@ -1308,14 +1308,22 @@ impl Connection {
     }
 
     /// Get current market prices (bid, ask) for a symbol
-    /// First tries PRICE_CACHE (from WebSocket), falls back to REST API if cache is empty
+    /// ✅ WebSocket-first approach (Binance recommendation)
+    /// First tries PRICE_CACHE (from WebSocket), falls back to REST API only if cache is empty
+    /// REST API fallback should be rare - only on startup before WebSocket data arrives
     pub async fn get_current_prices(&self, symbol: &str) -> Result<(Px, Px)> {
-        // Try PRICE_CACHE first (fastest, most up-to-date)
+        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
+        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
         if let Some(price_update) = PRICE_CACHE.get(symbol) {
             return Ok((price_update.bid, price_update.ask));
         }
         
-        // Fallback to REST API if cache is empty
+        // Fallback to REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
+        // This should be rare - WebSocket should populate cache quickly after connection
+        warn!(
+            symbol = %symbol,
+            "PRICE_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
+        );
         self.venue.best_prices(symbol).await
     }
 
@@ -2142,13 +2150,19 @@ impl BinanceFutures {
     }
 
     pub async fn available_balance(&self, asset: &str) -> Result<Decimal> {
-        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
-        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        // ✅ BEST PRACTICE: WebSocket-first approach (Binance recommendation)
+        // Try WebSocket cache first - WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        // REST API fallback should be rare - only on startup before WebSocket data arrives
         if let Some(balance) = BALANCE_CACHE.get(asset) {
             return Ok(*balance);
         }
         
-        // Fallback to REST API if cache is empty (e.g., on startup before WebSocket data arrives)
+        // Fallback to REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
+        // This should be rare - WebSocket should populate cache quickly after connection
+        warn!(
+            asset = %asset,
+            "BALANCE_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
+        );
         #[derive(Deserialize)]
         struct FutBalance {
             asset: String,
@@ -2263,13 +2277,19 @@ impl BinanceFutures {
     }
 
     pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
-        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
-        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        // ✅ BEST PRACTICE: WebSocket-first approach (Binance recommendation)
+        // Try WebSocket cache first - WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        // REST API fallback should be rare - only on startup before WebSocket data arrives
         if let Some(position) = POSITION_CACHE.get(sym) {
             return Ok(position.clone());
         }
         
-        // Fallback to REST API if cache is empty (e.g., on startup before WebSocket data arrives)
+        // Fallback to REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
+        // This should be rare - WebSocket should populate cache quickly after connection
+        warn!(
+            symbol = %sym,
+            "POSITION_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
+        );
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
             sym,
@@ -2639,9 +2659,22 @@ impl BinanceFutures {
                     // Hemen kontrol etmek yanlış sonuçlara yol açabilir (pozisyon henüz kapanmamış olabilir)
                     // KRİTİK İYİLEŞTİRME: Binance için 1000ms daha güvenli (500ms yeterli olmayabilir)
                     // Exchange'in order'ı işlemesi ve position update'i için yeterli süre
+                    // ✅ WebSocket-first: Wait for WebSocket PositionUpdate event instead of polling REST API
+                    // WebSocket should receive PositionUpdate quickly after order fill
                     tokio::time::sleep(Duration::from_millis(1000)).await; // Exchange işlemesi için 1000ms bekle (Binance)
 
-                    let verify_pos = self.fetch_position(sym).await?;
+                    // ✅ WebSocket-first: Try POSITION_CACHE first (Binance recommendation)
+                    // WebSocket PositionUpdate should have updated cache by now
+                    let verify_pos = if let Some(position) = POSITION_CACHE.get(sym) {
+                        position.clone()
+                    } else {
+                        // Fallback to REST API only if cache is empty (should be rare)
+                        warn!(
+                            symbol = %sym,
+                            "POSITION_CACHE empty during position verification, falling back to REST API"
+                        );
+                        self.fetch_position(sym).await?
+                    };
                     let verify_qty = verify_pos.qty.0;
 
                     if verify_qty.is_zero() {
@@ -2800,7 +2833,59 @@ impl BinanceFutures {
                     {
                         // ✅ KRİTİK: MIN_NOTIONAL hatası önce dust kontrolü yap
                         // Eğer remaining_qty çok küçükse, LIMIT fallback denemeden pozisyonu kapalı kabul et
-                        let dust_threshold = rules.min_notional / Decimal::from(1000);
+                        // ✅ WebSocket-first: Try PRICE_CACHE first (Binance recommendation)
+                        // Fetch prices first for accurate dust threshold calculation
+                        let (best_bid, best_ask) = {
+                            // Try WebSocket cache first (fastest, most up-to-date)
+                            if let Some(price_update) = PRICE_CACHE.get(sym) {
+                                (price_update.bid, price_update.ask)
+                            } else {
+                                // Fallback to REST API only if cache is empty (should be rare)
+                                match self.best_prices(sym).await {
+                                    Ok(prices) => prices,
+                                    Err(e2) => {
+                                        warn!(symbol = %sym, error = %e2, "failed to fetch best prices for dust check (WebSocket cache empty and REST API failed)");
+                                        // If price fetch fails, use conservative fixed threshold
+                                        let dust_threshold = rules.min_notional / Decimal::from(1000);
+                                        if remaining_qty < dust_threshold {
+                                            info!(
+                                                symbol = %sym,
+                                                remaining_qty = %remaining_qty,
+                                                dust_threshold = %dust_threshold,
+                                                min_notional = %rules.min_notional,
+                                                "MIN_NOTIONAL error: remaining qty is dust (below threshold), considering position closed without LIMIT fallback"
+                                            );
+                                            return Ok(());
+                                        }
+                                        // Price fetch failed but not dust - continue to LIMIT fallback
+                                        return Err(anyhow!(
+                                            "MIN_NOTIONAL error and failed to fetch prices for dust check: {}",
+                                            e2
+                                        ));
+                                    }
+                                }
+                            }
+                        };
+                        
+                        // Dust threshold: min_notional / current_price (more accurate than fixed divisor)
+                        // If price is not available, use conservative fixed threshold
+                        let dust_threshold = {
+                            let current_price = if matches!(side, Side::Buy) {
+                                // Short position closing: use bid price
+                                best_bid.0
+                            } else {
+                                // Long position closing: use ask price
+                                best_ask.0
+                            };
+                            // Calculate dust threshold as min_notional / price (more accurate)
+                            // Fallback to min_notional / 1000 if price is zero or calculation fails
+                            if !current_price.is_zero() {
+                                rules.min_notional / current_price
+                            } else {
+                                rules.min_notional / Decimal::from(1000)
+                            }
+                        };
+                        
                         if remaining_qty < dust_threshold {
                             info!(
                                 symbol = %sym,
@@ -2823,17 +2908,7 @@ impl BinanceFutures {
                         );
 
                         // Fallback: Limit reduce-only ile karşı tarafta 1-2 tick avantajlı pasif bırak
-                        let (best_bid, best_ask) = match self.best_prices(sym).await {
-                            Ok(prices) => prices,
-                            Err(e2) => {
-                                warn!(symbol = %sym, error = %e2, "failed to fetch best prices for limit fallback");
-                                // ✅ KRİTİK: LIMIT fallback başarısız, direkt hata döndür (sonsuz loop önleme)
-                                return Err(anyhow!(
-                                    "MIN_NOTIONAL error and limit fallback failed (best prices fetch failed): {}",
-                                    e
-                                ));
-                            }
-                        };
+                        // (best_bid, best_ask already fetched above for dust check)
 
                         // Limit reduce-only emri: karşı tarafta 1-2 tick avantajlı
                         let tick_size = rules.tick_size;
@@ -2908,14 +2983,32 @@ impl BinanceFutures {
                                 // ✅ KRİTİK GÜVENLİK: LIMIT fallback başarısız, dust kontrolü yap
                                 // Eğer remaining_qty çok küçükse (dust), pozisyonu kapalı kabul et
                                 // Bu, MIN_NOTIONAL hatası olan çok küçük pozisyonlar için güvenli bir çıkış yolu sağlar
-                                let dust_threshold = rules.min_notional / Decimal::from(1000);
+                                // Recalculate dust threshold with current prices (may have changed)
+                                // Note: best_bid and best_ask are already fetched from WebSocket cache above
+                                let dust_threshold = {
+                                    let current_price = if matches!(side, Side::Buy) {
+                                        // Short position closing: use bid price
+                                        best_bid.0
+                                    } else {
+                                        // Long position closing: use ask price
+                                        best_ask.0
+                                    };
+                                    // Calculate dust threshold as min_notional / price (more accurate)
+                                    // Fallback to min_notional / 1000 if price is zero or calculation fails
+                                    if !current_price.is_zero() {
+                                        rules.min_notional / current_price
+                                    } else {
+                                        rules.min_notional / Decimal::from(1000)
+                                    }
+                                };
+                                
                                 if remaining_qty < dust_threshold {
                                     info!(
                                         symbol = %sym,
                                         remaining_qty = %remaining_qty,
                                         dust_threshold = %dust_threshold,
                                         min_notional = %rules.min_notional,
-                                        "MIN_NOTIONAL: remaining qty is dust (below threshold), considering position closed"
+                                        "MIN_NOTIONAL: remaining qty is dust (below threshold), considering position closed after LIMIT fallback failed"
                                     );
                                     return Ok(());
                                 }
@@ -2923,7 +3016,7 @@ impl BinanceFutures {
                                 // ✅ KRİTİK: LIMIT fallback başarısız ve dust değil, tekrar MARKET denenmemeli (sonsuz loop önleme)
                                 // Direkt hata döndür - retry loop'a girmemeli
                                 return Err(anyhow!(
-                                    "MIN_NOTIONAL error: market and limit reduce-only both failed (market: {}, limit: {}). Remaining qty: {}, min_notional: {}",
+                                    "MIN_NOTIONAL error: market and limit reduce-only both failed (market: {}, limit: {}). Remaining qty: {}, min_notional: {}. Position may need manual intervention.",
                                     e, e2, remaining_qty, rules.min_notional
                                 ));
                             }
@@ -3283,12 +3376,19 @@ impl Venue for BinanceFutures {
     }
 
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)> {
-        // ✅ BEST PRACTICE: Önce WebSocket cache'den oku, yoksa REST API'ye fallback
+        // ✅ BEST PRACTICE: WebSocket-first approach (Binance recommendation)
+        // Try WebSocket cache first - WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        // REST API fallback should be rare - only on startup before WebSocket data arrives
         if let Some(price_update) = PRICE_CACHE.get(sym) {
             return Ok((price_update.bid, price_update.ask));
         }
         
-        // Fallback: REST API (WebSocket cache'de yoksa)
+        // Fallback: REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
+        // This should be rare - WebSocket should populate cache quickly after connection
+        warn!(
+            symbol = %sym,
+            "PRICE_CACHE empty in best_prices, falling back to REST API (should be rare)"
+        );
         let url = format!("{}/fapi/v1/depth?symbol={}&limit=5", self.base, encode(sym));
         let d: OrderBookTop = send_json(self.common.client.get(url)).await?;
         use rust_decimal::Decimal;
