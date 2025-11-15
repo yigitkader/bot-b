@@ -472,11 +472,27 @@ impl Connection {
     }
     
     /// Start periodic cleanup task for order fill history
-    /// This task is only for memory leak prevention (very old entries).
-    /// Normal cleanup happens immediately when orders close.
+    /// 
+    /// CRITICAL: Memory leak prevention with stale cache detection
+    /// 
+    /// Problem: OPEN_ORDERS_CACHE can become stale if WebSocket disconnects/reconnects
+    /// - Order placed → added to OPEN_ORDERS_CACHE
+    /// - WebSocket disconnects
+    /// - Order fills and closes (but cache is not synced)
+    /// - WebSocket reconnects but cache sync may be incomplete
+    /// - Cleanup task sees order in cache, keeps history forever → memory leak
+    /// 
+    /// Solution: Stale cache detection using history update timestamp
+    /// - If order is in cache but history wasn't updated recently (>5 min), cache might be stale
+    /// - If history is very old (>24 hours) even though in cache, cache is definitely stale
+    /// - Remove stale entries to prevent memory leak
+    /// 
+    /// Normal cleanup happens immediately when orders close (OrderFill event handler).
+    /// This task only handles edge cases where normal cleanup didn't happen.
     /// 
     /// - Only removes entries older than 24 hours (very conservative)
-    /// - Protects active orders (never removes history for active orders)
+    /// - Protects active orders (never removes history for active orders with fresh updates)
+    /// - Detects stale cache entries and removes them to prevent memory leak
     /// - Does not handle normal cleanup (order close events do that)
     async fn start_order_fill_history_cleanup_task(&self) {
         let order_fill_history = self.order_fill_history.clone();
@@ -497,8 +513,19 @@ impl Connection {
                 let initial_count = order_fill_history.len();
                 
                 // Memory leak prevention with stale cache detection
-                // OPEN_ORDERS_CACHE can become stale if WebSocket disconnects/reconnects
-                // Verify cache freshness by checking history update time
+                // 
+                // Problem: OPEN_ORDERS_CACHE can become stale if WebSocket disconnects/reconnects
+                // Scenario:
+                // 1. Order placed → added to OPEN_ORDERS_CACHE
+                // 2. WebSocket disconnects
+                // 3. Order fills and closes (but cache is not synced)
+                // 4. WebSocket reconnects but cache sync may be incomplete
+                // 5. Cleanup task sees order in cache, keeps history forever → memory leak
+                // 
+                // Solution: Stale cache detection using history update timestamp
+                // - If order is in cache but history wasn't updated recently (>5 min), cache might be stale
+                // - If history is very old (>24 hours) even though in cache, cache is definitely stale
+                // - Remove stale entries to prevent memory leak
                 order_fill_history.retain(|order_id, history| {
                     // First check: Is order in OPEN_ORDERS_CACHE?
                     let is_in_cache = OPEN_ORDERS_CACHE.iter().any(|entry| {
@@ -518,6 +545,12 @@ impl Connection {
                             if history_age.as_secs() > MAX_AGE_SECS {
                                 // Very old entry even though in cache - cache is definitely stale
                                 // Remove to prevent memory leak
+                                // 
+                                // Note: We don't verify with REST API here because:
+                                // 1. This is a background cleanup task, not critical path
+                                // 2. REST API calls would add latency and rate limit usage
+                                // 3. 24-hour threshold is very conservative - if history is this old,
+                                //    order is almost certainly closed (normal cleanup should have removed it)
                                 tracing::warn!(
                                     order_id = %order_id,
                                     history_age_secs = history_age.as_secs(),
@@ -528,6 +561,8 @@ impl Connection {
                             } else {
                                 // History is old but not very old - cache might be stale
                                 // Keep for now but log warning
+                                // This handles edge cases where order is still active but no recent updates
+                                // (e.g., order is partially filled but no new fills for a while)
                                 tracing::debug!(
                                     order_id = %order_id,
                                     history_age_secs = history_age.as_secs(),
@@ -537,15 +572,18 @@ impl Connection {
                                 true // Keep for now (might be active but no recent updates)
                             }
                         } else {
-                            // Cache is fresh - history was updated recently
+                            // Cache is fresh - history was updated recently (<5 minutes)
                             // Order is definitely active, keep it
                             true
                         }
                     } else {
                         // Order not in cache - check age and remove if very old
+                        // This is the normal cleanup path for closed orders
                         let age = now.duration_since(history.last_update);
                         if age.as_secs() > MAX_AGE_SECS {
                             // Very old entry (24+ hours) - safe to remove (memory leak prevention)
+                            // Normal cleanup should have removed this already when order closed,
+                            // but this catches edge cases where cleanup didn't happen
                             false
                         } else {
                             // Recent entry - keep (may receive late-arriving fill events)
@@ -2771,16 +2809,9 @@ impl BinanceFutures {
         let initial_pos = match self.fetch_position(sym).await {
             Ok(pos) => pos,
             Err(e) => {
-                let error_str = e.to_string().to_lowercase();
                 // CRITICAL: Only handle specific "position not found" errors
                 // Network errors (timeout, connection refused, etc.) should be retried, not ignored
-                // Binance error codes:
-                // - "-2011": Unknown order (position not found)
-                // - "position not found": Explicit position not found message
-                // - "no position": Alternative position not found message
-                if error_str.contains("position not found") 
-                    || error_str.contains("no position")
-                    || error_str.contains("-2011") {  // Binance: Unknown order (position not found)
+                if is_position_not_found_error(&e) {
                     info!(symbol = %sym, "position already closed (manual intervention detected), skipping close");
                     return Ok(());
                 }
@@ -2829,21 +2860,14 @@ impl BinanceFutures {
                 ));
             }
             
-            // KRİTİK İYİLEŞTİRME: Her attempt'te mevcut pozisyonu kontrol et
-            // Retry durumunda pozisyon değişmiş olabilir (kısmi kapatma veya manuel kapatma)
+            // CRITICAL: Check current position on each attempt
+            // Position may have changed during retry (partial close or manual close)
             let current_pos = match self.fetch_position(sym).await {
                 Ok(pos) => pos,
                 Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
                     // CRITICAL: Only handle specific "position not found" errors
                     // Network errors should be retried, not ignored
-                    // Binance error codes:
-                    // - "-2011": Unknown order (position not found)
-                    // - "position not found": Explicit position not found message
-                    // - "no position": Alternative position not found message
-                    if error_str.contains("position not found") 
-                        || error_str.contains("no position")
-                        || error_str.contains("-2011") {  // Binance: Unknown order (position not found)
+                    if is_position_not_found_error(&e) {
                         info!(symbol = %sym, attempt, "position already closed during retry (manual intervention detected)");
                         return Ok(());
                     }
@@ -3105,17 +3129,8 @@ impl BinanceFutures {
                     let error_str = e.to_string();
                     let error_lower = error_str.to_lowercase();
 
-                    // ✅ KRİTİK: Manuel kapatma durumlarını handle et - pozisyon zaten kapalıysa hata verme
-                    if error_lower.contains("position not found")
-                        || error_lower.contains("no position")
-                        || error_lower.contains("position already closed")
-                        || error_lower.contains("reduceonly")
-                        || error_lower.contains("reduce only")
-                        || error_lower.contains("-2011") // Binance: "Unknown order sent"
-                        || error_lower.contains("-2019") // Binance: "Margin is insufficient"
-                        || error_lower.contains("-2021") // Binance: "Order would immediately match"
-                    {
-                        // Pozisyon zaten kapalı veya manuel kapatılmış - hata verme, başarılı say
+                    // CRITICAL: Handle manual close cases - treat as success if position already closed
+                    if is_position_already_closed_error(&e) {
                         info!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -3148,14 +3163,11 @@ impl BinanceFutures {
                         }
                     }
 
-                    // KRİTİK DÜZELTME: MIN_NOTIONAL hatası yakalama (-1013 veya "min notional")
-                    // Küçük "artık" miktarlarda reduce-only market close borsa min_notional eşiğini sağlamayabilir
-                    // Normal kapanış modunda LIMIT fallback yap
-                    // ✅ KRİTİK GÜVENLİK: LIMIT fallback sadece bir kez denenmeli (sonsuz loop önleme)
-                    if (error_lower.contains("-1013")
-                        || error_lower.contains("min notional")
-                        || error_lower.contains("min_notional"))
-                        && !limit_fallback_attempted
+                    // CRITICAL: MIN_NOTIONAL error handling
+                    // Small remaining quantities may not meet exchange min_notional threshold
+                    // In normal close mode, fallback to LIMIT order
+                    // CRITICAL: LIMIT fallback should only be attempted once (prevent infinite loop)
+                    if is_min_notional_error(&e) && !limit_fallback_attempted
                     {
                         // ✅ KRİTİK: MIN_NOTIONAL hatası önce dust kontrolü yap
                         // Eğer remaining_qty çok küçükse, LIMIT fallback denemeden pozisyonu kapalı kabul et
@@ -3964,6 +3976,44 @@ impl BinanceFutures {
 }
 
 // ---- helpers ----
+
+/// Check if error indicates position not found (already closed)
+/// 
+/// Returns true if error message contains position not found indicators.
+/// This is used to handle cases where position was manually closed or doesn't exist.
+fn is_position_not_found_error(error: &anyhow::Error) -> bool {
+    let error_str = error.to_string().to_lowercase();
+    error_str.contains("position not found")
+        || error_str.contains("no position")
+        || error_str.contains("-2011") // Binance: Unknown order (position not found)
+}
+
+/// Check if error indicates MIN_NOTIONAL error
+/// 
+/// Returns true if error message contains MIN_NOTIONAL error indicators.
+/// This is used to trigger LIMIT fallback for small position sizes.
+fn is_min_notional_error(error: &anyhow::Error) -> bool {
+    let error_str = error.to_string().to_lowercase();
+    error_str.contains("-1013")
+        || error_str.contains("min notional")
+        || error_str.contains("min_notional")
+}
+
+/// Check if error indicates position already closed or invalid state
+/// 
+/// Returns true if error message indicates position is already closed or in invalid state.
+/// This is used to treat certain errors as success (position already closed).
+fn is_position_already_closed_error(error: &anyhow::Error) -> bool {
+    let error_str = error.to_string().to_lowercase();
+    error_str.contains("position not found")
+        || error_str.contains("no position")
+        || error_str.contains("position already closed")
+        || error_str.contains("reduceonly")
+        || error_str.contains("reduce only")
+        || error_str.contains("-2011") // Binance: "Unknown order sent"
+        || error_str.contains("-2019") // Binance: "Margin is insufficient"
+        || error_str.contains("-2021") // Binance: "Order would immediately match"
+}
 
 /// Quantize decimal value to step (floor to nearest step multiple)
 /// 

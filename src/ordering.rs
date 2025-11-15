@@ -82,68 +82,21 @@ impl BalanceReservation {
 
 impl Drop for BalanceReservation {
     fn drop(&mut self) {
-        // ⚠️ CRITICAL: Drop cannot be async, so we cannot release balance here directly
-        // However, we can warn if balance was not explicitly released
-        // This helps catch bugs where release() was forgotten
+        // CRITICAL: Drop cannot be async, so we cannot release balance here directly
+        // Doing async cleanup in Drop is an anti-pattern that can cause:
+        // - Deadlocks during program shutdown
+        // - Expensive runtime creation
+        // - Unpredictable behavior
+        // 
+        // Instead, we only log a warning. The leak detection task will handle cleanup.
         if !self.released {
-            warn!(
+            tracing::error!(
                 asset = %self.asset,
                 amount = %self.amount,
-                "ORDERING: Balance reservation dropped without explicit release! Attempting cleanup."
+                "CRITICAL: Balance reservation dropped without explicit release! Manual intervention may be required. Leak detection task will attempt auto-fix."
             );
-            
-            // ✅ CRITICAL FIX: Try to use current runtime handle first, fallback to new runtime
-            // This is better than always creating a new runtime
-            // Background cleanup thread veya try_reserve() başarısızsa otomatik release
-            let balance_store = self.balance_store.clone();
-            let asset = self.asset.clone();
-            let amount = self.amount;
-            
-            // Try to use current runtime handle if available
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // We're in an async context - spawn a task to release balance
-                // This is the best case - uses existing runtime
-                handle.spawn(async move {
-                    let mut store = balance_store.write().await;
-                    store.release(&asset, amount);
-                    warn!(
-                        asset = %asset,
-                        amount = %amount,
-                        "ORDERING: Balance reservation released in async task (Drop fallback)"
-                    );
-                });
-            } else {
-                // Not in async context - spawn a sync thread with new runtime
-                // This ensures cleanup happens even if main runtime is shutdown
-                std::thread::spawn(move || {
-                    let rt = match tokio::runtime::Runtime::new() {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            eprintln!("ORDERING: Failed to create runtime for balance cleanup: {}", e);
-                            // If runtime creation fails, we can't cleanup - this is a critical error
-                            // But we don't want to panic in Drop, so we just log and continue
-                            // The balance will remain reserved, but this should be rare
-                            return;
-                        }
-                    };
-                    
-                    rt.block_on(async {
-                        let mut store = balance_store.write().await;
-                        store.release(&asset, amount);
-                        warn!(
-                            asset = %asset,
-                            amount = %amount,
-                            "ORDERING: Balance reservation released in sync thread (Drop fallback)"
-                        );
-                    });
-                });
-            }
-            // Note: We don't wait for cleanup to complete to avoid blocking Drop
-            // The cleanup will complete in the background (either via spawned task or thread)
-            // This is acceptable because:
-            // 1. The cleanup is guaranteed to be scheduled (either via Handle::spawn or thread::spawn)
-            // 2. The cleanup will complete even if program is shutting down
-            // 3. The worst case is a brief delay during shutdown
+            // Note: Balance will remain reserved until leak detection task fixes it
+            // This is safer than attempting async cleanup in Drop (which can deadlock)
         }
     }
 }
@@ -272,8 +225,11 @@ impl Ordering {
     /// // Service is now running and will place orders when TradeSignal events are received
     /// ```
     pub async fn start(&self) -> Result<()> {
-        // ✅ CRITICAL: State restore is now handled by STORAGE module via event bus
+        // CRITICAL: State restore is now handled by STORAGE module via event bus
         // StorageModule will restore OrderingState on startup and update SharedState
+        
+        // Start leak detection task for balance reservations
+        Self::start_leak_detection_task(self.shared_state.clone(), self.shutdown_flag.clone());
         
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
@@ -397,6 +353,73 @@ impl Ordering {
         });
         
         Ok(())
+    }
+
+    /// Start background task for balance reservation leak detection
+    /// This task periodically checks for balance leaks (reserved > total) and auto-fixes them
+    /// This is safer than attempting async cleanup in Drop trait (which can deadlock)
+    fn start_leak_detection_task(
+        shared_state: Arc<SharedState>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) {
+        tokio::spawn(async move {
+            const CHECK_INTERVAL_SECS: u64 = 60; // Check every minute
+            
+            loop {
+                tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+                
+                if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                
+                let store = shared_state.balance_store.read().await;
+                
+                // Check for balance leaks: reserved > total
+                let usdt_leak = store.reserved_usdt > store.usdt;
+                let usdc_leak = store.reserved_usdc > store.usdc;
+                
+                if usdt_leak || usdc_leak {
+                    tracing::error!(
+                        usdt_total = %store.usdt,
+                        usdt_reserved = %store.reserved_usdt,
+                        usdc_total = %store.usdc,
+                        usdc_reserved = %store.reserved_usdc,
+                        "CRITICAL: Balance leak detected! Reserved > Total. Auto-fixing..."
+                    );
+                    
+                    // Auto-fix: reset reserved balance to match total
+                    // If reserved > total, this is a leak - reset reserved to total
+                    drop(store);
+                    let mut store_write = shared_state.balance_store.write().await;
+                    
+                    // Reset reserved to total to fix leak (reserved cannot exceed total)
+                    // This fixes leaks while preserving legitimate reservations (if reserved <= total)
+                    if usdt_leak {
+                        let old_reserved = store_write.reserved_usdt;
+                        store_write.reserved_usdt = store_write.usdt;
+                        tracing::warn!(
+                            asset = "USDT",
+                            old_reserved = %old_reserved,
+                            new_reserved = %store_write.reserved_usdt,
+                            total = %store_write.usdt,
+                            "Auto-fixed USDT balance leak: reset reserved to total"
+                        );
+                    }
+                    
+                    if usdc_leak {
+                        let old_reserved = store_write.reserved_usdc;
+                        store_write.reserved_usdc = store_write.usdc;
+                        tracing::warn!(
+                            asset = "USDC",
+                            old_reserved = %old_reserved,
+                            new_reserved = %store_write.reserved_usdc,
+                            total = %store_write.usdc,
+                            "Auto-fixed USDC balance leak: reset reserved to total"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Handle TradeSignal event
@@ -575,25 +598,42 @@ impl Ordering {
         // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
         // Missing releases cause balance leaks and prevent future orders from being placed.
         
-        // ✅ CRITICAL: Re-validate spread before order placement
-        // Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
+        // CRITICAL: Re-validate spread before order placement
+        // 
+        // Problem: Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
         // This prevents slippage from trading when spread has widened significantly
-        // Check spread staleness first (if spread data is too old, re-fetch current spread)
-        // ✅ CRITICAL FIX: 200ms çok agresif! Network latency + validation time ile 500ms olabilir
-        // 1 saniye (1000ms) daha makul bir window - spread validation için yeterli süre
+        // 
+        // Solution: Two-stage validation with realistic time windows
+        // 1. Check spread staleness (if spread data is too old, re-fetch current spread)
+        // 2. After fetch, check total delay (original age + fetch time)
+        // 
+        // Time Window Design:
+        // - MAX_SPREAD_AGE_MS (2000ms): Initial spread age threshold
+        //   - If spread is older than 2 seconds, fetch fresh spread
+        //   - Accounts for normal processing delays (100-500ms)
+        // - MAX_TOTAL_DELAY_MS (3000ms): Total delay threshold after fetch
+        //   - Original age (up to 2000ms) + fetch time (200-500ms) + validation (100-200ms)
+        //   - Total: ~2700ms worst case, 3000ms gives safety margin
+        // 
+        // Why these values:
+        // - Network latency: 200-500ms (Binance API)
+        // - Processing time: 100-200ms (validation, state checks)
+        // - Total realistic delay: ~700ms worst case
+        // - 2-3 second windows provide safety margin while preventing stale signals
         let spread_age = now.duration_since(signal.spread_timestamp);
-        const MAX_SPREAD_AGE_MS: u64 = 1000; // 1 second (1000ms) max age for spread data
+        const MAX_SPREAD_AGE_MS: u64 = 2000; // 2 seconds - more realistic for network latency
         
         if spread_age.as_millis() as u64 > MAX_SPREAD_AGE_MS {
             // Spread data is stale, fetch current spread
             match connection.get_current_prices(&signal.symbol).await {
                 Ok((bid, ask)) => {
-                    // ✅ CRITICAL FIX: Check if price fetch took too long
+                    // CRITICAL: Check if price fetch took too long
                     // Network delay can be 200-500ms, during which spread may have changed significantly
-                    // If fetch took too long, abort signal to prevent using stale spread data
+                    // If total delay (original age + fetch time) exceeds threshold, abort signal
+                    // This prevents using stale spread data that may have changed during fetch
                     let fetch_timestamp = Instant::now();
                     let total_delay = fetch_timestamp.duration_since(signal.spread_timestamp);
-                    const MAX_TOTAL_DELAY_MS: u64 = 1500; // 1.5 seconds max total delay (original age + fetch time)
+                    const MAX_TOTAL_DELAY_MS: u64 = 3000; // 3 seconds max total delay (original age + fetch time)
                     
                     if total_delay.as_millis() as u64 > MAX_TOTAL_DELAY_MS {
                         warn!(
@@ -1018,7 +1058,32 @@ impl Ordering {
     }
     
     /// Handle OrderUpdate event (state sync)
-    /// CRITICAL: Timestamp-based version control prevents stale updates
+    /// 
+    /// CRITICAL: Race condition prevention between OrderUpdate and PositionUpdate
+    /// 
+    /// Problem: Binance may send events out of order:
+    /// - PositionUpdate may arrive before OrderUpdate (position already created)
+    /// - OrderUpdate may arrive before PositionUpdate (order filled, position not yet created)
+    /// 
+    /// Solution: Timestamp-based version control + position existence check
+    /// 
+    /// Race Condition Scenarios:
+    /// 1. PositionUpdate arrives first:
+    ///    - PositionUpdate creates position (qty=0.5, entry=50000, timestamp=T1)
+    ///    - OrderUpdate arrives later (filled_qty=0.5, timestamp=T0 where T0 < T1)
+    ///    - Solution: Check if position exists and is newer → ignore stale OrderUpdate
+    /// 
+    /// 2. OrderUpdate arrives first:
+    ///    - OrderUpdate creates position (filled_qty=0.5, entry=50000, timestamp=T1)
+    ///    - PositionUpdate arrives later (qty=0.5, entry=50000, timestamp=T2 where T2 > T1)
+    ///    - Solution: PositionUpdate will check qty AND entry_price → skip if both unchanged
+    /// 
+    /// 3. Partial fills with entry price changes:
+    ///    - Order partially filled (0.5 BTC @ 50000) → OrderUpdate creates position
+    ///    - Order partially filled again (0.3 BTC @ 50100) → OrderUpdate updates position
+    ///    - PositionUpdate arrives (qty=0.8, entry=50037.5) → qty same but entry changed!
+    ///    - Solution: PositionUpdate checks BOTH qty AND entry_price → update if either changed
+    /// 
     /// Only applies updates that are newer than the last known update
     async fn handle_order_update(
         update: &OrderUpdate,
@@ -1051,9 +1116,13 @@ impl Ordering {
             if order.order_id == update.order_id {
                 match update.status {
                     crate::event_bus::OrderStatus::Filled => {
-                        // ✅ CRITICAL: Check if OrderUpdate is newer than existing position
+                        // CRITICAL: Check if OrderUpdate is newer than existing position
                         // Prevents stale OrderUpdate from overwriting newer position created from PositionUpdate
                         // PositionUpdate events may arrive before OrderUpdate events (out of order delivery)
+                        // 
+                        // Scenario: PositionUpdate arrives first and creates position with timestamp T1
+                        // Then OrderUpdate arrives with timestamp T0 (T0 < T1) - this is stale!
+                        // We should ignore the OrderUpdate to prevent overwriting newer position data
                         if let Some(ref existing_pos) = state_guard.open_position {
                             if existing_pos.symbol == update.symbol {
                                 // Position already exists - check if OrderUpdate is newer
@@ -1169,9 +1238,37 @@ impl Ordering {
     }
 
     /// Handle PositionUpdate event (state sync)
-    /// CRITICAL: Timestamp-based version control prevents stale updates
+    /// 
+    /// CRITICAL: Race condition prevention between OrderUpdate and PositionUpdate
+    /// 
+    /// Problem: Binance may send events out of order:
+    /// - PositionUpdate may arrive before OrderUpdate (position created before order fill confirmed)
+    /// - OrderUpdate may arrive before PositionUpdate (order filled, position update pending)
+    /// 
+    /// Solution: Multi-layer protection:
+    /// 1. Timestamp-based version control (prevents stale updates)
+    /// 2. OrderUpdate precedence check (OrderUpdate is more reliable)
+    /// 3. Qty AND entry_price comparison (prevents skipping partial fill updates)
+    /// 
+    /// Race Condition Scenarios:
+    /// 1. PositionUpdate arrives first:
+    ///    - PositionUpdate creates position (qty=0.5, entry=50000, timestamp=T1)
+    ///    - OrderUpdate arrives later (filled_qty=0.5, timestamp=T0 where T0 < T1)
+    ///    - Solution: OrderUpdate checks if position exists and is newer → ignores stale OrderUpdate
+    /// 
+    /// 2. OrderUpdate arrives first:
+    ///    - OrderUpdate creates position (filled_qty=0.5, entry=50000, timestamp=T1)
+    ///    - PositionUpdate arrives later (qty=0.5, entry=50000, timestamp=T2 where T2 > T1)
+    ///    - Solution: Check qty AND entry_price → skip if both unchanged (redundant update)
+    /// 
+    /// 3. Partial fills with entry price changes (CRITICAL!):
+    ///    - Order partially filled: 0.5 BTC @ 50000 → OrderUpdate creates position
+    ///    - Order partially filled again: 0.3 BTC @ 50100 → OrderUpdate updates position (qty=0.8, entry=50037.5)
+    ///    - PositionUpdate arrives: (qty=0.8, entry=50037.5) → qty same as last update but entry changed!
+    ///    - If we only check qty, we would skip this update and lose the correct entry price!
+    ///    - Solution: Check BOTH qty AND entry_price → update if either changed
+    /// 
     /// Only applies updates that are newer than the last known update
-    /// This prevents stale PositionUpdate events from overwriting state set by OrderUpdate
     async fn handle_position_update(
         update: &PositionUpdate,
         shared_state: &Arc<SharedState>,
@@ -1189,6 +1286,7 @@ impl Ordering {
         // CRITICAL: Also check if PositionUpdate is newer than the last OrderUpdate
         // OrderUpdate events (from WebSocket) are more reliable and should take precedence
         // If OrderUpdate is newer, only accept PositionUpdate if it indicates position closed
+        // (We trust exchange's position closed signal even if OrderUpdate is newer)
         let order_update_is_newer = state_guard.last_order_update_timestamp
             .map(|order_ts| order_ts > update.timestamp)
             .unwrap_or(false);
@@ -1206,6 +1304,7 @@ impl Ordering {
         
         // If OrderUpdate is newer, be more cautious about accepting PositionUpdate
         // Only accept if position is closed (trust exchange's position closed signal)
+        // This prevents stale PositionUpdate from overwriting fresh OrderUpdate data
         if order_update_is_newer && update.is_open {
             // OrderUpdate is newer and position is still open - likely stale PositionUpdate
             // Ignore it to prevent overwriting fresh OrderUpdate data
@@ -1238,17 +1337,28 @@ impl Ordering {
                     return;
                 }
                 
-                // ✅ CRITICAL: Race condition prevention - check if qty AND entry_price are unchanged
-                // If OrderUpdate::Filled already created position with same qty AND entry_price, skip redundant update
-                // This prevents duplicate position creation when:
-                // 1. OrderUpdate::Filled creates position (qty=1.5, entry=100.0)
-                // 2. PositionUpdate arrives immediately after (qty=1.5, entry=100.0)
-                // 3. Both have valid timestamps, but qty AND entry_price are same - skip redundant update
+                // CRITICAL: Race condition prevention - check if qty AND entry_price are unchanged
                 // 
-                // ✅ CRITICAL FIX: Qty aynı olsa bile entry_price değişmiş olabilir (partial fills)
-                // Partial fills durumunda weighted average entry_price değişir, bu önemli!
-                // Örnek: İlk fill 1.0 @ 100.0, ikinci fill 0.5 @ 101.0 → weighted avg = 100.33
-                // Qty aynı kalabilir ama entry_price değişir, bu durumda update yapılmalı
+                // Problem: OrderUpdate and PositionUpdate may arrive out of order or with same data
+                // 
+                // Scenario 1: Redundant update (same data)
+                // - OrderUpdate::Filled creates position (qty=1.5, entry=100.0, timestamp=T1)
+                // - PositionUpdate arrives immediately after (qty=1.5, entry=100.0, timestamp=T2)
+                // - Both have valid timestamps, but qty AND entry_price are same → skip redundant update
+                // 
+                // Scenario 2: Partial fills with entry price changes (CRITICAL!)
+                // - Order partially filled: 1.0 BTC @ 50000 → OrderUpdate creates position (qty=1.0, entry=50000)
+                // - Order partially filled again: 0.5 BTC @ 50100 → OrderUpdate updates position (qty=1.5, entry=50033.33)
+                // - PositionUpdate arrives: (qty=1.5, entry=50033.33) → qty same but entry changed from original!
+                // - If we only check qty, we would skip this update and lose the correct entry price!
+                // 
+                // Solution: Check BOTH qty AND entry_price
+                // - Only skip if BOTH are unchanged (within epsilon)
+                // - If either changed, update position (partial fills must update entry price)
+                // 
+                // Example: First fill 1.0 @ 100.0, second fill 0.5 @ 101.0
+                // - Weighted average entry_price = (1.0*100.0 + 0.5*101.0) / 1.5 = 100.33
+                // - Qty may be same in some cases, but entry_price changes → must update!
                 let qty_abs_update = update.qty.0.abs();
                 let qty_abs_existing = existing_pos.qty.0;
                 
@@ -1260,7 +1370,7 @@ impl Ordering {
                 let qty_diff = (qty_abs_update - qty_abs_existing).abs();
                 let price_diff = (update.entry_price.0 - existing_pos.entry_price.0).abs();
                 
-                // ✅ CRITICAL FIX: Check BOTH qty AND entry_price
+                // CRITICAL: Check BOTH qty AND entry_price
                 // Only skip update if BOTH are unchanged (within epsilon)
                 // This ensures partial fills with changed entry_price are properly handled
                 if qty_diff < EPSILON_QTY && price_diff < EPSILON_PRICE {

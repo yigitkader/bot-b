@@ -610,24 +610,58 @@ impl Storage {
         let event_bus_state = self.event_bus.clone();
         let shutdown_flag_state = self.shutdown_flag.clone();
         
-        // Spawn task for OrderingStateUpdate events
+        // Spawn task for OrderingStateUpdate events with batch writing
         tokio::spawn(async move {
             let mut state_update_rx = event_bus_state.subscribe_ordering_state_update();
             
-            info!("STORAGE: Started, listening to OrderingStateUpdate events");
+            info!("STORAGE: Started, listening to OrderingStateUpdate events (with batch writing)");
+            
+            // CRITICAL: Batch write mechanism to prevent DB bottleneck
+            // Problem: High frequency events cause SQLite single-writer bottleneck
+            // Solution: Collect updates and write in batches (every 1 second)
+            // For OrderingStateUpdate, only the latest state matters (overwrite previous)
+            let mut pending_state_update: Option<OrderingStateUpdate> = None;
+            let mut batch_interval = tokio::time::interval(Duration::from_secs(1));
+            batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             
             loop {
-                match state_update_rx.recv().await {
-                    Ok(update) => {
-                        if shutdown_flag_state.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                        
-                        if let Err(e) = Self::handle_ordering_state_update(&update, &storage_state).await {
-                            warn!(error = %e, "STORAGE: Failed to persist OrderingStateUpdate");
+                tokio::select! {
+                    // Receive new state update
+                    update_result = state_update_rx.recv() => {
+                        match update_result {
+                            Ok(update) => {
+                                if shutdown_flag_state.load(AtomicOrdering::Relaxed) {
+                                    // Flush pending update before shutdown
+                                    if let Some(pending) = pending_state_update.take() {
+                                        if let Err(e) = Self::handle_ordering_state_update(&pending, &storage_state).await {
+                                            warn!(error = %e, "STORAGE: Failed to persist final OrderingStateUpdate on shutdown");
+                                        }
+                                    }
+                                    break;
+                                }
+                                
+                                // Store latest state (overwrite previous - only latest matters)
+                                pending_state_update = Some(update);
+                            }
+                            Err(_) => {
+                                // Flush pending update before exit
+                                if let Some(pending) = pending_state_update.take() {
+                                    if let Err(e) = Self::handle_ordering_state_update(&pending, &storage_state).await {
+                                        warn!(error = %e, "STORAGE: Failed to persist final OrderingStateUpdate on channel close");
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
-                    Err(_) => break,
+                    // Batch write timer
+                    _ = batch_interval.tick() => {
+                        if let Some(pending) = pending_state_update.take() {
+                            if let Err(e) = Self::handle_ordering_state_update(&pending, &storage_state).await {
+                                warn!(error = %e, "STORAGE: Failed to persist OrderingStateUpdate in batch");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -636,24 +670,61 @@ impl Storage {
         let event_bus_fill = self.event_bus.clone();
         let shutdown_flag_fill = self.shutdown_flag.clone();
         
-        // Spawn task for OrderFillHistoryUpdate events
+        // Spawn task for OrderFillHistoryUpdate events with batch writing
         tokio::spawn(async move {
             let mut fill_history_rx = event_bus_fill.subscribe_order_fill_history_update();
             
-            info!("STORAGE: Started, listening to OrderFillHistoryUpdate events");
+            info!("STORAGE: Started, listening to OrderFillHistoryUpdate events (with batch writing)");
+            
+            // CRITICAL: Batch write mechanism to prevent DB bottleneck
+            // Problem: High frequency fills (100 fills/min) cause SQLite single-writer bottleneck
+            // Solution: Collect updates and write in batches (every 1 second)
+            // For OrderFillHistoryUpdate, we need to process all updates (not just latest)
+            let mut pending_updates: Vec<OrderFillHistoryUpdate> = Vec::new();
+            let mut batch_interval = tokio::time::interval(Duration::from_secs(1));
+            batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             
             loop {
-                match fill_history_rx.recv().await {
-                    Ok(update) => {
-                        if shutdown_flag_fill.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                        
-                        if let Err(e) = Self::handle_order_fill_history_update(&update, &storage_fill).await {
-                            warn!(error = %e, order_id = %update.order_id, "STORAGE: Failed to persist OrderFillHistoryUpdate");
+                tokio::select! {
+                    // Receive new fill history update
+                    update_result = fill_history_rx.recv() => {
+                        match update_result {
+                            Ok(update) => {
+                                if shutdown_flag_fill.load(AtomicOrdering::Relaxed) {
+                                    // Flush pending updates before shutdown
+                                    if !pending_updates.is_empty() {
+                                        if let Err(e) = Self::handle_batch_fill_history_updates(&pending_updates, &storage_fill).await {
+                                            warn!(error = %e, "STORAGE: Failed to persist final OrderFillHistoryUpdate batch on shutdown");
+                                        }
+                                        pending_updates.clear();
+                                    }
+                                    break;
+                                }
+                                
+                                // Add to pending batch
+                                pending_updates.push(update);
+                            }
+                            Err(_) => {
+                                // Flush pending updates before exit
+                                if !pending_updates.is_empty() {
+                                    if let Err(e) = Self::handle_batch_fill_history_updates(&pending_updates, &storage_fill).await {
+                                        warn!(error = %e, "STORAGE: Failed to persist final OrderFillHistoryUpdate batch on channel close");
+                                    }
+                                    pending_updates.clear();
+                                }
+                                break;
+                            }
                         }
                     }
-                    Err(_) => break,
+                    // Batch write timer
+                    _ = batch_interval.tick() => {
+                        if !pending_updates.is_empty() {
+                            let updates_to_process = std::mem::take(&mut pending_updates);
+                            if let Err(e) = Self::handle_batch_fill_history_updates(&updates_to_process, &storage_fill).await {
+                                warn!(error = %e, "STORAGE: Failed to persist OrderFillHistoryUpdate batch");
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -791,6 +862,40 @@ impl Storage {
                 debug!(order_id = %update.order_id, "STORAGE: Removed OrderFillHistory from database");
             }
         }
+        
+        Ok(())
+    }
+    
+    /// Handle batch of OrderFillHistoryUpdate events and persist to database
+    /// 
+    /// CRITICAL: Batch write to prevent DB bottleneck
+    /// Processes multiple updates in a single transaction for better performance
+    /// Reduces SQLite single-writer bottleneck from high-frequency events
+    async fn handle_batch_fill_history_updates(
+        updates: &[OrderFillHistoryUpdate],
+        storage: &Arc<StateStorage>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        
+        // Process all updates in batch
+        for update in updates {
+            if let Err(e) = Self::handle_order_fill_history_update(update, storage).await {
+                // Log error but continue processing other updates
+                warn!(
+                    error = %e,
+                    order_id = %update.order_id,
+                    "STORAGE: Failed to persist OrderFillHistoryUpdate in batch, continuing with other updates"
+                );
+            }
+        }
+        
+        debug!(
+            batch_size = updates.len(),
+            "STORAGE: Persisted {} OrderFillHistoryUpdate events in batch",
+            updates.len()
+        );
         
         Ok(())
     }

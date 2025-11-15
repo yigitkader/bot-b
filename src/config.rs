@@ -382,6 +382,25 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             ));
         }
     }
+    
+    // CRITICAL: Cross margin mode validation
+    // TP/SL PnL calculation in follow_orders.rs assumes isolated margin
+    // Cross margin uses shared account equity, which requires different PnL calculation
+    // Formula for isolated: PnL% = PriceChange% × Leverage
+    // Formula for cross: PnL% = (PriceChange% × PositionNotional) / TotalAccountEquity
+    // Using isolated formula with cross margin causes incorrect TP/SL triggers:
+    // - Premature or delayed TP/SL triggers
+    // - Incorrect risk management
+    // - Potential financial losses
+    if !cfg.risk.use_isolated_margin {
+        return Err(anyhow!(
+            "CRITICAL: Cross margin mode is NOT supported for TP/SL. \
+             PnL calculation in follow_orders.rs assumes isolated margin. \
+             Cross margin requires different PnL calculation formula that accounts for shared account equity. \
+             Please set risk.use_isolated_margin: true in config.yaml"
+        ));
+    }
+    
     // Also validate exec.default_leverage
     if cfg.exec.default_leverage == 0 {
         return Err(anyhow!("exec.default_leverage must be greater than 0"));
@@ -478,15 +497,47 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // ⚠️ CRITICAL: Validate hedge mode configuration
-    // Hedge mode support is incomplete - warn user if enabled
+    // CRITICAL: Validate hedge mode configuration
+    // Hedge mode support is incomplete and causes system failures
+    // 
+    // Problem: Current implementation cannot handle hedge mode correctly
+    // - Position struct only supports single position per symbol (one qty, one entry)
+    // - TP/SL tracking is symbol-based, not position-side-based
+    // - If both LONG and SHORT positions exist, only one is tracked (the other is lost)
+    // - flatten_position closes ALL positions for the symbol (both LONG and SHORT)
+    // - Position tracking is incomplete - LONG and SHORT should be tracked separately
+    // 
+    // This causes:
+    // - Incorrect TP/SL triggers (only one position tracked)
+    // - Unintended position closures (both LONG and SHORT closed when closing one)
+    // - Position data loss (one position ignored)
+    // - System instability and potential financial losses
+    // 
+    // Full hedge mode support requires:
+    // - Position struct to support multiple positions per symbol (LONG and SHORT separately)
+    // - Separate TP/SL tracking for LONG and SHORT positions
+    // - position_id-based closing (CloseRequest.position_id)
+    // - Separate position tracking in ORDERING state
+    // - HashMap<(String, PositionSide), PositionInfo> for TP/SL tracking
     if cfg.binance.hedge_mode {
-        eprintln!("⚠️  WARNING: Hedge mode (hedge_mode=true) is enabled but support is incomplete.");
-        eprintln!("   - Position tracking only supports one position per symbol");
-        eprintln!("   - TP/SL will only work for one position (LONG or SHORT)");
-        eprintln!("   - Closing a position will close BOTH LONG and SHORT");
-        eprintln!("   - CloseRequest.position_id is not used");
-        eprintln!("   RECOMMENDATION: Use hedge_mode=false until full support is implemented.");
+        return Err(anyhow!(
+            "CRITICAL: Hedge mode (hedge_mode=true) is NOT supported. \
+             Current implementation cannot handle hedge mode correctly and will cause system failures. \
+             \
+             Limitations: \
+             - Position struct only supports single position per symbol \
+             - TP/SL tracking is symbol-based, not position-side-based \
+             - If both LONG and SHORT positions exist, only one is tracked \
+             - flatten_position closes ALL positions (both LONG and SHORT) \
+             \
+             Please set binance.hedge_mode: false in config.yaml \
+             \
+             Full hedge mode support requires significant architectural changes: \
+             - Position struct to support multiple positions per symbol \
+             - Separate TP/SL tracking for LONG and SHORT \
+             - position_id-based closing \
+             - Separate position tracking in ORDERING state"
+        ));
     }
 
     // ⚠️ CRITICAL: Validate margin mode configuration

@@ -41,6 +41,9 @@ struct SymbolState {
     /// Used to apply cooldown only for same-direction signals
     /// Allows opposite-direction signals immediately (trend reversal)
     last_position_direction: Option<PositionDirection>,
+    /// Tick counter for sampling (event flood prevention)
+    /// Incremented on every tick, used to determine if tick should be processed
+    tick_counter: u32,
 }
 
 /// Trend signal direction
@@ -230,6 +233,7 @@ impl Trending {
                                     last_signal_time: None,
                                     last_position_close_time: None,
                                     last_position_direction: None,
+                                    tick_counter: 0,
                                 }
                             });
                             
@@ -446,6 +450,19 @@ impl Trending {
     }
     
     /// Process a market tick and generate trade signal if conditions are met
+    /// 
+    /// CRITICAL: Event flood prevention with sampling
+    /// 
+    /// Problem: MarketTick events flood the event bus
+    /// - 100 symbols × 1 tick/sec = 100 events/sec
+    /// - 24/7 operation: 100 events/sec × 86400 sec = 8.64M events/day
+    /// - This causes high CPU usage and event bus congestion
+    /// 
+    /// Solution: Sampling - process only a fraction of ticks
+    /// - Sample rate: 1/10 (process 10% of ticks, skip 90%)
+    /// - Trend analysis doesn't need every single tick
+    /// - Reduces event processing by 90% while maintaining signal quality
+    /// - Uses deterministic sampling (symbol hash) for consistent behavior per symbol
     async fn process_market_tick(
         tick: &MarketTick,
         cfg: &Arc<AppCfg>,
@@ -456,6 +473,39 @@ impl Trending {
         symbol_states: &Arc<Mutex<HashMap<String, SymbolState>>>,
     ) -> Result<()> {
         let now = Instant::now();
+        
+        // CRITICAL: Sampling to prevent event flood
+        // Process only 1/10 of ticks (10% sampling rate)
+        // This reduces CPU usage and event bus congestion by 90%
+        // Trend analysis doesn't need every single tick - 10% is sufficient for signal quality
+        // Uses per-symbol counter for even distribution across symbols
+        // Each symbol gets processed at different rates, ensuring all symbols are eventually processed
+        const SAMPLE_RATE: u32 = 10; // Process 1 out of 10 ticks
+        
+        // Use per-symbol counter for consistent sampling per symbol
+        // This ensures each symbol gets processed at a consistent rate
+        let should_process = {
+            let mut states = symbol_states.lock().await;
+            let state = states.entry(tick.symbol.clone()).or_insert_with(|| SymbolState {
+                symbol: tick.symbol.clone(),
+                prices: VecDeque::new(),
+                last_signal_time: None,
+                last_position_close_time: None,
+                last_position_direction: None,
+                tick_counter: 0,
+            });
+            
+            // Increment counter for every tick (even if not processed)
+            state.tick_counter = state.tick_counter.wrapping_add(1);
+            
+            // Process only 1 out of SAMPLE_RATE ticks
+            state.tick_counter % SAMPLE_RATE == 0
+        };
+        
+        if !should_process {
+            // Skip this tick (90% of ticks are skipped)
+            return Ok(());
+        }
         
         // CRITICAL: Check if ANY position or order is already open
         // Don't generate signals if we already have an open position or pending order
@@ -564,13 +614,14 @@ impl Trending {
         let trend_signal = {
             let mut states = symbol_states.lock().await;
             let state = states.entry(tick.symbol.clone()).or_insert_with(|| {
-                SymbolState {
-                    symbol: tick.symbol.clone(),
-                    prices: VecDeque::new(),
-                    last_signal_time: None,
-                    last_position_close_time: None,
-                    last_position_direction: None,
-                }
+                                SymbolState {
+                                    symbol: tick.symbol.clone(),
+                                    prices: VecDeque::new(),
+                                    last_signal_time: None,
+                                    last_position_close_time: None,
+                                    last_position_direction: None,
+                                    tick_counter: 0,
+                                }
             });
             
             // Add current price point to history

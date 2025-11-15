@@ -107,6 +107,12 @@ impl FollowOrders {
     /// - Triggers CloseRequest when TP or SL thresholds are reached
     /// - Removes positions from tracking immediately after trigger to prevent duplicates
     ///
+    /// # Errors
+    ///
+    /// Returns `Err` if cross margin mode is detected. Cross margin is not supported because
+    /// TP/SL PnL calculation assumes isolated margin. Cross margin requires different PnL formula
+    /// that accounts for shared account equity across all positions.
+    ///
     /// # Example
     ///
     /// ```no_run
@@ -115,6 +121,19 @@ impl FollowOrders {
     /// // Service is now tracking positions and monitoring TP/SL
     /// ```
     pub async fn start(&self) -> Result<()> {
+        // CRITICAL: Validate margin mode before starting
+        // TP/SL PnL calculation assumes isolated margin
+        // Cross margin requires different PnL calculation that accounts for shared account equity
+        if !self.cfg.risk.use_isolated_margin {
+            return Err(anyhow!(
+                "CRITICAL: Cross margin mode is NOT supported for TP/SL. \
+                 PnL calculation assumes isolated margin. \
+                 Cross margin uses shared account equity across all positions, which requires: \
+                 PnL% = (PriceChange% × PositionNotional) / TotalAccountEquity \
+                 instead of: PnL% = PriceChange% × Leverage \
+                 Please set risk.use_isolated_margin: true in config.yaml"
+            ));
+        }
         let cfg = self.cfg.clone();
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
@@ -403,71 +422,56 @@ impl FollowOrders {
         // Apply leverage to get gross PnL percentage (without commission)
         // Gross PnL% = PriceChange% * Leverage
         // 
-        // ✅ CRITICAL: This calculation is correct ONLY for ISOLATED MARGIN mode
+        // CRITICAL: This calculation is correct ONLY for ISOLATED MARGIN mode
         // In isolated margin, each position has its own margin and leverage applies directly:
         // - Position margin = Notional / Leverage
         // - PnL% = PriceChange% * Leverage (correct for isolated margin)
         //
-        // ⚠️ CRITICAL WARNING: This calculation is INCORRECT for CROSS MARGIN mode
-        // Cross margin uses shared account equity across all positions:
-        // - Total account equity is shared between all positions
-        // - Effective leverage might differ from position leverage
-        // - PnL calculation needs to account for total account balance and margin allocation
-        // - Formula should be: PnL% = (PriceChange% * PositionNotional) / TotalAccountEquity
-        // 
-        // Current implementation assumes use_isolated_margin: true (from config)
+        // Cross margin mode is NOT supported and is validated at startup
         // If cross margin is used, TP/SL trigger levels will be WRONG, leading to:
         // - Premature or delayed TP/SL triggers
         // - Incorrect risk management
         // - Potential financial losses
-        if !cfg.risk.use_isolated_margin {
-            error!(
-                symbol = %tick.symbol,
-                "FOLLOW_ORDERS: CRITICAL - Cross margin mode detected but TP/SL PnL calculation assumes isolated margin. TP/SL trigger levels will be incorrect!"
-            );
-            // Continue with calculation but log error - user should fix config
-        }
+        // 
+        // Cross margin would require: PnL% = (PriceChange% * PositionNotional) / TotalAccountEquity
+        // This is not implemented because it requires real-time account equity tracking
+        // and complex margin allocation calculations across all positions.
         
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         
-        // ✅ CRITICAL FIX: Calculate commission correctly using is_maker from OrderUpdate
+        // CRITICAL: Calculate commission correctly using is_maker from OrderUpdate
         // 
-        // SOLUTION: Use is_maker flag from OrderUpdate to determine commission type
-        // - If all fills were maker (is_maker = Some(true)), use maker commission
-        // - If any fill was taker (is_maker = Some(false)), use taker commission
-        // - If is_maker is None (OrderUpdate hasn't arrived yet), estimate based on TIF:
-        //   * If TIF is "post_only", likely maker (use maker commission)
-        //   * Otherwise, use taker commission (conservative approach)
-        // Post-only orders are typically maker, but can become taker if they cross the spread
+        // Problem: is_maker may be None if OrderUpdate hasn't arrived yet
+        // - Post-only orders are typically maker, but can become taker if they cross the spread
+        // - If we assume maker commission but order was actually taker, TP triggers too early
+        // - If we assume taker commission but order was actually maker, TP triggers slightly later (acceptable)
+        // 
+        // Solution: Conservative approach - always use taker commission when is_maker is unknown
+        // - If is_maker = Some(true), use maker commission (confirmed)
+        // - If is_maker = Some(false) or None, use taker commission (conservative)
+        // 
+        // Why conservative:
+        // - Better to trigger TP slightly later than too early
+        // - Early trigger = money loss (commission underestimated)
+        // - Late trigger = opportunity cost (acceptable, no money loss)
+        // - Post-only orders can become taker if spread crosses, so assuming maker is risky
         //
         // Exit commission (TP/SL) is always Taker (market order with reduceOnly) - guaranteed.
         let entry_commission_pct = match position.is_maker {
             Some(true) => {
                 // All fills were maker - use maker commission (lower, better for PnL)
+                // This is confirmed from OrderUpdate, safe to use
                 Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
                     .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
             }
-            Some(false) => {
-                // Any fill was taker - use taker commission
+            Some(false) | None => {
+                // Any fill was taker OR is_maker is unknown - use taker commission (conservative)
+                // Conservative approach prevents early TP trigger due to commission underestimation
+                // If is_maker is None, OrderUpdate hasn't arrived yet - better to be conservative
+                // Post-only orders can become taker if spread crosses, so assuming maker is risky
                 Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
                     .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
-            }
-            None => {
-                // is_maker henüz bilinmiyor - TIF'e göre tahmin et
-                // Post-only orders are typically maker, but can become taker if they cross the spread
-                if cfg.exec.tif == "post_only" {
-                    // Post-only genelde maker olur
-                    Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
-                        .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
-                } else {
-                    // Conservative yaklaşım - taker commission kullan
-                    // This ensures we don't underestimate commission, which would cause TP/SL to trigger
-                    // too early and result in money loss. Better to be conservative and trigger slightly
-                    // later than to trigger too early.
-                    Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-                        .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
-                }
             }
         };
         
