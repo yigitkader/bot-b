@@ -272,6 +272,9 @@ impl Ordering {
     /// // Service is now running and will place orders when TradeSignal events are received
     /// ```
     pub async fn start(&self) -> Result<()> {
+        // ✅ CRITICAL: State restore is now handled by STORAGE module via event bus
+        // StorageModule will restore OrderingState on startup and update SharedState
+        
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let connection = self.connection.clone();
@@ -347,6 +350,7 @@ impl Ordering {
         
         // Spawn task for OrderUpdate events (state sync)
         let state_order = shared_state.clone();
+        let connection_order = self.connection.clone();
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -361,7 +365,7 @@ impl Ordering {
                             break;
                         }
                         
-                        Self::handle_order_update(&update, &state_order).await;
+                        Self::handle_order_update(&update, &state_order, &event_bus_order).await;
                     }
                     Err(_) => break,
                 }
@@ -370,6 +374,7 @@ impl Ordering {
         
         // Spawn task for PositionUpdate events (state sync)
         let state_pos = shared_state.clone();
+        let connection_pos = self.connection.clone();
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -384,7 +389,7 @@ impl Ordering {
                             break;
                         }
                         
-                        Self::handle_position_update(&update, &state_pos).await;
+                        Self::handle_position_update(&update, &state_pos, &event_bus_pos).await;
                     }
                     Err(_) => break,
                 }
@@ -552,8 +557,23 @@ impl Ordering {
             }
         }; // Lock released here, but balance is already reserved (prevents other threads from placing orders)
         
+        // ✅ CRITICAL: Balance Reservation Release Checklist
         // Balance reserved - will be released automatically when balance_reservation is dropped
         // Explicit release() should be called before returning (Drop will warn if forgotten)
+        // 
+        // ALL early return paths MUST call balance_reservation.release().await:
+        // 1. ✅ Line ~603: Price fetch took too long (spread may have changed during fetch)
+        // 2. ✅ Line ~626: Stale spread validation - current spread out of acceptable range
+        // 3. ✅ Line ~654: Price fetch error during spread validation
+        // 4. ✅ Line ~673: Fresh spread validation - signal spread out of acceptable range
+        // 5. ✅ Line ~722: Order placement permanent error (returns early for performance)
+        // 6. ✅ Line ~751: Order placement retries exhausted (returns early for performance)
+        // 7. ✅ Line ~803: Success path - released after state is updated
+        // 8. ✅ Line ~827: Race condition - released ONLY if cancel succeeds (prevents double-spend)
+        //    ⚠️ If cancel fails, balance is kept reserved to prevent double-spend (acceptable leak)
+        //
+        // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
+        // Missing releases cause balance leaks and prevent future orders from being placed.
         
         // ✅ CRITICAL: Re-validate spread before order placement
         // Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
@@ -568,6 +588,27 @@ impl Ordering {
             // Spread data is stale, fetch current spread
             match connection.get_current_prices(&signal.symbol).await {
                 Ok((bid, ask)) => {
+                    // ✅ CRITICAL FIX: Check if price fetch took too long
+                    // Network delay can be 200-500ms, during which spread may have changed significantly
+                    // If fetch took too long, abort signal to prevent using stale spread data
+                    let fetch_timestamp = Instant::now();
+                    let total_delay = fetch_timestamp.duration_since(signal.spread_timestamp);
+                    const MAX_TOTAL_DELAY_MS: u64 = 1500; // 1.5 seconds max total delay (original age + fetch time)
+                    
+                    if total_delay.as_millis() as u64 > MAX_TOTAL_DELAY_MS {
+                        warn!(
+                            symbol = %signal.symbol,
+                            total_delay_ms = total_delay.as_millis(),
+                            original_spread_age_ms = spread_age.as_millis(),
+                            fetch_delay_ms = total_delay.as_millis() - spread_age.as_millis(),
+                            max_delay_ms = MAX_TOTAL_DELAY_MS,
+                            "ORDERING: Price fetch took too long, spread may have changed during fetch, aborting signal"
+                        );
+                        // Release balance reservation before returning
+                        balance_reservation.release().await;
+                        return Ok(());
+                    }
+                    
                     use rust_decimal::Decimal;
                     let current_spread_bps = ((ask.0 - bid.0) / bid.0) * Decimal::from(10000);
                     let current_spread_bps_f64 = current_spread_bps.to_f64().unwrap_or(0.0);
@@ -581,7 +622,7 @@ impl Ordering {
                             symbol = %signal.symbol,
                             original_spread_bps = signal.spread_bps,
                             current_spread_bps = current_spread_bps_f64,
-                            spread_age_ms = spread_age.as_millis(),
+                            total_delay_ms = total_delay.as_millis(),
                             min_spread = min_acceptable_spread_bps,
                             max_spread = max_acceptable_spread_bps,
                             "ORDERING: Spread changed and is now out of acceptable range, skipping order placement"
@@ -599,6 +640,7 @@ impl Ordering {
                             original_spread_bps = signal.spread_bps,
                             current_spread_bps = current_spread_bps_f64,
                             spread_change_bps = spread_change,
+                            total_delay_ms = total_delay.as_millis(),
                             "ORDERING: Spread changed significantly since signal generation"
                         );
                     }
@@ -656,15 +698,19 @@ impl Ordering {
             tif,
         };
         
-        let mut last_error: Option<anyhow::Error> = None;
-        
         // Attempt order placement with retry logic
-        let order_result: Result<String, anyhow::Error> = {
-            let mut result: Option<Result<String, anyhow::Error>> = None;
+        // ✅ CRITICAL: Permanent errors return early with balance release for better performance
+        let order_id = {
+            let mut last_error: Option<anyhow::Error> = None;
+            let mut order_id_result: Option<String> = None;
+            
             for attempt in 0..MAX_RETRIES {
                 match connection.send_order(command.clone()).await {
                     Ok(id) => {
-                        result = Some(Ok(id));
+                        // ✅ Success: Keep balance reserved until state is updated
+                        // This prevents race condition where another thread could reserve balance
+                        // and place duplicate order between order placement and state update
+                        order_id_result = Some(id);
                         break; // Success, exit retry loop
                     }
                     Err(e) => {
@@ -676,8 +722,10 @@ impl Ordering {
                                 attempt = attempt + 1,
                                 "ORDERING: Permanent error, not retrying"
                             );
-                            result = Some(Err(e));
-                            break;
+                            // ✅ CRITICAL: Permanent error - release balance and return early
+                            // This is more efficient than breaking and matching later
+                            balance_reservation.release().await;
+                            return Err(e);
                         }
                         
                         // Store error for final fallback (only if all retries fail)
@@ -704,30 +752,23 @@ impl Ordering {
                                 attempt = attempt + 1,
                                 "ORDERING: All retries exhausted"
                             );
-                            result = Some(Err(e));
-                            break;
+                            // ✅ CRITICAL: All retries exhausted - release balance and return
+                            balance_reservation.release().await;
+                            return Err(e);
                         }
                     }
                 }
             }
-            result.unwrap_or_else(|| {
-                Err(last_error.unwrap_or_else(|| anyhow!("Unknown error after retries")))
-            })
-        };
-        
-        // Handle order result - ensure balance is released in ALL paths (success and failure)
-        let order_id = match order_result {
-            Ok(id) => {
-                // ✅ Success: Keep balance reserved until state is updated
-                // This prevents race condition where another thread could reserve balance
-                // and place duplicate order between order placement and state update
-                id
-            }
-            Err(e) => {
-                // ✅ CRITICAL: Failure: Balance was NOT used, MUST release reservation immediately
-                // This prevents memory leak where reserved balance accumulates
-                balance_reservation.release().await;
-                return Err(e);
+            
+            // Extract order_id if successful, otherwise return error
+            match order_id_result {
+                Some(id) => id,
+                None => {
+                    // This should never be reached if all paths above return or break correctly
+                    // But Rust requires this for the block to compile
+                    balance_reservation.release().await;
+                    return Err(last_error.unwrap_or_else(|| anyhow!("Unknown error after retries")));
+                }
             }
         };
         
@@ -753,6 +794,11 @@ impl Ordering {
                 // This ensures subsequent OrderUpdate events are compared against this timestamp
                 state_guard.last_order_update_timestamp = Some(Instant::now());
                 
+                // ✅ CRITICAL: Publish OrderingStateUpdate event for STORAGE module
+                let state_to_publish = state_guard.clone();
+                drop(state_guard); // Release lock before async call
+                Self::publish_ordering_state_update(&state_to_publish, &event_bus);
+                
                 info!(
                     symbol = %signal.symbol,
                     side = ?signal.side,
@@ -763,7 +809,6 @@ impl Ordering {
                 // ✅ CRITICAL: Release balance AFTER state is updated
                 // This ensures no other thread can reserve balance and place duplicate order
                 // State is now updated, so other threads will see the open order and skip
-                drop(state_guard); // Release lock before async call
                 balance_reservation.release().await;
             } else {
                 // Another thread placed an order/position while we were making the network call
@@ -777,23 +822,33 @@ impl Ordering {
                 // Cancel the order we just placed (lock released before async call)
                 drop(state_guard);
                 
-                // ✅ CRITICAL: Release balance before canceling order
-                // Balance was reserved but order won't be used (will be canceled)
-                balance_reservation.release().await;
-                
-                if let Err(cancel_err) = connection.cancel_order(&order_id, &signal.symbol).await {
-                    warn!(
-                        error = %cancel_err,
-                        symbol = %signal.symbol,
-                        order_id = %order_id,
-                        "ORDERING: Failed to cancel duplicate order after race condition"
-                    );
-                } else {
-                    info!(
-                        symbol = %signal.symbol,
-                        order_id = %order_id,
-                        "ORDERING: Successfully canceled duplicate order after race condition"
-                    );
+                // ✅ CRITICAL FIX: Cancel FIRST, then release balance
+                // If cancel fails, order remains on exchange - keeping balance reserved prevents double-spend
+                // Balance leak is acceptable here (prevents double-spend risk)
+                match connection.cancel_order(&order_id, &signal.symbol).await {
+                    Ok(()) => {
+                        info!(
+                            symbol = %signal.symbol,
+                            order_id = %order_id,
+                            "ORDERING: Successfully canceled duplicate order after race condition"
+                        );
+                        // ✅ Cancel succeeded - now safe to release balance
+                        balance_reservation.release().await;
+                    }
+                    Err(cancel_err) => {
+                        // ❌ CRITICAL: Cancel failed - order is still active on exchange
+                        // DO NOT release balance - keep it reserved to prevent double-spend
+                        // If we release balance here, another thread could use it and place duplicate order
+                        warn!(
+                            error = %cancel_err,
+                            symbol = %signal.symbol,
+                            order_id = %order_id,
+                            "ORDERING: Failed to cancel duplicate order after race condition, keeping balance reserved to prevent double-spend"
+                        );
+                        // Balance leak is acceptable here (prevents double-spend)
+                        // Alternative: Track this order and retry cancel later, then release balance
+                        // For now, keeping balance reserved is safer than risking double-spend
+                    }
                 }
                 
                 return Ok(());
@@ -929,12 +984,46 @@ impl Ordering {
         }
     }
 
+    /// Helper function to publish OrderingStateUpdate event
+    /// This is called after state changes to ensure persistence across restarts via STORAGE module
+    fn publish_ordering_state_update(
+        state: &OrderingState,
+        event_bus: &Arc<EventBus>,
+    ) {
+        use crate::event_bus::{OpenOrderSnapshot, OpenPositionSnapshot, OrderingStateUpdate};
+        
+        let update = OrderingStateUpdate {
+            open_position: state.open_position.as_ref().map(|pos| {
+                OpenPositionSnapshot {
+                    symbol: pos.symbol.clone(),
+                    direction: format!("{:?}", pos.direction),
+                    qty: pos.qty.0.to_string(),
+                    entry_price: pos.entry_price.0.to_string(),
+                }
+            }),
+            open_order: state.open_order.as_ref().map(|order| {
+                OpenOrderSnapshot {
+                    symbol: order.symbol.clone(),
+                    order_id: order.order_id.clone(),
+                    side: format!("{:?}", order.side),
+                    qty: order.qty.0.to_string(),
+                }
+            }),
+            timestamp: Instant::now(),
+        };
+        
+        if let Err(e) = event_bus.ordering_state_update_tx.send(update) {
+            warn!(error = ?e, "ORDERING: Failed to publish OrderingStateUpdate event (no subscribers)");
+        }
+    }
+    
     /// Handle OrderUpdate event (state sync)
     /// CRITICAL: Timestamp-based version control prevents stale updates
     /// Only applies updates that are newer than the last known update
     async fn handle_order_update(
         update: &OrderUpdate,
         shared_state: &Arc<SharedState>,
+        connection: Option<&Arc<Connection>>,
     ) {
         let mut state_guard = shared_state.ordering_state.lock().await;
         
@@ -1011,6 +1100,11 @@ impl Ordering {
                         // Update timestamp after state change
                         state_guard.last_order_update_timestamp = Some(update.timestamp);
                         
+                        // ✅ CRITICAL: Publish state update event for STORAGE module
+                        let state_to_publish = state_guard.clone();
+                        drop(state_guard);
+                        Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                        
                         info!(
                             symbol = %update.symbol,
                             order_id = %update.order_id,
@@ -1023,6 +1117,11 @@ impl Ordering {
                         
                         // Update timestamp after state change
                         state_guard.last_order_update_timestamp = Some(update.timestamp);
+                        
+                        // ✅ CRITICAL: Publish state update event for STORAGE module
+                        let state_to_publish = state_guard.clone();
+                        drop(state_guard);
+                        Self::publish_ordering_state_update(&state_to_publish, event_bus);
                         
                         info!(
                             symbol = %update.symbol,
@@ -1076,6 +1175,7 @@ impl Ordering {
     async fn handle_position_update(
         update: &PositionUpdate,
         shared_state: &Arc<SharedState>,
+        event_bus: &Arc<EventBus>,
     ) {
         let mut state_guard = shared_state.ordering_state.lock().await;
         
@@ -1125,6 +1225,11 @@ impl Ordering {
                     // Position closed - always trust this (from exchange)
                     state_guard.open_position = None;
                     state_guard.last_position_update_timestamp = Some(update.timestamp);
+                    
+                    // ✅ CRITICAL: Publish state update event for STORAGE module
+                    let state_to_publish = state_guard.clone();
+                    drop(state_guard);
+                    Self::publish_ordering_state_update(&state_to_publish, event_bus);
                     
                     info!(
                         symbol = %update.symbol,
@@ -1195,6 +1300,11 @@ impl Ordering {
                 });
                 state_guard.last_position_update_timestamp = Some(update.timestamp);
                 
+                // ✅ CRITICAL: Persist state after change
+                let state_to_publish = state_guard.clone();
+                drop(state_guard);
+                Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                
                 info!(
                     symbol = %update.symbol,
                     qty_diff = %qty_diff,
@@ -1225,6 +1335,11 @@ impl Ordering {
             });
             state_guard.last_position_update_timestamp = Some(update.timestamp);
             
+            // ✅ CRITICAL: Persist state after change
+            let state_to_publish = state_guard.clone();
+            drop(state_guard);
+            Self::publish_ordering_state_update(&state_to_publish, event_bus);
+            
             info!(
                 symbol = %update.symbol,
                 "ORDERING: Position created from PositionUpdate"
@@ -1232,6 +1347,7 @@ impl Ordering {
         } else {
             // Position is closed and no existing position - just update timestamp
             state_guard.last_position_update_timestamp = Some(update.timestamp);
+            // No state change, no need to persist
         }
     }
 }

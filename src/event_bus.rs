@@ -133,6 +133,63 @@ pub struct BalanceUpdate {
     pub timestamp: Instant, // Not serialized, only for runtime use
 }
 
+/// Ordering state update event - published by ORDERING
+/// Published when OrderingState changes (order placed, filled, canceled, position opened/closed)
+/// STORAGE module listens to this event to persist state
+#[derive(Clone, Debug, Serialize)]
+pub struct OrderingStateUpdate {
+    pub open_position: Option<OpenPositionSnapshot>,
+    pub open_order: Option<OpenOrderSnapshot>,
+    #[serde(skip)]
+    pub timestamp: Instant, // Not serialized, only for runtime use
+}
+
+/// Snapshot of open position for persistence
+#[derive(Clone, Debug, Serialize)]
+pub struct OpenPositionSnapshot {
+    pub symbol: String,
+    pub direction: String, // "Long" or "Short"
+    pub qty: String, // Decimal as string
+    pub entry_price: String, // Decimal as string
+}
+
+/// Snapshot of open order for persistence
+#[derive(Clone, Debug, Serialize)]
+pub struct OpenOrderSnapshot {
+    pub symbol: String,
+    pub order_id: String,
+    pub side: String, // "Buy" or "Sell"
+    pub qty: String, // Decimal as string
+}
+
+/// Order fill history update event - published by CONNECTION
+/// Published when order fill history changes (new fill, order closed)
+/// STORAGE module listens to this event to persist fill history
+#[derive(Clone, Debug, Serialize)]
+pub struct OrderFillHistoryUpdate {
+    pub order_id: String,
+    pub symbol: String,
+    pub action: FillHistoryAction,
+    pub data: Option<FillHistoryData>, // None for Remove action
+    #[serde(skip)]
+    pub timestamp: Instant, // Not serialized, only for runtime use
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub enum FillHistoryAction {
+    Save,   // Save or update fill history
+    Remove, // Remove fill history (order closed)
+}
+
+/// Fill history data for persistence
+#[derive(Clone, Debug, Serialize)]
+pub struct FillHistoryData {
+    pub total_filled_qty: String, // Decimal as string
+    pub weighted_price_sum: String, // Decimal as string
+    pub maker_fill_count: u32,
+    pub total_fill_count: u32,
+}
+
 /// Log event - published by any module
 #[derive(Clone, Debug, Serialize)]
 pub struct LogEvent {
@@ -174,6 +231,10 @@ pub struct EventBus {
     
     pub balance_update_tx: broadcast::Sender<BalanceUpdate>,
     
+    pub ordering_state_update_tx: broadcast::Sender<OrderingStateUpdate>,
+    
+    pub order_fill_history_update_tx: broadcast::Sender<OrderFillHistoryUpdate>,
+    
     pub log_event_tx: mpsc::UnboundedSender<LogEvent>,
 }
 
@@ -210,6 +271,8 @@ impl EventBus {
         let (order_update_tx, _) = broadcast::channel(cfg.order_update_buffer);
         let (position_update_tx, _) = broadcast::channel(cfg.position_update_buffer);
         let (balance_update_tx, _) = broadcast::channel(cfg.balance_update_buffer);
+        let (ordering_state_update_tx, _) = broadcast::channel(1000); // Buffer for state updates
+        let (order_fill_history_update_tx, _) = broadcast::channel(1000); // Buffer for fill history updates
         let (log_event_tx, _) = mpsc::unbounded_channel();
         
         Self {
@@ -219,6 +282,8 @@ impl EventBus {
             order_update_tx,
             position_update_tx,
             balance_update_tx,
+            ordering_state_update_tx,
+            order_fill_history_update_tx,
             log_event_tx,
         }
     }
@@ -320,6 +385,32 @@ impl EventBus {
         self.balance_update_tx.subscribe()
     }
     
+    /// Subscribe to ordering state update events.
+    ///
+    /// Returns a new broadcast receiver for OrderingStateUpdate events published by ORDERING module
+    /// when OrderingState changes (order placed, filled, canceled, position opened/closed).
+    /// STORAGE module listens to this event to persist state.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `broadcast::Receiver<OrderingStateUpdate>` for receiving state updates.
+    pub fn subscribe_ordering_state_update(&self) -> broadcast::Receiver<OrderingStateUpdate> {
+        self.ordering_state_update_tx.subscribe()
+    }
+    
+    /// Subscribe to order fill history update events.
+    ///
+    /// Returns a new broadcast receiver for OrderFillHistoryUpdate events published by CONNECTION module
+    /// when order fill history changes (new fill, order closed).
+    /// STORAGE module listens to this event to persist fill history.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `broadcast::Receiver<OrderFillHistoryUpdate>` for receiving fill history updates.
+    pub fn subscribe_order_fill_history_update(&self) -> broadcast::Receiver<OrderFillHistoryUpdate> {
+        self.order_fill_history_update_tx.subscribe()
+    }
+    
     /// Get health statistics for monitoring event bus status.
     ///
     /// Returns receiver counts for all event channels, which can be used to detect if modules
@@ -347,6 +438,8 @@ impl EventBus {
             order_update_receivers: self.order_update_tx.receiver_count(),
             position_update_receivers: self.position_update_tx.receiver_count(),
             balance_update_receivers: self.balance_update_tx.receiver_count(),
+            ordering_state_update_receivers: self.ordering_state_update_tx.receiver_count(),
+            order_fill_history_update_receivers: self.order_fill_history_update_tx.receiver_count(),
         }
     }
 }
@@ -360,6 +453,8 @@ pub struct EventBusHealth {
     pub order_update_receivers: usize,
     pub position_update_receivers: usize,
     pub balance_update_receivers: usize,
+    pub ordering_state_update_receivers: usize,
+    pub order_fill_history_update_receivers: usize,
 }
 
 impl Default for EventBus {

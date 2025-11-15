@@ -11,4 +11,5 @@ pub mod ordering;
 pub mod follow_orders;
 pub mod balance;
 pub mod logging;
+pub mod storage;
 

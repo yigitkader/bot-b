@@ -502,10 +502,25 @@ impl FollowOrders {
                     timestamp: Instant::now(),
                 };
                 
-                // ✅ CRITICAL: Send CloseRequest FIRST, only remove position if successful
+                // ✅ CRITICAL: Send CloseRequest FIRST, only remove position if successful AND ORDERING is alive
                 match event_bus.close_request_tx.send(close_request) {
                     Ok(()) => {
-                        // CloseRequest sent successfully - now safe to remove position from tracking
+                        // ✅ CRITICAL FIX: Check if ORDERING module is still alive (has subscribers)
+                        // If ORDERING has shutdown, receiver_count() will be 0
+                        // In this case, don't remove position - let it retry when ORDERING restarts
+                        let receiver_count = event_bus.close_request_tx.receiver_count();
+                        if receiver_count == 0 {
+                            warn!(
+                                symbol = %tick.symbol,
+                                net_pnl_pct = net_pnl_pct_f64,
+                                tp_pct,
+                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position will retry on next tick"
+                            );
+                            // Don't remove position from tracking - retry later when ORDERING is back
+                            return Ok(());
+                        }
+                        
+                        // CloseRequest sent successfully AND ORDERING is alive - now safe to remove position from tracking
                         // This prevents duplicate triggers while ensuring close request is sent
                         {
                             let mut positions_guard = positions.write().await;
@@ -562,10 +577,25 @@ impl FollowOrders {
                     timestamp: Instant::now(),
                 };
                 
-                // ✅ CRITICAL: Send CloseRequest FIRST, only remove position if successful
+                // ✅ CRITICAL: Send CloseRequest FIRST, only remove position if successful AND ORDERING is alive
                 match event_bus.close_request_tx.send(close_request) {
                     Ok(()) => {
-                        // CloseRequest sent successfully - now safe to remove position from tracking
+                        // ✅ CRITICAL FIX: Check if ORDERING module is still alive (has subscribers)
+                        // If ORDERING has shutdown, receiver_count() will be 0
+                        // In this case, don't remove position - let it retry when ORDERING restarts
+                        let receiver_count = event_bus.close_request_tx.receiver_count();
+                        if receiver_count == 0 {
+                            warn!(
+                                symbol = %tick.symbol,
+                                net_pnl_pct = net_pnl_pct_f64,
+                                sl_pct,
+                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position will retry on next tick"
+                            );
+                            // Don't remove position from tracking - retry later when ORDERING is back
+                            return Ok(());
+                        }
+                        
+                        // CloseRequest sent successfully AND ORDERING is alive - now safe to remove position from tracking
                         // This prevents duplicate triggers while ensuring close request is sent
                         {
                             let mut positions_guard = positions.write().await;

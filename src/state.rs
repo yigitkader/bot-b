@@ -118,8 +118,13 @@ impl BalanceStore {
     /// CRITICAL: This method atomically checks available balance and reserves it in a single operation
     /// Do not call available() separately before this method - it's already included here
     pub fn try_reserve(&mut self, asset: &str, amount: Decimal) -> bool {
+        // ✅ PERFORMANCE: Single allocation, reused (avoid calling to_uppercase() twice)
+        // High-frequency scenarios (100+ req/s) benefit from this optimization
+        let asset_upper = asset.to_uppercase();
+        let is_usdt = asset_upper == "USDT";
+        
         // Atomic read + reserve: read total and reserved, check, and increment in one operation
-        let (total, reserved) = if asset.to_uppercase() == "USDT" {
+        let (total, reserved) = if is_usdt {
             (self.usdt, self.reserved_usdt)
         } else {
             (self.usdc, self.reserved_usdc)
@@ -127,7 +132,7 @@ impl BalanceStore {
         
         let available = total - reserved;
         if available >= amount {
-            if asset.to_uppercase() == "USDT" {
+            if is_usdt {
                 self.reserved_usdt += amount;
             } else {
                 self.reserved_usdc += amount;

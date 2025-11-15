@@ -36,7 +36,7 @@ use urlencoding::encode;
 // Helper Functions
 // ============================================================================
 
-/// Decimal adımından hassasiyet (ondalık hane sayısı) çıkarır
+/// Extract precision (decimal places) from a decimal step size
 fn decimal_places(step: Decimal) -> usize {
     if step.is_zero() {
         return 0;
@@ -78,6 +78,8 @@ pub struct Connection {
     shared_state: Option<Arc<SharedState>>,
     // Order fill history: order_id -> fill history (for average fill price calculation)
     order_fill_history: Arc<DashMap<String, OrderFillHistory>>,
+    // Persistent storage for state (optional, for restart recovery)
+    storage: Option<Arc<crate::storage::StateStorage>>,
 }
 
 /// Simple rate limiter for REST API calls
@@ -191,6 +193,19 @@ impl Connection {
             cfg.qty_step,
         )?);
         
+        // Storage is managed by StorageModule via event bus
+        // Connection still needs storage for fill history restore (temporary)
+        let storage = match crate::storage::StateStorage::new(None) {
+            Ok(storage) => {
+                debug!("CONNECTION: Storage initialized for fill history restore");
+                Some(Arc::new(storage))
+            }
+            Err(e) => {
+                warn!(error = %e, "CONNECTION: Failed to initialize storage for fill history restore");
+                None
+            }
+        };
+        
         Ok(Self {
             venue,
             cfg,
@@ -199,6 +214,7 @@ impl Connection {
             rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
             shared_state,
             order_fill_history: Arc::new(DashMap::new()),
+            storage,
         })
     }
     
@@ -217,7 +233,14 @@ impl Connection {
             shutdown_flag,
             rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
             shared_state: None,
+            order_fill_history: Arc::new(DashMap::new()),
+            storage: None,
         }
+    }
+    
+    /// Get storage instance (if available)
+    pub fn storage(&self) -> Option<Arc<crate::storage::StateStorage>> {
+        self.storage.clone()
     }
 
     /// Start all connection services and begin receiving market data.
@@ -262,7 +285,34 @@ impl Connection {
     /// This method is async and should be awaited. It will spawn background tasks that continue
     /// running until `shutdown_flag` is set to true.
     pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
-        // Set hedge mode according to config (CRITICAL: must be done before any orders)
+        // State restore is handled by STORAGE module via event bus
+        // For now, we restore fill history directly here (Connection manages its own cache)
+        if let Some(storage) = &self.storage {
+            match storage.restore_order_fill_history().await {
+                Ok(history_entries) => {
+                    for (order_id, history) in history_entries {
+                        let conn_history = OrderFillHistory {
+                            total_filled_qty: history.total_filled_qty,
+                            weighted_price_sum: history.weighted_price_sum,
+                            last_update: history.last_update,
+                            maker_fill_count: history.maker_fill_count,
+                            total_fill_count: history.total_fill_count,
+                        };
+                        self.order_fill_history.insert(order_id, conn_history);
+                    }
+                    info!(
+                        restored_count = self.order_fill_history.len(),
+                        "CONNECTION: Restored {} order fill history entries from persistent storage",
+                        self.order_fill_history.len()
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "CONNECTION: Failed to restore order fill history from storage, continuing without restore");
+                }
+            }
+        }
+        
+        // Set hedge mode according to config (must be done before any orders)
         let hedge_mode = self.cfg.binance.hedge_mode;
         if let Err(e) = self.venue.set_position_side_dual(hedge_mode).await {
             warn!(
@@ -277,7 +327,7 @@ impl Connection {
             );
         }
         
-        // Set leverage and margin type for each symbol (CRITICAL: must be done before any orders)
+        // Set leverage and margin type for each symbol (must be done before any orders)
         // Use cfg.leverage if set, otherwise use cfg.exec.default_leverage
         let leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage);
         let use_isolated_margin = self.cfg.risk.use_isolated_margin;
@@ -304,21 +354,41 @@ impl Connection {
                 );
             }
             
-            // CRITICAL: Verify current leverage and auto-fix if mismatch (if position exists)
-            // This prevents conflicts if exchange has different leverage
+            // Verify current leverage and auto-fix if mismatch (only if position is closed)
+            // Cannot change leverage while position is open - Binance will reject or cause unexpected behavior
             if let Ok(position) = self.venue.get_position(symbol).await {
                 if !position.qty.0.is_zero() {
-                    // Position exists - check if leverage matches
+                    // Position is OPEN - check if leverage matches, but do not try to fix
+                    if position.leverage != leverage {
+                        // Cannot auto-fix leverage while position is open
+                        error!(
+                            symbol = %symbol,
+                            current_leverage = position.leverage,
+                            config_leverage = leverage,
+                            "CONNECTION: CRITICAL - Leverage mismatch detected but position is open! Cannot auto-fix. Please close position manually and restart bot."
+                        );
+                        return Err(anyhow!(
+                            "Leverage mismatch for symbol {}: exchange has {}x but config requires {}x. Cannot change leverage while position is open. Please close position manually and restart bot.",
+                            symbol,
+                            position.leverage,
+                            leverage
+                        ));
+                    } else {
+                        info!(
+                            symbol = %symbol,
+                            leverage,
+                            "CONNECTION: Leverage verified (matches config, position is open)"
+                        );
+                    }
+                } else {
+                    // Position is CLOSED - safe to set leverage
                     if position.leverage != leverage {
                         warn!(
                             symbol = %symbol,
                             current_leverage = position.leverage,
                             config_leverage = leverage,
-                            "CONNECTION: Leverage mismatch detected! Exchange has {}x but config requires {}x. Auto-fixing...",
-                            position.leverage,
-                            leverage
+                            "CONNECTION: Leverage mismatch detected (position is closed). Auto-fixing..."
                         );
-                        // ✅ Auto-fix: Set leverage to match config
                         if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
                             error!(
                                 error = %e,
@@ -342,7 +412,7 @@ impl Connection {
                                     symbol = %symbol,
                                     old_leverage = position.leverage,
                                     new_leverage = leverage,
-                                    "CONNECTION: Leverage mismatch auto-fixed successfully"
+                                    "CONNECTION: Leverage mismatch auto-fixed successfully (position was closed)"
                                 );
                             } else {
                                 warn!(
@@ -357,33 +427,33 @@ impl Connection {
                         info!(
                             symbol = %symbol,
                             leverage,
-                            "CONNECTION: Leverage verified (matches config)"
+                            "CONNECTION: Leverage verified (matches config, position is closed)"
                         );
                     }
                 }
-            }
-            
-            // Set leverage (for new positions or to ensure it's set correctly)
-            if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
-                error!(
-                    error = %e,
-                    symbol = %symbol,
-                    leverage,
-                    "CONNECTION: CRITICAL - Failed to set leverage for symbol. Cannot continue with incorrect leverage."
-                );
-                return Err(anyhow!(
-                    "Failed to set leverage for symbol {}: {}",
-                    symbol,
-                    e
-                ));
             } else {
-                info!(
-                    symbol = %symbol,
-                    leverage,
-                    "CONNECTION: Leverage set successfully for symbol"
-                );
+                // No position exists - safe to set leverage
+                // Set leverage (for new positions or to ensure it's set correctly)
+                if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
+                    error!(
+                        error = %e,
+                        symbol = %symbol,
+                        leverage,
+                        "CONNECTION: CRITICAL - Failed to set leverage for symbol. Cannot continue with incorrect leverage."
+                    );
+                    return Err(anyhow!(
+                        "Failed to set leverage for symbol {}: {}",
+                        symbol,
+                        e
+                    ));
+                } else {
+                    info!(
+                        symbol = %symbol,
+                        leverage,
+                        "CONNECTION: Leverage set successfully for symbol"
+                    );
+                }
             }
-        }
         
         // Start market data stream
         self.start_market_data_stream(symbols.clone()).await?;
@@ -402,20 +472,12 @@ impl Connection {
     }
     
     /// Start periodic cleanup task for order fill history
-    /// Order fill history cleanup task (memory leak prevention only)
+    /// This task is only for memory leak prevention (very old entries).
+    /// Normal cleanup happens immediately when orders close.
     /// 
-    /// ✅ CRITICAL: This task is ONLY for memory leak prevention (very old entries)
-    /// Normal cleanup happens immediately when orders close (see OrderFill event handler)
-    /// 
-    /// This task:
     /// - Only removes entries older than 24 hours (very conservative)
     /// - Protects active orders (never removes history for active orders)
-    /// - Does NOT handle normal cleanup (order close events do that)
-    /// 
-    /// Why this approach:
-    /// - Order close events (Filled/Canceled/Expired) immediately remove history (lines 1034-1043)
-    /// - This task only catches edge cases where history wasn't cleaned up (memory leak prevention)
-    /// - No race condition: we only check age, not order status (active orders are always protected)
+    /// - Does not handle normal cleanup (order close events do that)
     async fn start_order_fill_history_cleanup_task(&self) {
         let order_fill_history = self.order_fill_history.clone();
         let shutdown_flag = self.shutdown_flag.clone();
@@ -434,23 +496,53 @@ impl Connection {
                 let now = Instant::now();
                 let initial_count = order_fill_history.len();
                 
-                // ✅ SIMPLIFIED: Only remove very old entries (memory leak prevention)
-                // Active orders are always protected (never removed)
-                // Normal cleanup happens immediately on order close (OrderFill event handler)
-                // No race condition: we only check age, active orders are always kept
+                // Memory leak prevention with stale cache detection
+                // OPEN_ORDERS_CACHE can become stale if WebSocket disconnects/reconnects
+                // Verify cache freshness by checking history update time
                 order_fill_history.retain(|order_id, history| {
-                    // ✅ CRITICAL: Always protect active orders (regardless of age)
-                    // This prevents any race condition - active orders are never removed
-                    let is_active = OPEN_ORDERS_CACHE.iter().any(|entry| {
+                    // First check: Is order in OPEN_ORDERS_CACHE?
+                    let is_in_cache = OPEN_ORDERS_CACHE.iter().any(|entry| {
                         entry.value().iter().any(|o| o.order_id == *order_id)
                     });
                     
-                    if is_active {
-                        // Order is active - always keep (protect from cleanup)
-                        true
+                    if is_in_cache {
+                        // Order is in cache - but is cache data fresh?
+                        // If history wasn't updated recently, cache might be stale (WebSocket disconnect)
+                        let history_age = now.duration_since(history.last_update);
+                        const CACHE_STALE_THRESHOLD_SECS: u64 = 300; // 5 minutes
+                        
+                        if history_age.as_secs() > CACHE_STALE_THRESHOLD_SECS {
+                            // Cache might be stale - history wasn't updated recently
+                            // This could mean WebSocket disconnected and order is actually closed
+                            // Check overall age to decide if we should remove it
+                            if history_age.as_secs() > MAX_AGE_SECS {
+                                // Very old entry even though in cache - cache is definitely stale
+                                // Remove to prevent memory leak
+                                tracing::warn!(
+                                    order_id = %order_id,
+                                    history_age_secs = history_age.as_secs(),
+                                    "CONNECTION: Order in cache but history is very old ({} hours), cache likely stale. Removing to prevent memory leak.",
+                                    history_age.as_secs() / 3600
+                                );
+                                false // Remove stale entry
+                            } else {
+                                // History is old but not very old - cache might be stale
+                                // Keep for now but log warning
+                                tracing::debug!(
+                                    order_id = %order_id,
+                                    history_age_secs = history_age.as_secs(),
+                                    "CONNECTION: Order in cache but history is old ({} minutes), cache may be stale. Keeping for now.",
+                                    history_age.as_secs() / 60
+                                );
+                                true // Keep for now (might be active but no recent updates)
+                            }
+                        } else {
+                            // Cache is fresh - history was updated recently
+                            // Order is definitely active, keep it
+                            true
+                        }
                     } else {
-                        // Order is closed - only remove if very old (memory leak prevention)
-                        // Normal cleanup happens immediately on order close, so this should rarely trigger
+                        // Order not in cache - check age and remove if very old
                         let age = now.duration_since(history.last_update);
                         if age.as_secs() > MAX_AGE_SECS {
                             // Very old entry (24+ hours) - safe to remove (memory leak prevention)
@@ -696,9 +788,9 @@ impl Connection {
                     Ok(mut stream) => {
                         info!(?kind, "CONNECTION: connected to Binance user data stream");
                         
-                        // ✅ İYİLEŞTİRME: Reconnect sonrası REST API ile doğrula
-                        // Binance WebSocket otomatik olarak ACCOUNT_UPDATE ve ORDER_TRADE_UPDATE gönderir
-                        // Ama ekstra validation ekleyerek missed events'i yakalayabiliriz
+                        // After reconnect, verify with REST API
+                        // Binance WebSocket automatically sends ACCOUNT_UPDATE and ORDER_TRADE_UPDATE
+                        // Extra validation can catch missed events
                         let venue_for_validation = venue.clone();
                         let symbols_for_validation = symbols.clone();
                         stream.set_on_reconnect(move || {
@@ -726,10 +818,10 @@ impl Connection {
                                                 let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
                                                 let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
                                                 
-                                                // ✅ CRITICAL FIX: REST API is source of truth after reconnect
+                                                // REST API is source of truth after reconnect
                                                 // If there's a mismatch, update WebSocket cache with REST API data
                                                 // This ensures state consistency after WebSocket reconnect
-                                                // REST API doğru kabul edilir, WebSocket cache güncellenir
+                                                // REST API is considered correct, update WebSocket cache
                                                 let needs_update = qty_diff > Decimal::from_str("0.0001").unwrap()
                                                     || entry_diff > Decimal::from_str("0.01").unwrap();
                                                 
@@ -745,8 +837,8 @@ impl Connection {
                                                         "CONNECTION: Position mismatch after reconnect (REST vs WebSocket), updating cache with REST API data"
                                                     );
                                                     
-                                                    // ✅ CRITICAL FIX: REST API doğru kabul edilir, WebSocket cache güncellenir
-                                                    // REST API validation sadece log değil, state fix ediliyor
+                                                    // REST API is considered correct, update WebSocket cache
+                                                    // REST API validation not just logging, fixing state
                                                     // Update WebSocket cache with REST API data (REST API is source of truth)
                                                     POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
                                                     
@@ -767,7 +859,7 @@ impl Connection {
                                                 }
                                             } else if !rest_position.qty.0.is_zero() {
                                                 // REST API shows position but WebSocket cache doesn't
-                                                // ✅ CRITICAL FIX: Add missing position to cache
+                                                // Add missing position to cache
                                                 warn!(
                                                     symbol = %symbol,
                                                     rest_qty = %rest_position.qty.0,
@@ -988,10 +1080,28 @@ impl Connection {
                                                 // This is conservative: if any fill is taker, use taker commission
                                                 let all_maker = history.maker_fill_count == history.total_fill_count;
                                                 
+                                                // Publish OrderFillHistoryUpdate event for STORAGE module
+                                                use crate::event_bus::{FillHistoryAction, FillHistoryData, OrderFillHistoryUpdate};
+                                                let fill_history_update = OrderFillHistoryUpdate {
+                                                    order_id: order_id.clone(),
+                                                    symbol: symbol.clone(),
+                                                    action: FillHistoryAction::Save,
+                                                    data: Some(FillHistoryData {
+                                                        total_filled_qty: history.total_filled_qty.0.to_string(),
+                                                        weighted_price_sum: history.weighted_price_sum.to_string(),
+                                                        maker_fill_count: history.maker_fill_count,
+                                                        total_fill_count: history.total_fill_count,
+                                                    }),
+                                                    timestamp: Instant::now(),
+                                                };
+                                                if let Err(e) = self.event_bus.order_fill_history_update_tx.send(fill_history_update) {
+                                                    warn!(error = ?e, order_id = %order_id, "CONNECTION: Failed to publish OrderFillHistoryUpdate event (no subscribers)");
+                                                }
+                                                
                                                 (avg_price, all_maker)
                                             };
                                             
-                                            // ✅ BEST PRACTICE: Update open orders cache from WebSocket (Binance recommendation)
+                                            // Update open orders cache from WebSocket
                                             // Update OPEN_ORDERS_CACHE based on order status
                                             let order_entry = OPEN_ORDERS_CACHE.entry(symbol.clone()).or_insert_with(Vec::new);
                                             
@@ -1034,6 +1144,19 @@ impl Connection {
                                                     | OrderStatus::ExpiredInMatch
                                             ) {
                                                 order_fill_history.remove(&order_id);
+                                                
+                                                // Publish OrderFillHistoryUpdate event (Remove) for STORAGE module
+                                                use crate::event_bus::{FillHistoryAction, OrderFillHistoryUpdate};
+                                                let fill_history_update = OrderFillHistoryUpdate {
+                                                    order_id: order_id.clone(),
+                                                    symbol: symbol.clone(),
+                                                    action: FillHistoryAction::Remove,
+                                                    data: None,
+                                                    timestamp: Instant::now(),
+                                                };
+                                                if let Err(e) = self.event_bus.order_fill_history_update_tx.send(fill_history_update) {
+                                                    warn!(error = ?e, order_id = %order_id, "CONNECTION: Failed to publish OrderFillHistoryUpdate event (Remove) (no subscribers)");
+                                                }
                                             }
                                             
                                             let order_update = OrderUpdate {
@@ -1059,9 +1182,9 @@ impl Connection {
                                                 );
                                             }
                                             
-                                            // CRITICAL: PositionUpdate race condition prevention
-                                            // Order fill olduğunda position değişir - PositionUpdate yayınla
-                                            // Position bilgisini venue'dan çek
+                                            // PositionUpdate race condition prevention
+                                            // When order fills, position changes - publish PositionUpdate
+                                            // Fetch position info from venue
                                             // IMPORTANT: We spawn this to avoid blocking the WebSocket stream,
                                             // but ORDERING module will ignore stale PositionUpdate events
                                             // (PositionUpdate that arrives after OrderUpdate has already set the position)
@@ -1116,7 +1239,7 @@ impl Connection {
                                             order_id,
                                             client_order_id: _,
                                         } => {
-                                            // ✅ BEST PRACTICE: Update open orders cache when order is canceled
+                                            // Update open orders cache when order is canceled
                                             // Remove canceled order from OPEN_ORDERS_CACHE
                                             if let Some(mut orders) = OPEN_ORDERS_CACHE.get_mut(&symbol) {
                                                 orders.retain(|o| o.order_id != order_id);
@@ -1130,7 +1253,7 @@ impl Connection {
                                             // We don't have enough info here to create OrderUpdate
                                         }
                                         UserEvent::AccountUpdate { positions, balances } => {
-                                            // ✅ BEST PRACTICE: Cache positions from WebSocket (Binance recommendation)
+                                            // Cache positions from WebSocket
                                             // Update POSITION_CACHE from ACCOUNT_UPDATE event
                                             for pos in &positions {
                                                 // Convert AccountPosition to Position for cache
@@ -1144,7 +1267,7 @@ impl Connection {
                                                 POSITION_CACHE.insert(pos.symbol.clone(), position);
                                             }
                                             
-                                            // ✅ BEST PRACTICE: Cache balances from WebSocket (Binance recommendation)
+                                            // Cache balances from WebSocket
                                             // Update BALANCE_CACHE from ACCOUNT_UPDATE event
                                             for bal in &balances {
                                                 BALANCE_CACHE.insert(bal.asset.clone(), bal.available_balance);
@@ -1230,7 +1353,7 @@ impl Connection {
         
         use std::time::{SystemTime, UNIX_EPOCH};
         
-        // ✅ CRITICAL: Graceful error handling for system time
+        // Graceful error handling for system time
         // System clock can be adjusted (NTP sync, manual changes, etc.)
         // Use fallback value instead of panicking
         let client_order_id = format!(
@@ -1410,12 +1533,10 @@ impl Connection {
     }
 
     /// Get current market prices (bid, ask) for a symbol
-    /// ✅ WebSocket-first approach (Binance recommendation)
-    /// First tries PRICE_CACHE (from WebSocket), falls back to REST API only if cache is empty
+    /// WebSocket-first approach: tries PRICE_CACHE (from WebSocket), falls back to REST API only if cache is empty
     /// REST API fallback should be rare - only on startup before WebSocket data arrives
     pub async fn get_current_prices(&self, symbol: &str) -> Result<(Px, Px)> {
-        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
-        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        // Try WebSocket cache first (faster, more efficient, reduces REST API rate limit usage)
         if let Some(price_update) = PRICE_CACHE.get(symbol) {
             return Ok((price_update.bid, price_update.ask));
         }
@@ -1577,7 +1698,7 @@ struct FutExchangeSymbol {
 
 pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
 
-/// ✅ BEST PRACTICE: Price cache from WebSocket market data stream
+/// Price cache from WebSocket market data stream
 /// Thread-safe price storage - updated by WebSocket, read by main loop
 /// 
 /// CONCURRENT WRITE BEHAVIOR:
@@ -1588,17 +1709,17 @@ pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| Das
 /// - Each symbol should ideally be in only one stream chunk to avoid duplicate updates
 pub static PRICE_CACHE: Lazy<DashMap<String, PriceUpdate>> = Lazy::new(|| DashMap::new());
 
-/// ✅ BEST PRACTICE: Position cache from WebSocket user data stream (ACCOUNT_UPDATE events)
+/// Position cache from WebSocket user data stream (ACCOUNT_UPDATE events)
 /// Thread-safe position storage - updated by WebSocket, read by main loop
 /// Binance recommendation: Use WebSocket instead of REST API for real-time data
 pub static POSITION_CACHE: Lazy<DashMap<String, Position>> = Lazy::new(|| DashMap::new());
 
-/// ✅ BEST PRACTICE: Balance cache from WebSocket user data stream (ACCOUNT_UPDATE events)
+/// Balance cache from WebSocket user data stream (ACCOUNT_UPDATE events)
 /// Thread-safe balance storage - updated by WebSocket, read by main loop
 /// Binance recommendation: Use WebSocket instead of REST API for real-time data
 pub static BALANCE_CACHE: Lazy<DashMap<String, Decimal>> = Lazy::new(|| DashMap::new());
 
-/// ✅ BEST PRACTICE: Open orders cache from WebSocket user data stream (ORDER_TRADE_UPDATE events)
+/// Open orders cache from WebSocket user data stream (ORDER_TRADE_UPDATE events)
 /// Thread-safe open orders storage - updated by WebSocket, read by main loop
 /// Binance recommendation: Use WebSocket instead of REST API for real-time data
 pub static OPEN_ORDERS_CACHE: Lazy<DashMap<String, Vec<VenueOrder>>> = Lazy::new(|| DashMap::new());
@@ -1615,13 +1736,13 @@ fn scale_from_step(step: Decimal) -> usize {
     if step.is_zero() {
         return 8; // Default precision
     }
-    // Eğer step 1 veya daha büyükse, precision 0 olmalı
+    // If step is 1 or greater, precision should be 0
     if step >= Decimal::ONE {
         return 0;
     }
-    // tick_size veya step_size'dan precision hesapla
-    // Decimal'in scale() metodu internal scale'i döner (trailing zero'lar dahil)
-    // Bu bizim için doğru precision'ı verir
+    // Calculate precision from tick_size or step_size
+    // Decimal's scale() method returns internal scale (including trailing zeros)
+    // This gives us the correct precision
     let scale = step.scale() as usize;
     scale
 }
@@ -1664,7 +1785,7 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         }
     }
 
-    // KRİTİK: Precision hesaplama scale_from_step ile değil, doğrudan API'den al
+    // Precision calculation: use API value directly, not scale_from_step
     let p_prec = sym.price_precision.unwrap_or_else(|| {
         let calc = scale_from_step(tick);
         tracing::warn!(
@@ -1687,7 +1808,7 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         calc
     });
 
-    // KRİTİK: Fallback değerleri daha makul yap
+    // Use more reasonable fallback values
     let final_tick = if tick.is_zero() {
         tracing::warn!(symbol = %sym.symbol, "tickSize is zero, using fallback 0.01");
         Decimal::new(1, 2) // 0.01
@@ -1734,10 +1855,9 @@ pub struct SymbolMeta {
 
 /// Binance API common configuration
 /// 
-/// ✅ KRİTİK: Thread-safety ve performans optimizasyonu
-/// - `client: Arc<Client>`: reqwest::Client thread-safe ama clone edilmesi gereksiz overhead
-///   Arc ile wrap ederek clone işlemi sadece pointer kopyalama olur
-/// - `sign()` fonksiyonu thread-safe (immutable data kullanıyor, sadece read-only)
+/// Thread-safety and performance optimization
+/// - `client: Arc<Client>`: reqwest::Client is thread-safe, wrapping in Arc avoids unnecessary overhead
+/// - `sign()` function is thread-safe (uses immutable data, read-only)
 #[derive(Clone)]
 pub struct BinanceCommon {
     pub client: Arc<Client>,
@@ -1748,7 +1868,7 @@ pub struct BinanceCommon {
 
 impl BinanceCommon {
     fn ts() -> u64 {
-        // ✅ CRITICAL: Graceful error handling for system time
+        // Graceful error handling for system time
         // System clock can be adjusted (NTP sync, manual changes, etc.)
         // Use fallback value instead of panicking
         SystemTime::now()
@@ -1763,13 +1883,13 @@ impl BinanceCommon {
     }
     /// Sign a query string with HMAC-SHA256
     /// 
-    /// ✅ KRİTİK: Thread-safe - immutable data kullanıyor (sadece read-only)
-    /// - `self.secret_key` immutable olarak okunuyor (String clone edilmiyor)
-    /// - `qs` parametresi immutable
-    /// - HMAC hesaplama thread-safe (her çağrı bağımsız)
-    /// - İki thread aynı anda farklı request'ler için sign() çağırabilir (race condition yok)
+    /// Thread-safe - uses immutable data (read-only)
+    /// - `self.secret_key` is read immutably (String is not cloned)
+    /// - `qs` parameter is immutable
+    /// - HMAC calculation is thread-safe (each call is independent)
+    /// - Multiple threads can call sign() concurrently for different requests (no race condition)
     fn sign(&self, qs: &str) -> String {
-        // ✅ CRITICAL: Graceful error handling for HMAC key initialization
+        // Graceful error handling for HMAC key initialization
         // HMAC key initialization can fail if key is too long (should be caught in config validation)
         // Use fallback empty signature instead of panicking (API call will fail with invalid signature)
         let mut mac = match Hmac::<Sha256>::new_from_slice(self.secret_key.as_bytes()) {
@@ -1802,7 +1922,7 @@ pub struct BinanceFutures {
     pub qty_step: Decimal,
     pub price_precision: usize,
     pub qty_precision: usize,
-    pub hedge_mode: bool, // Hedge mode (dual-side position) açık mı?
+    pub hedge_mode: bool, // Is hedge mode (dual-side position) enabled?
 }
 
 #[derive(Deserialize)]
@@ -1845,7 +1965,7 @@ struct FutPosition {
     #[serde(rename = "liquidationPrice")]
     liquidation_price: String,
     #[serde(rename = "positionSide", default)]
-    position_side: Option<String>, // ✅ KRİTİK: "LONG" | "SHORT" | "BOTH" (hedge mode) veya None (one-way mode)
+    position_side: Option<String>, // "LONG" | "SHORT" | "BOTH" (hedge mode) or None (one-way mode)
     #[serde(rename = "marginType", default)]
     margin_type: String, // "isolated" or "cross"
 }
@@ -1899,9 +2019,9 @@ impl BinanceFutures {
         })
     }
     
-    /// Leverage ayarla (sembol bazlı)
-    /// KRİTİK: Başlangıçta her sembol için leverage'i açıkça ayarla
-    /// /fapi/v1/leverage endpoint'i ile sembol bazlı leverage set edilir
+    /// Set leverage (per symbol)
+    /// Must be set explicitly for each symbol at startup
+    /// Uses /fapi/v1/leverage endpoint for per-symbol leverage
     pub async fn set_leverage(&self, sym: &str, leverage: u32) -> Result<()> {
         let params = vec![
             format!("symbol={}", sym),
@@ -1932,9 +2052,9 @@ impl BinanceFutures {
         }
     }
 
-    /// Position side mode ayarla (hedge mode aç/kapa)
-    /// KRİTİK: Başlangıçta hesap modunu açıkça ayarla
-    /// /fapi/v1/positionSide/dual endpoint'i ile hedge mode açılır/kapanır
+    /// Set position side mode (enable/disable hedge mode)
+    /// Must be set explicitly at startup
+    /// Uses /fapi/v1/positionSide/dual endpoint to enable/disable hedge mode
     pub async fn set_position_side_dual(&self, dual: bool) -> Result<()> {
         let params = vec![
             format!("dualSidePosition={}", if dual { "true" } else { "false" }),
@@ -1967,12 +2087,12 @@ impl BinanceFutures {
         }
     }
 
-    /// Margin type ayarla (isolated veya cross)
-    /// KRİTİK: Başlangıçta her sembol için margin type'ı açıkça ayarla
-    /// /fapi/v1/marginType endpoint'i ile isolated/cross margin set edilir
+    /// Set margin type (isolated or cross)
+    /// Must be set explicitly for each symbol at startup
+    /// Uses /fapi/v1/marginType endpoint to set isolated/cross margin
     ///
     /// # Arguments
-    /// * `sym` - Symbol (örn: "BTCUSDT")
+    /// * `sym` - Symbol (e.g., "BTCUSDT")
     /// * `isolated` - true = isolated margin, false = cross margin
     pub async fn set_margin_type(&self, sym: &str, isolated: bool) -> Result<()> {
         let margin_type = if isolated { "ISOLATED" } else { "CROSSED" };
@@ -2005,12 +2125,12 @@ impl BinanceFutures {
         }
     }
 
-    /// Per-symbol metadata (tick_size, step_size) alır
-    /// KRİTİK: Global fallback kullanmaz - her sembol için gerçek rules gerekli
-    /// Fallback kullanmak LOT_SIZE ve PRICE_FILTER hatalarına yol açabilir
+    /// Get per-symbol metadata (tick_size, step_size)
+    /// Does not use global fallback - real rules required for each symbol
+    /// Using fallback can cause LOT_SIZE and PRICE_FILTER errors
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
-        // ✅ KRİTİK: Double-check locking pattern - race condition önleme
-        // İlk kontrol: Cache'de var mı?
+        // Double-check locking pattern - prevent race condition
+        // First check: Is it in cache?
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }
@@ -2477,7 +2597,7 @@ impl BinanceFutures {
                     leverage,
                     liq_px,
                 };
-                // ✅ BEST PRACTICE: Update cache with REST API result (for startup sync)
+                // Update cache with REST API result (for startup sync)
                 POSITION_CACHE.insert(sym.to_string(), position.clone());
                 Ok(position)
             } else {
@@ -2488,12 +2608,12 @@ impl BinanceFutures {
                     leverage,
                     liq_px,
                 };
-                // ✅ BEST PRACTICE: Update cache with REST API result (for startup sync)
+                // Update cache with REST API result (for startup sync)
                 POSITION_CACHE.insert(sym.to_string(), position.clone());
                 Ok(position)
             }
         } else {
-            // ⚠️ CRITICAL DESIGN LIMITATION: Hedge mode support is incomplete
+            // CRITICAL DESIGN LIMITATION: Hedge mode support is incomplete
             // The Position struct only supports a single position (one qty, one entry, one leverage).
             // In hedge mode, LONG and SHORT positions should be tracked separately, but the current
             // implementation can only return one position at a time.
@@ -2519,8 +2639,8 @@ impl BinanceFutures {
                 "CONNECTION: Hedge mode enabled but support is incomplete. Position tracking, TP/SL, and closing may not work correctly for multiple positions per symbol."
             );
             
-            // ✅ KRİTİK: Hedge modunda - LONG ve SHORT ayrı ayrı track edilmeli, net hesaplama YANLIŞ!
-            // Hedge modunda birden fazla pozisyon olabilir (LONG ve SHORT ayrı ayrı, bağımsız)
+            // In hedge mode, LONG and SHORT should be tracked separately, net calculation is incorrect
+            // In hedge mode, multiple positions can exist (LONG and SHORT separately, independent)
             let mut long_qty = Decimal::ZERO;
             let mut short_qty = Decimal::ZERO;
             let mut long_entry = Decimal::ZERO;
@@ -2536,7 +2656,7 @@ impl BinanceFutures {
                 let lev = pos.leverage.parse::<u32>().unwrap_or(1);
                 let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
                 
-                // ✅ KRİTİK: positionSide kontrolü - hedge modunda "LONG" veya "SHORT" olmalı
+                // positionSide check - in hedge mode should be "LONG" or "SHORT"
                 match pos.position_side.as_deref() {
                     Some("LONG") => {
                         long_qty = qty;
@@ -2556,7 +2676,7 @@ impl BinanceFutures {
                         }
                     }
                     Some("BOTH") | None => {
-                        // ✅ KRİTİK: Hedge modunda "BOTH" veya None beklenmiyor, uyarı ver
+                        // In hedge mode, "BOTH" or None is not expected, log warning
                         warn!(
                             symbol = %sym,
                             position_side = ?pos.position_side,
@@ -2586,12 +2706,12 @@ impl BinanceFutures {
                 }
             }
             
-            // ✅ KRİTİK: Hedge modunda LONG ve SHORT ayrı ayrı track edilmeli
-            // Net hesaplama YANLIŞ - her pozisyon bağımsız olarak yönetilmeli
-            // Position struct tek qty desteklediği için, öncelik sırası: LONG > SHORT
-            // Eğer her ikisi de varsa, LONG pozisyonunu döndür (SHORT ayrı track edilmeli)
+            // In hedge mode, LONG and SHORT should be tracked separately
+            // Net calculation is incorrect - each position should be managed independently
+            // Since Position struct supports only one qty, priority order: LONG > SHORT
+            // If both exist, return LONG position (SHORT should be tracked separately)
             let (final_qty, final_entry, final_leverage, final_liq_px) = if long_qty > Decimal::ZERO {
-                // LONG pozisyon var - öncelik LONG'a ver
+                // LONG position exists - prioritize LONG
                 if short_qty > Decimal::ZERO {
                     warn!(
                         symbol = %sym,
@@ -2602,10 +2722,10 @@ impl BinanceFutures {
                 }
                 (long_qty, long_entry, long_leverage, long_liq_px)
             } else if short_qty > Decimal::ZERO {
-                // Sadece SHORT pozisyon var
+                // Only SHORT position exists
                 (short_qty, short_entry, short_leverage, short_liq_px)
             } else {
-                // Hiç pozisyon yok (sıfır)
+                // No position (zero)
                 (Decimal::ZERO, Decimal::ZERO, 1u32, None)
             };
             
@@ -2636,18 +2756,18 @@ impl BinanceFutures {
 
     /// Close position with reduceOnly guarantee and verification
     ///
-    /// KRİTİK: Futures için pozisyon kapatma garantisi:
-    /// 1. reduceOnly=true ile market order gönder (veya use_market_only=false ise limit fallback)
-    /// 2. Pozisyon tam olarak kapatıldığını doğrula
-    /// 3. Kısmi kapatma durumunda retry yap
-    /// 4. Leverage ile uyumlu olduğundan emin ol
-    /// 5. Hedge mode açıksa positionSide parametresi ekle
+    /// Close position with reduceOnly guarantee and verification for Futures
+    /// 1. Send market order with reduceOnly=true (or limit fallback if use_market_only=false)
+    /// 2. Verify position is fully closed
+    /// 3. Retry on partial close
+    /// 4. Ensure compatibility with leverage
+    /// 5. Add positionSide parameter if hedge mode is enabled
     ///
     /// # Arguments
-    /// * `use_market_only` - Hızlı kapanış gereksiniminde true (risk halt, stop loss). 
-    ///   False ise MARKET başarısız olursa LIMIT fallback yapar.
+    /// * `use_market_only` - If true, only use MARKET orders (for fast close: risk halt, stop loss).
+    ///   If false, falls back to LIMIT if MARKET fails.
     pub async fn flatten_position(&self, sym: &str, use_market_only: bool) -> Result<()> {
-        // İlk pozisyon kontrolü
+        // Initial position check
         let initial_pos = match self.fetch_position(sym).await {
             Ok(pos) => pos,
             Err(e) => {
@@ -2694,6 +2814,10 @@ impl BinanceFutures {
         // MIN_NOTIONAL hatası yakalandığında LIMIT fallback yapılır, ama LIMIT de başarısız olursa
         // tekrar MARKET denenmemeli (sonsuz loop riski)
         let mut limit_fallback_attempted = false;
+        // ✅ CRITICAL: Track position growth events to prevent infinite loops
+        // If position keeps growing after multiple retries, abort to prevent infinite loop
+        let mut growth_event_count = 0u32;
+        const MAX_RETRIES_ON_GROWTH: u32 = 2; // Max retries allowed when position grows
 
         for attempt in 0..max_attempts {
             // ✅ KRİTİK GÜVENLİK: LIMIT fallback başarısız olduysa HEMEN çık (sonsuz loop önleme)
@@ -2861,27 +2985,57 @@ impl BinanceFutures {
                             
                             const MAX_ACCEPTABLE_GROWTH_PCT: f64 = 10.0; // %10 üzeri kritik
                             
-                            // ✅ CRITICAL FIX: Position growth'u %10'un üzerindeyse warn ver, ama devam et
+                            // ✅ CRITICAL FIX: Position growth detection with abort mechanism
                             // Position büyümesi her zaman hata değil! Volatile market'lerde aynı anda birden fazla fill olabilir
-                            // Bot bunu "manual intervention" sanıyor ve hata veriyor, ama bu normal olabilir
-                            // Çözüm: Position growth'u %10'un üzerindeyse warn ver, ama devam et (retry yap)
+                            // Ancak çok fazla growth event'i infinite loop riskine yol açabilir
+                            // Çözüm: Growth %10'un üzerindeyse ve çok fazla growth event varsa abort et
                             if growth_from_initial > MAX_ACCEPTABLE_GROWTH_PCT {
+                                growth_event_count += 1;
+                                
+                                // ✅ CRITICAL: Too many growth events - abort to prevent infinite loop
+                                if growth_event_count > MAX_RETRIES_ON_GROWTH {
+                                    tracing::error!(
+                                        symbol = %sym,
+                                        attempt = attempt + 1,
+                                        growth_events = growth_event_count,
+                                        initial_qty = %initial_qty,
+                                        current_qty_at_attempt = %current_qty,
+                                        verify_qty = %verify_qty,
+                                        growth_pct = growth_from_initial,
+                                        max_growth_retries = MAX_RETRIES_ON_GROWTH,
+                                        "POSITION GROWTH ABORT: Position grew {}% during close (exceeds {}% threshold) after {} growth events. Aborting to prevent infinite loop.",
+                                        growth_from_initial,
+                                        MAX_ACCEPTABLE_GROWTH_PCT,
+                                        growth_event_count
+                                    );
+                                    return Err(anyhow!(
+                                        "Position grew {}% during close (exceeds {}% threshold), aborting after {} growth events to prevent infinite loop. Position may need manual intervention.",
+                                        growth_from_initial,
+                                        MAX_ACCEPTABLE_GROWTH_PCT,
+                                        growth_event_count
+                                    ));
+                                }
+                                
                                 // ⚠️ WARNING: Position %10'dan fazla büyüdü - volatile market'te normal olabilir
-                                // Aynı anda birden fazla fill olabilir, devam et
+                                // Aynı anda birden fazla fill olabilir, devam et (ama growth event sayısını artır)
                                 tracing::warn!(
                                     symbol = %sym,
                                     attempt = attempt + 1,
+                                    growth_events = growth_event_count,
+                                    max_growth_retries = MAX_RETRIES_ON_GROWTH,
                                     initial_qty = %initial_qty,
                                     current_qty_at_attempt = %current_qty,
                                     verify_qty = %verify_qty,
                                     growth_pct = growth_from_initial,
                                     grew_from_attempt = position_grew_from_attempt,
                                     grew_from_initial = position_grew_from_initial,
-                                    "POSITION GROWTH DETECTED: Position grew {}% during close (exceeds {}% threshold). Continuing with retry - this may be normal in volatile markets with multiple simultaneous fills.",
+                                    "POSITION GROWTH DETECTED: Position grew {}% during close (exceeds {}% threshold). Continuing with retry (attempt {}/{}) - this may be normal in volatile markets with multiple simultaneous fills.",
                                     growth_from_initial,
-                                    MAX_ACCEPTABLE_GROWTH_PCT
+                                    MAX_ACCEPTABLE_GROWTH_PCT,
+                                    growth_event_count,
+                                    MAX_RETRIES_ON_GROWTH
                                 );
-                                // Devam et, retry yap (hata verme)
+                                // Devam et, retry yap (ama growth event sayısını artırdık)
                             } else {
                                 // ⚠️ WARNING: Position büyüdü ama %10'un altında - volatile market'te normal olabilir
                                 // Aynı anda birden fazla fill olabilir, devam et
@@ -2898,7 +3052,7 @@ impl BinanceFutures {
                                     growth_from_initial,
                                     MAX_ACCEPTABLE_GROWTH_PCT
                                 );
-                                // Devam et, retry yap
+                                // Devam et, retry yap (küçük growth, normal kabul et)
                             }
                         }
                         
@@ -3849,29 +4003,29 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
 
 /// Format decimal with fixed precision
 /// 
-/// ✅ KRİTİK: Precision loss önleme
-/// ToZero strategy truncate ediyor, bu precision loss'a yol açabilir.
-/// Normalize ederek ve doğru rounding strategy kullanarak precision loss'u önlüyoruz.
+/// Prevents precision loss
+/// ToZero strategy truncates, which can cause precision loss.
+/// Normalize and use correct rounding strategy to prevent precision loss.
 pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
-    // KRİTİK DÜZELTME: Edge case'ler için ek kontroller
-    // Precision overflow kontrolü (max 28 decimal places)
+    // Edge case checks
+    // Precision overflow check (max 28 decimal places)
     let precision = precision.min(28);
     let scale = precision as u32;
 
-    // Decimal her zaman finite'dir, bu yüzden direkt işle
+    // Decimal is always finite, so process directly
 
-    // ✅ KRİTİK: Precision loss önleme
-    // 1. Önce normalize et (internal representation'ı temizle)
-    // 2. Sonra precision'a göre yuvarla
-    // ToZero yerine ToNegativeInfinity (floor) kullan - daha güvenli ve precision loss'u önler
+    // Prevent precision loss
+    // 1. First normalize (clean internal representation)
+    // 2. Then round to precision
+    // Use ToNegativeInfinity (floor) instead of ToZero - safer and prevents precision loss
     let normalized = value.normalize();
     let rounded = normalized.round_dp_with_strategy(scale, RoundingStrategy::ToNegativeInfinity);
 
-    // KRİTİK: String formatlamada kesinlikle precision'dan fazla basamak gösterme
-    // Decimal'in to_string() metodu bazen internal precision'ı gösterebilir
-    // Bu yüzden manuel olarak string'i kontrol edip kesmeliyiz
+    // Never show more digits than precision in string formatting
+    // Decimal's to_string() method may show internal precision
+    // Must manually check and truncate string
     if scale == 0 {
-        // Integer kısmı al (nokta varsa kes)
+        // Get integer part (truncate if decimal point exists)
         let s = rounded.to_string();
         if let Some(dot_pos) = s.find('.') {
             s[..dot_pos].to_string()
@@ -3889,7 +4043,7 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
             let current_decimals = decimal_part.len();
 
             if current_decimals < scale as usize {
-                // Eksik trailing zero'ları ekle
+                // Add missing trailing zeros
                 format!(
                     "{}.{}{}",
                     integer_part,
@@ -3897,17 +4051,17 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
                     "0".repeat(scale as usize - current_decimals)
                 )
             } else if current_decimals > scale as usize {
-                // KRİTİK: Fazla decimal varsa kes - kesinlikle precision'dan fazla basamak gösterme
-                // String'i kes - bu "Precision is over the maximum" hatasını önler
+                // If too many decimals, truncate - never show more digits than precision
+                // Truncate string - prevents "Precision is over the maximum" error
                 let truncated_decimal = &decimal_part[..scale as usize];
                 format!("{}.{}", integer_part, truncated_decimal)
             } else {
-                // ✅ FIX: Tam precision - trailing zero'ları koru
-                // Decimal'in to_string() trailing zero'ları kaldırabilir, bu yüzden kontrol et
+                // Exact precision - preserve trailing zeros
+                // Decimal's to_string() may remove trailing zeros, so check
                 if decimal_part.len() == scale as usize {
                     s
                 } else {
-                    // Trailing zero eksikse ekle
+                    // Add trailing zeros if missing
                     format!(
                         "{}.{}{}",
                         integer_part,
@@ -3917,7 +4071,7 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
                 }
             }
         } else {
-            // Nokta yoksa ekle ve trailing zero ekle
+            // Add decimal point and trailing zeros if missing
             format!("{}.{}", s, "0".repeat(scale as usize))
         }
     }
@@ -3934,39 +4088,39 @@ async fn ensure_success(resp: Response) -> Result<Response> {
     }
 }
 
-/// Transient hata mı kontrol et (retry yapılabilir mi?)
+/// Check if error is transient (can retry?)
 /// 408 (Request Timeout), 429 (Too Many Requests), 5xx (Server Errors) → transient
-/// 400 (Bad Request) → body'ye göre karar ver (bazıları transient olabilir)
+/// 400 (Bad Request) → decide based on body (some may be transient)
 fn is_transient_error(status: u16, _body: &str) -> bool {
     match status {
         408 => true,       // Request Timeout
         429 => true,       // Too Many Requests
         500..=599 => true, // Server Errors
         400 => {
-            // 400 için body'ye bak - bazı hatalar transient olabilir
-            // "Invalid symbol" gibi kalıcı hatalar retry edilmemeli
-            // "Precision is over" gibi hatalar kalıcı
-            // "Insufficient margin" gibi hatalar kalıcı
-            // Ama network timeout gibi durumlar transient olabilir
-            // Şimdilik 400'leri kalıcı sayalım (daha güvenli)
+            // For 400, check body - some errors may be transient
+            // Permanent errors like "Invalid symbol" should not be retried
+            // Errors like "Precision is over" are permanent
+            // Errors like "Insufficient margin" are permanent
+            // But network timeout situations may be transient
+            // For now, treat 400s as permanent (safer)
             false
         }
-        _ => false, // Diğer hatalar kalıcı
+        _ => false, // Other errors are permanent
     }
 }
 
-/// Kalıcı hata mı kontrol et (sembol disable edilmeli mi?)
-/// "invalid", "margin", "precision" gibi hatalar kalıcıdır
+/// Check if error is permanent (should symbol be disabled?)
+/// Errors like "invalid", "margin", "precision" are permanent
 fn is_permanent_error(status: u16, body: &str) -> bool {
     if status == 400 {
         let body_lower = body.to_lowercase();
-        // ✅ DOĞRU: -1111 (precision) hatası permanent değil, retry edilebilir
-        // Çünkü girdiyi düzelterek geçilebilir
+        // -1111 (precision) error is not permanent, can retry
+        // Can be fixed by correcting input
         if body_lower.contains("precision is over") || body_lower.contains("-1111") {
-            return false; // Precision hatası retry edilebilir
+            return false; // Precision error can be retried
         }
-        // ✅ DOĞRU: MIN_NOTIONAL hatası (-1013) permanent değil, retry edilebilir
-        // Çünkü rules refresh ile yeni min_notional değeri alınabilir ve retry yapılabilir
+        // MIN_NOTIONAL error (-1013) is not permanent, can retry
+        // Can get new min_notional value with rules refresh and retry
         if body_lower.contains("-1013")
             || body_lower.contains("min notional")
             || body_lower.contains("min_notional")
@@ -3986,20 +4140,20 @@ async fn send_json<T>(builder: RequestBuilder) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    // KRİTİK DÜZELTME: Retry/backoff mekanizması
-    // RequestBuilder clone edilemediği için, request'i baştan oluşturmalıyız
-    // Ama builder'ı closure'a wrap edemeyiz çünkü builder consume ediliyor
-    // Bu yüzden şimdilik sadece ilk denemeyi yapıyoruz, retry mekanizması üst seviyede implement edilebilir
+    // Retry/backoff mechanism
+    // RequestBuilder cannot be cloned, so must recreate request from scratch
+    // Cannot wrap builder in closure because builder is consumed
+    // For now, only do first attempt, retry mechanism can be implemented at higher level
     let resp = builder.send().await?;
     let resp = ensure_success(resp).await?;
     Ok(resp.json().await?)
 }
 
 async fn send_void(builder: RequestBuilder) -> Result<()> {
-    // KRİTİK DÜZELTME: Retry/backoff mekanizması
-    // RequestBuilder clone edilemediği için, request'i baştan oluşturmalıyız
-    // Ama builder'ı closure'a wrap edemeyiz çünkü builder consume ediliyor
-    // Bu yüzden şimdilik sadece ilk denemeyi yapıyoruz, retry mekanizması üst seviyede implement edilebilir
+    // Retry/backoff mechanism
+    // RequestBuilder cannot be cloned, so must recreate request from scratch
+    // Cannot wrap builder in closure because builder is consumed
+    // For now, only do first attempt, retry mechanism can be implemented at higher level
     let resp = builder.send().await?;
     ensure_success(resp).await?;
     Ok(())

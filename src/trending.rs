@@ -611,30 +611,51 @@ impl Trending {
             // Convert signal side to position direction for comparison
             let signal_direction = PositionDirection::from_order_side(side);
             
-            // Check if direction matches (or if last_direction is None, apply cooldown to both)
-            let direction_matches = last_direction
-                .map(|dir| dir == signal_direction)
-                .unwrap_or(true); // If direction unknown, apply cooldown to both directions
-            
-            if direction_matches {
-                // Same direction as last closed position - apply cooldown
-                debug!(
-                    symbol = %tick.symbol,
-                    signal_direction = ?signal_direction,
-                    last_direction = ?last_direction,
-                    elapsed_secs = elapsed.as_secs(),
-                    cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
-                    "TRENDING: Skipping signal generation - position close cooldown active (same direction)"
-                );
-                return Ok(());
+            // ✅ CRITICAL FIX: Extended cooldown for unknown direction
+            // When direction is unknown, apply longer cooldown to prevent aggressive trading
+            // This is more conservative and prevents trading when we're uncertain about last position
+            if last_direction.is_none() {
+                // Direction unknown - apply extended cooldown (2x normal cooldown)
+                const EXTENDED_COOLDOWN_SECS: u64 = POSITION_CLOSE_COOLDOWN_SECS * 2; // 10 seconds
+                if elapsed < Duration::from_secs(EXTENDED_COOLDOWN_SECS) {
+                    debug!(
+                        symbol = %tick.symbol,
+                        signal_direction = ?signal_direction,
+                        last_direction = ?last_direction,
+                        elapsed_secs = elapsed.as_secs(),
+                        extended_cooldown_secs = EXTENDED_COOLDOWN_SECS,
+                        "TRENDING: Skipping signal generation - extended cooldown active for unknown direction"
+                    );
+                    return Ok(());
+                }
             } else {
-                // Opposite direction - allow signal (trend reversal)
-                debug!(
-                    symbol = %tick.symbol,
-                    signal_direction = ?signal_direction,
-                    last_direction = ?last_direction,
-                    "TRENDING: Allowing opposite-direction signal (trend reversal, cooldown bypassed)"
-                );
+                // Direction is known - check if it matches signal direction
+                let direction_matches = last_direction
+                    .map(|dir| dir == signal_direction)
+                    .unwrap_or(false); // Should never be None here, but default to false for safety
+                
+                if direction_matches {
+                    // Same direction as last closed position - apply normal cooldown
+                    if elapsed < Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
+                        debug!(
+                            symbol = %tick.symbol,
+                            signal_direction = ?signal_direction,
+                            last_direction = ?last_direction,
+                            elapsed_secs = elapsed.as_secs(),
+                            cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
+                            "TRENDING: Skipping signal generation - position close cooldown active (same direction)"
+                        );
+                        return Ok(());
+                    }
+                } else {
+                    // Opposite direction - allow signal (trend reversal)
+                    debug!(
+                        symbol = %tick.symbol,
+                        signal_direction = ?signal_direction,
+                        last_direction = ?last_direction,
+                        "TRENDING: Allowing opposite-direction signal (trend reversal, cooldown bypassed)"
+                    );
+                }
             }
         }
         
