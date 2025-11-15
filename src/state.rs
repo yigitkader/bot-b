@@ -4,7 +4,7 @@
 // BALANCE updates this
 // TRENDING/ORDERING can read from this
 
-use crate::types::{Px, Qty, Side};
+use crate::types::{Px, Qty, Side, PositionDirection};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,7 +25,10 @@ pub struct OrderingState {
 #[derive(Clone, Debug)]
 pub struct OpenPosition {
     pub symbol: String,
-    pub side: Side,
+    /// Position direction (Long or Short) - separate from order side to avoid confusion
+    pub direction: PositionDirection,
+    /// Position quantity - always positive (absolute value)
+    /// Use direction to determine if it's long or short
     pub qty: Qty,
     pub entry_price: Px,
 }

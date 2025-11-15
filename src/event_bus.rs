@@ -42,6 +42,11 @@ pub struct CloseRequest {
     pub symbol: String,
     pub position_id: Option<String>, // Optional position identifier
     pub reason: CloseReason,
+    /// Current bid and ask prices from the market tick that triggered this close request
+    /// If provided, these prices will be used instead of fetching fresh prices (reduces slippage)
+    /// If None, prices will be fetched when processing the close request
+    pub current_bid: Option<Px>,
+    pub current_ask: Option<Px>,
     #[serde(skip)]
     pub timestamp: Instant, // Not serialized, only for runtime use
 }

@@ -7,11 +7,17 @@ use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, EventBus, OrderUpdate, PositionUpdate, TradeSignal};
 use crate::state::{OpenPosition, OpenOrder, SharedState};
-use crate::types::{Side, Tif};
+use crate::types::{Qty, Side, Tif, PositionDirection};
 use anyhow::{anyhow, Result};
+use rust_decimal::Decimal;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+/// Maximum number of retry attempts for order placement
+const MAX_RETRIES: u32 = 3;
 
 /// ORDERING module - order placement and closure
 /// Guarantees single position/order at a time using global lock
@@ -76,6 +82,31 @@ impl Ordering {
             "ioc" | "IOC" => Tif::Ioc,
             _ => Tif::Gtc,
         }
+    }
+
+    /// Check if an error is permanent (should not retry)
+    /// Permanent errors: invalid parameters, insufficient balance, invalid symbol, etc.
+    /// Temporary errors: network errors, rate limits, timeouts, server errors
+    fn is_permanent_error(error: &anyhow::Error) -> bool {
+        let error_str = error.to_string();
+        let error_lower = error_str.to_lowercase();
+        
+        // Permanent errors - don't retry
+        error_lower.contains("invalid")
+            || error_lower.contains("margin")
+            || error_lower.contains("insufficient balance")
+            || error_lower.contains("min notional")
+            || error_lower.contains("below min notional")
+            || error_lower.contains("invalid symbol")
+            || error_lower.contains("symbol not found")
+            || error_lower.contains("position not found")
+            || error_lower.contains("no position")
+            || error_lower.contains("position already closed")
+            || error_lower.contains("reduceonly")
+            || error_lower.contains("reduce only")
+            || error_lower.contains("-2011") // Binance: "Unknown order sent"
+            || error_lower.contains("-2019") // Binance: "Margin is insufficient"
+            || error_lower.contains("-2021") // Binance: "Order would immediately match"
     }
 
     /// Start the ordering service and begin processing trade signals.
@@ -239,6 +270,72 @@ impl Ordering {
         shared_state: &Arc<SharedState>,
         cfg: &Arc<AppCfg>,
     ) -> Result<()> {
+        // 1. Signal validity check - timestamp age
+        let now = Instant::now();
+        if let Some(signal_age) = now.checked_duration_since(signal.timestamp) {
+            if signal_age > Duration::from_secs(5) {
+                warn!(
+                    symbol = %signal.symbol,
+                    age_seconds = signal_age.as_secs(),
+                    "ORDERING: Ignoring TradeSignal - signal too old"
+                );
+                return Ok(());
+            }
+        } else {
+            // Signal timestamp is in the future (invalid signal)
+            warn!(
+                symbol = %signal.symbol,
+                "ORDERING: Ignoring TradeSignal - timestamp in the future"
+            );
+            return Ok(());
+        }
+        
+        // 2. Signal validity check - symbol and side
+        if signal.symbol.is_empty() {
+            warn!("ORDERING: Ignoring TradeSignal - empty symbol");
+            return Ok(());
+        }
+        
+        // 3. Balance pre-check - calculate required margin
+        let leverage = signal.leverage;
+        let notional = signal.entry_price.0 * signal.size.0;
+        let required_margin = notional / Decimal::from(leverage);
+        
+        // Get available balance from shared state
+        let available_balance = {
+            let balance_store = shared_state.balance_store.read().await;
+            if cfg.quote_asset.to_uppercase() == "USDT" {
+                balance_store.usdt
+            } else {
+                balance_store.usdc
+            }
+        };
+        
+        if available_balance < required_margin {
+            warn!(
+                symbol = %signal.symbol,
+                required_margin = %required_margin,
+                available_balance = %available_balance,
+                "ORDERING: Ignoring TradeSignal - insufficient balance"
+            );
+            return Ok(());
+        }
+        
+        // 4. Risk control check - max position notional
+        let max_position_notional = Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
+            .unwrap_or(Decimal::from(10000)); // Default to 10000 USD if conversion fails
+        
+        if notional > max_position_notional {
+            warn!(
+                symbol = %signal.symbol,
+                notional = %notional,
+                max_notional = %max_position_notional,
+                "ORDERING: Ignoring TradeSignal - exceeds max position notional"
+            );
+            return Ok(());
+        }
+        
+        // 5. Position check - ensure no open position/order
         // CRITICAL: Lock scope minimized - only for state check
         {
             let state_guard = shared_state.ordering_state.lock().await;
@@ -261,6 +358,7 @@ impl Ordering {
         };
         
         // Place order via CONNECTION (lock released, no deadlock risk)
+        // Retry logic with exponential backoff
         use crate::connection::OrderCommand;
         let command = OrderCommand::Open {
             symbol: signal.symbol.clone(),
@@ -270,17 +368,62 @@ impl Ordering {
             tif,
         };
         
-        let order_id = match connection.send_order(command).await {
-            Ok(order_id) => order_id,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    symbol = %signal.symbol,
-                    "ORDERING: Failed to place order"
-                );
-                return Err(e);
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut order_id = None;
+        
+        for attempt in 0..MAX_RETRIES {
+            match connection.send_order(command.clone()).await {
+                Ok(id) => {
+                    order_id = Some(id);
+                    break; // Success, exit retry loop
+                }
+                Err(e) => {
+                    // Check if error is permanent (don't retry)
+                    if Self::is_permanent_error(&e) {
+                        warn!(
+                            error = %e,
+                            symbol = %signal.symbol,
+                            attempt = attempt + 1,
+                            "ORDERING: Permanent error, not retrying"
+                        );
+                        return Err(e);
+                    }
+                    
+                    // Store error for final fallback (only if all retries fail)
+                    last_error = Some(anyhow::format_err!("{}", e));
+                    
+                    // Temporary error - retry with exponential backoff
+                    if attempt < MAX_RETRIES - 1 {
+                        let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                        warn!(
+                            error = %e,
+                            symbol = %signal.symbol,
+                            attempt = attempt + 1,
+                            max_retries = MAX_RETRIES,
+                            delay_ms = delay.as_millis(),
+                            "ORDERING: Temporary error, retrying with exponential backoff"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    } else {
+                        // All retries exhausted
+                        warn!(
+                            error = %e,
+                            symbol = %signal.symbol,
+                            attempt = attempt + 1,
+                            "ORDERING: All retries exhausted"
+                        );
+                        return Err(e);
+                    }
+                }
             }
-        };
+        }
+        
+        // Get order_id from successful attempt
+        // This should never fail if we reach here (order_id should be Some)
+        let order_id = order_id.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("Unknown error after retries"))
+        })?;
         
         // Update state (re-acquire lock for state update)
         // CRITICAL: Double-check pattern - another thread might have placed an order
@@ -289,7 +432,7 @@ impl Ordering {
             let mut state_guard = shared_state.ordering_state.lock().await;
             
             // Double-check: if another thread placed an order while we were making the network call,
-            // we should not overwrite it (though this is unlikely, it's a safety measure)
+            // we should cancel our order to prevent duplicate orders
             if state_guard.open_order.is_none() && state_guard.open_position.is_none() {
                 state_guard.open_order = Some(OpenOrder {
                     symbol: signal.symbol.clone(),
@@ -306,12 +449,32 @@ impl Ordering {
                 );
             } else {
                 // Another thread placed an order/position while we were making the network call
-                // This is a race condition - we should log it but not fail
+                // This is a race condition - cancel our order to prevent duplicate orders
                 warn!(
                     symbol = %signal.symbol,
                     order_id = %order_id,
-                    "ORDERING: Order placed but state already has open position/order (race condition)"
+                    "ORDERING: Race condition detected - another thread placed order/position, canceling our order"
                 );
+                
+                // Cancel the order we just placed (lock released before async call)
+                drop(state_guard);
+                
+                if let Err(cancel_err) = connection.cancel_order(&order_id, &signal.symbol).await {
+                    warn!(
+                        error = %cancel_err,
+                        symbol = %signal.symbol,
+                        order_id = %order_id,
+                        "ORDERING: Failed to cancel duplicate order after race condition"
+                    );
+                } else {
+                    info!(
+                        symbol = %signal.symbol,
+                        order_id = %order_id,
+                        "ORDERING: Successfully canceled duplicate order after race condition"
+                    );
+                }
+                
+                return Ok(());
             }
         } // Lock released
         
@@ -326,12 +489,14 @@ impl Ordering {
         shared_state: &Arc<SharedState>,
         cfg: &Arc<AppCfg>,
     ) -> Result<()> {
-        // CRITICAL: Lock scope minimized - only for position check and clone
-        let position = {
+        // CRITICAL: Make position check + price calculation atomic
+        // This prevents race condition where position is closed by another thread
+        // between position check and order placement
+        let (position, close_price) = {
             let state_guard = shared_state.ordering_state.lock().await;
             
             // Check if we have an open position for this symbol
-            match &state_guard.open_position {
+            let position = match &state_guard.open_position {
                 Some(pos) if pos.symbol == request.symbol => pos.clone(),
                 _ => {
                     warn!(
@@ -340,34 +505,96 @@ impl Ordering {
                     );
                     return Ok(());
                 }
+            };
+            
+            // Get current market prices for closing (atomically, while lock is held)
+            // CRITICAL: Use prices from CloseRequest if available (reduces slippage from fetch delay)
+            // If not provided, try cached prices (synchronous, no async call)
+            // Price selection must match the order side:
+            // - Long position: close with SELL order → use ask price (selling to buyers at ask)
+            // - Short position: close with BUY order → use bid price (buying from sellers at bid)
+            let prices_opt = if let (Some(provided_bid), Some(provided_ask)) = (request.current_bid, request.current_ask) {
+                // Use prices from CloseRequest (from market tick that triggered the close)
+                Some((provided_bid, provided_ask))
+            } else if let Some((cached_bid, cached_ask)) = Connection::get_cached_prices(&request.symbol) {
+                // Use cached prices (synchronous, no async call - safe to do while lock is held)
+                Some((cached_bid, cached_ask))
+            } else {
+                // No cached prices available - we can't fetch async while holding lock
+                // Return None to indicate we need to fetch after lock release
+                None
+            };
+            
+            // If we have prices, calculate close_price atomically
+            if let Some((bid, ask)) = prices_opt {
+                let close_price = match position.direction {
+                    PositionDirection::Long => ask,  // Long position: SELL order → ask price
+                    PositionDirection::Short => bid, // Short position: BUY order → bid price
+                };
+                (position, Some(close_price))
+            } else {
+                // Need to fetch prices after lock release
+                (position, None)
             }
-        }; // Lock released here, before async network calls
+        }; // Lock released here
         
-        // Calculate close side (opposite of position side)
-        let close_side = match position.side {
-            Side::Buy => Side::Sell,
-            Side::Sell => Side::Buy,
+        // Handle case where we need to fetch prices (cache miss)
+        let (position, close_price) = if let Some(price) = close_price {
+            (position, price)
+        } else {
+            // Fetch prices (lock already released)
+            let (fetched_bid, fetched_ask) = connection.get_current_prices(&request.symbol).await
+                .map_err(|e| anyhow!("Failed to get current market prices for {}: {}", request.symbol, e))?;
+            
+            // Re-acquire lock to verify position still exists
+            let state_guard = shared_state.ordering_state.lock().await;
+            let position = match &state_guard.open_position {
+                Some(pos) if pos.symbol == request.symbol => pos.clone(),
+                _ => {
+                    warn!(
+                        symbol = %request.symbol,
+                        "ORDERING: Position closed by another thread while fetching prices"
+                    );
+                    return Ok(());
+                }
+            };
+            let close_price = match position.direction {
+                PositionDirection::Long => fetched_ask,
+                PositionDirection::Short => fetched_bid,
+            };
+            drop(state_guard);
+            (position, close_price)
         };
         
-        // Get current market price for closing (lock released, no deadlock risk)
-        // Long position: close with SELL at bid price
-        // Short position: close with BUY at ask price
-        let (bid, ask) = connection.get_current_prices(&request.symbol).await
-            .map_err(|e| anyhow!("Failed to get current market prices for {}: {}", request.symbol, e))?;
+        // CRITICAL: Double-check before sending order
+        // Another thread might have closed the position while we were calculating prices
+        {
+            let state_guard = shared_state.ordering_state.lock().await;
+            if state_guard.open_position.is_none() || 
+               state_guard.open_position.as_ref().map(|p| p.symbol != request.symbol).unwrap_or(true) {
+                warn!(
+                    symbol = %request.symbol,
+                    "ORDERING: Position closed by another thread before order placement"
+                );
+                return Ok(());
+            }
+        } // Lock released
         
-        let close_price = match position.side {
-            Side::Buy => bid,  // Long position: SELL at bid
-            Side::Sell => ask, // Short position: BUY at ask
-        };
+        // Calculate close side from position direction
+        let close_side = position.direction.to_close_side();
         
-        // Get TIF from config
-        let tif = match cfg.exec.tif.as_str() {
-            "post_only" | "GTX" => Tif::PostOnly,
-            "ioc" | "IOC" => Tif::Ioc,
-            _ => Tif::Gtc,
+        // Get TIF for close order
+        // CRITICAL: Never use PostOnly for close orders!
+        // PostOnly orders get canceled if they would cross the spread, leaving the position open.
+        // For close orders, we must ensure execution, so use IOC or GTC only.
+        let tif = if matches!(cfg.exec.tif.as_str(), "ioc" | "IOC") {
+            Tif::Ioc
+        } else {
+            Tif::Gtc  // Default to GTC for close orders (ensures execution)
         };
         
         // Place close order via CONNECTION (lock released, no deadlock risk)
+        // Retry logic with exponential backoff
         use crate::connection::OrderCommand;
         let command = OrderCommand::Close {
             symbol: request.symbol.clone(),
@@ -377,24 +604,69 @@ impl Ordering {
             tif,
         };
         
-        match connection.send_order(command).await {
-            Ok(order_id) => {
-                info!(
-                    symbol = %request.symbol,
-                    order_id = %order_id,
-                    reason = ?request.reason,
-                    "ORDERING: Close order placed successfully"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    symbol = %request.symbol,
-                    "ORDERING: Failed to place close order"
-                );
-                return Err(e);
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut order_id = None;
+        
+        for attempt in 0..MAX_RETRIES {
+            match connection.send_order(command.clone()).await {
+                Ok(id) => {
+                    order_id = Some(id);
+                    break; // Success, exit retry loop
+                }
+                Err(e) => {
+                    // Check if error is permanent (don't retry)
+                    if Self::is_permanent_error(&e) {
+                        warn!(
+                            error = %e,
+                            symbol = %request.symbol,
+                            attempt = attempt + 1,
+                            "ORDERING: Permanent error placing close order, not retrying"
+                        );
+                        return Err(e);
+                    }
+                    
+                    // Store error for final fallback (only if all retries fail)
+                    last_error = Some(anyhow::format_err!("{}", e));
+                    
+                    // Temporary error - retry with exponential backoff
+                    if attempt < MAX_RETRIES - 1 {
+                        let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                        warn!(
+                            error = %e,
+                            symbol = %request.symbol,
+                            attempt = attempt + 1,
+                            max_retries = MAX_RETRIES,
+                            delay_ms = delay.as_millis(),
+                            "ORDERING: Temporary error placing close order, retrying with exponential backoff"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    } else {
+                        // All retries exhausted
+                        warn!(
+                            error = %e,
+                            symbol = %request.symbol,
+                            attempt = attempt + 1,
+                            "ORDERING: All retries exhausted for close order"
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
+        
+        // Get order_id from successful attempt
+        // This should never fail if we reach here (order_id should be Some)
+        let order_id = order_id.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("Unknown error after retries for close order"))
+        })?;
+        
+        info!(
+            symbol = %request.symbol,
+            order_id = %order_id,
+            reason = ?request.reason,
+            "ORDERING: Close order placed successfully"
+        );
         
         Ok(())
     }
@@ -412,10 +684,18 @@ impl Ordering {
                 match update.status {
                     crate::event_bus::OrderStatus::Filled => {
                         // Order filled, convert to position
+                        // Convert order side to position direction and ensure qty is positive
+                        let direction = PositionDirection::from_order_side(update.side);
+                        let qty_abs = if update.filled_qty.0.is_sign_negative() {
+                            Qty(-update.filled_qty.0) // Make positive
+                        } else {
+                            update.filled_qty
+                        };
+                        
                         state_guard.open_position = Some(OpenPosition {
                             symbol: update.symbol.clone(),
-                            side: update.side,
-                            qty: update.filled_qty,
+                            direction,
+                            qty: qty_abs,
                             entry_price: update.average_fill_price, // Use average fill price (weighted average of all fills)
                         });
                         state_guard.open_order = None;
@@ -504,14 +784,18 @@ impl Ordering {
                 // Small differences might be due to timing/rounding, ignore them
                 if qty_diff > rust_decimal::Decimal::new(1, 8) || price_diff > rust_decimal::Decimal::new(1, 8) {
                     // Significant change, update position
+                    // Determine direction from qty sign and ensure qty is positive
+                    let direction = PositionDirection::from_qty_sign(update.qty.0);
+                    let qty_abs = if update.qty.0.is_sign_negative() {
+                        Qty(-update.qty.0) // Make positive
+                    } else {
+                        update.qty
+                    };
+                    
                     state_guard.open_position = Some(OpenPosition {
                         symbol: update.symbol.clone(),
-                        side: if update.qty.0.is_sign_positive() {
-                            Side::Buy  // Long position (qty > 0)
-                        } else {
-                            Side::Sell // Short position (qty < 0)
-                        },
-                        qty: update.qty,
+                        direction,
+                        qty: qty_abs,
                         entry_price: update.entry_price,
                     });
                     
@@ -538,16 +822,17 @@ impl Ordering {
             // Determine position direction from quantity sign:
             // - Long position: qty > 0 (opened with BUY order)
             // - Short position: qty < 0 (opened with SELL order)
-            // Note: Side::Buy/Sell represents the order side used to open the position,
-            // which corresponds to Long/Short position direction
+            let direction = PositionDirection::from_qty_sign(update.qty.0);
+            let qty_abs = if update.qty.0.is_sign_negative() {
+                Qty(-update.qty.0) // Make positive
+            } else {
+                update.qty
+            };
+            
             state_guard.open_position = Some(OpenPosition {
                 symbol: update.symbol.clone(),
-                side: if update.qty.0.is_sign_positive() {
-                    Side::Buy  // Long position (qty > 0)
-                } else {
-                    Side::Sell // Short position (qty < 0)
-                },
-                qty: update.qty,
+                direction,
+                qty: qty_abs,
                 entry_price: update.entry_price,
             });
             

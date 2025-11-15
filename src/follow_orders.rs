@@ -3,12 +3,14 @@
 // Listens to PositionUpdate and MarketTick events
 // Publishes CloseRequest events
 
+use crate::config::AppCfg;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
-use crate::types::{Px, Qty};
+use crate::types::{Px, Qty, PositionDirection};
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,12 +19,14 @@ use tracing::{error, info, warn};
 
 /// FOLLOW_ORDERS module - position tracking and TP/SL control
 pub struct FollowOrders {
+    cfg: Arc<AppCfg>,
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
     // Tracked positions: symbol -> PositionInfo
     positions: Arc<RwLock<HashMap<String, PositionInfo>>>,
     // TP/SL from TradeSignal: symbol -> (stop_loss_pct, take_profit_pct)
     // This allows us to set TP/SL when position is opened
+    // Falls back to config defaults if TradeSignal hasn't arrived yet
     tp_sl_from_signals: Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
 }
 
@@ -31,7 +35,8 @@ struct PositionInfo {
     symbol: String,
     qty: Qty,
     entry_price: Px,
-    side: crate::types::Side,
+    /// Position direction (Long or Short) - clearer than using Side
+    direction: PositionDirection,
     leverage: u32,
     stop_loss_pct: Option<f64>,
     take_profit_pct: Option<f64>,
@@ -46,6 +51,7 @@ impl FollowOrders {
     ///
     /// # Arguments
     ///
+    /// * `cfg` - Application configuration containing default TP/SL percentages
     /// * `event_bus` - Event bus for subscribing to PositionUpdate/MarketTick and publishing CloseRequest
     /// * `shutdown_flag` - Shared flag to signal graceful shutdown
     ///
@@ -57,16 +63,19 @@ impl FollowOrders {
     ///
     /// ```no_run
     /// # use std::sync::Arc;
+    /// # let cfg = Arc::new(crate::config::load_config()?);
     /// # let event_bus = Arc::new(crate::event_bus::EventBus::new());
     /// # let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    /// let follow_orders = FollowOrders::new(event_bus, shutdown_flag);
+    /// let follow_orders = FollowOrders::new(cfg, event_bus, shutdown_flag);
     /// follow_orders.start().await?;
     /// ```
     pub fn new(
+        cfg: Arc<AppCfg>,
         event_bus: Arc<EventBus>,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            cfg,
             event_bus,
             shutdown_flag,
             positions: Arc::new(RwLock::new(HashMap::new())),
@@ -102,6 +111,7 @@ impl FollowOrders {
     /// // Service is now tracking positions and monitoring TP/SL
     /// ```
     pub async fn start(&self) -> Result<()> {
+        let cfg = self.cfg.clone();
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let positions = self.positions.clone();
@@ -132,6 +142,7 @@ impl FollowOrders {
         });
         
         // Spawn task for PositionUpdate events
+        let cfg_pos = cfg.clone();
         let positions_pos = positions.clone();
         let tp_sl_pos = tp_sl_from_signals.clone();
         let event_bus_pos = event_bus.clone();
@@ -148,7 +159,7 @@ impl FollowOrders {
                             break;
                         }
                         
-                        Self::handle_position_update(&update, &positions_pos, &tp_sl_pos).await;
+                        Self::handle_position_update(&update, &cfg_pos, &positions_pos, &tp_sl_pos).await;
                     }
                     Err(_) => break,
                 }
@@ -228,8 +239,10 @@ impl FollowOrders {
 
     /// Handle PositionUpdate event
     /// Updates tracked positions and sets TP/SL from TradeSignal if available
+    /// Falls back to config defaults if TradeSignal hasn't arrived yet (race condition prevention)
     async fn handle_position_update(
         update: &PositionUpdate,
+        cfg: &Arc<AppCfg>,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         tp_sl_from_signals: &Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
     ) {
@@ -240,27 +253,33 @@ impl FollowOrders {
             // Determine position direction from quantity sign:
             // - Long position: qty > 0 (opened with BUY order)
             // - Short position: qty < 0 (opened with SELL order)
-            // Note: Side::Buy/Sell represents the order side used to open the position,
-            // which corresponds to Long/Short position direction
-            let side = if update.qty.0.is_sign_positive() {
-                crate::types::Side::Buy  // Long position (qty > 0)
-            } else {
-                crate::types::Side::Sell // Short position (qty < 0)
-            };
             
-            // Get TP/SL from TradeSignal if available
+            // Get TP/SL from TradeSignal if available, otherwise use config defaults
+            // CRITICAL: Prevents race condition where PositionUpdate arrives before TradeSignal
+            // If TradeSignal hasn't arrived yet, use config defaults to ensure TP/SL is always set
             let (stop_loss_pct, take_profit_pct) = {
                 let tp_sl_guard = tp_sl_from_signals.read().await;
                 tp_sl_guard.get(&update.symbol)
                     .cloned()
-                    .unwrap_or((None, None))
+                    .unwrap_or((
+                        Some(cfg.stop_loss_pct),    // Default from config
+                        Some(cfg.take_profit_pct)   // Default from config
+                    ))
+            };
+            
+            // Determine position direction from qty sign and ensure qty is positive
+            let direction = PositionDirection::from_qty_sign(update.qty.0);
+            let qty_abs = if update.qty.0.is_sign_negative() {
+                Qty(-update.qty.0) // Make positive
+            } else {
+                update.qty
             };
             
             positions_guard.insert(update.symbol.clone(), PositionInfo {
                 symbol: update.symbol.clone(),
-                qty: update.qty,
+                qty: qty_abs,
                 entry_price: update.entry_price,
-                side,
+                direction,
                 leverage: update.leverage,
                 stop_loss_pct,
                 take_profit_pct,
@@ -269,9 +288,9 @@ impl FollowOrders {
             
             info!(
                 symbol = %update.symbol,
-                qty = %update.qty.0,
+                qty = %qty_abs.0,
                 entry_price = %update.entry_price.0,
-                side = ?side,
+                direction = ?direction,
                 stop_loss_pct = ?stop_loss_pct,
                 take_profit_pct = ?take_profit_pct,
                 "FOLLOW_ORDERS: Position tracked with TP/SL"
@@ -312,7 +331,9 @@ impl FollowOrders {
         
         drop(positions_read);
         
-        // Calculate current price (use mark price if available, otherwise mid price)
+        // CRITICAL: Use mark price if available (more accurate for futures PnL calculation)
+        // Mark price is the fair value price used for liquidation and PnL calculations
+        // If mark price is not available, fall back to bid/ask mid price
         let current_price = tick.mark_price.unwrap_or_else(|| {
             Px((tick.bid.0 + tick.ask.0) / Decimal::from(2))
         });
@@ -324,35 +345,49 @@ impl FollowOrders {
         let current_price_val = current_price.0;
         
         // Calculate price change percentage based on position direction
-        // Side::Buy = Long position (qty > 0): profit when price goes up
-        // Side::Sell = Short position (qty < 0): profit when price goes down
-        let price_change_pct = match position.side {
-            crate::types::Side::Buy => {
+        // Long position: profit when price goes up
+        // Short position: profit when price goes down
+        let price_change_pct = match position.direction {
+            PositionDirection::Long => {
                 // Long position: profit when price goes up
                 ((current_price_val - entry_price) / entry_price) * Decimal::from(100)
             }
-            crate::types::Side::Sell => {
+            PositionDirection::Short => {
                 // Short position: profit when price goes down
                 ((entry_price - current_price_val) / entry_price) * Decimal::from(100)
             }
         };
         
-        // Apply leverage to get actual PnL percentage
-        // PnL% = PriceChange% * Leverage
+        // Apply leverage to get gross PnL percentage (without commission)
+        // Gross PnL% = PriceChange% * Leverage
         let leverage_decimal = Decimal::from(position.leverage);
-        let pnl_pct = price_change_pct * leverage_decimal;
+        let gross_pnl_pct = price_change_pct * leverage_decimal;
         
-        let pnl_pct_f64 = pnl_pct.to_f64().unwrap_or(0.0);
+        // CRITICAL: Calculate commission (taker fee: 0.04% per trade)
+        // Commission applies to both open and close trades (2x commission)
+        // Commission reduces the actual PnL
+        let commission_pct = Decimal::from_str("0.04").unwrap_or_else(|_| Decimal::ZERO);
+        let total_commission_pct = commission_pct * Decimal::from(2); // Open + close
         
-        // Check take profit
+        // Calculate net PnL percentage (gross PnL - commission)
+        // Net PnL% = Gross PnL% - (Commission% * 2)
+        let net_pnl_pct = gross_pnl_pct - total_commission_pct;
+        
+        let net_pnl_pct_f64 = net_pnl_pct.to_f64().unwrap_or(0.0);
+        let gross_pnl_pct_f64 = gross_pnl_pct.to_f64().unwrap_or(0.0);
+        
+        // Check take profit (using net PnL - commission included)
         if let Some(tp_pct) = position.take_profit_pct {
-            if pnl_pct_f64 >= tp_pct {
+            if net_pnl_pct_f64 >= tp_pct {
                 // Take profit triggered - send close request and remove position from tracking
                 // This prevents multiple close requests for the same trigger
+                // Include current bid/ask prices to reduce slippage (avoid price fetch delay)
                 let close_request = CloseRequest {
                     symbol: tick.symbol.clone(),
                     position_id: None,
                     reason: CloseReason::TakeProfit,
+                    current_bid: Some(tick.bid),
+                    current_ask: Some(tick.ask),
                     timestamp: Instant::now(),
                 };
                 
@@ -371,26 +406,31 @@ impl FollowOrders {
                 } else {
                     info!(
                         symbol = %tick.symbol,
-                        pnl_pct = pnl_pct_f64,
+                        net_pnl_pct = net_pnl_pct_f64,
+                        gross_pnl_pct = gross_pnl_pct_f64,
+                        commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
                         tp_pct,
                         leverage = position.leverage,
                         price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
-                        "FOLLOW_ORDERS: Take profit triggered, position removed from tracking"
+                        "FOLLOW_ORDERS: Take profit triggered (net PnL), position removed from tracking"
                     );
                 }
                 return Ok(());
             }
         }
         
-        // Check stop loss
+        // Check stop loss (using net PnL - commission included)
         if let Some(sl_pct) = position.stop_loss_pct {
-            if pnl_pct_f64 <= -sl_pct {
+            if net_pnl_pct_f64 <= -sl_pct {
                 // Stop loss triggered - send close request and remove position from tracking
                 // This prevents multiple close requests for the same trigger
+                // Include current bid/ask prices to reduce slippage (avoid price fetch delay)
                 let close_request = CloseRequest {
                     symbol: tick.symbol.clone(),
                     position_id: None,
                     reason: CloseReason::StopLoss,
+                    current_bid: Some(tick.bid),
+                    current_ask: Some(tick.ask),
                     timestamp: Instant::now(),
                 };
                 
@@ -409,11 +449,13 @@ impl FollowOrders {
                 } else {
                     info!(
                         symbol = %tick.symbol,
-                        pnl_pct = pnl_pct_f64,
+                        net_pnl_pct = net_pnl_pct_f64,
+                        gross_pnl_pct = gross_pnl_pct_f64,
+                        commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
                         sl_pct,
                         leverage = position.leverage,
                         price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
-                        "FOLLOW_ORDERS: Stop loss triggered, position removed from tracking"
+                        "FOLLOW_ORDERS: Stop loss triggered (net PnL), position removed from tracking"
                     );
                 }
                 return Ok(());

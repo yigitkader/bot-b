@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
     
     // Initialize FOLLOW_ORDERS module
     let follow_orders = FollowOrders::new(
+        cfg.clone(),
         event_bus.clone(),
         shutdown_flag.clone(),
     );
@@ -139,6 +140,8 @@ async fn main() -> Result<()> {
         cfg.clone(),
         event_bus.clone(),
         shutdown_flag.clone(),
+        shared_state.clone(),
+        connection.clone(),
     );
     trending.start().await?;
     

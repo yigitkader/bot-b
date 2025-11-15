@@ -618,24 +618,43 @@ impl Connection {
                                             let event_bus_pos = event_bus.clone();
                                             let symbol_clone = symbol.clone();
                                             tokio::spawn(async move {
-                                                // Small delay to ensure OrderUpdate is processed first
-                                                // This reduces (but doesn't eliminate) race condition risk
-                                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                                // Retry mechanism: Binance API sometimes takes time to update position
+                                                // Use exponential backoff instead of arbitrary fixed delay
+                                                const MAX_RETRIES: u32 = 5;
+                                                const BASE_DELAY_MS: u64 = 200;
                                                 
-                                                if let Ok(position) = venue_clone.get_position(&symbol_clone).await {
-                                                    let position_update = PositionUpdate {
-                                                        symbol: symbol_clone,
-                                                        qty: position.qty,
-                                                        entry_price: position.entry,
-                                                        leverage: position.leverage,
-                                                        unrealized_pnl: None, // Can be calculated from mark price
-                                                        is_open: !position.qty.0.is_zero(),
-                                                        timestamp: Instant::now(),
-                                                    };
-                                                    if let Err(e) = event_bus_pos.position_update_tx.send(position_update) {
-                                                        error!(
-                                                            error = ?e,
-                                                            "CONNECTION: Failed to send PositionUpdate event (no subscribers or channel closed)"
+                                                for attempt in 0..MAX_RETRIES {
+                                                    // Exponential backoff: 200ms, 400ms, 600ms, 800ms, 1000ms
+                                                    let delay_ms = BASE_DELAY_MS * (attempt + 1) as u64;
+                                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                                    
+                                                    if let Ok(position) = venue_clone.get_position(&symbol_clone).await {
+                                                        // Position successfully fetched, send update event
+                                                        let position_update = PositionUpdate {
+                                                            symbol: symbol_clone,
+                                                            qty: position.qty,
+                                                            entry_price: position.entry,
+                                                            leverage: position.leverage,
+                                                            unrealized_pnl: None, // Can be calculated from mark price
+                                                            is_open: !position.qty.0.is_zero(),
+                                                            timestamp: Instant::now(),
+                                                        };
+                                                        if let Err(e) = event_bus_pos.position_update_tx.send(position_update) {
+                                                            error!(
+                                                                error = ?e,
+                                                                "CONNECTION: Failed to send PositionUpdate event (no subscribers or channel closed)"
+                                                            );
+                                                        }
+                                                        // Successfully fetched and sent, break retry loop
+                                                        break;
+                                                    }
+                                                    
+                                                    // If this was the last attempt, log warning
+                                                    if attempt == MAX_RETRIES - 1 {
+                                                        warn!(
+                                                            symbol = %symbol_clone,
+                                                            attempts = MAX_RETRIES,
+                                                            "CONNECTION: Failed to fetch position after order fill (max retries reached)"
                                                         );
                                                     }
                                                 }
@@ -829,11 +848,6 @@ impl Connection {
         
         // 6. Check balance (if shared_state is available)
         if let Some(shared_state) = &self.shared_state {
-            // For futures, we need margin = notional / leverage
-            // Get leverage from config (use cfg.leverage if set, otherwise use cfg.exec.default_leverage)
-            let leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage) as u32;
-            let required_margin = notional / Decimal::from(leverage);
-            
             // Check available balance (USDT or USDC depending on quote asset)
             let balance_store = shared_state.balance_store.read().await;
             let available_balance = if self.cfg.quote_asset.to_uppercase() == "USDT" {
@@ -842,26 +856,65 @@ impl Connection {
                 balance_store.usdc
             };
             
-            if available_balance < required_margin {
-                return Err(anyhow!(
-                    "Insufficient balance: required margin {} (notional {} / leverage {}x) > available balance {} for {}",
-                    required_margin,
-                    notional,
-                    leverage,
-                    available_balance,
-                    self.cfg.quote_asset
-                ));
+            if is_open_order {
+                // For Open orders: check margin requirement
+                // For futures, we need margin = notional / leverage
+                // Get leverage from config (use cfg.leverage if set, otherwise use cfg.exec.default_leverage)
+                let leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage) as u32;
+                let required_margin = notional / Decimal::from(leverage);
+                
+                if available_balance < required_margin {
+                    return Err(anyhow!(
+                        "Insufficient balance: required margin {} (notional {} / leverage {}x) > available balance {} for {}",
+                        required_margin,
+                        notional,
+                        leverage,
+                        available_balance,
+                        self.cfg.quote_asset
+                    ));
+                }
+                
+                info!(
+                    symbol = %symbol,
+                    side = ?side,
+                    notional = %notional,
+                    required_margin = %required_margin,
+                    available_balance = %available_balance,
+                    leverage = leverage,
+                    "Order validation passed: balance sufficient for margin"
+                );
+            } else {
+                // For Close orders: check minimum balance for commission
+                // Close orders don't require margin (position already open), but commission is needed
+                // Binance futures commission is typically 0.02-0.04% of notional
+                // Use 0.1% as safety margin to account for commission and potential price movement
+                let commission_rate = Decimal::new(1, 3); // 0.001 = 0.1%
+                let commission_estimate = notional * commission_rate;
+                // Also check against minimum quote balance from config
+                let min_balance = Decimal::from(self.cfg.min_quote_balance_usd);
+                let required_balance = commission_estimate.max(min_balance);
+                
+                if available_balance < required_balance {
+                    return Err(anyhow!(
+                        "Insufficient balance for close order: required {} (commission estimate {} or min balance {}) > available balance {} for {}",
+                        required_balance,
+                        commission_estimate,
+                        min_balance,
+                        available_balance,
+                        self.cfg.quote_asset
+                    ));
+                }
+                
+                info!(
+                    symbol = %symbol,
+                    side = ?side,
+                    notional = %notional,
+                    commission_estimate = %commission_estimate,
+                    min_balance = %min_balance,
+                    available_balance = %available_balance,
+                    "Order validation passed: balance sufficient for commission"
+                );
             }
-            
-            info!(
-                symbol = %symbol,
-                side = ?side,
-                notional = %notional,
-                required_margin = %required_margin,
-                available_balance = %available_balance,
-                leverage = leverage,
-                "Order validation passed: balance sufficient"
-            );
         } else {
             // Shared state not available, skip balance check (log warning)
             warn!(
@@ -896,6 +949,25 @@ impl Connection {
         
         // Fallback to REST API if cache is empty
         self.venue.best_prices(symbol).await
+    }
+
+    /// Get cached market prices (bid, ask) for a symbol synchronously
+    /// Returns None if price is not in cache (no async fallback)
+    /// Use this when you need prices atomically without async operations
+    pub fn get_cached_prices(symbol: &str) -> Option<(Px, Px)> {
+        PRICE_CACHE.get(symbol).map(|price_update| (price_update.bid, price_update.ask))
+    }
+
+    /// Cancel an order by order ID and symbol
+    /// Used for cleaning up orders in race condition scenarios
+    pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> Result<()> {
+        // Rate limit check
+        {
+            let mut limiter = self.rate_limiter.lock().await;
+            limiter.check_order_rate().await;
+        }
+        
+        self.venue.cancel(order_id, symbol).await
     }
 }
 
@@ -1958,13 +2030,19 @@ impl BinanceFutures {
             Ok(pos) => pos,
             Err(e) => {
                 let error_str = e.to_string().to_lowercase();
-                // Manuel kapatma durumlarını handle et - pozisyon zaten kapalıysa hata verme
+                // CRITICAL: Only handle specific "position not found" errors
+                // Network errors (timeout, connection refused, etc.) should be retried, not ignored
+                // Binance error codes:
+                // - "-2011": Unknown order (position not found)
+                // - "position not found": Explicit position not found message
+                // - "no position": Alternative position not found message
                 if error_str.contains("position not found") 
                     || error_str.contains("no position")
-                    || error_str.contains("position already closed") {
+                    || error_str.contains("-2011") {  // Binance: Unknown order (position not found)
                     info!(symbol = %sym, "position already closed (manual intervention detected), skipping close");
                     return Ok(());
                 }
+                // Other errors (network, API errors, etc.) should be retried
                 return Err(e);
             }
         };
@@ -2002,13 +2080,19 @@ impl BinanceFutures {
                 Ok(pos) => pos,
                 Err(e) => {
                     let error_str = e.to_string().to_lowercase();
-                    // Manuel kapatma durumlarını handle et
+                    // CRITICAL: Only handle specific "position not found" errors
+                    // Network errors should be retried, not ignored
+                    // Binance error codes:
+                    // - "-2011": Unknown order (position not found)
+                    // - "position not found": Explicit position not found message
+                    // - "no position": Alternative position not found message
                     if error_str.contains("position not found") 
                         || error_str.contains("no position")
-                        || error_str.contains("position already closed") {
+                        || error_str.contains("-2011") {  // Binance: Unknown order (position not found)
                         info!(symbol = %sym, attempt, "position already closed during retry (manual intervention detected)");
                         return Ok(());
                     }
+                    // Other errors (network, API errors, etc.) should be retried
                     return Err(e);
                 }
             };
