@@ -59,6 +59,7 @@ fn decimal_places(step: Decimal) -> usize {
 struct OrderFillHistory {
     total_filled_qty: Qty,
     weighted_price_sum: Decimal, // Sum of (price * qty) for all fills
+    last_update: Instant, // Timestamp of last update (for cleanup)
 }
 
 pub struct Connection {
@@ -279,12 +280,17 @@ impl Connection {
         for symbol in &symbols {
             // Set margin type (isolated or cross)
             if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {
-                warn!(
+                error!(
                     error = %e,
                     symbol = %symbol,
                     isolated = use_isolated_margin,
-                    "CONNECTION: Failed to set margin type for symbol, continuing anyway (may cause issues)"
+                    "CONNECTION: CRITICAL - Failed to set margin type for symbol. Cannot continue with incorrect margin type."
                 );
+                return Err(anyhow!(
+                    "Failed to set margin type for symbol {}: {}",
+                    symbol,
+                    e
+                ));
             } else {
                 info!(
                     symbol = %symbol,
@@ -293,14 +299,49 @@ impl Connection {
                 );
             }
             
-            // Set leverage
+            // CRITICAL: Verify current leverage before setting (if position exists)
+            // This prevents conflicts if exchange has different leverage
+            if let Ok(position) = self.venue.get_position(symbol).await {
+                if !position.qty.0.is_zero() {
+                    // Position exists - verify leverage matches
+                    if position.leverage != leverage {
+                        error!(
+                            symbol = %symbol,
+                            current_leverage = position.leverage,
+                            config_leverage = leverage,
+                            "CONNECTION: CRITICAL - Leverage mismatch! Exchange has {}x but config requires {}x. Cannot proceed with different leverage.",
+                            position.leverage,
+                            leverage
+                        );
+                        return Err(anyhow!(
+                            "Leverage mismatch for symbol {}: exchange has {}x but config requires {}x",
+                            symbol,
+                            position.leverage,
+                            leverage
+                        ));
+                    } else {
+                        info!(
+                            symbol = %symbol,
+                            leverage,
+                            "CONNECTION: Leverage verified (matches config)"
+                        );
+                    }
+                }
+            }
+            
+            // Set leverage (only if no position exists or leverage matches)
             if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
-                warn!(
+                error!(
                     error = %e,
                     symbol = %symbol,
                     leverage,
-                    "CONNECTION: Failed to set leverage for symbol, continuing anyway (may cause issues)"
+                    "CONNECTION: CRITICAL - Failed to set leverage for symbol. Cannot continue with incorrect leverage."
                 );
+                return Err(anyhow!(
+                    "Failed to set leverage for symbol {}: {}",
+                    symbol,
+                    e
+                ));
             } else {
                 info!(
                     symbol = %symbol,
@@ -313,30 +354,104 @@ impl Connection {
         // Start market data stream
         self.start_market_data_stream(symbols.clone()).await?;
         
-        // Start user data stream
-        self.start_user_data_stream().await?;
+        // Start user data stream (pass symbols for missed events sync)
+        self.start_user_data_stream(symbols.clone()).await?;
         
         // Start periodic rules refresh task
         self.start_rules_refresh_task().await;
         
+        // Start periodic order fill history cleanup task
+        self.start_order_fill_history_cleanup_task().await;
+        
         info!("CONNECTION: All streams started");
         Ok(())
+    }
+    
+    /// Start periodic cleanup task for order fill history
+    /// Removes entries older than 24 hours to prevent memory leaks
+    /// This is critical because if OrderUpdate events are missed (WebSocket disconnect),
+    /// history entries may never be cleaned up, causing memory to grow unbounded
+    async fn start_order_fill_history_cleanup_task(&self) {
+        let order_fill_history = self.order_fill_history.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+        
+        tokio::spawn(async move {
+            const CLEANUP_INTERVAL_SECS: u64 = 3600; // Every hour
+            const MAX_AGE_SECS: u64 = 86400; // 24 hours
+            
+            loop {
+                tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
+                
+                if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                
+                let now = Instant::now();
+                let mut removed_count = 0;
+                
+                // Remove entries older than MAX_AGE_SECS
+                order_fill_history.retain(|order_id, history| {
+                    let age = now.duration_since(history.last_update);
+                    if age.as_secs() > MAX_AGE_SECS {
+                        removed_count += 1;
+                        false // Remove this entry
+                    } else {
+                        true // Keep this entry
+                    }
+                });
+                
+                if removed_count > 0 {
+                    info!(
+                        removed_count,
+                        remaining_entries = order_fill_history.len(),
+                        "CONNECTION: Cleaned up {} old order fill history entries (older than {} hours)",
+                        removed_count,
+                        MAX_AGE_SECS / 3600
+                    );
+                } else {
+                    tracing::debug!(
+                        total_entries = order_fill_history.len(),
+                        "CONNECTION: Order fill history cleanup completed (no entries to remove)"
+                    );
+                }
+            }
+        });
     }
 
     /// Start market data WebSocket stream
     /// Publishes MarketTick events to event bus
     async fn start_market_data_stream(&self, symbols: Vec<String>) -> Result<()> {
+        // CRITICAL: Deduplicate symbols to prevent duplicate subscriptions
+        // If duplicate symbols exist, multiple streams would subscribe to the same symbol,
+        // causing unnecessary writes to PRICE_CACHE, duplicate data processing, and potential event ordering issues
+        let original_count = symbols.len();
+        let unique_symbols: Vec<String> = symbols
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let deduplicated_count = unique_symbols.len();
+        
+        if original_count != deduplicated_count {
+            warn!(
+                original_count,
+                deduplicated_count,
+                "CONNECTION: Removed {} duplicate symbols from market data stream subscription",
+                original_count - deduplicated_count
+            );
+        }
+        
         // Binance URL limit: max 200 chars, so we need to split symbols into groups
         const MAX_SYMBOLS_PER_STREAM: usize = 10;
         
         info!(
-            total_symbols = symbols.len(),
-            streams_needed = (symbols.len() + MAX_SYMBOLS_PER_STREAM - 1) / MAX_SYMBOLS_PER_STREAM,
+            total_symbols = unique_symbols.len(),
+            streams_needed = (unique_symbols.len() + MAX_SYMBOLS_PER_STREAM - 1) / MAX_SYMBOLS_PER_STREAM,
             "CONNECTION: setting up market data websocket streams"
         );
         
         // Split symbols into groups
-        for chunk in symbols.chunks(MAX_SYMBOLS_PER_STREAM) {
+        for chunk in unique_symbols.chunks(MAX_SYMBOLS_PER_STREAM) {
             let symbols_chunk = chunk.to_vec();
             let event_bus = self.event_bus.clone();
             let shutdown_flag = self.shutdown_flag.clone();
@@ -464,9 +579,11 @@ impl Connection {
         Ok(())
     }
 
-    /// Start user data WebSocket stream
-    /// Publishes OrderUpdate and PositionUpdate events to event bus
-    async fn start_user_data_stream(&self) -> Result<()> {
+    // Note: sync_missed_events removed - Binance WebSocket automatically sends
+    // ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events after reconnect which contain
+    // current state. No REST API sync needed - WebSocket-first approach as recommended by Binance.
+
+    async fn start_user_data_stream(&self, symbols: Vec<String>) -> Result<()> {
         let client = reqwest::Client::builder().build()?;
         let api_key = self.cfg.binance.api_key.clone();
         let futures_base = self.cfg.binance.futures_base.clone();
@@ -494,9 +611,12 @@ impl Connection {
                 match UserDataStream::connect(client.clone(), &base, &api_key, kind).await {
                     Ok(mut stream) => {
                         info!(?kind, "CONNECTION: connected to Binance user data stream");
+                        
+                        // Set reconnect callback - Binance WebSocket automatically sends
+                        // ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events after reconnect
+                        // which contain current state. No REST API sync needed.
                         stream.set_on_reconnect(move || {
-                            info!("CONNECTION: reconnect callback triggered, sync event sent");
-                            // Heartbeat can be sent if needed
+                            info!("CONNECTION: WebSocket reconnected - Binance will automatically send state updates via ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events");
                         });
                         
                         let mut first_event_after_reconnect = true;
@@ -557,17 +677,20 @@ impl Connection {
                                             // CRITICAL: Calculate average fill price using weighted average
                                             // Formula: new_avg = (old_weighted_sum + new_price * new_qty) / total_qty
                                             // We track weighted_price_sum = sum of (price * qty) for all fills
+                                            let now = Instant::now();
                                             let average_fill_price = {
                                                 let mut history = order_fill_history.entry(order_id.clone()).or_insert_with(|| {
                                                     OrderFillHistory {
                                                         total_filled_qty: Qty(Decimal::ZERO),
                                                         weighted_price_sum: Decimal::ZERO,
+                                                        last_update: now,
                                                     }
                                                 });
                                                 
                                                 // Add this fill to weighted sum: price * qty
                                                 history.weighted_price_sum += last_fill_price.0 * last_filled_qty.0;
                                                 history.total_filled_qty = cumulative_filled_qty;
+                                                history.last_update = now; // Update timestamp
                                                 
                                                 // Calculate average: weighted_sum / total_qty
                                                 if !cumulative_filled_qty.0.is_zero() {
@@ -576,6 +699,40 @@ impl Connection {
                                                     last_fill_price // Fallback if qty is zero (should not happen)
                                                 }
                                             };
+                                            
+                                            // ✅ BEST PRACTICE: Update open orders cache from WebSocket (Binance recommendation)
+                                            // Update OPEN_ORDERS_CACHE based on order status
+                                            let order_entry = OPEN_ORDERS_CACHE.entry(symbol.clone()).or_insert_with(Vec::new);
+                                            
+                                            // Find existing order in cache
+                                            let existing_order_idx = order_entry.iter().position(|o| o.order_id == order_id);
+                                            
+                                            match status {
+                                                OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::ExpiredInMatch | OrderStatus::Rejected => {
+                                                    // Order is closed - remove from cache
+                                                    if let Some(idx) = existing_order_idx {
+                                                        order_entry.remove(idx);
+                                                    }
+                                                    // If no more open orders for this symbol, remove symbol entry
+                                                    if order_entry.is_empty() {
+                                                        OPEN_ORDERS_CACHE.remove(&symbol);
+                                                    }
+                                                }
+                                                OrderStatus::New | OrderStatus::PartiallyFilled => {
+                                                    // Order is still open - update or add to cache
+                                                    let venue_order = VenueOrder {
+                                                        order_id: order_id.clone(),
+                                                        side,
+                                                        price: last_fill_price, // Use last fill price (or could use order price if available)
+                                                        qty: total_order_qty,
+                                                    };
+                                                    if let Some(idx) = existing_order_idx {
+                                                        order_entry[idx] = venue_order;
+                                                    } else {
+                                                        order_entry.push(venue_order);
+                                                    }
+                                                }
+                                            }
                                             
                                             // Clean up fill history when order is fully filled, canceled, or expired
                                             if matches!(
@@ -661,15 +818,45 @@ impl Connection {
                                             });
                                         }
                                         UserEvent::OrderCanceled {
-                                            symbol: _,
-                                            order_id: _,
+                                            symbol,
+                                            order_id,
                                             client_order_id: _,
                                         } => {
+                                            // ✅ BEST PRACTICE: Update open orders cache when order is canceled
+                                            // Remove canceled order from OPEN_ORDERS_CACHE
+                                            if let Some(mut orders) = OPEN_ORDERS_CACHE.get_mut(&symbol) {
+                                                orders.retain(|o| o.order_id != order_id);
+                                                // If no more open orders for this symbol, remove symbol entry
+                                                if orders.is_empty() {
+                                                    drop(orders); // Release lock before remove
+                                                    OPEN_ORDERS_CACHE.remove(&symbol);
+                                                }
+                                            }
                                             // OrderCanceled event - ORDERING module will handle from its state
                                             // We don't have enough info here to create OrderUpdate
                                         }
                                         UserEvent::AccountUpdate { positions, balances } => {
-                                            // Position updates
+                                            // ✅ BEST PRACTICE: Cache positions from WebSocket (Binance recommendation)
+                                            // Update POSITION_CACHE from ACCOUNT_UPDATE event
+                                            for pos in &positions {
+                                                // Convert AccountPosition to Position for cache
+                                                let position = Position {
+                                                    symbol: pos.symbol.clone(),
+                                                    qty: Qty(pos.position_amt),
+                                                    entry: Px(pos.entry_price),
+                                                    leverage: pos.leverage,
+                                                    liq_px: None, // ACCOUNT_UPDATE doesn't include liquidation price
+                                                };
+                                                POSITION_CACHE.insert(pos.symbol.clone(), position);
+                                            }
+                                            
+                                            // ✅ BEST PRACTICE: Cache balances from WebSocket (Binance recommendation)
+                                            // Update BALANCE_CACHE from ACCOUNT_UPDATE event
+                                            for bal in &balances {
+                                                BALANCE_CACHE.insert(bal.asset.clone(), bal.available_balance);
+                                            }
+                                            
+                                            // Position updates (publish events)
                                             for pos in positions {
                                                 let position_update = PositionUpdate {
                                                     symbol: pos.symbol,
@@ -759,7 +946,8 @@ impl Connection {
         
         match command {
             OrderCommand::Open { symbol, side, price, qty, tif } => {
-                // Pre-order validation (includes position check for Open orders)
+                // Pre-order validation (exchange-level: rules, min_notional, balance)
+                // Position/order state validation is handled by ORDERING module
                 self.validate_order_before_send(&symbol, price, qty, side, true).await?;
                 
                 let (order_id, _) = self.venue.place_limit_with_client_id(
@@ -773,8 +961,8 @@ impl Connection {
                 Ok(order_id)
             }
             OrderCommand::Close { symbol, side, price, qty, tif } => {
-                // Pre-order validation (for close orders, position check is not needed)
-                // But still validate rules and min_notional
+                // Pre-order validation (exchange-level: rules, min_notional, balance)
+                // Position/order state validation is handled by ORDERING module
                 self.validate_order_before_send(&symbol, price, qty, side, false).await?;
                 
                 let (order_id, _) = self.venue.place_limit_with_client_id(
@@ -791,7 +979,9 @@ impl Connection {
     }
 
     /// Validate order before sending
-    /// Checks: symbol rules, min_notional, balance (if available), position (for Open orders)
+    /// Checks: symbol rules, min_notional, balance (if available)
+    /// NOTE: Position/order state validation is handled by ORDERING module (separation of concerns)
+    /// CONNECTION only handles exchange-level validation, not business logic validation
     async fn validate_order_before_send(
         &self,
         symbol: &str,
@@ -826,35 +1016,13 @@ impl Connection {
             ));
         }
         
-        // 5. Check position/order state (for Open orders only)
-        // Defense in depth: ORDERING module also checks, but we validate here too
-        if is_open_order {
-            if let Some(shared_state) = &self.shared_state {
-                let ordering_state = shared_state.ordering_state.lock().await;
-                if ordering_state.open_position.is_some() {
-                    return Err(anyhow!(
-                        "Cannot open new order: position already exists for symbol {}",
-                        symbol
-                    ));
-                }
-                if ordering_state.open_order.is_some() {
-                    return Err(anyhow!(
-                        "Cannot open new order: order already exists for symbol {}",
-                        symbol
-                    ));
-                }
-            }
-        }
-        
-        // 6. Check balance (if shared_state is available)
+        // 5. Check balance (if shared_state is available)
+        // CRITICAL: Use available() method which accounts for reserved balance
+        // This prevents double-spending when balance is reserved by ORDERING module
         if let Some(shared_state) = &self.shared_state {
-            // Check available balance (USDT or USDC depending on quote asset)
+            // Check available balance (total - reserved) for USDT or USDC
             let balance_store = shared_state.balance_store.read().await;
-            let available_balance = if self.cfg.quote_asset.to_uppercase() == "USDT" {
-                balance_store.usdt
-            } else {
-                balance_store.usdc
-            };
+            let available_balance = balance_store.available(&self.cfg.quote_asset);
             
             if is_open_order {
                 // For Open orders: check margin requirement
@@ -956,6 +1124,18 @@ impl Connection {
     /// Use this when you need prices atomically without async operations
     pub fn get_cached_prices(symbol: &str) -> Option<(Px, Px)> {
         PRICE_CACHE.get(symbol).map(|price_update| (price_update.bid, price_update.ask))
+    }
+
+    /// Close position using MARKET order with reduceOnly=true
+    /// This is the recommended method for closing positions as it guarantees immediate execution
+    /// 
+    /// # Arguments
+    /// * `symbol` - Symbol to close position for
+    /// * `use_market_only` - If true, only use MARKET orders (no LIMIT fallback). 
+    ///   Use true for TP/SL scenarios where fast execution is critical.
+    ///   Use false for manual closes where LIMIT fallback is acceptable.
+    pub async fn flatten_position(&self, symbol: &str, use_market_only: bool) -> Result<()> {
+        self.venue.flatten_position(symbol, use_market_only).await
     }
 
     /// Cancel an order by order ID and symbol
@@ -1097,6 +1277,21 @@ pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| Das
 /// - No data corruption or race conditions, but may have unnecessary writes
 /// - Each symbol should ideally be in only one stream chunk to avoid duplicate updates
 pub static PRICE_CACHE: Lazy<DashMap<String, PriceUpdate>> = Lazy::new(|| DashMap::new());
+
+/// ✅ BEST PRACTICE: Position cache from WebSocket user data stream (ACCOUNT_UPDATE events)
+/// Thread-safe position storage - updated by WebSocket, read by main loop
+/// Binance recommendation: Use WebSocket instead of REST API for real-time data
+pub static POSITION_CACHE: Lazy<DashMap<String, Position>> = Lazy::new(|| DashMap::new());
+
+/// ✅ BEST PRACTICE: Balance cache from WebSocket user data stream (ACCOUNT_UPDATE events)
+/// Thread-safe balance storage - updated by WebSocket, read by main loop
+/// Binance recommendation: Use WebSocket instead of REST API for real-time data
+pub static BALANCE_CACHE: Lazy<DashMap<String, Decimal>> = Lazy::new(|| DashMap::new());
+
+/// ✅ BEST PRACTICE: Open orders cache from WebSocket user data stream (ORDER_TRADE_UPDATE events)
+/// Thread-safe open orders storage - updated by WebSocket, read by main loop
+/// Binance recommendation: Use WebSocket instead of REST API for real-time data
+pub static OPEN_ORDERS_CACHE: Lazy<DashMap<String, Vec<VenueOrder>>> = Lazy::new(|| DashMap::new());
 
 fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
     let value = s.as_ref();
@@ -1726,6 +1921,13 @@ impl BinanceFutures {
     }
 
     pub async fn available_balance(&self, asset: &str) -> Result<Decimal> {
+        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
+        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        if let Some(balance) = BALANCE_CACHE.get(asset) {
+            return Ok(*balance);
+        }
+        
+        // Fallback to REST API if cache is empty (e.g., on startup before WebSocket data arrives)
         #[derive(Deserialize)]
         struct FutBalance {
             asset: String,
@@ -1750,13 +1952,25 @@ impl BinanceFutures {
 
         let bal = balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
-            Some(b) => Decimal::from_str(&b.available_balance)?,
+            Some(b) => {
+                let balance = Decimal::from_str(&b.available_balance)?;
+                // Update cache with REST API result (for startup sync)
+                BALANCE_CACHE.insert(asset.to_string(), balance);
+                balance
+            }
             None => Decimal::ZERO,
         };
         Ok(amt)
     }
 
     pub async fn fetch_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
+        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
+        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        if let Some(orders) = OPEN_ORDERS_CACHE.get(sym) {
+            return Ok(orders.clone());
+        }
+        
+        // Fallback to REST API if cache is empty (e.g., on startup before WebSocket data arrives)
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
             sym,
@@ -1788,6 +2002,12 @@ impl BinanceFutures {
                 qty: Qty(qty),
             });
         }
+        
+        // Update cache with REST API result (for startup sync)
+        if !res.is_empty() {
+            OPEN_ORDERS_CACHE.insert(sym.to_string(), res.clone());
+        }
+        
         Ok(res)
     }
 
@@ -1822,6 +2042,13 @@ impl BinanceFutures {
     }
 
     pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
+        // ✅ BEST PRACTICE: Try WebSocket cache first (Binance recommendation)
+        // WebSocket is faster, more efficient, and reduces REST API rate limit usage
+        if let Some(position) = POSITION_CACHE.get(sym) {
+            return Ok(position.clone());
+        }
+        
+        // Fallback to REST API if cache is empty (e.g., on startup before WebSocket data arrives)
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
             sym,
@@ -1900,21 +2127,27 @@ impl BinanceFutures {
                     "WARNING: Multiple positions found in one-way mode, using net position"
                 );
                 // Net pozisyonu kullan (LONG - SHORT)
-                Ok(Position {
+                let position = Position {
                     symbol: sym.to_string(),
                     qty: Qty(net_qty),
                     entry: Px(entry), // İlk pozisyonun entry'si (net pozisyon için ortalama hesaplanabilir ama basit tutuyoruz)
                     leverage,
                     liq_px,
-                })
+                };
+                // ✅ BEST PRACTICE: Update cache with REST API result (for startup sync)
+                POSITION_CACHE.insert(sym.to_string(), position.clone());
+                Ok(position)
             } else {
-                Ok(Position {
+                let position = Position {
                     symbol: sym.to_string(),
                     qty: Qty(qty),
                     entry: Px(entry),
                     leverage,
                     liq_px,
-                })
+                };
+                // ✅ BEST PRACTICE: Update cache with REST API result (for startup sync)
+                POSITION_CACHE.insert(sym.to_string(), position.clone());
+                Ok(position)
             }
         } else {
             // ✅ KRİTİK: Hedge modunda - net pozisyonu hesapla (LONG - SHORT)
@@ -1990,13 +2223,16 @@ impl BinanceFutures {
                 Decimal::ZERO
             };
             
-            Ok(Position {
+            let position = Position {
                 symbol: sym.to_string(),
                 qty: Qty(net_qty),
                 entry: Px(net_entry),
                 leverage,
                 liq_px,
-            })
+            };
+            // ✅ BEST PRACTICE: Update cache with REST API result (for startup sync)
+            POSITION_CACHE.insert(sym.to_string(), position.clone());
+            Ok(position)
         }
     }
 
@@ -3470,24 +3706,19 @@ impl UserDataStream {
         self.ws = ws;
         self.last_keep_alive = Instant::now();
 
-        // ✅ KRİTİK: Reconnect sonrası missed events sync callback'i çağır
+        // Optional reconnect callback (for logging only)
+        // Binance WebSocket automatically sends state updates after reconnect
         if let Some(ref callback) = self.on_reconnect {
             callback();
-            info!(%url, "reconnected user data websocket (same listen key), sync callback triggered - missed events will be synced");
-        } else {
-            error!(
-                %url,
-                "CRITICAL: WebSocket reconnected, but no sync callback set - missed events will NOT be synced! This may cause state inconsistencies."
-            );
         }
-
         info!(%url, "reconnected user data websocket (same listen key)");
         Ok(())
     }
 
-    /// WS'yi yeni listenKey ile tekrar bağlar (var olan ws kapatılır)
-    /// KRİTİK DÜZELTME: Reconnect sonrası missed events sync eklendi
-    /// ✅ KRİTİK: Bu fonksiyon sadece listen key expire olduğunda veya keep_alive başarısız olduğunda çağrılmalı
+    /// Reconnect WebSocket with new listen key (existing connection is closed)
+    /// This function is called when listen key expires or keep_alive fails
+    /// Binance WebSocket automatically sends state updates after reconnect via
+    /// ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events. No REST API sync needed.
     async fn reconnect_ws(&mut self) -> Result<()> {
         // ✅ KRİTİK DÜZELTME: Önce mevcut listen key ile yeniden bağlanmayı dene
         // Timeout olunca listen key hala geçerli olabilir (60 dakika geçerli)
@@ -3514,27 +3745,21 @@ impl UserDataStream {
         self.ws = ws;
         self.last_keep_alive = Instant::now();
 
-        // 3. ✅ KRİTİK: Reconnect sonrası missed events sync callback'i çağır
-        // Callback app_init.rs'de set edilir ve REST API'den missed events'leri sync eder
-        // Callback her reconnect'te set edilmelidir (app_init.rs'deki setup_websocket içinde)
+        // 3. Reconnect callback (optional, for logging only)
+        // Binance WebSocket automatically sends ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events
+        // after reconnect which contain current state. No REST API sync needed.
         if let Some(ref callback) = self.on_reconnect {
             callback();
-            info!(%url, "reconnected user data websocket (new listen key), sync callback triggered - missed events will be synced");
-        } else {
-            // ✅ KRİTİK: Callback set edilmemişse uyarı ver
-            // Bu durumda missed events sync edilmeyecek ve state tutarsız olabilir
-            error!(
-                %url,
-                "CRITICAL: WebSocket reconnected, but no sync callback set - missed events will NOT be synced! This may cause state inconsistencies."
-            );
+            info!(%url, "reconnected user data websocket (new listen key), callback triggered");
         }
 
         info!(%url, "reconnected user data websocket (new listen key)");
         Ok(())
     }
 
-    /// Reconnect sonrası missed events sync callback'i set et
-    /// Callback reconnect sonrası çağrılır ve REST API'den missed events'leri sync etmek için kullanılır
+    /// Set optional reconnect callback (for logging only)
+    /// Binance WebSocket automatically sends state updates after reconnect via
+    /// ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events. No REST API sync needed.
     pub fn set_on_reconnect<F>(&mut self, callback: F)
     where
         F: Fn() + Send + Sync + 'static,

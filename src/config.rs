@@ -18,6 +18,15 @@ pub struct RiskCfg {
     pub use_isolated_margin: bool,
     #[serde(default = "default_max_position_notional_usd")]
     pub max_position_notional_usd: f64,
+    /// Maker commission rate (percentage, e.g., 0.02 for 0.02%)
+    /// Maker orders add liquidity to the order book (post-only orders)
+    #[serde(default = "default_maker_commission_pct")]
+    pub maker_commission_pct: f64,
+    /// Taker commission rate (percentage, e.g., 0.04 for 0.04%)
+    /// Taker orders remove liquidity from the order book (market orders, IOC orders)
+    /// Default: 0.04% (Binance futures standard taker fee)
+    #[serde(default = "default_taker_commission_pct")]
+    pub taker_commission_pct: f64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -144,6 +153,14 @@ fn default_use_isolated_margin() -> bool {
 
 fn default_max_position_notional_usd() -> f64 {
     1000.0
+}
+
+fn default_maker_commission_pct() -> f64 {
+    0.02 // 0.02% (Binance futures standard maker fee)
+}
+
+fn default_taker_commission_pct() -> f64 {
+    0.04 // 0.04% (Binance futures standard taker fee)
 }
 
 fn default_min_spread_bps() -> f64 {
@@ -412,6 +429,53 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     // Minimum quote balance validation
     if cfg.min_quote_balance_usd <= 0.0 {
         return Err(anyhow!("min_quote_balance_usd must be greater than 0"));
+    }
+
+    // Validate max_usd_per_order vs min_quote_balance_usd relationship
+    // The minimum balance must be at least as large as the maximum order size
+    // Otherwise, we might try to place orders larger than the available balance
+    if cfg.min_quote_balance_usd < cfg.max_usd_per_order {
+        return Err(anyhow!(
+            "min_quote_balance_usd ({}) must be at least as large as max_usd_per_order ({}) to ensure sufficient balance for trading",
+            cfg.min_quote_balance_usd,
+            cfg.max_usd_per_order
+        ));
+    }
+
+    // Validate that profitable trades are possible
+    // For a trade to be profitable, take_profit_pct must exceed stop_loss_pct + total commission
+    // Total commission = entry commission + exit commission (worst case: both taker fees)
+    // Entry commission: taker_commission_pct
+    // Exit commission (TP): taker_commission_pct (on exit price)
+    // Exit commission (SL): taker_commission_pct (on exit price)
+    // Worst case total commission ≈ 2 * taker_commission_pct (entry + exit)
+    // We need: take_profit_pct > stop_loss_pct + (2 * taker_commission_pct)
+    let total_commission_pct = 2.0 * cfg.risk.taker_commission_pct;
+    let min_required_tp = cfg.stop_loss_pct + total_commission_pct;
+    if cfg.take_profit_pct <= min_required_tp {
+        return Err(anyhow!(
+            "take_profit_pct ({}) must be greater than stop_loss_pct ({}) + total commission ({}). Current: {} <= {}. Profitable trades would be impossible.",
+            cfg.take_profit_pct,
+            cfg.stop_loss_pct,
+            total_commission_pct,
+            cfg.take_profit_pct,
+            min_required_tp
+        ));
+    }
+
+    // Validate trending spread configuration
+    if cfg.trending.min_spread_bps < 0.0 {
+        return Err(anyhow!("trending.min_spread_bps must be non-negative"));
+    }
+    if cfg.trending.max_spread_bps <= 0.0 {
+        return Err(anyhow!("trending.max_spread_bps must be greater than 0"));
+    }
+    if cfg.trending.min_spread_bps > cfg.trending.max_spread_bps {
+        return Err(anyhow!(
+            "trending.min_spread_bps ({}) must be less than or equal to trending.max_spread_bps ({})",
+            cfg.trending.min_spread_bps,
+            cfg.trending.max_spread_bps
+        ));
     }
 
     Ok(())

@@ -16,10 +16,20 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Global state for ORDERING module
 /// Guarantees single position/order at a time
+/// 
+/// CRITICAL: Timestamp tracking prevents stale event updates
+/// OrderUpdate and PositionUpdate events may arrive out of order or be stale
+/// We track the last update timestamp to ensure we only apply newer updates
 #[derive(Clone, Debug)]
 pub struct OrderingState {
     pub open_position: Option<OpenPosition>,
     pub open_order: Option<OpenOrder>,
+    /// Timestamp of the last OrderUpdate event that modified state
+    /// Used to prevent stale OrderUpdate events from overwriting newer state
+    pub last_order_update_timestamp: Option<Instant>,
+    /// Timestamp of the last PositionUpdate event that modified state
+    /// Used to prevent stale PositionUpdate events from overwriting newer state
+    pub last_position_update_timestamp: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +56,8 @@ impl OrderingState {
         Self {
             open_position: None,
             open_order: None,
+            last_order_update_timestamp: None,
+            last_position_update_timestamp: None,
         }
     }
 }
@@ -63,11 +75,20 @@ impl Default for OrderingState {
 /// Shared balance store
 /// Updated by BALANCE module
 /// Read by TRENDING/ORDERING modules
+/// 
+/// CRITICAL: Balance reservation system prevents double-spending race conditions
+/// When placing an order, balance should be reserved atomically before sending
+/// Reservation is released after order is placed (success or failure)
 #[derive(Clone, Debug)]
 pub struct BalanceStore {
     pub usdt: Decimal,
     pub usdc: Decimal,
     pub last_updated: Instant,
+    /// Reserved balance (USDT) - balance reserved for pending orders
+    /// This prevents double-spending when multiple threads check balance simultaneously
+    pub reserved_usdt: Decimal,
+    /// Reserved balance (USDC) - balance reserved for pending orders
+    pub reserved_usdc: Decimal,
 }
 
 impl BalanceStore {
@@ -76,6 +97,44 @@ impl BalanceStore {
             usdt: Decimal::ZERO,
             usdc: Decimal::ZERO,
             last_updated: Instant::now(),
+            reserved_usdt: Decimal::ZERO,
+            reserved_usdc: Decimal::ZERO,
+        }
+    }
+    
+    /// Get available balance (total - reserved) for an asset
+    /// This is the actual available balance that can be used for new orders
+    pub fn available(&self, asset: &str) -> Decimal {
+        let (total, reserved) = if asset.to_uppercase() == "USDT" {
+            (self.usdt, self.reserved_usdt)
+        } else {
+            (self.usdc, self.reserved_usdc)
+        };
+        total - reserved
+    }
+    
+    /// Reserve balance atomically (returns true if reservation successful, false if insufficient)
+    /// This prevents double-spending race conditions
+    pub fn try_reserve(&mut self, asset: &str, amount: Decimal) -> bool {
+        let available = self.available(asset);
+        if available >= amount {
+            if asset.to_uppercase() == "USDT" {
+                self.reserved_usdt += amount;
+            } else {
+                self.reserved_usdc += amount;
+            }
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Release reserved balance
+    pub fn release(&mut self, asset: &str, amount: Decimal) {
+        if asset.to_uppercase() == "USDT" {
+            self.reserved_usdt = (self.reserved_usdt - amount).max(Decimal::ZERO);
+        } else {
+            self.reserved_usdc = (self.reserved_usdc - amount).max(Decimal::ZERO);
         }
     }
 }

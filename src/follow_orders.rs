@@ -170,6 +170,7 @@ impl FollowOrders {
         let positions_tick = positions.clone();
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
+        let cfg_tick = cfg.clone();
         tokio::spawn(async move {
             let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
             
@@ -182,7 +183,7 @@ impl FollowOrders {
                             break;
                         }
                         
-                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &event_bus_tick).await {
+                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &event_bus_tick, &cfg_tick).await {
                             warn!(error = %e, symbol = %tick.symbol, "FOLLOW_ORDERS: error checking TP/SL");
                         }
                     }
@@ -318,6 +319,7 @@ impl FollowOrders {
         tick: &MarketTick,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         event_bus: &Arc<EventBus>,
+        cfg: &Arc<AppCfg>,
     ) -> Result<()> {
         let positions_read = positions.read().await;
         
@@ -363,11 +365,15 @@ impl FollowOrders {
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         
-        // CRITICAL: Calculate commission (taker fee: 0.04% per trade)
+        // CRITICAL: Calculate commission from config
         // Commission applies to both open and close trades (2x commission)
         // Commission reduces the actual PnL
-        let commission_pct = Decimal::from_str("0.04").unwrap_or_else(|_| Decimal::ZERO);
-        let total_commission_pct = commission_pct * Decimal::from(2); // Open + close
+        // Note: Currently using taker rate (more conservative). In the future, we can use
+        // actual maker/taker status from OrderUpdate events if available.
+        // For now, using taker rate ensures we don't overestimate PnL.
+        let taker_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+            .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
+        let total_commission_pct = taker_commission_pct * Decimal::from(2); // Open + close
         
         // Calculate net PnL percentage (gross PnL - commission)
         // Net PnL% = Gross PnL% - (Commission% * 2)

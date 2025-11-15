@@ -296,36 +296,55 @@ impl Ordering {
             return Ok(());
         }
         
-        // 3. Balance pre-check - calculate required margin
+        // 3. Balance pre-check and reservation - calculate required margin
         let leverage = signal.leverage;
         let notional = signal.entry_price.0 * signal.size.0;
         let required_margin = notional / Decimal::from(leverage);
         
-        // Get available balance from shared state
-        let available_balance = {
-            let balance_store = shared_state.balance_store.read().await;
-            if cfg.quote_asset.to_uppercase() == "USDT" {
-                balance_store.usdt
-            } else {
-                balance_store.usdc
+        // CRITICAL: Reserve balance atomically to prevent double-spending race condition
+        // Without reservation, two threads could both check balance (sufficient) and both send orders
+        // With reservation, only one thread can reserve the balance, others will see insufficient balance
+        let balance_reserved = {
+            let mut balance_store = shared_state.balance_store.write().await;
+            let available = balance_store.available(&cfg.quote_asset);
+            
+            if available < required_margin {
+                warn!(
+                    symbol = %signal.symbol,
+                    required_margin = %required_margin,
+                    available_balance = %available,
+                    "ORDERING: Ignoring TradeSignal - insufficient balance"
+                );
+                return Ok(());
             }
+            
+            // Atomically reserve balance (prevents other threads from using it)
+            balance_store.try_reserve(&cfg.quote_asset, required_margin)
         };
         
-        if available_balance < required_margin {
+        if !balance_reserved {
+            // This should not happen if available >= required_margin, but handle it anyway
             warn!(
                 symbol = %signal.symbol,
                 required_margin = %required_margin,
-                available_balance = %available_balance,
-                "ORDERING: Ignoring TradeSignal - insufficient balance"
+                "ORDERING: Failed to reserve balance (race condition detected)"
             );
             return Ok(());
         }
+        
+        // Balance reserved - will be released after order placement (success or failure)
+        // If any check fails after reservation, balance must be released
         
         // 4. Risk control check - max position notional
         let max_position_notional = Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
             .unwrap_or(Decimal::from(10000)); // Default to 10000 USD if conversion fails
         
         if notional > max_position_notional {
+            // Release balance reservation before returning
+            {
+                let mut balance_store = shared_state.balance_store.write().await;
+                balance_store.release(&cfg.quote_asset, required_margin);
+            }
             warn!(
                 symbol = %signal.symbol,
                 notional = %notional,
@@ -342,6 +361,12 @@ impl Ordering {
             
             // Check if we already have an open position or order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
+                // Release balance reservation before returning
+                drop(state_guard);
+                {
+                    let mut balance_store = shared_state.balance_store.write().await;
+                    balance_store.release(&cfg.quote_asset, required_margin);
+                }
                 warn!(
                     symbol = %signal.symbol,
                     "ORDERING: Ignoring TradeSignal - already have open position/order"
@@ -369,61 +394,81 @@ impl Ordering {
         };
         
         let mut last_error: Option<anyhow::Error> = None;
-        let mut order_id = None;
         
-        for attempt in 0..MAX_RETRIES {
-            match connection.send_order(command.clone()).await {
-                Ok(id) => {
-                    order_id = Some(id);
-                    break; // Success, exit retry loop
-                }
-                Err(e) => {
-                    // Check if error is permanent (don't retry)
-                    if Self::is_permanent_error(&e) {
-                        warn!(
-                            error = %e,
-                            symbol = %signal.symbol,
-                            attempt = attempt + 1,
-                            "ORDERING: Permanent error, not retrying"
-                        );
-                        return Err(e);
+        // Attempt order placement with retry logic
+        let order_result: Result<String, anyhow::Error> = {
+            let mut result: Option<Result<String, anyhow::Error>> = None;
+            for attempt in 0..MAX_RETRIES {
+                match connection.send_order(command.clone()).await {
+                    Ok(id) => {
+                        result = Some(Ok(id));
+                        break; // Success, exit retry loop
                     }
-                    
-                    // Store error for final fallback (only if all retries fail)
-                    last_error = Some(anyhow::format_err!("{}", e));
-                    
-                    // Temporary error - retry with exponential backoff
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(100 * 2u64.pow(attempt));
-                        warn!(
-                            error = %e,
-                            symbol = %signal.symbol,
-                            attempt = attempt + 1,
-                            max_retries = MAX_RETRIES,
-                            delay_ms = delay.as_millis(),
-                            "ORDERING: Temporary error, retrying with exponential backoff"
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    } else {
-                        // All retries exhausted
-                        warn!(
-                            error = %e,
-                            symbol = %signal.symbol,
-                            attempt = attempt + 1,
-                            "ORDERING: All retries exhausted"
-                        );
-                        return Err(e);
+                    Err(e) => {
+                        // Check if error is permanent (don't retry)
+                        if Self::is_permanent_error(&e) {
+                            warn!(
+                                error = %e,
+                                symbol = %signal.symbol,
+                                attempt = attempt + 1,
+                                "ORDERING: Permanent error, not retrying"
+                            );
+                            result = Some(Err(e));
+                            break;
+                        }
+                        
+                        // Store error for final fallback (only if all retries fail)
+                        last_error = Some(anyhow::format_err!("{}", e));
+                        
+                        // Temporary error - retry with exponential backoff
+                        if attempt < MAX_RETRIES - 1 {
+                            let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                            warn!(
+                                error = %e,
+                                symbol = %signal.symbol,
+                                attempt = attempt + 1,
+                                max_retries = MAX_RETRIES,
+                                delay_ms = delay.as_millis(),
+                                "ORDERING: Temporary error, retrying with exponential backoff"
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        } else {
+                            // All retries exhausted
+                            warn!(
+                                error = %e,
+                                symbol = %signal.symbol,
+                                attempt = attempt + 1,
+                                "ORDERING: All retries exhausted"
+                            );
+                            result = Some(Err(e));
+                            break;
+                        }
                     }
                 }
             }
+            result.unwrap_or_else(|| {
+                Err(last_error.unwrap_or_else(|| anyhow!("Unknown error after retries")))
+            })
+        };
+        
+        // CRITICAL: Release balance reservation after order placement attempt
+        // Balance is released regardless of success/failure:
+        // - On success: Balance is actually used by the order, reservation can be released
+        // - On failure: Balance was not used, reservation must be released
+        {
+            let mut balance_store = shared_state.balance_store.write().await;
+            balance_store.release(&cfg.quote_asset, required_margin);
         }
         
-        // Get order_id from successful attempt
-        // This should never fail if we reach here (order_id should be Some)
-        let order_id = order_id.ok_or_else(|| {
-            last_error.unwrap_or_else(|| anyhow!("Unknown error after retries"))
-        })?;
+        // Handle order result
+        let order_id = match order_result {
+            Ok(id) => id,
+            Err(e) => {
+                // Balance already released above
+                return Err(e);
+            }
+        };
         
         // Update state (re-acquire lock for state update)
         // CRITICAL: Double-check pattern - another thread might have placed an order
@@ -440,6 +485,10 @@ impl Ordering {
                     side: signal.side,
                     qty: signal.size,
                 });
+                
+                // Update timestamp to reflect manual state change
+                // This ensures subsequent OrderUpdate events are compared against this timestamp
+                state_guard.last_order_update_timestamp = Some(Instant::now());
                 
                 info!(
                     symbol = %signal.symbol,
@@ -489,194 +538,103 @@ impl Ordering {
         shared_state: &Arc<SharedState>,
         cfg: &Arc<AppCfg>,
     ) -> Result<()> {
-        // CRITICAL: Make position check + price calculation atomic
-        // This prevents race condition where position is closed by another thread
-        // between position check and order placement
-        let (position, close_price) = {
-            let state_guard = shared_state.ordering_state.lock().await;
-            
-            // Check if we have an open position for this symbol
-            let position = match &state_guard.open_position {
-                Some(pos) if pos.symbol == request.symbol => pos.clone(),
-                _ => {
-                    warn!(
-                        symbol = %request.symbol,
-                        "ORDERING: Ignoring CloseRequest - no open position for symbol"
-                    );
-                    return Ok(());
-                }
-            };
-            
-            // Get current market prices for closing (atomically, while lock is held)
-            // CRITICAL: Use prices from CloseRequest if available (reduces slippage from fetch delay)
-            // If not provided, try cached prices (synchronous, no async call)
-            // Price selection must match the order side:
-            // - Long position: close with SELL order → use ask price (selling to buyers at ask)
-            // - Short position: close with BUY order → use bid price (buying from sellers at bid)
-            let prices_opt = if let (Some(provided_bid), Some(provided_ask)) = (request.current_bid, request.current_ask) {
-                // Use prices from CloseRequest (from market tick that triggered the close)
-                Some((provided_bid, provided_ask))
-            } else if let Some((cached_bid, cached_ask)) = Connection::get_cached_prices(&request.symbol) {
-                // Use cached prices (synchronous, no async call - safe to do while lock is held)
-                Some((cached_bid, cached_ask))
-            } else {
-                // No cached prices available - we can't fetch async while holding lock
-                // Return None to indicate we need to fetch after lock release
-                None
-            };
-            
-            // If we have prices, calculate close_price atomically
-            if let Some((bid, ask)) = prices_opt {
-                let close_price = match position.direction {
-                    PositionDirection::Long => ask,  // Long position: SELL order → ask price
-                    PositionDirection::Short => bid, // Short position: BUY order → bid price
-                };
-                (position, Some(close_price))
-            } else {
-                // Need to fetch prices after lock release
-                (position, None)
-            }
-        }; // Lock released here
-        
-        // Handle case where we need to fetch prices (cache miss)
-        let (position, close_price) = if let Some(price) = close_price {
-            (position, price)
-        } else {
-            // Fetch prices (lock already released)
-            let (fetched_bid, fetched_ask) = connection.get_current_prices(&request.symbol).await
-                .map_err(|e| anyhow!("Failed to get current market prices for {}: {}", request.symbol, e))?;
-            
-            // Re-acquire lock to verify position still exists
-            let state_guard = shared_state.ordering_state.lock().await;
-            let position = match &state_guard.open_position {
-                Some(pos) if pos.symbol == request.symbol => pos.clone(),
-                _ => {
-                    warn!(
-                        symbol = %request.symbol,
-                        "ORDERING: Position closed by another thread while fetching prices"
-                    );
-                    return Ok(());
-                }
-            };
-            let close_price = match position.direction {
-                PositionDirection::Long => fetched_ask,
-                PositionDirection::Short => fetched_bid,
-            };
-            drop(state_guard);
-            (position, close_price)
-        };
-        
-        // CRITICAL: Double-check before sending order
-        // Another thread might have closed the position while we were calculating prices
+        // CRITICAL: Check if position exists before closing
+        // This prevents unnecessary API calls if position was already closed
+        // Note: flatten_position also checks position, but this early check saves API calls
         {
             let state_guard = shared_state.ordering_state.lock().await;
             if state_guard.open_position.is_none() || 
                state_guard.open_position.as_ref().map(|p| p.symbol != request.symbol).unwrap_or(true) {
                 warn!(
                     symbol = %request.symbol,
-                    "ORDERING: Position closed by another thread before order placement"
+                    "ORDERING: Ignoring CloseRequest - no open position for symbol"
                 );
                 return Ok(());
             }
         } // Lock released
         
-        // Calculate close side from position direction
-        let close_side = position.direction.to_close_side();
+        // CRITICAL: Use MARKET order with reduceOnly=true for closing positions
+        // LIMIT orders are risky for close orders because:
+        // 1. They may not fill immediately if price moves away
+        // 2. TP/SL scenarios require immediate execution
+        // 3. Position may remain open if limit order doesn't fill
+        // Solution: Use flatten_position which sends MARKET orders with reduceOnly=true
+        // This guarantees immediate execution and prevents position from staying open
         
-        // Get TIF for close order
-        // CRITICAL: Never use PostOnly for close orders!
-        // PostOnly orders get canceled if they would cross the spread, leaving the position open.
-        // For close orders, we must ensure execution, so use IOC or GTC only.
-        let tif = if matches!(cfg.exec.tif.as_str(), "ioc" | "IOC") {
-            Tif::Ioc
-        } else {
-            Tif::Gtc  // Default to GTC for close orders (ensures execution)
-        };
+        // Determine if this is a fast close scenario (TP/SL)
+        // Fast close requires use_market_only=true to prevent LIMIT fallback delays
+        use crate::event_bus::CloseReason;
+        let use_market_only = matches!(request.reason, CloseReason::TakeProfit | CloseReason::StopLoss);
         
-        // Place close order via CONNECTION (lock released, no deadlock risk)
-        // Retry logic with exponential backoff
-        use crate::connection::OrderCommand;
-        let command = OrderCommand::Close {
-            symbol: request.symbol.clone(),
-            side: close_side,
-            price: close_price,
-            qty: position.qty,
-            tif,
-        };
-        
-        let mut last_error: Option<anyhow::Error> = None;
-        let mut order_id = None;
-        
-        for attempt in 0..MAX_RETRIES {
-            match connection.send_order(command.clone()).await {
-                Ok(id) => {
-                    order_id = Some(id);
-                    break; // Success, exit retry loop
+        // Close position using MARKET order with reduceOnly=true
+        // flatten_position handles:
+        // - Position verification
+        // - Retry logic for partial fills
+        // - Edge case handling (position already closed, etc.)
+        // - MARKET order with reduceOnly=true guarantee
+        match connection.flatten_position(&request.symbol, use_market_only).await {
+            Ok(()) => {
+                info!(
+                    symbol = %request.symbol,
+                    reason = ?request.reason,
+                    use_market_only,
+                    "ORDERING: Position closed successfully using MARKET order (reduceOnly=true)"
+                );
+            }
+            Err(e) => {
+                // Check if error is permanent (don't retry)
+                if Self::is_permanent_error(&e) {
+                    warn!(
+                        error = %e,
+                        symbol = %request.symbol,
+                        reason = ?request.reason,
+                        "ORDERING: Permanent error closing position, not retrying"
+                    );
+                    return Err(e);
                 }
-                Err(e) => {
-                    // Check if error is permanent (don't retry)
-                    if Self::is_permanent_error(&e) {
-                        warn!(
-                            error = %e,
-                            symbol = %request.symbol,
-                            attempt = attempt + 1,
-                            "ORDERING: Permanent error placing close order, not retrying"
-                        );
-                        return Err(e);
-                    }
-                    
-                    // Store error for final fallback (only if all retries fail)
-                    last_error = Some(anyhow::format_err!("{}", e));
-                    
-                    // Temporary error - retry with exponential backoff
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(100 * 2u64.pow(attempt));
-                        warn!(
-                            error = %e,
-                            symbol = %request.symbol,
-                            attempt = attempt + 1,
-                            max_retries = MAX_RETRIES,
-                            delay_ms = delay.as_millis(),
-                            "ORDERING: Temporary error placing close order, retrying with exponential backoff"
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    } else {
-                        // All retries exhausted
-                        warn!(
-                            error = %e,
-                            symbol = %request.symbol,
-                            attempt = attempt + 1,
-                            "ORDERING: All retries exhausted for close order"
-                        );
-                        return Err(e);
-                    }
-                }
+                
+                // Temporary error - flatten_position already has retry logic
+                // But we can log it for visibility
+                warn!(
+                    error = %e,
+                    symbol = %request.symbol,
+                    reason = ?request.reason,
+                    "ORDERING: Error closing position (flatten_position handles retries internally)"
+                );
+                return Err(e);
             }
         }
-        
-        // Get order_id from successful attempt
-        // This should never fail if we reach here (order_id should be Some)
-        let order_id = order_id.ok_or_else(|| {
-            last_error.unwrap_or_else(|| anyhow!("Unknown error after retries for close order"))
-        })?;
-        
-        info!(
-            symbol = %request.symbol,
-            order_id = %order_id,
-            reason = ?request.reason,
-            "ORDERING: Close order placed successfully"
-        );
         
         Ok(())
     }
 
     /// Handle OrderUpdate event (state sync)
+    /// CRITICAL: Timestamp-based version control prevents stale updates
+    /// Only applies updates that are newer than the last known update
     async fn handle_order_update(
         update: &OrderUpdate,
         shared_state: &Arc<SharedState>,
     ) {
         let mut state_guard = shared_state.ordering_state.lock().await;
+        
+        // CRITICAL: Check if this update is newer than the last known update
+        // Prevents stale OrderUpdate events from overwriting newer state
+        // If no previous timestamp exists, accept the update (first update)
+        let is_newer = state_guard.last_order_update_timestamp
+            .map(|last_ts| update.timestamp > last_ts)
+            .unwrap_or(true);
+        
+        if !is_newer {
+            // Stale update - ignore it
+            tracing::debug!(
+                symbol = %update.symbol,
+                order_id = %update.order_id,
+                update_timestamp = ?update.timestamp,
+                last_timestamp = ?state_guard.last_order_update_timestamp,
+                "ORDERING: Ignoring stale OrderUpdate event"
+            );
+            return;
+        }
         
         // Update order state
         if let Some(ref mut order) = state_guard.open_order {
@@ -700,6 +658,9 @@ impl Ordering {
                         });
                         state_guard.open_order = None;
                         
+                        // Update timestamp after state change
+                        state_guard.last_order_update_timestamp = Some(update.timestamp);
+                        
                         info!(
                             symbol = %update.symbol,
                             order_id = %update.order_id,
@@ -710,6 +671,9 @@ impl Ordering {
                         // Order canceled, clear state
                         state_guard.open_order = None;
                         
+                        // Update timestamp after state change
+                        state_guard.last_order_update_timestamp = Some(update.timestamp);
+                        
                         info!(
                             symbol = %update.symbol,
                             order_id = %update.order_id,
@@ -719,6 +683,9 @@ impl Ordering {
                     crate::event_bus::OrderStatus::Expired | crate::event_bus::OrderStatus::ExpiredInMatch => {
                         // Order expired, clear state (similar to canceled)
                         state_guard.open_order = None;
+                        
+                        // Update timestamp after state change
+                        state_guard.last_order_update_timestamp = Some(update.timestamp);
                         
                         info!(
                             symbol = %update.symbol,
@@ -731,6 +698,9 @@ impl Ordering {
                         // Order rejected, clear state
                         state_guard.open_order = None;
                         
+                        // Update timestamp after state change
+                        state_guard.last_order_update_timestamp = Some(update.timestamp);
+                        
                         warn!(
                             symbol = %update.symbol,
                             order_id = %update.order_id,
@@ -740,6 +710,9 @@ impl Ordering {
                     _ => {
                         // Partial fill or other status, update order
                         order.qty = update.remaining_qty;
+                        
+                        // Update timestamp after state change
+                        state_guard.last_order_update_timestamp = Some(update.timestamp);
                     }
                 }
             }
@@ -747,7 +720,8 @@ impl Ordering {
     }
 
     /// Handle PositionUpdate event (state sync)
-    /// CRITICAL: Race condition prevention - only update if PositionUpdate is newer than OrderUpdate
+    /// CRITICAL: Timestamp-based version control prevents stale updates
+    /// Only applies updates that are newer than the last known update
     /// This prevents stale PositionUpdate events from overwriting state set by OrderUpdate
     async fn handle_position_update(
         update: &PositionUpdate,
@@ -755,18 +729,52 @@ impl Ordering {
     ) {
         let mut state_guard = shared_state.ordering_state.lock().await;
         
-        // CRITICAL: Check if we have a position that was set by OrderUpdate
-        // If PositionUpdate timestamp is older than the last OrderUpdate timestamp, ignore it
-        // This prevents race condition where async PositionUpdate fetch arrives after OrderUpdate
+        // CRITICAL: Check if this update is newer than the last known PositionUpdate
+        // Prevents stale PositionUpdate events from overwriting newer state
+        // If no previous timestamp exists, accept the update (first update)
+        let is_newer_position_update = state_guard.last_position_update_timestamp
+            .map(|last_ts| update.timestamp > last_ts)
+            .unwrap_or(true);
+        
+        // CRITICAL: Also check if PositionUpdate is newer than the last OrderUpdate
+        // OrderUpdate events (from WebSocket) are more reliable and should take precedence
+        // If OrderUpdate is newer, only accept PositionUpdate if it indicates position closed
+        let order_update_is_newer = state_guard.last_order_update_timestamp
+            .map(|order_ts| order_ts > update.timestamp)
+            .unwrap_or(false);
+        
+        if !is_newer_position_update {
+            // Stale PositionUpdate - ignore it
+            tracing::debug!(
+                symbol = %update.symbol,
+                update_timestamp = ?update.timestamp,
+                last_position_timestamp = ?state_guard.last_position_update_timestamp,
+                "ORDERING: Ignoring stale PositionUpdate event"
+            );
+            return;
+        }
+        
+        // If OrderUpdate is newer, be more cautious about accepting PositionUpdate
+        // Only accept if position is closed (trust exchange's position closed signal)
+        if order_update_is_newer && update.is_open {
+            // OrderUpdate is newer and position is still open - likely stale PositionUpdate
+            // Ignore it to prevent overwriting fresh OrderUpdate data
+            tracing::debug!(
+                symbol = %update.symbol,
+                update_timestamp = ?update.timestamp,
+                last_order_timestamp = ?state_guard.last_order_update_timestamp,
+                "ORDERING: Ignoring PositionUpdate (OrderUpdate is newer and position is open)"
+            );
+            return;
+        }
+        
+        // Check if we have an existing position for this symbol
         if let Some(ref existing_pos) = state_guard.open_position {
             if existing_pos.symbol == update.symbol {
-                // Check if PositionUpdate is stale (arrived after OrderUpdate set the position)
-                // We can't compare timestamps directly, but we can check if position was just set
-                // If position exists and PositionUpdate says it's open, it's likely a refresh
-                // If position exists and PositionUpdate says it's closed, we should trust it
                 if !update.is_open {
                     // Position closed - always trust this (from exchange)
                     state_guard.open_position = None;
+                    state_guard.last_position_update_timestamp = Some(update.timestamp);
                     
                     info!(
                         symbol = %update.symbol,
@@ -775,50 +783,40 @@ impl Ordering {
                     return;
                 }
                 
-                // Position is open - only update if qty or entry_price changed significantly
-                // This prevents stale PositionUpdate from overwriting fresh OrderUpdate data
+                // Position is open - check if there are significant changes
+                // Calculate differences for logging, but use timestamp as primary decision factor
                 let qty_diff = (update.qty.0 - existing_pos.qty.0).abs();
                 let price_diff = (update.entry_price.0 - existing_pos.entry_price.0).abs();
                 
-                // Only update if there's a significant change (position was modified externally)
-                // Small differences might be due to timing/rounding, ignore them
-                if qty_diff > rust_decimal::Decimal::new(1, 8) || price_diff > rust_decimal::Decimal::new(1, 8) {
-                    // Significant change, update position
-                    // Determine direction from qty sign and ensure qty is positive
-                    let direction = PositionDirection::from_qty_sign(update.qty.0);
-                    let qty_abs = if update.qty.0.is_sign_negative() {
-                        Qty(-update.qty.0) // Make positive
-                    } else {
-                        update.qty
-                    };
-                    
-                    state_guard.open_position = Some(OpenPosition {
-                        symbol: update.symbol.clone(),
-                        direction,
-                        qty: qty_abs,
-                        entry_price: update.entry_price,
-                    });
-                    
-                    info!(
-                        symbol = %update.symbol,
-                        qty_diff = %qty_diff,
-                        price_diff = %price_diff,
-                        "ORDERING: Position updated from PositionUpdate (significant change detected)"
-                    );
+                // Update position (timestamp check already passed)
+                // Determine direction from qty sign and ensure qty is positive
+                let direction = PositionDirection::from_qty_sign(update.qty.0);
+                let qty_abs = if update.qty.0.is_sign_negative() {
+                    Qty(-update.qty.0) // Make positive
                 } else {
-                    // No significant change, ignore (likely stale PositionUpdate)
-                    tracing::debug!(
-                        symbol = %update.symbol,
-                        "ORDERING: Ignoring PositionUpdate (no significant change, likely stale)"
-                    );
-                }
+                    update.qty
+                };
+                
+                state_guard.open_position = Some(OpenPosition {
+                    symbol: update.symbol.clone(),
+                    direction,
+                    qty: qty_abs,
+                    entry_price: update.entry_price,
+                });
+                state_guard.last_position_update_timestamp = Some(update.timestamp);
+                
+                info!(
+                    symbol = %update.symbol,
+                    qty_diff = %qty_diff,
+                    price_diff = %price_diff,
+                    "ORDERING: Position updated from PositionUpdate (timestamp verified)"
+                );
                 return;
             }
         }
         
-        // No existing position - create new one
+        // No existing position - create new one if position is open
         if update.is_open {
-            // Update or create position
             // Determine position direction from quantity sign:
             // - Long position: qty > 0 (opened with BUY order)
             // - Short position: qty < 0 (opened with SELL order)
@@ -835,11 +833,15 @@ impl Ordering {
                 qty: qty_abs,
                 entry_price: update.entry_price,
             });
+            state_guard.last_position_update_timestamp = Some(update.timestamp);
             
             info!(
                 symbol = %update.symbol,
                 "ORDERING: Position created from PositionUpdate"
             );
+        } else {
+            // Position is closed and no existing position - just update timestamp
+            state_guard.last_position_update_timestamp = Some(update.timestamp);
         }
     }
 }

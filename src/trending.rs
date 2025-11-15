@@ -210,12 +210,114 @@ impl Trending {
         change_pct.to_f64()
     }
     
-    /// Analyze trend based on price history
+    /// Analyze trend for a specific timeframe
     /// Returns Some(TrendSignal) if clear trend detected, None otherwise
+    fn analyze_trend_timeframe(prices: &VecDeque<PricePoint>, period: usize, threshold_pct: f64) -> Option<TrendSignal> {
+        if prices.len() < period {
+            return None;
+        }
+        
+        // Calculate SMA of last period prices
+        let sma = Self::calculate_sma(prices, period)?;
+        let current_price = prices.back()?.price;
+        
+        // Calculate price deviation from SMA
+        let deviation_pct = ((current_price - sma) / sma) * Decimal::from(100);
+        let deviation_pct_f64 = deviation_pct.to_f64().unwrap_or(0.0);
+        
+        // Determine trend:
+        // - Price > SMA * (1 + threshold) → Uptrend → Long signal
+        // - Price < SMA * (1 - threshold) → Downtrend → Short signal
+        // - Otherwise → No clear trend
+        if deviation_pct_f64 > threshold_pct {
+            Some(TrendSignal::Long)
+        } else if deviation_pct_f64 < -threshold_pct {
+            Some(TrendSignal::Short)
+        } else {
+            None
+        }
+    }
+    
+    /// Calculate average volume over a period
+    fn calculate_avg_volume(prices: &VecDeque<PricePoint>, period: usize) -> Option<Decimal> {
+        if prices.len() < period {
+            return None;
+        }
+        
+        let volumes: Vec<Decimal> = prices
+            .iter()
+            .rev()
+            .take(period)
+            .filter_map(|p| p.volume)
+            .collect();
+        
+        if volumes.is_empty() {
+            return None;
+        }
+        
+        let sum: Decimal = volumes.iter().sum();
+        Some(sum / Decimal::from(volumes.len()))
+    }
+    
+    /// Check volume confirmation - volume should align with trend direction
+    fn check_volume_confirmation(prices: &VecDeque<PricePoint>, trend: TrendSignal, period: usize) -> bool {
+        // Need at least period + 1 prices to compare recent vs older volume
+        if prices.len() < period + 1 {
+            return false;
+        }
+        
+        // Calculate recent volume (last period/2 prices)
+        let recent_period = period / 2;
+        let recent_vol = Self::calculate_avg_volume(prices, recent_period);
+        let older_vol = {
+            if prices.len() < period {
+                return false;
+            }
+            // Get volume from period/2 to period prices ago
+            let older_prices: Vec<Decimal> = prices
+                .iter()
+                .rev()
+                .skip(recent_period)
+                .take(recent_period)
+                .filter_map(|p| p.volume)
+                .collect();
+            
+            if older_prices.is_empty() {
+                return false;
+            }
+            
+            let sum: Decimal = older_prices.iter().sum();
+            Some(sum / Decimal::from(older_prices.len()))
+        };
+        
+        match (recent_vol, older_vol) {
+            (Some(recent), Some(older)) if !older.is_zero() => {
+                // Volume change percentage
+                let vol_change_pct = ((recent - older) / older) * Decimal::from(100);
+                let vol_change_pct_f64 = vol_change_pct.to_f64().unwrap_or(0.0);
+                
+                // For uptrend (Long): volume should be increasing or at least stable
+                // For downtrend (Short): volume should be increasing (selling pressure) or at least stable
+                // Require at least -10% volume change (can decrease slightly but not collapse)
+                match trend {
+                    TrendSignal::Long => vol_change_pct_f64 >= -10.0, // Volume can decrease slightly but not collapse
+                    TrendSignal::Short => vol_change_pct_f64 >= -10.0, // Same for shorts
+                }
+            }
+            _ => false, // No volume data available
+        }
+    }
+    
+    /// Analyze trend based on price history with multiple timeframes and volume confirmation
+    /// Returns Some(TrendSignal) if clear trend detected across multiple timeframes, None otherwise
     fn analyze_trend(state: &SymbolState) -> Option<TrendSignal> {
-        const MIN_PRICES_FOR_ANALYSIS: usize = 10;
-        const SMA_PERIOD: usize = 10;
-        const TREND_THRESHOLD_PCT: f64 = 2.0; // 2% threshold for trend detection
+        // Increased minimum prices for more reliable analysis
+        const MIN_PRICES_FOR_ANALYSIS: usize = 25;
+        const SMA_PERIOD_SHORT: usize = 10;  // Short-term SMA (5-min equivalent)
+        const SMA_PERIOD_MEDIUM: usize = 15; // Medium-term SMA (15-min equivalent)
+        const SMA_PERIOD_LONG: usize = 20;   // Long-term SMA (1-hour equivalent)
+        const TREND_THRESHOLD_PCT: f64 = 1.5; // 1.5% threshold for trend detection (slightly lower for multi-timeframe)
+        const VOLUME_CONFIRMATION_PERIOD: usize = 10; // Period for volume analysis
         
         let prices = &state.prices;
         
@@ -224,25 +326,37 @@ impl Trending {
             return None;
         }
         
-        // Calculate SMA of last SMA_PERIOD prices
-        let sma = Self::calculate_sma(prices, SMA_PERIOD)?;
-        let current_price = prices.back()?.price;
+        // Multi-timeframe analysis: check trends across different periods
+        let trend_short = Self::analyze_trend_timeframe(prices, SMA_PERIOD_SHORT, TREND_THRESHOLD_PCT);
+        let trend_medium = Self::analyze_trend_timeframe(prices, SMA_PERIOD_MEDIUM, TREND_THRESHOLD_PCT);
+        let trend_long = Self::analyze_trend_timeframe(prices, SMA_PERIOD_LONG, TREND_THRESHOLD_PCT);
         
-        // Calculate price deviation from SMA
-        let deviation_pct = ((current_price - sma) / sma) * Decimal::from(100);
-        let deviation_pct_f64 = deviation_pct.to_f64().unwrap_or(0.0);
+        // Require at least 2 out of 3 timeframes to agree on trend direction
+        // This ensures stronger, more reliable signals
+        let trends: Vec<Option<TrendSignal>> = vec![trend_short, trend_medium, trend_long];
+        let long_count = trends.iter().filter(|&&t| t == Some(TrendSignal::Long)).count();
+        let short_count = trends.iter().filter(|&&t| t == Some(TrendSignal::Short)).count();
         
-        // Determine trend:
-        // - Price > SMA * 1.02 (2% above) → Uptrend → Long signal
-        // - Price < SMA * 0.98 (2% below) → Downtrend → Short signal
-        // - Otherwise → No clear trend
-        if deviation_pct_f64 > TREND_THRESHOLD_PCT {
+        // Determine final trend signal
+        let final_trend = if long_count >= 2 {
             Some(TrendSignal::Long)
-        } else if deviation_pct_f64 < -TREND_THRESHOLD_PCT {
+        } else if short_count >= 2 {
             Some(TrendSignal::Short)
         } else {
-            None
+            None // No clear consensus across timeframes
+        };
+        
+        // Volume confirmation: require volume to support the trend
+        if let Some(trend) = final_trend {
+            if Self::check_volume_confirmation(prices, trend, VOLUME_CONFIRMATION_PERIOD) {
+                return Some(trend);
+            } else {
+                // Trend detected but volume doesn't confirm - skip signal
+                return None;
+            }
         }
+        
+        None
     }
     
     /// Process a market tick and generate trade signal if conditions are met
@@ -282,15 +396,18 @@ impl Trending {
         let spread_bps = ((tick.ask.0 - tick.bid.0) / tick.bid.0) * Decimal::from(10000);
         let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
         
-        // CRITICAL: Only trade when spread is narrow (high liquidity)
-        // Wide spread = low liquidity = high slippage = bad for trading
-        // Narrow spread = high liquidity = low slippage = good for trading
-        // Use max_spread_bps as maximum acceptable spread (e.g., 10 bps)
+        // CRITICAL: Only trade when spread is within acceptable range
+        // Too wide spread = low liquidity = high slippage = bad for trading
+        // Too narrow spread = potential flash crash, liquidity trap, or stale data = bad for trading
+        // Acceptable range: min_spread_bps <= spread <= max_spread_bps
+        let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
         let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
         
-        // Check if spread is acceptable (narrow enough for trading)
-        if spread_bps_f64 > max_acceptable_spread_bps {
-            // Spread too wide → low liquidity → high slippage risk → skip signal
+        // Check if spread is within acceptable range
+        if spread_bps_f64 < min_acceptable_spread_bps || spread_bps_f64 > max_acceptable_spread_bps {
+            // Spread out of acceptable range → skip signal
+            // Too narrow: potential flash crash, liquidity trap, stale data
+            // Too wide: low liquidity, high slippage risk
             return Ok(());
         }
         
@@ -316,8 +433,9 @@ impl Trending {
                 volume: tick.volume,
             });
             
-            // Keep only last 20 prices (for reliable trend analysis)
-            const MAX_HISTORY: usize = 20;
+            // Keep more prices for multi-timeframe analysis (need at least 25-30 for analysis)
+            // Store up to 100 prices to support multiple timeframe analysis
+            const MAX_HISTORY: usize = 100;
             while state.prices.len() > MAX_HISTORY {
                 state.prices.pop_front();
             }
@@ -477,23 +595,43 @@ impl Trending {
             timestamp: now,
         };
         
-        // Update last signal information for this symbol (side and timestamp)
+        // CRITICAL: Double-check position/order state right before sending signal
+        // This prevents race condition where:
+        // 1. Early check passes (no position/order)
+        // 2. Signal generation takes time (spread check, momentum, balance, rules, etc.)
+        // 3. During signal generation, another thread opens position/order
+        // 4. Without this check, signal would be sent anyway
+        // Solution: Final check right before sending to ensure state hasn't changed
         {
-            let mut last_signals_map = last_signals.lock().await;
-            last_signals_map.insert(symbol.clone(), LastSignal {
-                side,
-                timestamp: now,
-            });
+            let ordering_state = shared_state.ordering_state.lock().await;
+            if ordering_state.open_position.is_some() || ordering_state.open_order.is_some() {
+                warn!(
+                    symbol = %tick.symbol,
+                    side = ?side,
+                    "TRENDING: Position/order opened while generating signal, discarding signal to prevent collision"
+                );
+                return Ok(());
+            }
         }
         
-        // Publish trade signal
-        if let Err(e) = event_bus.trade_signal_tx.send(signal) {
+        // Publish trade signal (state verified, safe to send)
+        if let Err(e) = event_bus.trade_signal_tx.send(signal.clone()) {
             error!(
                 error = ?e,
                 symbol = %tick.symbol,
                 "TRENDING: Failed to send TradeSignal event (no subscribers or channel closed)"
             );
         } else {
+            // Update last signal information only after successful send
+            // This ensures we only track signals that were actually sent
+            {
+                let mut last_signals_map = last_signals.lock().await;
+                last_signals_map.insert(symbol.clone(), LastSignal {
+                    side,
+                    timestamp: now,
+                });
+            }
+            
             let momentum_str = momentum.map(|m| format!("{:.2}%", m)).unwrap_or_else(|| "N/A".to_string());
             let trend_str = match trend_signal {
                 Some(TrendSignal::Long) => "Long (Uptrend)",
@@ -515,6 +653,7 @@ impl Trending {
                 trend = trend_str,
                 momentum_pct = momentum_str,
                 spread_bps = spread_bps_f64,
+                min_acceptable_spread_bps = min_acceptable_spread_bps,
                 max_acceptable_spread_bps = max_acceptable_spread_bps,
                 entry_price = %entry_price.0,
                 size = %size.0,

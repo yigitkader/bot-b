@@ -57,6 +57,8 @@ risk:
   max_leverage: 50  # Maximum leverage limit
   use_isolated_margin: true  # Use isolated margin (required for 20x-50x leverage)
   max_position_notional_usd: 1000.0  # Maximum position notional (USD)
+  maker_commission_pct: 0.02  # Maker commission rate (percentage, e.g., 0.02 for 0.02%)
+  taker_commission_pct: 0.04  # Taker commission rate (percentage, e.g., 0.04 for 0.04%)
 
 # ============================================================================
 # WebSocket Configuration
