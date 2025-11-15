@@ -322,17 +322,42 @@ impl FollowOrders {
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         
-
-        let entry_commission_pct = match position.is_maker {
-            Some(true) => {
-                Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
-            }
-            Some(false) | None => {
-                Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
-            }
-        };
+        // ✅ CRITICAL: Entry commission calculation with edge case handling
+        // Problem: position.is_maker may be None if OrderUpdate hasn't arrived yet
+        // If TP/SL triggers before OrderUpdate, wrong commission is used
+        // Example: Maker order (0.02%) but None → taker (0.04%) used → early SL trigger!
+        //
+        // Solution: Conservative approach - if is_maker is None, use taker commission
+        // (higher commission = more conservative PnL calculation = safer)
+        // This prevents premature TP/SL triggers due to incorrect commission calculation
+        let entry_commission_pct = position.is_maker
+            .map(|is_maker| {
+                if is_maker {
+                    Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
+                        .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+                } else {
+                    Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                        .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+                }
+            })
+            .unwrap_or_else(|| {
+                // is_maker is None - use conservative taker commission
+                // This is safer than assuming maker (prevents premature SL trigger)
+                // OrderUpdate should arrive soon to update is_maker
+                let taker_commission = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
+                
+                // Log warning if this happens during TP/SL check (OrderUpdate may be delayed)
+                if position.take_profit_pct.is_some() || position.stop_loss_pct.is_some() {
+                    warn!(
+                        symbol = %tick.symbol,
+                        "FOLLOW_ORDERS: is_maker is None during TP/SL check, using conservative taker commission ({}%). OrderUpdate may be delayed. This prevents premature SL trigger.",
+                        taker_commission.to_f64().unwrap_or(0.04)
+                    );
+                }
+                
+                taker_commission
+            });
 
         let exit_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
             .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));

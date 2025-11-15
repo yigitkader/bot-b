@@ -325,38 +325,41 @@ impl Connection {
             let now = Instant::now();
             let initial_count = order_fill_history.len();
             order_fill_history.retain(|order_id, history| {
+                // ✅ CRITICAL: Always check age FIRST to prevent memory leaks
+                // Problem: If cache is stale (WebSocket lag), order may appear "open" in cache
+                // but history is very old. Without age check first, these entries never get cleaned up.
+                //
+                // Solution: Check age first, then cache status. If age > MAX_AGE_SECS,
+                // force remove even if in cache (cache is likely stale).
+                let age = now.duration_since(history.last_update);
+
                 // First check: Is order in OPEN_ORDERS_CACHE?
                 let is_in_cache = OPEN_ORDERS_CACHE.iter().any(|entry| {
                     entry.value().iter().any(|o| o.order_id == *order_id)
                 });
 
                 if is_in_cache {
-                    let history_age = now.duration_since(history.last_update);
-                    const CACHE_STALE_THRESHOLD_SECS: u64 = 300; // 5 minutes
-
-                    if history_age.as_secs() > CACHE_STALE_THRESHOLD_SECS {
-                        if history_age.as_secs() > MAX_AGE_SECS {
-                            tracing::warn!(
-                                order_id = %order_id,
-                                history_age_secs = history_age.as_secs(),
-                                "CONNECTION: Order in cache but history is very old ({} hours), cache likely stale. Removing to prevent memory leak.",
-                                history_age.as_secs() / 3600
-                            );
-                            false // Remove stale entry
-                        } else {
-                            tracing::debug!(
-                                order_id = %order_id,
-                                history_age_secs = history_age.as_secs(),
-                                "CONNECTION: Order in cache but history is old ({} minutes), cache may be stale. Keeping for now.",
-                                history_age.as_secs() / 60
-                            );
-                            true // Keep for now (might be active but no recent updates)
-                        }
+                    // Order is in cache - but check age first to prevent memory leak
+                    if age.as_secs() > MAX_AGE_SECS {
+                        // Cache is stale - force remove to prevent leak
+                        // This handles the case where:
+                        // - Order was filled/cancelled but WebSocket update delayed
+                        // - Cache still shows order as "open" but history is very old
+                        // - Without this check, entry would never be cleaned up
+                        warn!(
+                            order_id = %order_id,
+                            history_age_secs = age.as_secs(),
+                            history_age_hours = age.as_secs() / 3600,
+                            "CONNECTION: Order in cache but history is very old ({} hours), cache likely stale. Force removing to prevent memory leak.",
+                            age.as_secs() / 3600
+                        );
+                        false // FORCE REMOVE - prevent memory leak
                     } else {
-                        true
+                        // Order in cache and history is recent - keep it
+                        true // Keep
                     }
                 } else {
-                    let age = now.duration_since(history.last_update);
+                    // Not in cache - normal age check
                     if age.as_secs() > MAX_AGE_SECS {
                         // Very old entry (24+ hours) - safe to remove (memory leak prevention)
                         // Normal cleanup should have removed this already when order closed,
@@ -614,13 +617,22 @@ impl Connection {
                                             let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
                                             let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
 
-                                            // REST API is source of truth after reconnect
-                                            // If there's a mismatch, update WebSocket cache with REST API data
-                                            // REST API is considered correct, update WebSocket cache
-                                            let needs_update = qty_diff > Decimal::from_str("0.0001").unwrap()
-                                                || entry_diff > Decimal::from_str("0.01").unwrap();
+                                            // ✅ CRITICAL: REST API is source of truth after reconnect
+                                            // Always update cache with REST API data to ensure state consistency
+                                            // Log level varies based on difference magnitude for debugging
+                                            
+                                            // Determine if this is a significant mismatch (for logging)
+                                            const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
+                                            const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
+                                            let significant_mismatch = qty_diff > Decimal::from_str(SIGNIFICANT_QTY_DIFF).unwrap()
+                                                || entry_diff > Decimal::from_str(SIGNIFICANT_ENTRY_DIFF).unwrap();
 
-                                            if needs_update {
+                                            // ✅ ALWAYS update cache with REST API data (REST API is source of truth)
+                                            // This ensures state consistency after reconnect
+                                            POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
+
+                                            if significant_mismatch {
+                                                // Significant mismatch - log warning
                                                 warn!(
                                                     symbol = %symbol,
                                                     rest_qty = %rest_position.qty.0,
@@ -629,27 +641,22 @@ impl Connection {
                                                     rest_entry = %rest_position.entry.0,
                                                     ws_entry = %ws_pos.entry.0,
                                                     entry_diff = %entry_diff,
-                                                    "CONNECTION: Position mismatch after reconnect (REST vs WebSocket), updating cache with REST API data"
+                                                    "CONNECTION: Position mismatch detected after reconnect (REST vs WebSocket), cache updated with REST API data (source of truth)"
                                                 );
-
-                                                // REST API is considered correct, update WebSocket cache
-                                                // REST API validation not just logging, fixing state
-                                                // Update WebSocket cache with REST API data (REST API is source of truth)
-                                                POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
-
-                                                info!(
-                                                    symbol = %symbol,
-                                                    "CONNECTION: Position cache updated with REST API data"
-                                                );
-                                            } else if qty_diff > Decimal::from_str("0.000001").unwrap_or_default() || entry_diff > Decimal::from_str("0.001").unwrap_or_default() {
-                                                // Small differences - still update cache but with less logging
-                                                // REST API is source of truth, always update cache
-                                                POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
+                                            } else if qty_diff > Decimal::from_str("0.000001").unwrap_or_default() 
+                                                || entry_diff > Decimal::from_str("0.001").unwrap_or_default() {
+                                                // Small differences - log at debug level
                                                 debug!(
                                                     symbol = %symbol,
                                                     qty_diff = %qty_diff,
                                                     entry_diff = %entry_diff,
-                                                    "CONNECTION: Small position difference detected, cache updated with REST API data"
+                                                    "CONNECTION: Small position difference detected after reconnect, cache updated with REST API data"
+                                                );
+                                            } else {
+                                                // No difference - cache already matches REST API
+                                                debug!(
+                                                    symbol = %symbol,
+                                                    "CONNECTION: Position cache matches REST API after reconnect"
                                                 );
                                             }
                                         } else if !rest_position.qty.0.is_zero() {
@@ -697,37 +704,77 @@ impl Connection {
                                 // Validate open orders
                                 match venue_clone.get_open_orders(symbol).await {
                                     Ok(rest_orders) => {
+                                        // ✅ CRITICAL: REST API is source of truth after reconnect
+                                        // Always update cache with REST API data to ensure state consistency
+                                        
                                         // Compare with WebSocket cache
                                         if let Some(ws_orders) = OPEN_ORDERS_CACHE.get(symbol) {
                                             let ws_orders_vec = ws_orders.value();
 
                                             // Check if order counts match
-                                            if rest_orders.len() != ws_orders_vec.len() {
+                                            let count_mismatch = rest_orders.len() != ws_orders_vec.len();
+                                            
+                                            // Check for missing orders in WebSocket cache
+                                            let mut missing_orders = Vec::new();
+                                            for rest_order in &rest_orders {
+                                                if !ws_orders_vec.iter().any(|o| o.order_id == rest_order.order_id) {
+                                                    missing_orders.push(rest_order.order_id.clone());
+                                                }
+                                            }
+
+                                            // ✅ ALWAYS update cache with REST API data (REST API is source of truth)
+                                            // This ensures state consistency after reconnect
+                                            let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
+                                                crate::types::VenueOrder {
+                                                    order_id: o.order_id.clone(),
+                                                    side: o.side,
+                                                    price: o.price,
+                                                    qty: o.qty,
+                                                }
+                                            }).collect();
+                                            OPEN_ORDERS_CACHE.insert(symbol.to_string(), rest_orders_vec);
+
+                                            if count_mismatch || !missing_orders.is_empty() {
                                                 warn!(
                                                     symbol = %symbol,
                                                     rest_order_count = rest_orders.len(),
                                                     ws_order_count = ws_orders_vec.len(),
-                                                    "CONNECTION: Open orders count mismatch after reconnect (REST vs WebSocket)"
+                                                    missing_order_ids = ?missing_orders,
+                                                    "CONNECTION: Open orders mismatch detected after reconnect (REST vs WebSocket), cache updated with REST API data (source of truth)"
                                                 );
-                                            }
-
-                                            // Check for missing orders in WebSocket cache
-                                            for rest_order in &rest_orders {
-                                                if !ws_orders_vec.iter().any(|o| o.order_id == rest_order.order_id) {
-                                                    warn!(
-                                                        symbol = %symbol,
-                                                        order_id = %rest_order.order_id,
-                                                        "CONNECTION: Order exists in REST API but missing from WebSocket cache after reconnect"
-                                                    );
-                                                }
+                                            } else {
+                                                debug!(
+                                                    symbol = %symbol,
+                                                    "CONNECTION: Open orders cache matches REST API after reconnect"
+                                                );
                                             }
                                         } else if !rest_orders.is_empty() {
                                             // REST API shows orders but WebSocket cache doesn't
+                                            // ✅ Add missing orders to cache
+                                            let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
+                                                crate::types::VenueOrder {
+                                                    order_id: o.order_id.clone(),
+                                                    side: o.side,
+                                                    price: o.price,
+                                                    qty: o.qty,
+                                                }
+                                            }).collect();
+                                            OPEN_ORDERS_CACHE.insert(symbol.to_string(), rest_orders_vec);
+                                            
                                             warn!(
                                                 symbol = %symbol,
                                                 rest_order_count = rest_orders.len(),
-                                                "CONNECTION: Open orders exist in REST API but missing from WebSocket cache after reconnect"
+                                                "CONNECTION: Open orders exist in REST API but missing from WebSocket cache after reconnect, cache updated with REST API data"
                                             );
+                                        } else {
+                                            // REST API shows no orders - remove from cache if exists
+                                            if OPEN_ORDERS_CACHE.contains_key(symbol) {
+                                                OPEN_ORDERS_CACHE.remove(symbol);
+                                                debug!(
+                                                    symbol = %symbol,
+                                                    "CONNECTION: No open orders in REST API, removed stale orders from cache"
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {

@@ -32,6 +32,11 @@ struct BalanceReservation {
     asset: String,
     amount: Decimal,
     released: bool,
+    /// Order ID associated with this reservation (for leak tracking)
+    /// Set after order is placed to help identify which order caused a leak
+    order_id: Option<String>,
+    /// Timestamp when reservation was allocated (for leak tracking)
+    allocation_timestamp: Instant,
 }
 
 impl BalanceReservation {
@@ -53,6 +58,8 @@ impl BalanceReservation {
                 asset: asset.to_string(),
                 amount,
                 released: false,
+                order_id: None, // Will be set after order is placed
+                allocation_timestamp: Instant::now(),
             })
         } else {
             None
@@ -88,10 +95,15 @@ impl Drop for BalanceReservation {
         //
         // Instead, we only log a warning. The leak detection task will handle cleanup.
         if !self.released {
+            let allocation_age = Instant::now().duration_since(self.allocation_timestamp);
             tracing::error!(
                 asset = %self.asset,
                 amount = %self.amount,
-                "CRITICAL: Balance reservation dropped without explicit release! Manual intervention may be required. Leak detection task will attempt auto-fix."
+                order_id = ?self.order_id,
+                allocation_age_secs = allocation_age.as_secs(),
+                "CRITICAL: Balance reservation dropped without explicit release! Order ID: {:?}, Allocation age: {}s. Manual intervention may be required. Leak detection task will attempt auto-fix.",
+                self.order_id,
+                allocation_age.as_secs()
             );
             // Balance will remain reserved until leak detection task fixes it
         }
@@ -367,12 +379,23 @@ impl Ordering {
                 let usdc_leak = store.reserved_usdc > store.usdc;
 
                 if usdt_leak || usdc_leak {
+                    // Get open order info to help identify which order caused the leak
+                    let open_order_info = {
+                        let ordering_state = shared_state.ordering_state.lock().await;
+                        ordering_state.open_order.as_ref().map(|order| {
+                            format!("order_id={}, symbol={}, side={:?}, qty={}", 
+                                order.order_id, order.symbol, order.side, order.qty.0)
+                        })
+                    };
+
                     tracing::error!(
                         usdt_total = %store.usdt,
                         usdt_reserved = %store.reserved_usdt,
                         usdc_total = %store.usdc,
                         usdc_reserved = %store.reserved_usdc,
-                        "CRITICAL: Balance leak detected! Reserved > Total. Auto-fixing..."
+                        open_order = ?open_order_info,
+                        "CRITICAL: Balance leak detected! Reserved > Total. Open order info: {:?}. Auto-fixing...",
+                        open_order_info
                     );
 
                     // Auto-fix: reset reserved balance to match total
@@ -390,7 +413,9 @@ impl Ordering {
                             old_reserved = %old_reserved,
                             new_reserved = %store_write.reserved_usdt,
                             total = %store_write.usdt,
-                            "Auto-fixed USDT balance leak: reset reserved to total"
+                            open_order = ?open_order_info,
+                            "Auto-fixed USDT balance leak: reset reserved to total. Open order: {:?}",
+                            open_order_info
                         );
                     }
 
@@ -402,7 +427,9 @@ impl Ordering {
                             old_reserved = %old_reserved,
                             new_reserved = %store_write.reserved_usdc,
                             total = %store_write.usdc,
-                            "Auto-fixed USDC balance leak: reset reserved to total"
+                            open_order = ?open_order_info,
+                            "Auto-fixed USDC balance leak: reset reserved to total. Open order: {:?}",
+                            open_order_info
                         );
                     }
                 }
@@ -811,7 +838,12 @@ impl Ordering {
 
             // Extract order_id if successful, otherwise return error
             match order_id_result {
-                Some(id) => id,
+                Some(id) => {
+                    // Set order_id in reservation for leak tracking
+                    // This helps identify which order caused a leak if reservation is not released
+                    balance_reservation.order_id = Some(id.clone());
+                    id
+                }
                 None => {
                     // This should never be reached if all paths above return or break correctly
                     // But Rust requires this for the block to compile

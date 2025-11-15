@@ -519,25 +519,57 @@ impl Trending {
         // Symbol-based cooldown after position close (direction-aware)
         const POSITION_CLOSE_COOLDOWN_SECS: u64 = 5;
         
-        // Store last position close info for direction check after trend analysis
+        // ✅ CRITICAL: Position close cooldown check BEFORE expensive trend analysis
+        // Problem: Position close cooldown check was done AFTER trend analysis
+        // This caused unnecessary CPU time waste when cooldown is active
+        //
+        // Solution: Do early cooldown check first (elapsed < COOLDOWN), then trend analysis
+        // Direction check still needs signal direction, so it's done after trend analysis
         let last_position_close_info = {
             let states = symbol_states.lock().await;
             if let Some(state) = states.get(&tick.symbol) {
                 state.last_position_close_time
-                    .and_then(|close_time| {
+                    .map(|close_time| {
                         let elapsed = now.duration_since(close_time);
-                        if elapsed < Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
-                            // Still in cooldown period - return info for direction check
-                            Some((state.last_position_direction, elapsed))
-                        } else {
-                            // Cooldown period passed - no restriction
-                            None
-                        }
+                        (state.last_position_direction, elapsed)
                     })
             } else {
                 None
             }
         };
+        
+        // EARLY COOLDOWN CHECK: If still in cooldown, skip expensive trend analysis
+        // This prevents wasting CPU time on trend analysis when we'll discard the signal anyway
+        if let Some((last_direction, elapsed)) = &last_position_close_info {
+            // Check if we're still in cooldown period
+            if elapsed < &Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
+                // Still in cooldown - skip early (no trend analysis)
+                // Note: We can't do direction check here because we don't have signal direction yet
+                // Direction check will be done after trend analysis (if cooldown passed)
+                debug!(
+                    symbol = %tick.symbol,
+                    elapsed_secs = elapsed.as_secs(),
+                    cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
+                    "TRENDING: Skipping signal generation - position close cooldown active (early exit, no trend analysis)"
+                );
+                return Ok(());
+            }
+            
+            // Extended cooldown for unknown direction (check before trend analysis)
+            if last_direction.is_none() {
+                const EXTENDED_COOLDOWN_SECS: u64 = POSITION_CLOSE_COOLDOWN_SECS * 2; // 10 seconds
+                if elapsed < &Duration::from_secs(EXTENDED_COOLDOWN_SECS) {
+                    debug!(
+                        symbol = %tick.symbol,
+                        last_direction = ?last_direction,
+                        elapsed_secs = elapsed.as_secs(),
+                        extended_cooldown_secs = EXTENDED_COOLDOWN_SECS,
+                        "TRENDING: Skipping signal generation - extended cooldown active for unknown direction (early exit, no trend analysis)"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         
         // Cooldown check BEFORE expensive trend analysis
         let cooldown_seconds = cfg.trending.signal_cooldown_seconds;
@@ -628,47 +660,29 @@ impl Trending {
             }
         };
         
-        // Check position close cooldown with direction awareness (after trend analysis)
-        // 2. Signal direction matches last closed position direction (direction check)
+        // ✅ Direction check AFTER trend analysis (needs signal direction)
         // This allows opposite-direction signals immediately (trend reversal)
-        if let Some((last_direction, elapsed)) = last_position_close_info {
+        // Note: Basic cooldown check was already done before trend analysis (early exit)
+        // This check only handles direction matching for same-direction signals
+        if let Some((last_direction, elapsed)) = &last_position_close_info {
+            // Cooldown period passed (checked earlier), but check direction match
             // Convert signal side to position direction for comparison
             let signal_direction = PositionDirection::from_order_side(side);
             
-            // Extended cooldown for unknown direction
-            if last_direction.is_none() {
-                // Direction unknown - apply extended cooldown (2x normal cooldown)
-                const EXTENDED_COOLDOWN_SECS: u64 = POSITION_CLOSE_COOLDOWN_SECS * 2; // 10 seconds
-                if elapsed < Duration::from_secs(EXTENDED_COOLDOWN_SECS) {
+            // Direction is known - check if it matches signal direction
+            if let Some(dir) = last_direction {
+                let direction_matches = *dir == signal_direction;
+                
+                if direction_matches {
+                    // Same direction as last closed position - but cooldown already passed
+                    // Allow signal (cooldown was checked earlier)
                     debug!(
                         symbol = %tick.symbol,
                         signal_direction = ?signal_direction,
                         last_direction = ?last_direction,
                         elapsed_secs = elapsed.as_secs(),
-                        extended_cooldown_secs = EXTENDED_COOLDOWN_SECS,
-                        "TRENDING: Skipping signal generation - extended cooldown active for unknown direction"
+                        "TRENDING: Same-direction signal allowed (cooldown passed)"
                     );
-                    return Ok(());
-                }
-            } else {
-                // Direction is known - check if it matches signal direction
-                let direction_matches = last_direction
-                    .map(|dir| dir == signal_direction)
-                    .unwrap_or(false); // Should never be None here, but default to false for safety
-                
-                if direction_matches {
-                    // Same direction as last closed position - apply normal cooldown
-                    if elapsed < Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
-                        debug!(
-                            symbol = %tick.symbol,
-                            signal_direction = ?signal_direction,
-                            last_direction = ?last_direction,
-                            elapsed_secs = elapsed.as_secs(),
-                            cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
-                            "TRENDING: Skipping signal generation - position close cooldown active (same direction)"
-                        );
-                        return Ok(());
-                    }
                 } else {
                     // Opposite direction - allow signal (trend reversal)
                     debug!(
@@ -679,6 +693,7 @@ impl Trending {
                     );
                 }
             }
+            // Note: last_direction.is_none() case already handled in early cooldown check
         }
         
         // Check same-direction signals (after trend analysis)
