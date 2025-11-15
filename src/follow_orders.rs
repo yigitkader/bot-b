@@ -41,6 +41,10 @@ struct PositionInfo {
     stop_loss_pct: Option<f64>,
     take_profit_pct: Option<f64>,
     opened_at: Instant,
+    /// True if entry order was all maker fills, None if unknown
+    /// Used for commission calculation: if all maker, use maker commission; otherwise taker
+    /// Post-only orders are typically maker, but can become taker if they cross the spread
+    is_maker: Option<bool>,
 }
 
 impl FollowOrders {
@@ -166,6 +170,41 @@ impl FollowOrders {
             }
         });
         
+        // Spawn task for OrderUpdate events (to capture is_maker for commission calculation)
+        let positions_order = positions.clone();
+        let shutdown_flag_order = shutdown_flag.clone();
+        tokio::spawn(async move {
+            let mut order_update_rx = event_bus.subscribe_order_update();
+            
+            info!("FOLLOW_ORDERS: Started, listening to OrderUpdate events for is_maker info");
+            
+            loop {
+                match order_update_rx.recv().await {
+                    Ok(update) => {
+                        if shutdown_flag_order.load(AtomicOrdering::Relaxed) {
+                            break;
+                        }
+                        
+                        // Update is_maker info in PositionInfo when order is filled
+                        if matches!(update.status, crate::event_bus::OrderStatus::Filled) {
+                            let mut positions_guard = positions_order.write().await;
+                            if let Some(position) = positions_guard.get_mut(&update.symbol) {
+                                // Update is_maker info for commission calculation
+                                position.is_maker = update.is_maker;
+                                
+                                debug!(
+                                    symbol = %update.symbol,
+                                    is_maker = ?update.is_maker,
+                                    "FOLLOW_ORDERS: Updated is_maker info from OrderUpdate"
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        
         // Spawn task for MarketTick events (TP/SL checking)
         let positions_tick = positions.clone();
         let event_bus_tick = event_bus.clone();
@@ -285,6 +324,7 @@ impl FollowOrders {
                 stop_loss_pct,
                 take_profit_pct,
                 opened_at: Instant::now(),
+                is_maker: None, // Will be updated from OrderUpdate when order is filled
             });
             
             info!(
@@ -365,26 +405,26 @@ impl FollowOrders {
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         
-        // ✅ CRITICAL: Calculate commission correctly using conservative approach
+        // ✅ CRITICAL FIX: Calculate commission correctly using is_maker from OrderUpdate
         // 
-        // PROBLEM: OrderUpdate events don't include maker/taker information. Post-only orders
-        // can become taker orders if they cross the spread, but we can't detect this from
-        // OrderUpdate events (only OrderFill events have is_maker field, but they're not
-        // published to the event bus).
-        //
-        // SOLUTION: Always assume Taker commission for entry orders (conservative/worst-case).
-        // This ensures we don't underestimate commission, which would cause TP/SL to trigger
-        // too early and result in money loss. Better to be conservative and trigger slightly
-        // later than to trigger too early.
+        // SOLUTION: Use is_maker flag from OrderUpdate to determine commission type
+        // - If all fills were maker (is_maker = Some(true)), use maker commission
+        // - If any fill was taker (is_maker = Some(false)) or unknown (None), use taker commission (conservative)
+        // Post-only orders are typically maker, but can become taker if they cross the spread
         //
         // Exit commission (TP/SL) is always Taker (market order with reduceOnly) - guaranteed.
-        //
-        // FUTURE IMPROVEMENT: To get accurate commission, we could:
-        // 1. Publish OrderFill events to event bus with is_maker field
-        // 2. Track maker/taker status per position from OrderFill events
-        // 3. Use actual commission from OrderFill.commission field
-        let entry_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-            .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
+        let entry_commission_pct = if position.is_maker == Some(true) {
+            // All fills were maker - use maker commission (lower, better for PnL)
+            Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
+                .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+        } else {
+            // Any fill was taker or unknown - use taker commission (conservative/worst-case)
+            // This ensures we don't underestimate commission, which would cause TP/SL to trigger
+            // too early and result in money loss. Better to be conservative and trigger slightly
+            // later than to trigger too early.
+            Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+        };
         
         // Exit commission (TP/SL close orders) is always Taker (market order with reduceOnly)
         // This is guaranteed because TP/SL orders are always market orders
@@ -441,17 +481,20 @@ impl FollowOrders {
                         );
                     }
                     Err(e) => {
-                        // ❌ CRITICAL: CloseRequest failed - DO NOT remove position
+                        // ✅ CRITICAL FIX: CloseRequest failed - DO NOT remove position, DO NOT return error
                         // Position remains in tracking so it can be retried on next tick
-                        error!(
+                        // Returning Ok(()) allows retry on next MarketTick event
+                        // If we return error, the caller might stop processing, preventing retry
+                        warn!(
                             error = ?e,
                             symbol = %tick.symbol,
                             net_pnl_pct = net_pnl_pct_f64,
                             tp_pct,
-                            "FOLLOW_ORDERS: Failed to send CloseRequest event for take profit (no subscribers or channel closed). Position remains in tracking for retry."
+                            "FOLLOW_ORDERS: CloseRequest failed for take profit, position will retry on next tick"
                         );
-                        // Return error so caller can handle it
-                        return Err(anyhow::anyhow!("Failed to send CloseRequest for take profit: {}", e));
+                        // Return Ok(()) to allow retry on next tick
+                        // Position remains in tracking, so it will be checked again
+                        return Ok(());
                     }
                 }
                 return Ok(());
@@ -498,17 +541,20 @@ impl FollowOrders {
                         );
                     }
                     Err(e) => {
-                        // ❌ CRITICAL: CloseRequest failed - DO NOT remove position
+                        // ✅ CRITICAL FIX: CloseRequest failed - DO NOT remove position, DO NOT return error
                         // Position remains in tracking so it can be retried on next tick
-                        error!(
+                        // Returning Ok(()) allows retry on next MarketTick event
+                        // If we return error, the caller might stop processing, preventing retry
+                        warn!(
                             error = ?e,
                             symbol = %tick.symbol,
                             net_pnl_pct = net_pnl_pct_f64,
                             sl_pct,
-                            "FOLLOW_ORDERS: Failed to send CloseRequest event for stop loss (no subscribers or channel closed). Position remains in tracking for retry."
+                            "FOLLOW_ORDERS: CloseRequest failed for stop loss, position will retry on next tick"
                         );
-                        // Return error so caller can handle it
-                        return Err(anyhow::anyhow!("Failed to send CloseRequest for stop loss: {}", e));
+                        // Return Ok(()) to allow retry on next tick
+                        // Position remains in tracking, so it will be checked again
+                        return Ok(());
                     }
                 }
                 return Ok(());

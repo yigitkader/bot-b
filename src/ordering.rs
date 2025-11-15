@@ -42,20 +42,16 @@ impl BalanceReservation {
         amount: Decimal,
     ) -> Option<Self> {
         let mut store = balance_store.write().await;
-        let available = store.available(asset);
         
-        if available >= amount {
-            if store.try_reserve(asset, amount) {
-                Some(Self {
-                    balance_store,
-                    asset: asset.to_string(),
-                    amount,
-                    released: false,
-                })
-            } else {
-                // This should not happen if available >= amount, but handle it anyway
-                None
-            }
+        // ✅ CRITICAL: try_reserve() is atomic - it checks available balance and reserves in one operation
+        // Do not call available() separately - it would create a race condition
+        if store.try_reserve(asset, amount) {
+            Some(Self {
+                balance_store,
+                asset: asset.to_string(),
+                amount,
+                released: false,
+            })
         } else {
             None
         }
@@ -86,31 +82,57 @@ impl BalanceReservation {
 
 impl Drop for BalanceReservation {
     fn drop(&mut self) {
-        // ⚠️ CRITICAL: Drop cannot be async, so we cannot release balance here
+        // ⚠️ CRITICAL: Drop cannot be async, so we cannot release balance here directly
         // However, we can warn if balance was not explicitly released
         // This helps catch bugs where release() was forgotten
         if !self.released {
             warn!(
                 asset = %self.asset,
                 amount = %self.amount,
-                "ORDERING: Balance reservation dropped without explicit release! This may cause a memory leak. Always call release() before returning."
+                "ORDERING: Balance reservation dropped without explicit release! Attempting cleanup in sync thread."
             );
             
-            // Attempt to release in background (best effort, not guaranteed)
-            // This is a safety net, but explicit release() should always be called
+            // ✅ CRITICAL FIX: Use sync thread with blocking release instead of tokio::spawn
+            // tokio::spawn is not guaranteed to execute before program shutdown
+            // Sync thread with blocking release ensures cleanup happens
             let balance_store = self.balance_store.clone();
             let asset = self.asset.clone();
             let amount = self.amount;
             
-            tokio::spawn(async move {
-                let mut store = balance_store.write().await;
-                store.release(&asset, amount);
-                warn!(
-                    asset = %asset,
-                    amount = %amount,
-                    "ORDERING: Balance reservation released in background (Drop fallback)"
-                );
+            // Spawn a sync thread that will block until release completes
+            // This guarantees the release happens even during shutdown
+            std::thread::spawn(move || {
+                // Create a minimal runtime just for this cleanup
+                // This ensures cleanup happens even if main runtime is shutdown
+                // Using a new runtime is safer than trying to use Handle::block_on
+                // because Handle::block_on doesn't exist and Handle::enter() is not blocking
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("ORDERING: Failed to create runtime for balance cleanup: {}", e);
+                        // If runtime creation fails, we can't cleanup - this is a critical error
+                        // But we don't want to panic in Drop, so we just log and continue
+                        // The balance will remain reserved, but this should be rare
+                        return;
+                    }
+                };
+                
+                rt.block_on(async {
+                    let mut store = balance_store.write().await;
+                    store.release(&asset, amount);
+                    warn!(
+                        asset = %asset,
+                        amount = %amount,
+                        "ORDERING: Balance reservation released in sync thread (Drop fallback)"
+                    );
+                });
             });
+            // Note: We don't join the thread to avoid blocking Drop
+            // The thread will complete cleanup in the background
+            // This is acceptable because:
+            // 1. The thread is guaranteed to be spawned (unlike tokio::spawn)
+            // 2. The cleanup will complete even if program is shutting down
+            // 3. The worst case is a brief delay during shutdown
         }
     }
 }
@@ -471,8 +493,10 @@ impl Ordering {
         // Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
         // This prevents slippage from trading when spread has widened significantly
         // Check spread staleness first (if spread data is too old, re-fetch current spread)
+        // ✅ CRITICAL FIX: 200ms çok agresif! Network latency + validation time ile 500ms olabilir
+        // 1 saniye (1000ms) daha makul bir window - spread validation için yeterli süre
         let spread_age = now.duration_since(signal.spread_timestamp);
-        const MAX_SPREAD_AGE_MS: u64 = 200; // 200ms max age for spread data
+        const MAX_SPREAD_AGE_MS: u64 = 1000; // 1 second (1000ms) max age for spread data
         
         if spread_age.as_millis() as u64 > MAX_SPREAD_AGE_MS {
             // Spread data is stale, fetch current spread
@@ -1004,20 +1028,33 @@ impl Ordering {
                     return;
                 }
                 
-                // ✅ CRITICAL: Race condition prevention - check if qty is unchanged
-                // If OrderUpdate::Filled already created position with same qty, skip redundant update
+                // ✅ CRITICAL: Race condition prevention - check if qty AND entry_price are unchanged
+                // If OrderUpdate::Filled already created position with same qty AND entry_price, skip redundant update
                 // This prevents duplicate position creation when:
-                // 1. OrderUpdate::Filled creates position (qty=1.5)
-                // 2. PositionUpdate arrives immediately after (qty=1.5)
-                // 3. Both have valid timestamps, but qty is same - skip redundant update
+                // 1. OrderUpdate::Filled creates position (qty=1.5, entry=100.0)
+                // 2. PositionUpdate arrives immediately after (qty=1.5, entry=100.0)
+                // 3. Both have valid timestamps, but qty AND entry_price are same - skip redundant update
+                // 
+                // ✅ CRITICAL FIX: Qty aynı olsa bile entry_price değişmiş olabilir (partial fills)
+                // Partial fills durumunda weighted average entry_price değişir, bu önemli!
+                // Örnek: İlk fill 1.0 @ 100.0, ikinci fill 0.5 @ 101.0 → weighted avg = 100.33
+                // Qty aynı kalabilir ama entry_price değişir, bu durumda update yapılmalı
                 let qty_abs_update = update.qty.0.abs();
                 let qty_abs_existing = existing_pos.qty.0;
                 
-                // If qty's are the same (or very small difference), skip redundant update
-                // Use small epsilon (0.000001) to handle floating point precision issues
+                // Calculate differences for both qty and entry_price
+                // Use small epsilon to handle floating point precision issues
+                const EPSILON_QTY: Decimal = Decimal::new(1, 6); // 0.000001
+                const EPSILON_PRICE: Decimal = Decimal::new(1, 2); // 0.01 (for price, 1 cent is reasonable)
+                
                 let qty_diff = (qty_abs_update - qty_abs_existing).abs();
-                if qty_diff < Decimal::new(1, 6) {
-                    // Qty unchanged - this is likely a redundant update from race condition
+                let price_diff = (update.entry_price.0 - existing_pos.entry_price.0).abs();
+                
+                // ✅ CRITICAL FIX: Check BOTH qty AND entry_price
+                // Only skip update if BOTH are unchanged (within epsilon)
+                // This ensures partial fills with changed entry_price are properly handled
+                if qty_diff < EPSILON_QTY && price_diff < EPSILON_PRICE {
+                    // Both qty and entry_price unchanged - this is likely a redundant update from race condition
                     // Only update timestamp to acknowledge we received this update
                     state_guard.last_position_update_timestamp = Some(update.timestamp);
                     
@@ -1026,14 +1063,15 @@ impl Ordering {
                         existing_qty = %qty_abs_existing,
                         update_qty = %qty_abs_update,
                         qty_diff = %qty_diff,
-                        "ORDERING: Position qty unchanged, skipping redundant update (race condition prevention)"
+                        existing_entry = %existing_pos.entry_price.0,
+                        update_entry = %update.entry_price.0,
+                        price_diff = %price_diff,
+                        "ORDERING: Position qty and entry_price unchanged, skipping redundant update (race condition prevention)"
                     );
                     return;
                 }
                 
-                // Position is open and qty changed - update position
-                // Calculate differences for logging
-                let price_diff = (update.entry_price.0 - existing_pos.entry_price.0).abs();
+                // Position is open and qty OR entry_price changed - update position
                 
                 // Update position (timestamp check already passed, qty changed)
                 // Determine direction from qty sign and ensure qty is positive

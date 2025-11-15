@@ -60,6 +60,11 @@ struct OrderFillHistory {
     total_filled_qty: Qty,
     weighted_price_sum: Decimal, // Sum of (price * qty) for all fills
     last_update: Instant, // Timestamp of last update (for cleanup)
+    /// Number of fills that were maker orders (for commission calculation)
+    /// If all fills are maker, use maker commission; otherwise use taker commission
+    maker_fill_count: u32,
+    /// Total number of fills for this order
+    total_fill_count: u32,
 }
 
 pub struct Connection {
@@ -299,26 +304,55 @@ impl Connection {
                 );
             }
             
-            // CRITICAL: Verify current leverage before setting (if position exists)
+            // CRITICAL: Verify current leverage and auto-fix if mismatch (if position exists)
             // This prevents conflicts if exchange has different leverage
             if let Ok(position) = self.venue.get_position(symbol).await {
                 if !position.qty.0.is_zero() {
-                    // Position exists - verify leverage matches
+                    // Position exists - check if leverage matches
                     if position.leverage != leverage {
-                        error!(
+                        warn!(
                             symbol = %symbol,
                             current_leverage = position.leverage,
                             config_leverage = leverage,
-                            "CONNECTION: CRITICAL - Leverage mismatch! Exchange has {}x but config requires {}x. Cannot proceed with different leverage.",
+                            "CONNECTION: Leverage mismatch detected! Exchange has {}x but config requires {}x. Auto-fixing...",
                             position.leverage,
                             leverage
                         );
-                        return Err(anyhow!(
-                            "Leverage mismatch for symbol {}: exchange has {}x but config requires {}x",
-                            symbol,
-                            position.leverage,
-                            leverage
-                        ));
+                        // ✅ Auto-fix: Set leverage to match config
+                        if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
+                            error!(
+                                error = %e,
+                                symbol = %symbol,
+                                current_leverage = position.leverage,
+                                config_leverage = leverage,
+                                "CONNECTION: Failed to auto-fix leverage mismatch for symbol"
+                            );
+                            return Err(anyhow!(
+                                "Failed to set leverage for symbol {} (was {}x, need {}x): {}",
+                                symbol,
+                                position.leverage,
+                                leverage,
+                                e
+                            ));
+                        }
+                        // Verify the fix worked
+                        if let Ok(updated_position) = self.venue.get_position(symbol).await {
+                            if updated_position.leverage == leverage {
+                                info!(
+                                    symbol = %symbol,
+                                    old_leverage = position.leverage,
+                                    new_leverage = leverage,
+                                    "CONNECTION: Leverage mismatch auto-fixed successfully"
+                                );
+                            } else {
+                                warn!(
+                                    symbol = %symbol,
+                                    expected_leverage = leverage,
+                                    actual_leverage = updated_position.leverage,
+                                    "CONNECTION: Leverage fix may not have taken effect immediately (will retry on next check)"
+                                );
+                            }
+                        }
                     } else {
                         info!(
                             symbol = %symbol,
@@ -329,7 +363,7 @@ impl Connection {
                 }
             }
             
-            // Set leverage (only if no position exists or leverage matches)
+            // Set leverage (for new positions or to ensure it's set correctly)
             if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
                 error!(
                     error = %e,
@@ -382,7 +416,7 @@ impl Connection {
         
         tokio::spawn(async move {
             const CLEANUP_INTERVAL_SECS: u64 = 3600; // Every hour
-            const MAX_AGE_SECS: u64 = 86400; // 24 hours
+            const MAX_AGE_SECS: u64 = 3600; // 1 hour (prevents memory leak)
             
             loop {
                 tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
@@ -698,32 +732,63 @@ impl Connection {
                                                 let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
                                                 let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
                                                 
-                                                if qty_diff > Decimal::from_str("0.0001").unwrap() {
+                                                // ✅ CRITICAL FIX: REST API is source of truth after reconnect
+                                                // If there's a mismatch, update WebSocket cache with REST API data
+                                                // This ensures state consistency after WebSocket reconnect
+                                                let needs_update = qty_diff > Decimal::from_str("0.0001").unwrap()
+                                                    || entry_diff > Decimal::from_str("0.01").unwrap();
+                                                
+                                                if needs_update {
                                                     warn!(
                                                         symbol = %symbol,
                                                         rest_qty = %rest_position.qty.0,
                                                         ws_qty = %ws_pos.qty.0,
                                                         qty_diff = %qty_diff,
-                                                        "CONNECTION: Position quantity mismatch after reconnect (REST vs WebSocket)"
-                                                    );
-                                                }
-                                                
-                                                if entry_diff > Decimal::from_str("0.01").unwrap() {
-                                                    warn!(
-                                                        symbol = %symbol,
                                                         rest_entry = %rest_position.entry.0,
                                                         ws_entry = %ws_pos.entry.0,
                                                         entry_diff = %entry_diff,
-                                                        "CONNECTION: Position entry price mismatch after reconnect (REST vs WebSocket)"
+                                                        "CONNECTION: Position mismatch after reconnect (REST vs WebSocket), updating cache with REST API data"
+                                                    );
+                                                    
+                                                    // Update WebSocket cache with REST API data (REST API is source of truth)
+                                                    POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
+                                                    
+                                                    info!(
+                                                        symbol = %symbol,
+                                                        "CONNECTION: Position cache updated with REST API data"
                                                     );
                                                 }
                                             } else if !rest_position.qty.0.is_zero() {
                                                 // REST API shows position but WebSocket cache doesn't
+                                                // ✅ CRITICAL FIX: Add missing position to cache
                                                 warn!(
                                                     symbol = %symbol,
                                                     rest_qty = %rest_position.qty.0,
-                                                    "CONNECTION: Position exists in REST API but missing from WebSocket cache after reconnect"
+                                                    "CONNECTION: Position exists in REST API but missing from WebSocket cache after reconnect, adding to cache"
                                                 );
+                                                
+                                                // Add missing position to cache
+                                                POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
+                                                
+                                                info!(
+                                                    symbol = %symbol,
+                                                    "CONNECTION: Missing position added to cache from REST API"
+                                                );
+                                            } else {
+                                                // REST API shows no position - remove from cache if exists
+                                                // This handles the case where WebSocket cache has stale position data
+                                                if POSITION_CACHE.contains_key(symbol) {
+                                                    warn!(
+                                                        symbol = %symbol,
+                                                        "CONNECTION: Position removed from REST API but exists in WebSocket cache, removing from cache"
+                                                    );
+                                                    POSITION_CACHE.remove(symbol);
+                                                    
+                                                    info!(
+                                                        symbol = %symbol,
+                                                        "CONNECTION: Stale position removed from cache"
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -847,7 +912,7 @@ impl Connection {
                                             cumulative_filled_qty,
                                             order_qty,
                                             price: last_fill_price, // Last executed price (this fill only)
-                                            is_maker: _,
+                                            is_maker,
                                             order_status,
                                             commission: _,
                                         } => {
@@ -883,12 +948,14 @@ impl Connection {
                                             // Formula: new_avg = (old_weighted_sum + new_price * new_qty) / total_qty
                                             // We track weighted_price_sum = sum of (price * qty) for all fills
                                             let now = Instant::now();
-                                            let average_fill_price = {
+                                            let (average_fill_price, is_all_maker) = {
                                                 let mut history = order_fill_history.entry(order_id.clone()).or_insert_with(|| {
                                                     OrderFillHistory {
                                                         total_filled_qty: Qty(Decimal::ZERO),
                                                         weighted_price_sum: Decimal::ZERO,
                                                         last_update: now,
+                                                        maker_fill_count: 0,
+                                                        total_fill_count: 0,
                                                     }
                                                 });
                                                 
@@ -897,12 +964,24 @@ impl Connection {
                                                 history.total_filled_qty = cumulative_filled_qty;
                                                 history.last_update = now; // Update timestamp
                                                 
+                                                // Track maker/taker status for commission calculation
+                                                history.total_fill_count += 1;
+                                                if is_maker {
+                                                    history.maker_fill_count += 1;
+                                                }
+                                                
                                                 // Calculate average: weighted_sum / total_qty
-                                                if !cumulative_filled_qty.0.is_zero() {
+                                                let avg_price = if !cumulative_filled_qty.0.is_zero() {
                                                     Px(history.weighted_price_sum / cumulative_filled_qty.0)
                                                 } else {
                                                     last_fill_price // Fallback if qty is zero (should not happen)
-                                                }
+                                                };
+                                                
+                                                // If all fills are maker, use maker commission; otherwise use taker commission
+                                                // This is conservative: if any fill is taker, use taker commission
+                                                let all_maker = history.maker_fill_count == history.total_fill_count;
+                                                
+                                                (avg_price, all_maker)
                                             };
                                             
                                             // ✅ BEST PRACTICE: Update open orders cache from WebSocket (Binance recommendation)
@@ -960,6 +1039,9 @@ impl Connection {
                                                 filled_qty: cumulative_filled_qty, // Cumulative filled qty (total filled so far)
                                                 remaining_qty, // Remaining qty = order_qty - cumulative_filled_qty
                                                 status,
+                                                /// True if all fills were maker orders, false if any fill was taker
+                                                /// Used for commission calculation: if all maker, use maker commission; otherwise taker
+                                                is_maker: Some(is_all_maker),
                                                 timestamp: Instant::now(),
                                             };
                                             
@@ -2404,14 +2486,16 @@ impl BinanceFutures {
                 Ok(position)
             }
         } else {
-            // ✅ KRİTİK: Hedge modunda - net pozisyonu hesapla (LONG - SHORT)
-            // Hedge modunda birden fazla pozisyon olabilir (LONG ve SHORT ayrı ayrı)
+            // ✅ KRİTİK: Hedge modunda - LONG ve SHORT ayrı ayrı track edilmeli, net hesaplama YANLIŞ!
+            // Hedge modunda birden fazla pozisyon olabilir (LONG ve SHORT ayrı ayrı, bağımsız)
             let mut long_qty = Decimal::ZERO;
             let mut short_qty = Decimal::ZERO;
             let mut long_entry = Decimal::ZERO;
             let mut short_entry = Decimal::ZERO;
-            let mut leverage = 1u32;
-            let mut liq_px = None;
+            let mut long_leverage = 1u32;
+            let mut short_leverage = 1u32;
+            let mut long_liq_px = None;
+            let mut short_liq_px = None;
             
             for pos in matching_positions {
                 let qty = Decimal::from_str(&pos.position_amt).unwrap_or(Decimal::ZERO);
@@ -2424,17 +2508,18 @@ impl BinanceFutures {
                     Some("LONG") => {
                         long_qty = qty;
                         long_entry = entry;
-                        leverage = lev;
+                        long_leverage = lev;
                         if liq > Decimal::ZERO {
-                            liq_px = Some(Px(liq));
+                            long_liq_px = Some(Px(liq));
                         }
                     }
                     Some("SHORT") => {
-                        short_qty = qty;
+                        // SHORT pozisyon için qty negatif olabilir, mutlak değerini al
+                        short_qty = qty.abs();
                         short_entry = entry;
-                        leverage = lev;
+                        short_leverage = lev;
                         if liq > Decimal::ZERO {
-                            liq_px = Some(Px(liq));
+                            short_liq_px = Some(Px(liq));
                         }
                     }
                     Some("BOTH") | None => {
@@ -2450,9 +2535,11 @@ impl BinanceFutures {
                         short_qty = (-qty).max(Decimal::ZERO);
                         long_entry = entry;
                         short_entry = entry;
-                        leverage = lev;
+                        long_leverage = lev;
+                        short_leverage = lev;
                         if liq > Decimal::ZERO {
-                            liq_px = Some(Px(liq));
+                            long_liq_px = Some(Px(liq));
+                            short_liq_px = Some(Px(liq));
                         }
                     }
                     Some(other) => {
@@ -2466,23 +2553,35 @@ impl BinanceFutures {
                 }
             }
             
-            // Net pozisyon: LONG - SHORT
-            let net_qty = long_qty - short_qty;
-            // Net entry: Weighted average (basit versiyon - ilk pozisyonun entry'si)
-            let net_entry = if net_qty.is_sign_positive() {
-                long_entry
-            } else if net_qty.is_sign_negative() {
-                short_entry
+            // ✅ KRİTİK: Hedge modunda LONG ve SHORT ayrı ayrı track edilmeli
+            // Net hesaplama YANLIŞ - her pozisyon bağımsız olarak yönetilmeli
+            // Position struct tek qty desteklediği için, öncelik sırası: LONG > SHORT
+            // Eğer her ikisi de varsa, LONG pozisyonunu döndür (SHORT ayrı track edilmeli)
+            let (final_qty, final_entry, final_leverage, final_liq_px) = if long_qty > Decimal::ZERO {
+                // LONG pozisyon var - öncelik LONG'a ver
+                if short_qty > Decimal::ZERO {
+                    warn!(
+                        symbol = %sym,
+                        long_qty = %long_qty,
+                        short_qty = %short_qty,
+                        "CONNECTION: Both LONG and SHORT positions exist in hedge mode. Returning LONG position. SHORT should be tracked separately."
+                    );
+                }
+                (long_qty, long_entry, long_leverage, long_liq_px)
+            } else if short_qty > Decimal::ZERO {
+                // Sadece SHORT pozisyon var
+                (short_qty, short_entry, short_leverage, short_liq_px)
             } else {
-                Decimal::ZERO
+                // Hiç pozisyon yok (sıfır)
+                (Decimal::ZERO, Decimal::ZERO, 1u32, None)
             };
             
             let position = Position {
                 symbol: sym.to_string(),
-                qty: Qty(net_qty),
-                entry: Px(net_entry),
-                leverage,
-                liq_px,
+                qty: Qty(final_qty),
+                entry: Px(final_entry),
+                leverage: final_leverage,
+                liq_px: final_liq_px,
             };
             // ✅ BEST PRACTICE: Update cache with REST API result (for startup sync)
             POSITION_CACHE.insert(sym.to_string(), position.clone());
@@ -2564,6 +2663,15 @@ impl BinanceFutures {
         let mut limit_fallback_attempted = false;
 
         for attempt in 0..max_attempts {
+            // ✅ KRİTİK GÜVENLİK: LIMIT fallback başarısız olduysa HEMEN çık (sonsuz loop önleme)
+            // LIMIT fallback başarısız olduktan sonra tekrar MARKET denenmemeli
+            // Bu kontrol retry loop'un başında yapılmalı ki sonsuz loop oluşmasın
+            if limit_fallback_attempted {
+                return Err(anyhow::anyhow!(
+                    "LIMIT fallback already attempted and failed, cannot proceed with retry. Position may need manual intervention."
+                ));
+            }
+            
             // KRİTİK İYİLEŞTİRME: Her attempt'te mevcut pozisyonu kontrol et
             // Retry durumunda pozisyon değişmiş olabilir (kısmi kapatma veya manuel kapatma)
             let current_pos = match self.fetch_position(sym).await {
@@ -2703,32 +2811,68 @@ impl BinanceFutures {
                         // ✅ KRİTİK DÜZELTME: Position growth tespiti - sonsuz loop önleme
                         // 1 saniye bekleme sırasında WebSocket'ten yeni fill event gelebilir
                         // Position büyüyebilir (yeni order fill oldu), bu durumda sonsuz loop riski var
+                        // Volatile market'lerde aynı anda birden fazla fill olabilir - bu normal olabilir
+                        // Küçük büyümeleri (%10 altı) tolere et, sadece büyük büyümeleri hata olarak işaretle
                         let position_grew_from_attempt = verify_qty.abs() > current_qty.abs();
                         let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
                         
                         if position_grew_from_attempt || position_grew_from_initial {
-                            // ❌ CRITICAL: Position büyüdü, bu bizim position'ımız değil
-                            // Yeni position manual intervention ile açılmış olabilir
-                            // Veya başka bir modül order açmış olabilir
-                            // Retry yapmak sonsuz loop'a yol açabilir (volatile market'te sürekli yeni fill olabilir)
-                            // HEMEN çık, retry yapma
-                            tracing::error!(
-                                symbol = %sym,
-                                attempt = attempt + 1,
-                                initial_qty = %initial_qty,
-                                current_qty_at_attempt = %current_qty,
-                                verify_qty = %verify_qty,
-                                grew_from_attempt = position_grew_from_attempt,
-                                grew_from_initial = position_grew_from_initial,
-                                "POSITION GROWTH DETECTED: Position grew during close - manual intervention or race condition detected. Cannot safely proceed."
-                            );
+                            // Position büyümesi tespit edildi - büyüme yüzdesini hesapla
+                            let growth_from_initial = if initial_qty.abs() > Decimal::ZERO {
+                                ((verify_qty.abs() - initial_qty.abs()) / initial_qty.abs() * Decimal::from(100))
+                                    .to_f64()
+                                    .unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
                             
-                            return Err(anyhow::anyhow!(
-                                "Position grew during close, cannot safely proceed. Initial: {}, Attempt qty: {}, Final qty: {}. This may indicate manual intervention or a race condition with another module.",
-                                initial_qty,
-                                current_qty,
-                                verify_qty
-                            ));
+                            const MAX_ACCEPTABLE_GROWTH_PCT: f64 = 10.0; // %10 üzeri kritik
+                            
+                            if growth_from_initial > MAX_ACCEPTABLE_GROWTH_PCT {
+                                // ❌ CRITICAL: Position %10'dan fazla büyüdü - bu ciddi bir sorun
+                                // Yeni position manual intervention ile açılmış olabilir
+                                // Veya başka bir modül order açmış olabilir
+                                // Retry yapmak sonsuz loop'a yol açabilir
+                                // HEMEN çık, retry yapma
+                                tracing::error!(
+                                    symbol = %sym,
+                                    attempt = attempt + 1,
+                                    initial_qty = %initial_qty,
+                                    current_qty_at_attempt = %current_qty,
+                                    verify_qty = %verify_qty,
+                                    growth_pct = growth_from_initial,
+                                    grew_from_attempt = position_grew_from_attempt,
+                                    grew_from_initial = position_grew_from_initial,
+                                    "POSITION GROWTH DETECTED: Position grew >{}% during close - manual intervention or race condition detected. Cannot safely proceed.",
+                                    MAX_ACCEPTABLE_GROWTH_PCT
+                                );
+                                
+                                return Err(anyhow::anyhow!(
+                                    "Position grew {}% during close (exceeds {}% threshold), cannot safely proceed. Initial: {}, Attempt qty: {}, Final qty: {}. This may indicate manual intervention or a race condition with another module.",
+                                    growth_from_initial,
+                                    MAX_ACCEPTABLE_GROWTH_PCT,
+                                    initial_qty,
+                                    current_qty,
+                                    verify_qty
+                                ));
+                            } else {
+                                // ⚠️ WARNING: Position büyüdü ama %10'un altında - volatile market'te normal olabilir
+                                // Aynı anda birden fazla fill olabilir, devam et
+                                tracing::warn!(
+                                    symbol = %sym,
+                                    attempt = attempt + 1,
+                                    initial_qty = %initial_qty,
+                                    current_qty_at_attempt = %current_qty,
+                                    verify_qty = %verify_qty,
+                                    growth_pct = growth_from_initial,
+                                    grew_from_attempt = position_grew_from_attempt,
+                                    grew_from_initial = position_grew_from_initial,
+                                    "POSITION GROWTH DETECTED: Position grew {}% during close (within acceptable {}% threshold). Continuing with retry - this may be normal in volatile markets.",
+                                    growth_from_initial,
+                                    MAX_ACCEPTABLE_GROWTH_PCT
+                                );
+                                // Devam et, retry yap
+                            }
                         }
                         
                         // KRİTİK İYİLEŞTİRME: Kısmi kapatma tespiti - kapatılan miktarı hesapla
@@ -3061,12 +3205,21 @@ impl BinanceFutures {
                                     return Ok(());
                                 }
                                 
-                                // ✅ KRİTİK: LIMIT fallback başarısız ve dust değil, tekrar MARKET denenmemeli (sonsuz loop önleme)
-                                // Direkt hata döndür - retry loop'a girmemeli
-                                return Err(anyhow!(
-                                    "MIN_NOTIONAL error: market and limit reduce-only both failed (market: {}, limit: {}). Remaining qty: {}, min_notional: {}. Position may need manual intervention.",
-                                    e, e2, remaining_qty, rules.min_notional
-                                ));
+                                // ✅ KRİTİK GÜVENLİK: LIMIT fallback başarısız ve dust değil
+                                // Flag'i set et ve retry loop'un başındaki kontrolle çıkışı sağla
+                                // Bu, sonsuz loop'u önler (tekrar MARKET denenmeyecek)
+                                limit_fallback_attempted = true;
+                                warn!(
+                                    symbol = %sym,
+                                    market_error = %e,
+                                    limit_error = %e2,
+                                    remaining_qty = %remaining_qty,
+                                    min_notional = %rules.min_notional,
+                                    "MIN_NOTIONAL: LIMIT fallback failed, will exit retry loop to prevent infinite loop"
+                                );
+                                // Retry loop'un başındaki kontrolle çıkış yapılacak
+                                // continue ile retry loop'un başına dön, orada limit_fallback_attempted kontrolü yapılacak
+                                continue;
                             }
                         }
                     } else {
@@ -3646,16 +3799,25 @@ pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     let floored = ratio.floor();
     let result = floored * step;
 
-    // ✅ KRİTİK: Precision loss önleme - sonucu normalize et
-    // Division ve multiplication sonrası sonucun step'in tam katı olduğundan emin ol
-    // Step'in scale'ini kullanarak normalize et (step'in ondalık basamak sayısı)
-    // Bu, 0.123456789 / 0.001 * 0.001 = 0.122999999 gibi durumları önler
+    // ✅ FIX: Float precision issue (0.999999 gibi değerler) - daha robust quantization
+    // Division ve multiplication sonrası floating point precision hatalarını önlemek için:
+    // 1. Sonucu normalize et
+    // 2. Step'in scale'ine göre quantize et (step'in tam katı olduğundan emin ol)
+    // 3. Son olarak tekrar step'e bölüp çarparak kesinliği garanti et
     let step_scale = step.scale();
     let normalized = result.normalize();
     
-    // Normalize edilmiş sonucu step'in scale'ine göre yuvarla
-    // Bu, step'in tam katı olduğundan emin olur
-    normalized.round_dp_with_strategy(step_scale, rust_decimal::RoundingStrategy::ToNegativeInfinity)
+    // Önce step'in scale'ine göre yuvarla
+    let rounded = normalized.round_dp_with_strategy(step_scale, rust_decimal::RoundingStrategy::ToNegativeInfinity);
+    
+    // ✅ CRITICAL: Double-check quantization - sonucun step'in tam katı olduğundan emin ol
+    // Bu, 0.999999 gibi precision hatalarını önler
+    let re_quantized_ratio = rounded / step;
+    let re_quantized_floor = re_quantized_ratio.floor();
+    let final_result = re_quantized_floor * step;
+    
+    // Final normalization ve rounding
+    final_result.normalize().round_dp_with_strategy(step_scale, rust_decimal::RoundingStrategy::ToNegativeInfinity)
 }
 
 /// Format decimal with fixed precision
@@ -3690,6 +3852,9 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
             s
         }
     } else {
+        // ✅ FIX: Trailing zero padding - daha robust yaklaşım
+        // Decimal'in format! makrosu ile doğru precision'ı garanti eder
+        // Ancak trailing zero'ları korumak için özel formatlama gerekir
         let s = rounded.to_string();
         if let Some(dot_pos) = s.find('.') {
             let integer_part = &s[..dot_pos];
@@ -3710,8 +3875,19 @@ pub fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
                 let truncated_decimal = &decimal_part[..scale as usize];
                 format!("{}.{}", integer_part, truncated_decimal)
             } else {
-                // Tam precision - olduğu gibi döndür
-                s
+                // ✅ FIX: Tam precision - trailing zero'ları koru
+                // Decimal'in to_string() trailing zero'ları kaldırabilir, bu yüzden kontrol et
+                if decimal_part.len() == scale as usize {
+                    s
+                } else {
+                    // Trailing zero eksikse ekle
+                    format!(
+                        "{}.{}{}",
+                        integer_part,
+                        decimal_part,
+                        "0".repeat(scale as usize - decimal_part.len())
+                    )
+                }
             }
         } else {
             // Nokta yoksa ekle ve trailing zero ekle

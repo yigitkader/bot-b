@@ -115,8 +115,17 @@ impl BalanceStore {
     
     /// Reserve balance atomically (returns true if reservation successful, false if insufficient)
     /// This prevents double-spending race conditions
+    /// CRITICAL: This method atomically checks available balance and reserves it in a single operation
+    /// Do not call available() separately before this method - it's already included here
     pub fn try_reserve(&mut self, asset: &str, amount: Decimal) -> bool {
-        let available = self.available(asset);
+        // Atomic read + reserve: read total and reserved, check, and increment in one operation
+        let (total, reserved) = if asset.to_uppercase() == "USDT" {
+            (self.usdt, self.reserved_usdt)
+        } else {
+            (self.usdc, self.reserved_usdc)
+        };
+        
+        let available = total - reserved;
         if available >= amount {
             if asset.to_uppercase() == "USDT" {
                 self.reserved_usdt += amount;

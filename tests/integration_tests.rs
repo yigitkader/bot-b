@@ -113,17 +113,13 @@ async fn test_balance_reservation_stress() {
             let amount = REQUIRED_MARGIN;
             
             // Try to reserve balance
+            // ✅ CRITICAL: try_reserve() is atomic - it checks available balance and reserves in one operation
+            // Do not call available() separately - it would create a race condition
             let reservation = {
                 let mut store = balance_store.write().await;
-                let available = store.available(asset);
-                
-                if available >= amount {
-                    if store.try_reserve(asset, amount) {
-                        reservation_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Some(amount)
-                    } else {
-                        None
-                    }
+                if store.try_reserve(asset, amount) {
+                    reservation_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(amount)
                 } else {
                     None
                 }
@@ -755,15 +751,13 @@ async fn test_order_placement_race_condition() {
         let balance_store = state1.balance_store.clone();
         let required_margin = dec!(50);
         
+        // ✅ CRITICAL: try_reserve() is atomic - it checks available balance and reserves in one operation
+        // Do not call available() separately - it would create a race condition
         let reserved = {
             let mut store = balance_store.write().await;
-            if store.available("USDT") >= required_margin {
-                if store.try_reserve("USDT", required_margin) {
-                    balance_count1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    true
-                } else {
-                    false
-                }
+            if store.try_reserve("USDT", required_margin) {
+                balance_count1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
             } else {
                 false
             }
@@ -808,15 +802,13 @@ async fn test_order_placement_race_condition() {
         let balance_store = state2.balance_store.clone();
         let required_margin = dec!(50);
         
+        // ✅ CRITICAL: try_reserve() is atomic - it checks available balance and reserves in one operation
+        // Do not call available() separately - it would create a race condition
         let reserved = {
             let mut store = balance_store.write().await;
-            if store.available("USDT") >= required_margin {
-                if store.try_reserve("USDT", required_margin) {
-                    balance_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    true
-                } else {
-                    false
-                }
+            if store.try_reserve("USDT", required_margin) {
+                balance_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
             } else {
                 false
             }

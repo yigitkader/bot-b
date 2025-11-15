@@ -6,7 +6,7 @@
 use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::connection::quantize_decimal;
-use crate::event_bus::{EventBus, MarketTick, TradeSignal};
+use crate::event_bus::{EventBus, MarketTick, PositionUpdate, TradeSignal};
 use crate::state::SharedState;
 use crate::types::{Px, Qty, Side};
 use anyhow::Result;
@@ -34,6 +34,9 @@ struct SymbolState {
     symbol: String,
     prices: VecDeque<PricePoint>,
     last_signal_time: Option<Instant>,
+    /// Timestamp of last position close for this symbol
+    /// Used to enforce cooldown after position close to prevent signal spam
+    last_position_close_time: Option<Instant>,
 }
 
 /// Trend signal direction
@@ -145,27 +148,35 @@ impl Trending {
         let last_signals = self.last_signals.clone();
         let symbol_states = self.symbol_states.clone();
         
+        // Spawn task for MarketTick events (signal generation)
+        let event_bus_tick = event_bus.clone();
+        let shutdown_flag_tick = shutdown_flag.clone();
+        let cfg_tick = cfg.clone();
+        let shared_state_tick = shared_state.clone();
+        let connection_tick = connection.clone();
+        let last_signals_tick = last_signals.clone();
+        let symbol_states_tick = symbol_states.clone();
         tokio::spawn(async move {
-            let mut market_tick_rx = event_bus.subscribe_market_tick();
+            let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
             
             info!("TRENDING: Started, listening to MarketTick events");
             
             loop {
                 match market_tick_rx.recv().await {
                     Ok(tick) => {
-                        if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                        if shutdown_flag_tick.load(AtomicOrdering::Relaxed) {
                             break;
                         }
                         
                         // Process market tick and generate trade signal if needed
                         if let Err(e) = Self::process_market_tick(
                             &tick,
-                            &cfg,
-                            &event_bus,
-                            &shared_state,
-                            &connection,
-                            &last_signals,
-                            &symbol_states,
+                            &cfg_tick,
+                            &event_bus_tick,
+                            &shared_state_tick,
+                            &connection_tick,
+                            &last_signals_tick,
+                            &symbol_states_tick,
                         ).await {
                             warn!(error = %e, symbol = %tick.symbol, "TRENDING: error processing market tick");
                         }
@@ -175,6 +186,47 @@ impl Trending {
             }
             
             info!("TRENDING: Stopped");
+        });
+        
+        // Spawn task for PositionUpdate events (to track position close for cooldown)
+        let symbol_states_pos = symbol_states.clone();
+        let shutdown_flag_pos = shutdown_flag.clone();
+        tokio::spawn(async move {
+            let mut position_update_rx = event_bus.subscribe_position_update();
+            
+            info!("TRENDING: Started, listening to PositionUpdate events for position close cooldown");
+            
+            loop {
+                match position_update_rx.recv().await {
+                    Ok(update) => {
+                        if shutdown_flag_pos.load(AtomicOrdering::Relaxed) {
+                            break;
+                        }
+                        
+                        // Track position close for cooldown
+                        if !update.is_open {
+                            // Position closed - set cooldown timestamp
+                            let mut states = symbol_states_pos.lock().await;
+                            let state = states.entry(update.symbol.clone()).or_insert_with(|| {
+                                SymbolState {
+                                    symbol: update.symbol.clone(),
+                                    prices: VecDeque::new(),
+                                    last_signal_time: None,
+                                    last_position_close_time: None,
+                                }
+                            });
+                            
+                            state.last_position_close_time = Some(Instant::now());
+                            
+                            debug!(
+                                symbol = %update.symbol,
+                                "TRENDING: Position closed, cooldown set for this symbol"
+                            );
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         });
         
         Ok(())
@@ -407,6 +459,30 @@ impl Trending {
             }
         }
         
+        // ✅ CRITICAL FIX: Symbol bazlı cooldown after position close
+        // Position close sonrası minimum 5 saniye bekle (signal spam önleme)
+        // TP trigger → position close → lock release → yeni signal → aynı sembol için yeni order!
+        // Bu cooldown aynı sembol için hemen yeni signal üretilmesini önler
+        const POSITION_CLOSE_COOLDOWN_SECS: u64 = 5;
+        {
+            let states = symbol_states.lock().await;
+            if let Some(state) = states.get(&tick.symbol) {
+                if let Some(last_close_time) = state.last_position_close_time {
+                    let elapsed = now.duration_since(last_close_time);
+                    if elapsed < Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
+                        // Still in cooldown after position close, skip signal generation
+                        debug!(
+                            symbol = %tick.symbol,
+                            elapsed_secs = elapsed.as_secs(),
+                            cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
+                            "TRENDING: Skipping signal generation - position close cooldown active"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        
         // ✅ PERFORMANCE OPTIMIZATION: Cooldown check BEFORE expensive trend analysis
         // This prevents unnecessary CPU usage when cooldown is still active
         // Check cooldown period first (cheap operation)
@@ -467,6 +543,7 @@ impl Trending {
                     symbol: tick.symbol.clone(),
                     prices: VecDeque::new(),
                     last_signal_time: None,
+                    last_position_close_time: None,
                 }
             });
             

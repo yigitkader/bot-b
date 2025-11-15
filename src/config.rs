@@ -62,7 +62,7 @@ pub struct WebsocketCfg {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct EventBusCfg {
     /// Buffer size for MarketTick events (high frequency, needs larger buffer)
-    /// With 100 symbols at 1 tick/sec = 100 ticks/sec, 10000 buffer = ~100 seconds
+    /// With 100 symbols at 1 tick/sec = 100 ticks/sec, 1000 buffer = ~10 seconds (sufficient for most use cases)
     #[serde(default = "default_market_tick_buffer")]
     pub market_tick_buffer: usize,
     /// Buffer size for TradeSignal events
@@ -172,7 +172,7 @@ fn default_max_spread_bps() -> f64 {
 }
 
 fn default_signal_cooldown_seconds() -> u64 {
-    60 // Default: 60 seconds cooldown between signals for same symbol
+    30 // Default: 30 seconds cooldown between signals for same symbol
 }
 
 fn default_tif() -> String {
@@ -248,7 +248,7 @@ fn default_stop_loss_pct() -> f64 {
 }
 
 fn default_market_tick_buffer() -> usize {
-    10000
+    1000 // Reduced from 10000 - 1000 is sufficient for most use cases
 }
 
 fn default_trade_signal_buffer() -> usize {

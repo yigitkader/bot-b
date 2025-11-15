@@ -81,6 +81,10 @@ pub struct OrderUpdate {
     /// Remaining quantity to be filled (qty - filled_qty)
     pub remaining_qty: Qty,
     pub status: OrderStatus,
+    /// True if all fills were maker orders, None if unknown
+    /// Used for commission calculation: if all maker, use maker commission; otherwise taker
+    /// Post-only orders are typically maker, but can become taker if they cross the spread
+    pub is_maker: Option<bool>,
     #[serde(skip)]
     pub timestamp: Instant, // Not serialized, only for runtime use
 }
