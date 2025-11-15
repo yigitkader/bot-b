@@ -4,7 +4,7 @@
 // BALANCE updates this
 // TRENDING/ORDERING can read from this
 
-use crate::types::{Px, Qty, Side, PositionDirection};
+use crate::types::{PositionDirection, Px, Qty, Side};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Global state for ORDERING module
 /// Guarantees single position/order at a time
-/// 
+///
 /// CRITICAL: Timestamp tracking prevents stale event updates
 /// OrderUpdate and PositionUpdate events may arrive out of order or be stale
 /// We track the last update timestamp to ensure we only apply newer updates
@@ -75,7 +75,7 @@ impl Default for OrderingState {
 /// Shared balance store
 /// Updated by BALANCE module
 /// Read by TRENDING/ORDERING modules
-/// 
+///
 /// CRITICAL: Balance reservation system prevents double-spending race conditions
 /// When placing an order, balance should be reserved atomically before sending
 /// Reservation is released after order is placed (success or failure)
@@ -101,7 +101,7 @@ impl BalanceStore {
             reserved_usdc: Decimal::ZERO,
         }
     }
-    
+
     /// Get available balance (total - reserved) for an asset
     /// This is the actual available balance that can be used for new orders
     pub fn available(&self, asset: &str) -> Decimal {
@@ -112,7 +112,7 @@ impl BalanceStore {
         };
         total - reserved
     }
-    
+
     /// Reserve balance atomically (returns true if reservation successful, false if insufficient)
     /// This prevents double-spending race conditions
     /// CRITICAL: This method atomically checks available balance and reserves it in a single operation
@@ -122,14 +122,14 @@ impl BalanceStore {
         // High-frequency scenarios (100+ req/s) benefit from this optimization
         let asset_upper = asset.to_uppercase();
         let is_usdt = asset_upper == "USDT";
-        
+
         // Atomic read + reserve: read total and reserved, check, and increment in one operation
         let (total, reserved) = if is_usdt {
             (self.usdt, self.reserved_usdt)
         } else {
             (self.usdc, self.reserved_usdc)
         };
-        
+
         let available = total - reserved;
         if available >= amount {
             if is_usdt {
@@ -142,7 +142,7 @@ impl BalanceStore {
             false
         }
     }
-    
+
     /// Release reserved balance
     pub fn release(&mut self, asset: &str, amount: Decimal) {
         if asset.to_uppercase() == "USDT" {
@@ -184,4 +184,3 @@ impl Default for SharedState {
         Self::new()
     }
 }
-

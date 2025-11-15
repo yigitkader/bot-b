@@ -15,15 +15,15 @@ pub struct Px(pub Decimal);
 pub struct Qty(pub Decimal);
 
 /// Order side - represents the direction of an order (BUY or SELL)
-/// 
+///
 /// **IMPORTANT**: This is for ORDER sides, NOT position directions!
 /// - Use `Side::Buy` / `Side::Sell` for placing orders
 /// - Use `PositionDirection::Long` / `PositionDirection::Short` for positions
-/// 
+///
 /// In Binance:
 /// - Long position: positionAmt > 0 (opened with BUY order)
 /// - Short position: positionAmt < 0 (opened with SELL order)
-/// 
+///
 /// When storing positions, use `PositionDirection` and store absolute qty values.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Side {
@@ -50,7 +50,7 @@ impl PositionDirection {
             Side::Sell => PositionDirection::Short,
         }
     }
-    
+
     /// Convert to order side for closing
     /// Long position closes with Sell order, Short position closes with Buy order
     pub fn to_close_side(self) -> Side {
@@ -59,7 +59,7 @@ impl PositionDirection {
             PositionDirection::Short => Side::Buy,
         }
     }
-    
+
     /// Determine position direction from quantity sign
     /// Positive qty = Long, Negative qty = Short
     pub fn from_qty_sign(qty: Decimal) -> Self {

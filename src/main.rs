@@ -1,17 +1,17 @@
 // Main application entry point
 // Clean architecture: event-driven modules with WebSocket-first approach
 
-mod config;
-mod types;
-mod event_bus;
-mod state;
-mod connection;
-mod trending;
-mod ordering;
-mod follow_orders;
 mod balance;
+mod config;
+mod connection;
+mod event_bus;
+mod follow_orders;
 mod logging;
+mod ordering;
+mod state;
 mod storage;
+mod trending;
+mod types;
 
 use crate::balance::Balance;
 use crate::config::load_config;
@@ -42,27 +42,27 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let cfg = Arc::new(load_config()?);
-    
+
     // Initialize logger
     let (json_logger, _logger_handle) = crate::logging::create_logger("logs/trading_events.json")?;
-    
+
     // Create shutdown flag
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = shutdown_flag.clone();
-    
+
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("Ctrl+C signal received, shutting down");
             shutdown_flag_clone.store(true, Ordering::Relaxed);
         }
     });
-    
+
     // Create shared state
     let shared_state = Arc::new(SharedState::new());
-    
+
     // Create event bus with configuration
     let event_bus = Arc::new(EventBus::new_with_config(&cfg.event_bus));
-    
+
     // Initialize CONNECTION module (only module that creates exchange connection)
     // Pass shared_state for balance validation
     let connection = Arc::new(Connection::from_config(
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
         shutdown_flag.clone(),
         Some(shared_state.clone()), // Pass shared_state for balance validation
     )?);
-    
+
     // Get symbols from config or discover them
     let symbols = if !cfg.symbols.is_empty() {
         // Use manually specified symbols
@@ -81,7 +81,10 @@ async fn main() -> Result<()> {
         vec![symbol.clone()]
     } else if cfg.auto_discover_quote {
         // Auto-discover symbols based on quote asset
-        info!("Auto-discovering symbols with quote asset: {}", cfg.quote_asset);
+        info!(
+            "Auto-discovering symbols with quote asset: {}",
+            cfg.quote_asset
+        );
         match connection.discover_symbols().await {
             Ok(discovered) => {
                 if discovered.is_empty() {
@@ -106,7 +109,7 @@ async fn main() -> Result<()> {
         // No symbols specified and auto-discovery is disabled
         return Err(anyhow!("No symbols specified and auto_discover_quote is false. Please specify symbols in config or enable auto_discover_quote."));
     };
-    
+
     // Initialize STORAGE module (must be started before other modules for state restore)
     let storage = Storage::new(
         None, // Use default database path: ./bot_state.db
@@ -115,10 +118,10 @@ async fn main() -> Result<()> {
         shared_state.clone(),
     )?;
     storage.start().await?;
-    
+
     // Start CONNECTION
     connection.start(symbols).await?;
-    
+
     // Initialize BALANCE module
     let balance = Balance::new(
         connection.clone(),
@@ -127,7 +130,7 @@ async fn main() -> Result<()> {
         shared_state.clone(),
     );
     balance.start().await?;
-    
+
     // Initialize ORDERING module
     let ordering = OrderingModule::new(
         cfg.clone(),
@@ -137,15 +140,11 @@ async fn main() -> Result<()> {
         shared_state.clone(),
     );
     ordering.start().await?;
-    
+
     // Initialize FOLLOW_ORDERS module
-    let follow_orders = FollowOrders::new(
-        cfg.clone(),
-        event_bus.clone(),
-        shutdown_flag.clone(),
-    );
+    let follow_orders = FollowOrders::new(cfg.clone(), event_bus.clone(), shutdown_flag.clone());
     follow_orders.start().await?;
-    
+
     // Initialize TRENDING module
     let trending = Trending::new(
         cfg.clone(),
@@ -155,44 +154,40 @@ async fn main() -> Result<()> {
         connection.clone(),
     );
     trending.start().await?;
-    
+
     // Initialize LOGGING module
-    let logging = Logging::new(
-        event_bus.clone(),
-        json_logger,
-        shutdown_flag.clone(),
-    );
+    let logging = Logging::new(event_bus.clone(), json_logger, shutdown_flag.clone());
     logging.start().await?;
-    
+
     info!("All modules started, waiting for shutdown signal...");
-    
+
     // Start health check task
     let event_bus_health = event_bus.clone();
     let shutdown_flag_health = shutdown_flag.clone();
     let app_start_time = Instant::now();
     tokio::spawn(async move {
         const HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
-        
+
         loop {
             tokio::time::sleep(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS)).await;
-            
+
             if shutdown_flag_health.load(Ordering::Relaxed) {
                 break;
             }
-            
+
             // Perform health check
             let uptime_secs = app_start_time.elapsed().as_secs();
             perform_health_check(&event_bus_health, uptime_secs);
         }
     });
-    
+
     // Wait for shutdown signal
     while !shutdown_flag.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    
+
     info!("Shutdown signal received, exiting...");
-    
+
     Ok(())
 }
 
@@ -200,7 +195,7 @@ async fn main() -> Result<()> {
 /// Checks event bus receiver counts and basic system health
 fn perform_health_check(event_bus: &EventBus, uptime_secs: u64) {
     let health = event_bus.health_stats();
-    
+
     // Check if any critical channels have no receivers (potential issue)
     let mut warnings = Vec::new();
     if health.order_update_receivers == 0 {
@@ -212,7 +207,7 @@ fn perform_health_check(event_bus: &EventBus, uptime_secs: u64) {
     if health.trade_signal_receivers == 0 {
         warnings.push("TradeSignal: no subscribers");
     }
-    
+
     // Log health status
     if warnings.is_empty() {
         info!(
@@ -238,16 +233,13 @@ fn perform_health_check(event_bus: &EventBus, uptime_secs: u64) {
             "HEALTH: Warning - some event channels have no subscribers"
         );
     }
-    
+
     // Log memory usage (basic check)
     // Note: More detailed memory profiling would require additional dependencies
     // This is a basic health check to ensure the process is still running
     let memory_info = get_memory_info();
     if let Some(mem_mb) = memory_info {
-        info!(
-            memory_mb = mem_mb,
-            "HEALTH: Process memory usage"
-        );
+        info!(memory_mb = mem_mb, "HEALTH: Process memory usage");
     }
 }
 
@@ -271,18 +263,18 @@ fn get_memory_info() -> Option<f64> {
             }
         }
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         // On macOS, we could use task_info, but it's complex
         // For now, return None - can be enhanced later
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         // On Windows, we could use GetProcessMemoryInfo, but it's complex
         // For now, return None - can be enhanced later
     }
-    
+
     None
 }

@@ -8,7 +8,7 @@ use serde::Deserialize;
 // Configuration Structures
 // ============================================================================
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RiskCfg {
     /// Maximum allowed leverage (validation only, not used as default)
     /// Used to validate that leverage and exec.default_leverage don't exceed this limit
@@ -29,7 +29,19 @@ pub struct RiskCfg {
     pub taker_commission_pct: f64,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+impl Default for RiskCfg {
+    fn default() -> Self {
+        Self {
+            max_leverage: default_max_leverage(),
+            use_isolated_margin: default_use_isolated_margin(),
+            max_position_notional_usd: default_max_position_notional_usd(),
+            maker_commission_pct: default_maker_commission_pct(),
+            taker_commission_pct: default_taker_commission_pct(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct TrendingCfg {
     #[serde(default = "default_min_spread_bps")]
     pub min_spread_bps: f64,
@@ -39,7 +51,17 @@ pub struct TrendingCfg {
     pub signal_cooldown_seconds: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+impl Default for TrendingCfg {
+    fn default() -> Self {
+        Self {
+            min_spread_bps: default_min_spread_bps(),
+            max_spread_bps: default_max_spread_bps(),
+            signal_cooldown_seconds: default_signal_cooldown_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExecCfg {
     #[serde(default = "default_tif")]
     pub tif: String,
@@ -49,7 +71,16 @@ pub struct ExecCfg {
     pub default_leverage: u32,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+impl Default for ExecCfg {
+    fn default() -> Self {
+        Self {
+            tif: default_tif(),
+            default_leverage: default_default_leverage(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct WebsocketCfg {
     #[serde(default = "default_ws_enabled")]
     pub enabled: bool,
@@ -59,7 +90,17 @@ pub struct WebsocketCfg {
     pub ping_interval_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+impl Default for WebsocketCfg {
+    fn default() -> Self {
+        Self {
+            enabled: default_ws_enabled(),
+            reconnect_delay_ms: default_ws_reconnect_delay(),
+            ping_interval_ms: default_ws_ping_interval(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct EventBusCfg {
     /// Buffer size for MarketTick events (high frequency, needs larger buffer)
     /// With 100 symbols at 1 tick/sec = 100 ticks/sec, 1000 buffer = ~10 seconds (sufficient for most use cases)
@@ -82,6 +123,19 @@ pub struct EventBusCfg {
     pub balance_update_buffer: usize,
 }
 
+impl Default for EventBusCfg {
+    fn default() -> Self {
+        Self {
+            market_tick_buffer: default_market_tick_buffer(),
+            trade_signal_buffer: default_trade_signal_buffer(),
+            close_request_buffer: default_default_event_buffer(),
+            order_update_buffer: default_default_event_buffer(),
+            position_update_buffer: default_default_event_buffer(),
+            balance_update_buffer: default_default_event_buffer(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct BinanceCfg {
     pub api_key: String,
@@ -91,6 +145,18 @@ pub struct BinanceCfg {
     pub futures_base: String,
     #[serde(default = "default_hedge_mode")]
     pub hedge_mode: bool,
+}
+
+impl Default for BinanceCfg {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            secret_key: String::new(),
+            recv_window_ms: default_recv_window(),
+            futures_base: String::new(),
+            hedge_mode: default_hedge_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -137,6 +203,33 @@ pub struct AppCfg {
     pub websocket: WebsocketCfg,
     #[serde(default)]
     pub event_bus: EventBusCfg,
+}
+
+impl Default for AppCfg {
+    fn default() -> Self {
+        Self {
+            symbol: None,
+            symbols: Vec::new(),
+            auto_discover_quote: default_auto_discover_quote(),
+            quote_asset: default_quote_asset(),
+            allow_usdt_quote: default_allow_usdt_quote(),
+            mode: default_mode(),
+            max_usd_per_order: default_max_usd_per_order(),
+            min_usd_per_order: default_min_usd_per_order(),
+            min_quote_balance_usd: default_min_quote_balance_usd(),
+            leverage: None,
+            price_tick: default_price_tick(),
+            qty_step: default_qty_step(),
+            take_profit_pct: default_take_profit_pct(),
+            stop_loss_pct: default_stop_loss_pct(),
+            binance: BinanceCfg::default(),
+            risk: RiskCfg::default(),
+            trending: TrendingCfg::default(),
+            exec: ExecCfg::default(),
+            websocket: WebsocketCfg::default(),
+            event_bus: EventBusCfg::default(),
+        }
+    }
 }
 
 // ============================================================================
@@ -382,7 +475,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             ));
         }
     }
-    
+
     // CRITICAL: Cross margin mode validation
     // TP/SL PnL calculation in follow_orders.rs assumes isolated margin
     // Cross margin uses shared account equity, which requires different PnL calculation
@@ -400,7 +493,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
              Please set risk.use_isolated_margin: true in config.yaml"
         ));
     }
-    
+
     // Also validate exec.default_leverage
     if cfg.exec.default_leverage == 0 {
         return Err(anyhow!("exec.default_leverage must be greater than 0"));
@@ -499,20 +592,20 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
 
     // CRITICAL: Validate hedge mode configuration
     // Hedge mode support is incomplete and causes system failures
-    // 
+    //
     // Problem: Current implementation cannot handle hedge mode correctly
     // - Position struct only supports single position per symbol (one qty, one entry)
     // - TP/SL tracking is symbol-based, not position-side-based
     // - If both LONG and SHORT positions exist, only one is tracked (the other is lost)
     // - flatten_position closes ALL positions for the symbol (both LONG and SHORT)
     // - Position tracking is incomplete - LONG and SHORT should be tracked separately
-    // 
+    //
     // This causes:
     // - Incorrect TP/SL triggers (only one position tracked)
     // - Unintended position closures (both LONG and SHORT closed when closing one)
     // - Position data loss (one position ignored)
     // - System instability and potential financial losses
-    // 
+    //
     // Full hedge mode support requires:
     // - Position struct to support multiple positions per symbol (LONG and SHORT separately)
     // - Separate TP/SL tracking for LONG and SHORT positions

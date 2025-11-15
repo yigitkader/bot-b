@@ -517,22 +517,22 @@ impl Logging {
         let event_bus = self.event_bus.clone();
         let json_logger = self.json_logger.clone();
         let shutdown_flag = self.shutdown_flag.clone();
-        
+
         // Spawn task for TradeSignal events
         let event_bus_trade = event_bus.clone();
         let shutdown_flag_trade = shutdown_flag.clone();
         tokio::spawn(async move {
             let mut trade_signal_rx = event_bus_trade.subscribe_trade_signal();
-            
+
             info!("LOGGING: Started, listening to TradeSignal events");
-            
+
             loop {
                 match trade_signal_rx.recv().await {
                     Ok(signal) => {
                         if shutdown_flag_trade.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
+
                         info!(
                             symbol = %signal.symbol,
                             side = ?signal.side,
@@ -545,8 +545,7 @@ impl Logging {
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         warn!(
                             missed_events = missed,
-                            "LOGGING: TradeSignal receiver lagged, {} events missed",
-                            missed
+                            "LOGGING: TradeSignal receiver lagged, {} events missed", missed
                         );
                         // Continue processing - don't break on lag
                     }
@@ -557,23 +556,23 @@ impl Logging {
                 }
             }
         });
-        
+
         // Spawn task for OrderUpdate events
         let json_logger_order = json_logger.clone();
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
         tokio::spawn(async move {
             let mut order_update_rx = event_bus_order.subscribe_order_update();
-            
+
             info!("LOGGING: Started, listening to OrderUpdate events");
-            
+
             loop {
                 match order_update_rx.recv().await {
                     Ok(update) => {
                         if shutdown_flag_order.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
+
                         match update.status {
                             crate::event_bus::OrderStatus::Filled => {
                                 // log_order_filled parameters:
@@ -585,7 +584,7 @@ impl Logging {
                                     &update.order_id,
                                     update.side,
                                     update.average_fill_price, // Average fill price (weighted average)
-                                    update.filled_qty, // Cumulative filled qty
+                                    update.filled_qty,         // Cumulative filled qty
                                     false,
                                     update.remaining_qty, // Remaining qty (not order_qty)
                                     1.0,
@@ -599,7 +598,8 @@ impl Logging {
                                     1.0,
                                 );
                             }
-                            crate::event_bus::OrderStatus::Expired | crate::event_bus::OrderStatus::ExpiredInMatch => {
+                            crate::event_bus::OrderStatus::Expired
+                            | crate::event_bus::OrderStatus::ExpiredInMatch => {
                                 json_logger_order.log_order_canceled(
                                     &update.symbol,
                                     &update.order_id,
@@ -640,30 +640,30 @@ impl Logging {
                 }
             }
         });
-        
+
         // Spawn task for PositionUpdate events
         let json_logger_pos = json_logger.clone();
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
         tokio::spawn(async move {
             let mut position_update_rx = event_bus_pos.subscribe_position_update();
-            
+
             info!("LOGGING: Started, listening to PositionUpdate events");
-            
+
             loop {
                 match position_update_rx.recv().await {
                     Ok(update) => {
                         if shutdown_flag_pos.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
+
                         if update.is_open {
                             let side_str = if update.qty.0.is_sign_positive() {
                                 "Buy"
                             } else {
                                 "Sell"
                             };
-                            
+
                             json_logger_pos.log_position_updated(
                                 &update.symbol,
                                 side_str,
@@ -694,22 +694,22 @@ impl Logging {
                 }
             }
         });
-        
+
         // Spawn task for CloseRequest events
         let event_bus_close = event_bus.clone();
         let shutdown_flag_close = shutdown_flag.clone();
         tokio::spawn(async move {
             let mut close_request_rx = event_bus_close.subscribe_close_request();
-            
+
             info!("LOGGING: Started, listening to CloseRequest events");
-            
+
             loop {
                 match close_request_rx.recv().await {
                     Ok(request) => {
                         if shutdown_flag_close.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
+
                         info!(
                             symbol = %request.symbol,
                             reason = ?request.reason,
@@ -719,8 +719,7 @@ impl Logging {
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         warn!(
                             missed_events = missed,
-                            "LOGGING: CloseRequest receiver lagged, {} events missed",
-                            missed
+                            "LOGGING: CloseRequest receiver lagged, {} events missed", missed
                         );
                         // Continue processing - don't break on lag
                     }
@@ -731,22 +730,22 @@ impl Logging {
                 }
             }
         });
-        
+
         // Spawn task for BalanceUpdate events
         let event_bus_balance = event_bus.clone();
         let shutdown_flag_balance = shutdown_flag.clone();
         tokio::spawn(async move {
             let mut balance_update_rx = event_bus_balance.subscribe_balance_update();
-            
+
             info!("LOGGING: Started, listening to BalanceUpdate events");
-            
+
             loop {
                 match balance_update_rx.recv().await {
                     Ok(update) => {
                         if shutdown_flag_balance.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
+
                         info!(
                             usdt = %update.usdt,
                             usdc = %update.usdc,
@@ -756,8 +755,7 @@ impl Logging {
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         warn!(
                             missed_events = missed,
-                            "LOGGING: BalanceUpdate receiver lagged, {} events missed",
-                            missed
+                            "LOGGING: BalanceUpdate receiver lagged, {} events missed", missed
                         );
                         // Continue processing - don't break on lag
                     }
@@ -768,7 +766,7 @@ impl Logging {
                 }
             }
         });
-        
+
         // Spawn task for MarketTick events
         // NOTE: MarketTick events are very frequent (hundreds per second per symbol)
         // We use per-symbol counters and higher threshold to reduce log pollution
@@ -778,11 +776,13 @@ impl Logging {
             let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
             use std::collections::HashMap;
             use tokio::sync::RwLock;
-            let tick_counts: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
-            let last_seen: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
+            let tick_counts: Arc<RwLock<HashMap<String, u64>>> =
+                Arc::new(RwLock::new(HashMap::new()));
+            let last_seen: Arc<RwLock<HashMap<String, Instant>>> =
+                Arc::new(RwLock::new(HashMap::new()));
             const LOG_INTERVAL: u64 = 1000; // Log every 1000 ticks per symbol (much less frequent)
             const CLEANUP_INTERVAL_SECS: u64 = 3600; // Cleanup symbols not seen in last hour
-            
+
             // Spawn periodic cleanup task to prevent memory leak
             let tick_counts_cleanup = tick_counts.clone();
             let last_seen_cleanup = last_seen.clone();
@@ -790,42 +790,42 @@ impl Logging {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
-                    
+
                     if shutdown_flag_cleanup.load(AtomicOrdering::Relaxed) {
                         break;
                     }
-                    
+
                     let now = Instant::now();
                     let mut counts = tick_counts_cleanup.write().await;
                     let mut last_seen_guard = last_seen_cleanup.write().await;
-                    
+
                     // Remove symbols that haven't been seen in the last hour
                     counts.retain(|symbol, _| {
-                        last_seen_guard.get(symbol)
+                        last_seen_guard
+                            .get(symbol)
                             .map(|ts| now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS)
                             .unwrap_or(false)
                     });
-                    
+
                     // Also clean up last_seen map
-                    last_seen_guard.retain(|_, ts| {
-                        now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS
-                    });
+                    last_seen_guard
+                        .retain(|_, ts| now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS);
                 }
             });
-            
+
             loop {
                 match market_tick_rx.recv().await {
                     Ok(tick) => {
                         if shutdown_flag_tick.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
+
                         // Update last seen timestamp
                         {
                             let mut last_seen_guard = last_seen.write().await;
                             last_seen_guard.insert(tick.symbol.clone(), Instant::now());
                         }
-                        
+
                         // Per-symbol counter to avoid log spam with multiple symbols
                         let should_log = {
                             let mut counts = tick_counts.write().await;
@@ -838,7 +838,7 @@ impl Logging {
                                 false
                             }
                         };
-                        
+
                         if should_log {
                             info!(
                                 symbol = %tick.symbol,
@@ -865,7 +865,7 @@ impl Logging {
                 }
             }
         });
-        
+
         Ok(())
     }
 }
