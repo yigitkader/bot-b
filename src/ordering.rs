@@ -549,14 +549,18 @@ impl Ordering {
                     }
                 }
                 Err(e) => {
-                    // Failed to fetch current prices, but spread was valid when signal was generated
-                    // Proceed with order placement but log the warning
+                    // ✅ CRITICAL FIX: Spread validation başarısız olursa signal'ı iptal et
+                    // Spread fetch başarısız olursa, spread'in hala geçerli olduğundan emin olamayız
+                    // Bu yüksek slippage riskine yol açabilir - signal'ı iptal etmek daha güvenli
                     warn!(
                         error = %e,
                         symbol = %signal.symbol,
                         spread_age_ms = spread_age.as_millis(),
-                        "ORDERING: Failed to fetch current prices for spread validation, proceeding with order placement"
+                        "ORDERING: Failed to fetch current prices for spread validation, ABORTING signal"
                     );
+                    // Release balance reservation before returning
+                    balance_reservation.release().await;
+                    return Ok(()); // Signal iptal et
                 }
             }
         } else {
@@ -659,12 +663,13 @@ impl Ordering {
         // Handle order result - ensure balance is released in ALL paths (success and failure)
         let order_id = match order_result {
             Ok(id) => {
-                // ✅ Success: Balance was used by the order, release reservation
-                balance_reservation.release().await;
+                // ✅ Success: Keep balance reserved until state is updated
+                // This prevents race condition where another thread could reserve balance
+                // and place duplicate order between order placement and state update
                 id
             }
             Err(e) => {
-                // ✅ CRITICAL: Failure: Balance was NOT used, MUST release reservation
+                // ✅ CRITICAL: Failure: Balance was NOT used, MUST release reservation immediately
                 // This prevents memory leak where reserved balance accumulates
                 balance_reservation.release().await;
                 return Err(e);
@@ -674,6 +679,8 @@ impl Ordering {
         // Update state (re-acquire lock for state update)
         // CRITICAL: Double-check pattern - another thread might have placed an order
         // between the initial check and the network call
+        // ✅ CRITICAL: Balance reservation is still held - prevents other threads from reserving
+        // and placing duplicate orders until state is updated
         {
             let mut state_guard = shared_state.ordering_state.lock().await;
             
@@ -697,6 +704,12 @@ impl Ordering {
                     order_id = %order_id,
                     "ORDERING: Order placed successfully"
                 );
+                
+                // ✅ CRITICAL: Release balance AFTER state is updated
+                // This ensures no other thread can reserve balance and place duplicate order
+                // State is now updated, so other threads will see the open order and skip
+                drop(state_guard); // Release lock before async call
+                balance_reservation.release().await;
             } else {
                 // Another thread placed an order/position while we were making the network call
                 // This is a race condition - cancel our order to prevent duplicate orders
@@ -708,6 +721,10 @@ impl Ordering {
                 
                 // Cancel the order we just placed (lock released before async call)
                 drop(state_guard);
+                
+                // ✅ CRITICAL: Release balance before canceling order
+                // Balance was reserved but order won't be used (will be canceled)
+                balance_reservation.release().await;
                 
                 if let Err(cancel_err) = connection.cancel_order(&order_id, &signal.symbol).await {
                     warn!(

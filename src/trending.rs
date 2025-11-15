@@ -8,7 +8,7 @@ use crate::connection::Connection;
 use crate::connection::quantize_decimal;
 use crate::event_bus::{EventBus, MarketTick, PositionUpdate, TradeSignal};
 use crate::state::SharedState;
-use crate::types::{Px, Qty, Side};
+use crate::types::{Px, Qty, Side, PositionDirection};
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -37,6 +37,10 @@ struct SymbolState {
     /// Timestamp of last position close for this symbol
     /// Used to enforce cooldown after position close to prevent signal spam
     last_position_close_time: Option<Instant>,
+    /// Direction of last closed position for this symbol
+    /// Used to apply cooldown only for same-direction signals
+    /// Allows opposite-direction signals immediately (trend reversal)
+    last_position_direction: Option<PositionDirection>,
 }
 
 /// Trend signal direction
@@ -205,7 +209,19 @@ impl Trending {
                         
                         // Track position close for cooldown
                         if !update.is_open {
-                            // Position closed - set cooldown timestamp
+                            // Position closed - set cooldown timestamp and direction
+                            // Determine direction from qty sign:
+                            // - Long position: qty > 0 (was opened with BUY order)
+                            // - Short position: qty < 0 (was opened with SELL order)
+                            // Note: When position closes, qty might be 0, so we check sign before close
+                            let direction = if !update.qty.0.is_zero() {
+                                // Qty is non-zero, determine direction from sign
+                                Some(PositionDirection::from_qty_sign(update.qty.0))
+                            } else {
+                                // Qty is zero - can't determine direction, apply cooldown to both
+                                None
+                            };
+                            
                             let mut states = symbol_states_pos.lock().await;
                             let state = states.entry(update.symbol.clone()).or_insert_with(|| {
                                 SymbolState {
@@ -213,14 +229,17 @@ impl Trending {
                                     prices: VecDeque::new(),
                                     last_signal_time: None,
                                     last_position_close_time: None,
+                                    last_position_direction: None,
                                 }
                             });
                             
                             state.last_position_close_time = Some(Instant::now());
+                            state.last_position_direction = direction;
                             
                             debug!(
                                 symbol = %update.symbol,
-                                "TRENDING: Position closed, cooldown set for this symbol"
+                                direction = ?direction,
+                                "TRENDING: Position closed, cooldown set for this symbol (direction-aware)"
                             );
                         }
                     }
@@ -459,29 +478,35 @@ impl Trending {
             }
         }
         
-        // ✅ CRITICAL FIX: Symbol bazlı cooldown after position close
+        // ✅ CRITICAL FIX: Symbol bazlı cooldown after position close (direction-aware)
         // Position close sonrası minimum 5 saniye bekle (signal spam önleme)
         // TP trigger → position close → lock release → yeni signal → aynı sembol için yeni order!
         // Bu cooldown aynı sembol için hemen yeni signal üretilmesini önler
+        // ✅ IMPROVEMENT: Cooldown sadece aynı yön için uygulanır
+        // - Long position close → Short signal hemen üretilebilir (trend reversal)
+        // - Long position close → Long signal cooldown'a tabi (aynı yön)
+        // Note: Direction check happens after trend analysis (see below)
         const POSITION_CLOSE_COOLDOWN_SECS: u64 = 5;
-        {
+        
+        // Store last position close info for direction check after trend analysis
+        let last_position_close_info = {
             let states = symbol_states.lock().await;
             if let Some(state) = states.get(&tick.symbol) {
-                if let Some(last_close_time) = state.last_position_close_time {
-                    let elapsed = now.duration_since(last_close_time);
-                    if elapsed < Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
-                        // Still in cooldown after position close, skip signal generation
-                        debug!(
-                            symbol = %tick.symbol,
-                            elapsed_secs = elapsed.as_secs(),
-                            cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
-                            "TRENDING: Skipping signal generation - position close cooldown active"
-                        );
-                        return Ok(());
-                    }
-                }
+                state.last_position_close_time
+                    .and_then(|close_time| {
+                        let elapsed = now.duration_since(close_time);
+                        if elapsed < Duration::from_secs(POSITION_CLOSE_COOLDOWN_SECS) {
+                            // Still in cooldown period - return info for direction check
+                            Some((state.last_position_direction, elapsed))
+                        } else {
+                            // Cooldown period passed - no restriction
+                            None
+                        }
+                    })
+            } else {
+                None
             }
-        }
+        };
         
         // ✅ PERFORMANCE OPTIMIZATION: Cooldown check BEFORE expensive trend analysis
         // This prevents unnecessary CPU usage when cooldown is still active
@@ -544,6 +569,7 @@ impl Trending {
                     prices: VecDeque::new(),
                     last_signal_time: None,
                     last_position_close_time: None,
+                    last_position_direction: None,
                 }
             });
             
@@ -575,6 +601,42 @@ impl Trending {
                 return Ok(());
             }
         };
+        
+        // ✅ CRITICAL: Check position close cooldown with direction awareness (after trend analysis)
+        // Only apply cooldown if:
+        // 1. Cooldown period hasn't passed (time check)
+        // 2. Signal direction matches last closed position direction (direction check)
+        // This allows opposite-direction signals immediately (trend reversal)
+        if let Some((last_direction, elapsed)) = last_position_close_info {
+            // Convert signal side to position direction for comparison
+            let signal_direction = PositionDirection::from_order_side(side);
+            
+            // Check if direction matches (or if last_direction is None, apply cooldown to both)
+            let direction_matches = last_direction
+                .map(|dir| dir == signal_direction)
+                .unwrap_or(true); // If direction unknown, apply cooldown to both directions
+            
+            if direction_matches {
+                // Same direction as last closed position - apply cooldown
+                debug!(
+                    symbol = %tick.symbol,
+                    signal_direction = ?signal_direction,
+                    last_direction = ?last_direction,
+                    elapsed_secs = elapsed.as_secs(),
+                    cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
+                    "TRENDING: Skipping signal generation - position close cooldown active (same direction)"
+                );
+                return Ok(());
+            } else {
+                // Opposite direction - allow signal (trend reversal)
+                debug!(
+                    symbol = %tick.symbol,
+                    signal_direction = ?signal_direction,
+                    last_direction = ?last_direction,
+                    "TRENDING: Allowing opposite-direction signal (trend reversal, cooldown bypassed)"
+                );
+            }
+        }
         
         // ✅ CRITICAL: Check same-direction signals (after trend analysis)
         // This prevents BUY-BUY-BUY or SELL-SELL-SELL spam

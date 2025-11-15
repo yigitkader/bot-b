@@ -402,21 +402,27 @@ impl Connection {
     }
     
     /// Start periodic cleanup task for order fill history
-    /// Removes entries older than 24 hours to prevent memory leaks
-    /// This is critical because if OrderUpdate events are missed (WebSocket disconnect),
-    /// history entries may never be cleaned up, causing memory to grow unbounded
+    /// Order fill history cleanup task (memory leak prevention only)
     /// 
-    /// CRITICAL: Race condition prevention
-    /// - Only removes entries for closed orders (not in OPEN_ORDERS_CACHE)
-    /// - Active orders are protected from cleanup to prevent race conditions
-    /// - If OrderFill event arrives while cleanup is running, active order history is preserved
+    /// ✅ CRITICAL: This task is ONLY for memory leak prevention (very old entries)
+    /// Normal cleanup happens immediately when orders close (see OrderFill event handler)
+    /// 
+    /// This task:
+    /// - Only removes entries older than 24 hours (very conservative)
+    /// - Protects active orders (never removes history for active orders)
+    /// - Does NOT handle normal cleanup (order close events do that)
+    /// 
+    /// Why this approach:
+    /// - Order close events (Filled/Canceled/Expired) immediately remove history (lines 1034-1043)
+    /// - This task only catches edge cases where history wasn't cleaned up (memory leak prevention)
+    /// - No race condition: we only check age, not order status (active orders are always protected)
     async fn start_order_fill_history_cleanup_task(&self) {
         let order_fill_history = self.order_fill_history.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         
         tokio::spawn(async move {
             const CLEANUP_INTERVAL_SECS: u64 = 3600; // Every hour
-            const MAX_AGE_SECS: u64 = 3600; // 1 hour (prevents memory leak)
+            const MAX_AGE_SECS: u64 = 86400; // 24 hours (very conservative, memory leak prevention only)
             
             loop {
                 tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
@@ -428,43 +434,31 @@ impl Connection {
                 let now = Instant::now();
                 let initial_count = order_fill_history.len();
                 
-                // ✅ CRITICAL: Use double-check pattern to prevent race condition
-                // Race window: is_active check → order close → age check → stale history kept
-                // Solution: Double-check active status right before keeping based on age
+                // ✅ SIMPLIFIED: Only remove very old entries (memory leak prevention)
+                // Active orders are always protected (never removed)
+                // Normal cleanup happens immediately on order close (OrderFill event handler)
+                // No race condition: we only check age, active orders are always kept
                 order_fill_history.retain(|order_id, history| {
-                    // ✅ First check: Is order active?
-                    let is_active_first = OPEN_ORDERS_CACHE.iter().any(|entry| {
+                    // ✅ CRITICAL: Always protect active orders (regardless of age)
+                    // This prevents any race condition - active orders are never removed
+                    let is_active = OPEN_ORDERS_CACHE.iter().any(|entry| {
                         entry.value().iter().any(|o| o.order_id == *order_id)
                     });
                     
-                    if is_active_first {
-                        // Order is still active - protect from cleanup (regardless of age)
-                        // This prevents race condition where OrderFill event arrives during cleanup
-                        true // Keep this entry (active order)
+                    if is_active {
+                        // Order is active - always keep (protect from cleanup)
+                        true
                     } else {
-                        // Order appears closed - check age to determine if safe to remove
+                        // Order is closed - only remove if very old (memory leak prevention)
+                        // Normal cleanup happens immediately on order close, so this should rarely trigger
                         let age = now.duration_since(history.last_update);
-                        
                         if age.as_secs() > MAX_AGE_SECS {
-                            // Order is closed and old - safe to remove
-                            false // Remove this entry (closed order, old)
+                            // Very old entry (24+ hours) - safe to remove (memory leak prevention)
+                            false
                         } else {
-                            // ✅ CRITICAL: Double-check active status before keeping based on age
-                            // Prevents race condition where order closes between first check and age check
-                            // If order closed during this window, we should still keep history for late-arriving events
-                            // But we double-check to ensure we're not keeping stale history for a newly opened order
-                            let is_active_second = OPEN_ORDERS_CACHE.iter().any(|entry| {
-                                entry.value().iter().any(|o| o.order_id == *order_id)
-                            });
-                            
-                            if is_active_second {
-                                // Order became active between checks - protect it
-                                true // Keep this entry (order became active)
-                            } else {
-                                // Order is closed but recent - keep for late-arriving fill events
-                                // This is safe because order IDs are unique, so no new order will reuse this ID
-                                true // Keep recent entries (closed but recent, may receive late fills)
-                            }
+                            // Recent entry - keep (may receive late-arriving fill events)
+                            // Note: Normal cleanup should have removed this already, but keep it as safety
+                            true
                         }
                     }
                 });
@@ -486,7 +480,7 @@ impl Connection {
                         removed_count,
                         protected_count,
                         remaining_entries = order_fill_history.len(),
-                        "CONNECTION: Cleaned up {} old order fill history entries (older than {} hours), protected {} active orders",
+                        "CONNECTION: Memory leak prevention - cleaned up {} very old order fill history entries (older than {} hours), protected {} active orders",
                         removed_count,
                         MAX_AGE_SECS / 3600,
                         protected_count
@@ -495,13 +489,13 @@ impl Connection {
                     tracing::debug!(
                         protected_count,
                         total_entries = order_fill_history.len(),
-                        "CONNECTION: Order fill history cleanup completed (protected {} active orders, no entries to remove)",
+                        "CONNECTION: Order fill history cleanup completed (protected {} active orders, no very old entries to remove)",
                         protected_count
                     );
                 } else {
                     tracing::debug!(
                         total_entries = order_fill_history.len(),
-                        "CONNECTION: Order fill history cleanup completed (no entries to remove)"
+                        "CONNECTION: Order fill history cleanup completed (no very old entries to remove)"
                     );
                 }
             }
@@ -3038,11 +3032,11 @@ impl BinanceFutures {
                         // If price is not available, use very conservative threshold (assume very low price)
                         let dust_threshold = {
                             let current_price = if matches!(side, Side::Buy) {
-                                // Short position closing: use bid price
-                                best_bid.0
-                            } else {
-                                // Long position closing: use ask price
+                                // Short position closing: use ask price (BUY orders execute at ask)
                                 best_ask.0
+                            } else {
+                                // Long position closing: use bid price (SELL orders execute at bid)
+                                best_bid.0
                             };
                             // Calculate dust threshold as min_notional / price (more accurate)
                             if !current_price.is_zero() {
@@ -3170,11 +3164,11 @@ impl BinanceFutures {
                                 // Note: best_bid and best_ask are already fetched from WebSocket cache above
                                 let dust_threshold = {
                                     let current_price = if matches!(side, Side::Buy) {
-                                        // Short position closing: use bid price
-                                        best_bid.0
-                                    } else {
-                                        // Long position closing: use ask price
+                                        // Short position closing: use ask price (BUY orders execute at ask)
                                         best_ask.0
+                                    } else {
+                                        // Long position closing: use bid price (SELL orders execute at bid)
+                                        best_bid.0
                                     };
                                     // Calculate dust threshold as min_notional / price (more accurate)
                                     if !current_price.is_zero() {

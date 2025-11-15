@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// FOLLOW_ORDERS module - position tracking and TP/SL control
 pub struct FollowOrders {
@@ -402,6 +402,20 @@ impl FollowOrders {
         
         // Apply leverage to get gross PnL percentage (without commission)
         // Gross PnL% = PriceChange% * Leverage
+        // 
+        // ✅ CRITICAL: This calculation is correct for ISOLATED MARGIN mode
+        // In isolated margin, each position has its own margin and leverage applies directly:
+        // - Position margin = Notional / Leverage
+        // - PnL% = PriceChange% * Leverage (correct for isolated margin)
+        //
+        // ⚠️ WARNING: If CROSS MARGIN support is added in the future, this calculation needs review
+        // Cross margin uses shared account equity across all positions:
+        // - Total account equity is shared between all positions
+        // - Effective leverage might differ from position leverage
+        // - PnL calculation may need to account for total account balance and margin allocation
+        // - Formula might need: PnL% = (PriceChange% * PositionNotional) / TotalAccountEquity
+        // 
+        // Current implementation assumes use_isolated_margin: true (from config)
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         
@@ -409,21 +423,40 @@ impl FollowOrders {
         // 
         // SOLUTION: Use is_maker flag from OrderUpdate to determine commission type
         // - If all fills were maker (is_maker = Some(true)), use maker commission
-        // - If any fill was taker (is_maker = Some(false)) or unknown (None), use taker commission (conservative)
+        // - If any fill was taker (is_maker = Some(false)), use taker commission
+        // - If is_maker is None (OrderUpdate hasn't arrived yet), estimate based on TIF:
+        //   * If TIF is "post_only", likely maker (use maker commission)
+        //   * Otherwise, use taker commission (conservative approach)
         // Post-only orders are typically maker, but can become taker if they cross the spread
         //
         // Exit commission (TP/SL) is always Taker (market order with reduceOnly) - guaranteed.
-        let entry_commission_pct = if position.is_maker == Some(true) {
-            // All fills were maker - use maker commission (lower, better for PnL)
-            Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
-                .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
-        } else {
-            // Any fill was taker or unknown - use taker commission (conservative/worst-case)
-            // This ensures we don't underestimate commission, which would cause TP/SL to trigger
-            // too early and result in money loss. Better to be conservative and trigger slightly
-            // later than to trigger too early.
-            Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-                .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+        let entry_commission_pct = match position.is_maker {
+            Some(true) => {
+                // All fills were maker - use maker commission (lower, better for PnL)
+                Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+            }
+            Some(false) => {
+                // Any fill was taker - use taker commission
+                Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+            }
+            None => {
+                // is_maker henüz bilinmiyor - TIF'e göre tahmin et
+                // Post-only orders are typically maker, but can become taker if they cross the spread
+                if cfg.exec.tif == "post_only" {
+                    // Post-only genelde maker olur
+                    Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
+                        .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+                } else {
+                    // Conservative yaklaşım - taker commission kullan
+                    // This ensures we don't underestimate commission, which would cause TP/SL to trigger
+                    // too early and result in money loss. Better to be conservative and trigger slightly
+                    // later than to trigger too early.
+                    Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                        .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+                }
+            }
         };
         
         // Exit commission (TP/SL close orders) is always Taker (market order with reduceOnly)
