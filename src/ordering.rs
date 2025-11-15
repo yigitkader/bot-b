@@ -520,67 +520,18 @@ impl Ordering {
             }
         }
 
-        // Atomic operation - state check + balance reserve in same lock
-        // Solution: State check + balance reserve atomically (same lock)
-        // Then release lock, do network call, re-acquire lock for state update
-        // Balance reservation is held until order is placed and state is updated
-        let mut balance_reservation = {
-            let state_guard = shared_state.ordering_state.lock().await;
-
-            // 5. Position check - ensure no open position/order
-            if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
-                warn!(
-                    symbol = %signal.symbol,
-                    "ORDERING: Ignoring TradeSignal - already have open position/order"
-                );
-                return Ok(());
-            }
-
-            // 6. Balance reservation (inside lock to prevent race condition)
-            // Balance reserve must happen AFTER state check, INSIDE the same lock
-            match BalanceReservation::new(
-                shared_state.balance_store.clone(),
-                &cfg.quote_asset,
-                required_margin,
-            )
-            .await
-            {
-                Some(reservation) => {
-                    // Balance reserved successfully - lock will be released after this block
-                    // Network call will happen outside lock (no deadlock risk)
-                    // Balance reservation prevents other threads from placing orders (insufficient balance)
-                    reservation
-                }
-                None => {
-                    // Insufficient balance or reservation failed
-                    warn!(
-                        symbol = %signal.symbol,
-                        required_margin = %required_margin,
-                        "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
-                    );
-                    return Ok(());
-                }
-            }
-        }; // Lock released here, but balance is already reserved (prevents other threads from placing orders)
-
-        // Balance Reservation Release Checklist
-        // Balance reserved - will be released automatically when balance_reservation is dropped
-        // Explicit release() should be called before returning (Drop will warn if forgotten)
+        // ✅ CRITICAL: Spread validation MUST happen BEFORE balance reservation
+        // This prevents expensive spread validation from happening while balance is reserved,
+        // which creates a race condition window where another thread can reserve balance
+        // and place an order while this thread is validating spread.
         //
-        // ALL early return paths MUST call balance_reservation.release().await:
-        // 1. ✅ Line ~603: Price fetch took too long (spread may have changed during fetch)
-        // 2. ✅ Line ~626: Stale spread validation - current spread out of acceptable range
-        // 3. ✅ Line ~654: Price fetch error during spread validation
-        // 4. ✅ Line ~673: Fresh spread validation - signal spread out of acceptable range
-        // 5. ✅ Line ~722: Order placement permanent error (returns early for performance)
-        // 6. ✅ Line ~751: Order placement retries exhausted (returns early for performance)
-        // 7. ✅ Line ~803: Success path - released after state is updated
-        // 8. ✅ Line ~827: Race condition - released ONLY if cancel succeeds (prevents double-spend)
-        //    ⚠️ If cancel fails, balance is kept reserved to prevent double-spend (acceptable leak)
+        // Problem: Spread validation can take 2-3 seconds (network call to get_current_prices)
+        // If balance is reserved during this time, another thread can also reserve balance
+        // and place an order, causing double-spend.
         //
-        // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
-        // Missing releases cause balance leaks and prevent future orders from being placed.
-
+        // Solution: Validate spread FIRST (before any lock), then immediately reserve balance
+        // and place order atomically.
+        //
         // CRITICAL: Re-validate spread before order placement
         //
         // Problem: Spread may have changed between signal generation (TRENDING) and order placement (ORDERING)
@@ -626,8 +577,6 @@ impl Ordering {
                             max_delay_ms = MAX_TOTAL_DELAY_MS,
                             "ORDERING: Price fetch took too long, spread may have changed during fetch, aborting signal"
                         );
-                        // Release balance reservation before returning
-                        balance_reservation.release().await;
                         return Ok(());
                     }
 
@@ -650,8 +599,6 @@ impl Ordering {
                             max_spread = max_acceptable_spread_bps,
                             "ORDERING: Spread changed and is now out of acceptable range, skipping order placement"
                         );
-                        // Release balance reservation before returning
-                        balance_reservation.release().await;
                         return Ok(());
                     }
 
@@ -677,8 +624,6 @@ impl Ordering {
                         spread_age_ms = spread_age.as_millis(),
                         "ORDERING: Failed to fetch current prices for spread validation, ABORTING signal"
                     );
-                    // Release balance reservation before returning
-                    balance_reservation.release().await;
                     return Ok(()); // Signal iptal et
                 }
             }
@@ -698,21 +643,18 @@ impl Ordering {
                     max_spread = max_acceptable_spread_bps,
                     "ORDERING: Signal spread is out of acceptable range, skipping order placement"
                 );
-                // Release balance reservation before returning
-                balance_reservation.release().await;
                 return Ok(());
             }
         }
 
-        // Get TIF from config
+        // Get TIF from config (before lock to minimize lock time)
         let tif = match cfg.exec.tif.as_str() {
             "post_only" | "GTX" => Tif::PostOnly,
             "ioc" | "IOC" => Tif::Ioc,
             _ => Tif::Gtc,
         };
 
-        // Place order via CONNECTION (lock released, no deadlock risk)
-        // Retry logic with exponential backoff
+        // Prepare order command (before lock to minimize lock time)
         use crate::types::OrderCommand;
         let command = OrderCommand::Open {
             symbol: signal.symbol.clone(),
@@ -721,6 +663,86 @@ impl Ordering {
             qty: signal.size,
             tif,
         };
+
+        // ✅ CRITICAL: Atomic operation - state check + balance reserve + order placement
+        // Solution: State check + balance reserve atomically (same lock)
+        // Then IMMEDIATELY place order (outside lock but right after reservation)
+        // Then IMMEDIATELY update state (re-acquire lock)
+        // This minimizes the window where another thread can interfere
+        //
+        // Flow:
+        // 1. Lock: Check state + reserve balance
+        // 2. Unlock: Place order IMMEDIATELY (minimize delay)
+        // 3. Lock: Update state atomically
+        //
+        // This prevents the race condition where:
+        // - Thread A reserves balance, lock released
+        // - Thread B also reserves balance (if enough balance for both)
+        // - Thread A does expensive spread validation (2-3 seconds)
+        // - Thread B places order (succeeds)
+        // - Thread A places order (double-spend!)
+        // Step 1: Atomic state check + balance reservation (inside lock)
+        let mut balance_reservation = {
+            let state_guard = shared_state.ordering_state.lock().await;
+
+            // 5. Position check - ensure no open position/order
+            if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
+                warn!(
+                    symbol = %signal.symbol,
+                    "ORDERING: Ignoring TradeSignal - already have open position/order"
+                );
+                return Ok(());
+            }
+
+            // 6. Balance reservation (inside lock to prevent race condition)
+            // Balance reserve must happen AFTER state check, INSIDE the same lock
+            match BalanceReservation::new(
+                shared_state.balance_store.clone(),
+                &cfg.quote_asset,
+                required_margin,
+            )
+            .await
+            {
+                Some(reservation) => {
+                    // Balance reserved successfully - lock will be released after this block
+                    // Order placement will happen IMMEDIATELY after lock release (minimize delay)
+                    // Balance reservation prevents other threads from reserving same balance
+                    reservation
+                }
+                None => {
+                    // Insufficient balance or reservation failed
+                    warn!(
+                        symbol = %signal.symbol,
+                        required_margin = %required_margin,
+                        "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
+                    );
+                    return Ok(());
+                }
+            }
+        }; // Lock released here - order placement happens IMMEDIATELY next
+
+        // Balance Reservation Release Checklist
+        // Balance reserved - will be released automatically when balance_reservation is dropped
+        // Explicit release() should be called before returning (Drop will warn if forgotten)
+        //
+        // ALL early return paths MUST call balance_reservation.release().await:
+        // 1. ✅ Order placement permanent error (returns early for performance)
+        // 2. ✅ Order placement retries exhausted (returns early for performance)
+        // 3. ✅ Success path - released after state is updated
+        // 4. ✅ Race condition - released ONLY if cancel succeeds (prevents double-spend)
+        //    ⚠️ If cancel fails, balance is kept reserved to prevent double-spend (acceptable leak)
+        //
+        // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
+        // Missing releases cause balance leaks and prevent future orders from being placed.
+
+        // Step 2: IMMEDIATELY place order (outside lock, but right after reservation)
+        // This minimizes the window where another thread can interfere
+        // Spread validation already done above, so we can proceed directly to order placement
+        //
+        // CRITICAL: Order placement happens IMMEDIATELY after balance reservation
+        // No expensive operations (like spread validation) happen between reservation and placement
+        // This prevents the race condition where another thread can reserve balance and place order
+        // while this thread is doing expensive validation
 
         // Attempt order placement with retry logic
         // Permanent errors return early with balance release
@@ -795,9 +817,10 @@ impl Ordering {
             }
         };
 
-        // Update state (re-acquire lock for state update)
+        // Step 3: Update state atomically (re-acquire lock for state update)
         // Double-check pattern - another thread might have placed an order
         // Balance reservation is still held - prevents other threads from reserving
+        // This completes the atomic operation: state check + balance reserve + order placement + state update
         {
             let mut state_guard = shared_state.ordering_state.lock().await;
 
