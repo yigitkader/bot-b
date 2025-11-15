@@ -5,16 +5,12 @@ mod config;
 mod types;
 mod event_bus;
 mod state;
-mod utils;
-mod venue;
-mod websocket;
 mod connection;
 mod trending;
 mod ordering;
 mod follow_orders;
 mod balance;
 mod logging;
-mod storage;
 
 use crate::balance::Balance;
 use crate::config::load_config;
@@ -24,7 +20,6 @@ use crate::follow_orders::FollowOrders;
 use crate::logging::Logging;
 use crate::ordering::Ordering as OrderingModule;
 use crate::state::SharedState;
-use crate::storage::Storage;
 use crate::trending::Trending;
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,15 +104,6 @@ async fn main() -> Result<()> {
         // No symbols specified and auto-discovery is disabled
         return Err(anyhow!("No symbols specified and auto_discover_quote is false. Please specify symbols in config or enable auto_discover_quote."));
     };
-    
-    // Initialize STORAGE module (must be started before other modules for state restore)
-    let storage = Storage::new(
-        None, // Use default database path: ./bot_state.db
-        event_bus.clone(),
-        shutdown_flag.clone(),
-        shared_state.clone(),
-    )?;
-    storage.start().await?;
     
     // Start CONNECTION
     connection.start(symbols).await?;

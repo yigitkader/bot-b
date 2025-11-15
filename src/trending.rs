@@ -5,7 +5,6 @@
 
 use crate::config::AppCfg;
 use crate::connection::Connection;
-use crate::utils::quantize_decimal;
 use crate::event_bus::{EventBus, MarketTick, TradeSignal};
 use crate::state::SharedState;
 use crate::types::{LastSignal, PositionDirection, PricePoint, Px, Qty, Side, SymbolState, TrendSignal};
@@ -19,6 +18,44 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Quantize decimal value to step (floor to nearest step multiple)
+///
+/// ✅ KRİTİK: Precision loss önleme
+/// Decimal division ve multiplication yaparken precision loss olabilir.
+/// Sonucu normalize ederek step'in tam katı olduğundan emin oluyoruz.
+fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() || step.is_sign_negative() {
+        return value;
+    }
+
+    let ratio = value / step;
+    let floored = ratio.floor();
+    let result = floored * step;
+    let step_scale = step.scale();
+    let normalized = result.normalize();
+
+    // Round to step's scale first
+    let rounded = normalized.round_dp_with_strategy(
+        step_scale,
+        rust_decimal::RoundingStrategy::ToNegativeInfinity,
+    );
+
+    // Double-check quantization - ensure result is a multiple of step
+    let re_quantized_ratio = rounded / step;
+    let re_quantized_floor = re_quantized_ratio.floor();
+    let final_result = re_quantized_floor * step;
+
+    // Final normalization and rounding
+    final_result.normalize().round_dp_with_strategy(
+        step_scale,
+        rust_decimal::RoundingStrategy::ToNegativeInfinity,
+    )
+}
 
 /// TRENDING module - trend analysis and signal generation
 pub struct Trending {

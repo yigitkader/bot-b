@@ -4,7 +4,7 @@
 // Re-export all event types from types.rs for convenience
 pub use crate::types::{
     BalanceUpdate, CloseReason, CloseRequest, FillHistoryAction, FillHistoryData,
-    LogEvent, LogLevel, MarketTick, OpenOrderSnapshot, OpenPositionSnapshot,
+    LogEvent, MarketTick, OpenOrderSnapshot, OpenPositionSnapshot,
     OrderFillHistoryUpdate, OrderingStateUpdate, OrderStatus, OrderUpdate,
     PositionUpdate, TradeSignal,
 };

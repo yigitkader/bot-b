@@ -3,18 +3,19 @@
 // Rate limit & reconnect management
 //
 // Single responsibility: Connection management (WebSocket + REST coordination)
-// Venue implementations moved to venue.rs
-// WebSocket streams moved to websocket.rs
+
+mod venue;
+mod websocket;
 
 use crate::config::AppCfg;
 use crate::event_bus::{
-    BalanceUpdate, EventBus, FillHistoryAction, FillHistoryData, MarketTick, OrderFillHistoryUpdate,
+    BalanceUpdate, EventBus, MarketTick,
     OrderStatus, OrderUpdate, PositionUpdate,
 };
 use crate::state::SharedState;
-use crate::types::{OrderFillHistory, OrderCommand, Position, PriceUpdate, Px, Qty, Side, SymbolMeta, UserEvent, UserStreamKind, VenueOrder};
-use crate::venue::{BinanceFutures, BALANCE_CACHE, FUT_RULES, OPEN_ORDERS_CACHE, POSITION_CACHE, PRICE_CACHE, Venue};
-use crate::websocket::{MarketDataStream, UserDataStream};
+use crate::types::{OrderFillHistory, OrderCommand, Position, Px, Qty, Side, UserEvent, UserStreamKind, VenueOrder};
+use venue::{BinanceFutures, BALANCE_CACHE, FUT_RULES, OPEN_ORDERS_CACHE, POSITION_CACHE, PRICE_CACHE, Venue};
+use websocket::{MarketDataStream, UserDataStream};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use rust_decimal::Decimal;
@@ -41,8 +42,6 @@ pub struct Connection {
     shared_state: Option<Arc<SharedState>>,
     // Order fill history: order_id -> fill history (for average fill price calculation)
     order_fill_history: Arc<DashMap<String, OrderFillHistory>>,
-    // Persistent storage for state (optional, for restart recovery)
-    storage: Option<Arc<crate::storage::StateStorage>>,
 }
 
 /// Simple rate limiter for REST API calls
@@ -124,17 +123,6 @@ impl Connection {
             cfg.qty_step,
         )?);
 
-        let storage = match crate::storage::StateStorage::new(None) {
-            Ok(storage) => {
-                debug!("CONNECTION: Storage initialized for fill history restore");
-                Some(Arc::new(storage))
-            }
-            Err(e) => {
-                warn!(error = %e, "CONNECTION: Failed to initialize storage for fill history restore");
-                None
-            }
-        };
-
         Ok(Self {
             venue,
             cfg,
@@ -143,7 +131,6 @@ impl Connection {
             rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
             shared_state,
             order_fill_history: Arc::new(DashMap::new()),
-            storage,
         })
     }
 
@@ -163,42 +150,10 @@ impl Connection {
             rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
             shared_state: None,
             order_fill_history: Arc::new(DashMap::new()),
-            storage: None,
         }
-    }
-
-    /// Get storage instance (if available)
-    pub fn storage(&self) -> Option<Arc<crate::storage::StateStorage>> {
-        self.storage.clone()
     }
 
     pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
-        // State restore is handled by STORAGE module via event bus
-        // For now, we restore fill history directly here (Connection manages its own cache)
-        if let Some(storage) = &self.storage {
-            match storage.restore_order_fill_history().await {
-                Ok(history_entries) => {
-                    for (order_id, history) in history_entries {
-                        let conn_history = OrderFillHistory {
-                            total_filled_qty: history.total_filled_qty,
-                            weighted_price_sum: history.weighted_price_sum,
-                            last_update: history.last_update,
-                            maker_fill_count: history.maker_fill_count,
-                            total_fill_count: history.total_fill_count,
-                        };
-                        self.order_fill_history.insert(order_id, conn_history);
-                    }
-                    info!(
-                        restored_count = self.order_fill_history.len(),
-                        "CONNECTION: Restored {} order fill history entries from persistent storage",
-                        self.order_fill_history.len()
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "CONNECTION: Failed to restore order fill history from storage, continuing without restore");
-                }
-            }
-        }
 
         // Set hedge mode according to config (must be done before any orders)
         let hedge_mode = self.cfg.binance.hedge_mode;
