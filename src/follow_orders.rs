@@ -403,19 +403,31 @@ impl FollowOrders {
         // Apply leverage to get gross PnL percentage (without commission)
         // Gross PnL% = PriceChange% * Leverage
         // 
-        // ✅ CRITICAL: This calculation is correct for ISOLATED MARGIN mode
+        // ✅ CRITICAL: This calculation is correct ONLY for ISOLATED MARGIN mode
         // In isolated margin, each position has its own margin and leverage applies directly:
         // - Position margin = Notional / Leverage
         // - PnL% = PriceChange% * Leverage (correct for isolated margin)
         //
-        // ⚠️ WARNING: If CROSS MARGIN support is added in the future, this calculation needs review
+        // ⚠️ CRITICAL WARNING: This calculation is INCORRECT for CROSS MARGIN mode
         // Cross margin uses shared account equity across all positions:
         // - Total account equity is shared between all positions
         // - Effective leverage might differ from position leverage
-        // - PnL calculation may need to account for total account balance and margin allocation
-        // - Formula might need: PnL% = (PriceChange% * PositionNotional) / TotalAccountEquity
+        // - PnL calculation needs to account for total account balance and margin allocation
+        // - Formula should be: PnL% = (PriceChange% * PositionNotional) / TotalAccountEquity
         // 
         // Current implementation assumes use_isolated_margin: true (from config)
+        // If cross margin is used, TP/SL trigger levels will be WRONG, leading to:
+        // - Premature or delayed TP/SL triggers
+        // - Incorrect risk management
+        // - Potential financial losses
+        if !cfg.risk.use_isolated_margin {
+            error!(
+                symbol = %tick.symbol,
+                "FOLLOW_ORDERS: CRITICAL - Cross margin mode detected but TP/SL PnL calculation assumes isolated margin. TP/SL trigger levels will be incorrect!"
+            );
+            // Continue with calculation but log error - user should fix config
+        }
+        
         let leverage_decimal = Decimal::from(position.leverage);
         let gross_pnl_pct = price_change_pct * leverage_decimal;
         

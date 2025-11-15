@@ -2493,6 +2493,32 @@ impl BinanceFutures {
                 Ok(position)
             }
         } else {
+            // ⚠️ CRITICAL DESIGN LIMITATION: Hedge mode support is incomplete
+            // The Position struct only supports a single position (one qty, one entry, one leverage).
+            // In hedge mode, LONG and SHORT positions should be tracked separately, but the current
+            // implementation can only return one position at a time.
+            // 
+            // Current behavior:
+            // - If both LONG and SHORT exist, only LONG is returned (SHORT is lost)
+            // - TP/SL tracking in FOLLOW_ORDERS only tracks one position per symbol
+            // - flatten_position closes ALL positions for the symbol (both LONG and SHORT)
+            // 
+            // This means:
+            // - TP/SL will only work for one position (LONG or SHORT, whichever is returned)
+            // - Closing a position will close BOTH LONG and SHORT (unintended behavior)
+            // - Position tracking is incomplete for hedge mode
+            // 
+            // RECOMMENDATION: Do not use hedge_mode=true until full support is implemented.
+            // Full support requires:
+            // - Position struct to support multiple positions per symbol
+            // - Separate TP/SL tracking for LONG and SHORT
+            // - position_id-based closing (CloseRequest.position_id)
+            // - Separate position tracking in ORDERING state
+            warn!(
+                symbol = %sym,
+                "CONNECTION: Hedge mode enabled but support is incomplete. Position tracking, TP/SL, and closing may not work correctly for multiple positions per symbol."
+            );
+            
             // ✅ KRİTİK: Hedge modunda - LONG ve SHORT ayrı ayrı track edilmeli, net hesaplama YANLIŞ!
             // Hedge modunda birden fazla pozisyon olabilir (LONG ve SHORT ayrı ayrı, bağımsız)
             let mut long_qty = Decimal::ZERO;

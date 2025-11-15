@@ -42,10 +42,21 @@ pub struct TradeSignal {
 }
 
 /// Close request event - published by FOLLOW_ORDERS
+/// 
+/// ⚠️ DESIGN LIMITATION: position_id is currently not used
+/// The position_id field exists but is ignored in the current implementation.
+/// Positions are always closed by symbol only, not by specific position_id.
+/// This is intentional for one-way mode (hedge_mode=false) where each symbol has only one position.
+/// 
+/// FUTURE: If hedge mode support is added with multiple positions per symbol, position_id
+/// should be used to close specific positions. Until then, position_id is reserved for future use.
 #[derive(Clone, Debug, Serialize)]
 pub struct CloseRequest {
     pub symbol: String,
-    pub position_id: Option<String>, // Optional position identifier
+    /// Optional position identifier - currently NOT USED (reserved for future hedge mode support)
+    /// In the current implementation, positions are closed by symbol only.
+    /// If provided, a warning will be logged but the position_id will be ignored.
+    pub position_id: Option<String>,
     pub reason: CloseReason,
     /// Current bid and ask prices from the market tick that triggered this close request
     /// If provided, these prices will be used instead of fetching fresh prices (reduces slippage)

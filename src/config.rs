@@ -478,5 +478,43 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
+    // ⚠️ CRITICAL: Validate hedge mode configuration
+    // Hedge mode support is incomplete - warn user if enabled
+    if cfg.binance.hedge_mode {
+        eprintln!("⚠️  WARNING: Hedge mode (hedge_mode=true) is enabled but support is incomplete.");
+        eprintln!("   - Position tracking only supports one position per symbol");
+        eprintln!("   - TP/SL will only work for one position (LONG or SHORT)");
+        eprintln!("   - Closing a position will close BOTH LONG and SHORT");
+        eprintln!("   - CloseRequest.position_id is not used");
+        eprintln!("   RECOMMENDATION: Use hedge_mode=false until full support is implemented.");
+    }
+
+    // ⚠️ CRITICAL: Validate margin mode configuration
+    // TP/SL PnL calculation assumes isolated margin - warn if cross margin is used
+    if !cfg.risk.use_isolated_margin {
+        eprintln!("⚠️  WARNING: Cross margin mode (use_isolated_margin=false) is enabled.");
+        eprintln!("   - TP/SL PnL calculation assumes isolated margin");
+        eprintln!("   - TP/SL trigger levels will be INCORRECT with cross margin");
+        eprintln!("   - This can lead to premature or delayed TP/SL triggers");
+        eprintln!("   - This can lead to financial losses");
+        eprintln!("   RECOMMENDATION: Use use_isolated_margin=true for correct TP/SL behavior.");
+    }
+
+    // ✅ CRITICAL: Validate signal size consistency
+    // TRENDING generates signals using: notional = max_usd_per_order * leverage
+    // ORDERING validates: notional <= max_position_notional_usd
+    // These must be consistent to avoid signals being systematically rejected
+    let leverage = cfg.leverage.unwrap_or(cfg.exec.default_leverage);
+    let expected_notional = cfg.max_usd_per_order * leverage as f64;
+    if expected_notional > cfg.risk.max_position_notional_usd {
+        return Err(anyhow!(
+            "Config mismatch: TRENDING will generate signals with notional {} (max_usd_per_order {} * leverage {}) but ORDERING limit is {}. Signals will be systematically rejected. Please ensure max_usd_per_order * leverage <= risk.max_position_notional_usd",
+            expected_notional,
+            cfg.max_usd_per_order,
+            leverage,
+            cfg.risk.max_position_notional_usd
+        ));
+    }
+
     Ok(())
 }

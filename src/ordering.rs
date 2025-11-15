@@ -433,10 +433,39 @@ impl Ordering {
         let notional = signal.entry_price.0 * signal.size.0;
         let required_margin = notional / Decimal::from(leverage);
         
-        // 4. Risk control check - max position notional (before lock)
+        // ✅ CRITICAL: Validate signal size consistency
+        // TRENDING generates signals using: notional = max_usd_per_order * leverage
+        // ORDERING validates: notional <= max_position_notional_usd
+        // These must be consistent to avoid signals being systematically rejected.
+        // 
+        // Example mismatch:
+        // - max_usd_per_order = 100, leverage = 20 → notional = 2000
+        // - max_position_notional_usd = 1000 → signal rejected
+        // 
+        // This validation ensures the signal's notional matches expectations from TRENDING.
         let max_position_notional = Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
             .unwrap_or(Decimal::from(10000)); // Default to 10000 USD if conversion fails
         
+        // Calculate expected notional from TRENDING's perspective
+        let max_usd_per_order = Decimal::from_str(&cfg.max_usd_per_order.to_string())
+            .unwrap_or(Decimal::from(100));
+        let expected_notional = max_usd_per_order * Decimal::from(leverage);
+        
+        // Warn if there's a mismatch between TRENDING's expected notional and ORDERING's limit
+        if expected_notional > max_position_notional {
+            warn!(
+                symbol = %signal.symbol,
+                expected_notional = %expected_notional,
+                max_position_notional = %max_position_notional,
+                max_usd_per_order = %max_usd_per_order,
+                leverage,
+                "ORDERING: Config mismatch - TRENDING will generate signals with notional {} but ORDERING limit is {}. Signals may be systematically rejected.",
+                expected_notional,
+                max_position_notional
+            );
+        }
+        
+        // 4. Risk control check - max position notional (before lock)
         if notional > max_position_notional {
             warn!(
                 symbol = %signal.symbol,
@@ -445,6 +474,32 @@ impl Ordering {
                 "ORDERING: Ignoring TradeSignal - exceeds max position notional"
             );
             return Ok(());
+        }
+        
+        // ✅ CRITICAL: Check minimum quote balance when opening positions
+        // This ensures we have sufficient balance for both margin AND closing commission.
+        // Previously, min_quote_balance_usd was only checked when closing positions,
+        // which could lead to situations where a position is opened but cannot be closed
+        // due to insufficient balance for commission.
+        let min_quote_balance = Decimal::from_str(&cfg.min_quote_balance_usd.to_string())
+            .unwrap_or(Decimal::ZERO);
+        {
+            let balance_store = shared_state.balance_store.read().await;
+            let available_balance = if cfg.quote_asset.to_uppercase() == "USDT" {
+                balance_store.usdt
+            } else {
+                balance_store.usdc
+            };
+            
+            if available_balance < min_quote_balance {
+                warn!(
+                    symbol = %signal.symbol,
+                    available_balance = %available_balance,
+                    min_quote_balance = %min_quote_balance,
+                    "ORDERING: Ignoring TradeSignal - available balance below minimum quote balance threshold"
+                );
+                return Ok(());
+            }
         }
         
         // ✅ CRITICAL: Atomic operation - state check + balance reserve in same lock
@@ -762,6 +817,23 @@ impl Ordering {
         shared_state: &Arc<SharedState>,
         cfg: &Arc<AppCfg>,
     ) -> Result<()> {
+        // ⚠️ DESIGN LIMITATION: position_id is currently ignored
+        // CloseRequest.position_id field exists but is not used in the current implementation.
+        // The code always closes positions by symbol only, not by specific position_id.
+        // This is intentional for one-way mode (hedge_mode=false) where each symbol has only one position.
+        // 
+        // FUTURE: If hedge mode support is added with multiple positions per symbol, position_id
+        // should be used to close specific positions. Until then, position_id is reserved for
+        // future use and will be logged if provided.
+        if request.position_id.is_some() {
+            warn!(
+                symbol = %request.symbol,
+                position_id = %request.position_id.as_ref().unwrap(),
+                reason = ?request.reason,
+                "ORDERING: CloseRequest.position_id provided but not used - current implementation closes by symbol only"
+            );
+        }
+        
         // ✅ Early check is only for logging/debugging, not for decision making
         // flatten_position will handle the actual position check atomically
         let has_position = {
@@ -800,6 +872,11 @@ impl Ordering {
         // - Zero quantity positions (returns Ok(()))
         // - Retry logic for partial fills
         // - Multiple threads can call this simultaneously - it's safe
+        // 
+        // ⚠️ DESIGN LIMITATION: flatten_position closes ALL positions for the symbol
+        // In one-way mode (hedge_mode=false), this is correct (one position per symbol).
+        // In hedge mode (hedge_mode=true), this closes both LONG and SHORT positions,
+        // which may not be desired. Future enhancement: support position_id-based closing.
         match connection.flatten_position(&request.symbol, use_market_only).await {
             Ok(()) => {
                 // Success - position closed (or was already closed)
