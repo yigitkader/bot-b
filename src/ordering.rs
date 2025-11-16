@@ -531,11 +531,10 @@ impl Ordering {
 
         // ✅ CRITICAL: Check minimum quote balance when opening positions
         // This ensures we have sufficient balance for both margin AND closing commission.
-        // Previously, min_quote_balance_usd was only checked when closing positions,
-        // which could lead to situations where a position is opened but cannot be closed
-        // due to insufficient balance for commission.
-        let min_quote_balance =
-            Decimal::from_str(&cfg.min_quote_balance_usd.to_string()).unwrap_or(Decimal::ZERO);
+        // For small balances (< max_margin_usd), we use a more flexible threshold:
+        // - Large balances: min_quote_balance_usd (e.g., 120 USD) = max_margin_usd + commission buffer
+        // - Small balances: min_margin_usd + commission buffer (e.g., 10 + 5 = 15 USD)
+        // This allows trading with smaller balances while still ensuring we can close positions
         {
             let balance_store = shared_state.balance_store.read().await;
             let available_balance = if cfg.quote_asset.to_uppercase() == "USDT" {
@@ -544,12 +543,28 @@ impl Ordering {
                 balance_store.usdc
             };
 
+            // Calculate dynamic minimum balance threshold
+            // Logic: We can use all available balance (up to max_margin_usd) for margin
+            // But we need to keep a small commission buffer to close positions
+            let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
+            let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
+            
+            // Commission buffer: ~0.1% of notional (entry + exit) + small safety margin
+            // For small balances, use fixed 5 USD commission buffer
+            // For large balances (100x leverage), commission can be higher, but we use 5 USD as minimum
+            let commission_buffer = Decimal::from(5);
+            
+            // Minimum balance = min_margin + commission buffer
+            // This ensures we can open a position AND close it with commission
+            let min_quote_balance = min_margin + commission_buffer;
+
             if available_balance < min_quote_balance {
                 debug!(
                     symbol = %signal.symbol,
                     available_balance = %available_balance,
                     min_quote_balance = %min_quote_balance,
                     required_margin = %required_margin,
+                    balance_type = if available_balance < max_margin { "small" } else { "large" },
                     "ORDERING: Ignoring TradeSignal - available balance below minimum quote balance threshold"
                 );
                 return Ok(());

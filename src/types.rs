@@ -559,6 +559,32 @@ pub struct OrderFillHistory {
 }
 
 // ============================================================================
+// Dynamic Symbol Selection Types
+// ============================================================================
+
+/// 24-hour statistics for a symbol (from Binance API)
+#[derive(Clone, Debug)]
+pub struct SymbolStats24h {
+    pub symbol: String,
+    pub price_change_percent: f64,
+    pub volume: f64,
+    pub quote_volume: f64,
+    pub trades: u64,
+    pub high_price: f64,
+    pub low_price: f64,
+}
+
+/// Scored symbol with opportunity score
+#[derive(Clone, Debug)]
+pub struct ScoredSymbol {
+    pub symbol: String,
+    pub score: f64,
+    pub volatility: f64,
+    pub volume: f64,
+    pub trades: u64,
+}
+
+// ============================================================================
 // Trending Module Types
 // ============================================================================
 

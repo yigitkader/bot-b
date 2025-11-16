@@ -13,7 +13,7 @@ mod balance;
 mod logging;
 
 use crate::balance::Balance;
-use crate::config::load_config;
+use crate::config::{load_config, AppCfg};
 use crate::connection::Connection;
 use crate::event_bus::EventBus;
 use crate::follow_orders::FollowOrders;
@@ -183,6 +183,16 @@ async fn main() -> Result<()> {
     
     info!("All modules started, waiting for shutdown signal...");
     
+    // Start dynamic symbol rotation task if enabled
+    if cfg.dynamic_symbol_selection.enabled {
+        start_dynamic_symbol_rotation(
+            connection.clone(),
+            event_bus.clone(),
+            shutdown_flag.clone(),
+            cfg.clone(),
+        );
+    }
+    
     // Start health check task
     let event_bus_health = event_bus.clone();
     let shutdown_flag_health = shutdown_flag.clone();
@@ -302,4 +312,74 @@ fn get_memory_info() -> Option<f64> {
     }
     
     None
+}
+
+/// Start dynamic symbol rotation task
+/// Periodically re-ranks symbols and updates WebSocket subscriptions
+fn start_dynamic_symbol_rotation(
+    connection: Arc<Connection>,
+    _event_bus: Arc<EventBus>,
+    shutdown_flag: Arc<AtomicBool>,
+    cfg: Arc<AppCfg>,
+) {
+    let rotation_interval = cfg.dynamic_symbol_selection.rotation_interval_minutes;
+    let max_symbols = cfg.dynamic_symbol_selection.max_symbols;
+
+    tokio::spawn(async move {
+        // First rotation immediately, then wait for interval
+        let mut first_rotation = true;
+        
+        loop {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            info!("Starting symbol rotation...");
+
+            // 1. Tüm symbol'leri çek ve skorla
+            match connection.discover_and_rank_symbols().await {
+                Ok(mut scored_symbols) => {
+                    // 2. En iyi N tanesini seç
+                    scored_symbols.truncate(max_symbols);
+
+                    // 3. Seçilen symbol'leri logla
+                    info!("Top {} symbols selected:", scored_symbols.len());
+                    for (i, scored) in scored_symbols.iter().enumerate().take(10) {
+                        info!(
+                            rank = i + 1,
+                            symbol = %scored.symbol,
+                            score = scored.score,
+                            volatility = scored.volatility,
+                            volume = scored.volume,
+                            "Top symbol"
+                        );
+                    }
+
+                    // 4. YENİ symbol listesiyle WebSocket'leri yeniden başlat
+                    let new_symbols: Vec<String> = scored_symbols
+                        .iter()
+                        .map(|s| s.symbol.clone())
+                        .collect();
+
+                    // ÖNEMLİ: Mevcut WebSocket'leri kapat, yenilerini başlat
+                    if let Err(e) = connection.restart_market_streams(new_symbols).await {
+                        error!(error = %e, "Failed to restart market streams");
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to discover and rank symbols");
+                }
+            }
+
+            // 5. Bir sonraki rotasyonu bekle
+            // First rotation happens immediately, subsequent rotations wait for interval
+            if first_rotation {
+                first_rotation = false;
+                // Continue to next iteration immediately for first rotation
+            } else {
+                // Wait for interval before next rotation
+                tokio::time::sleep(Duration::from_secs(rotation_interval * 60)).await;
+            }
+        }
+    });
 }

@@ -16,7 +16,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -70,6 +70,9 @@ pub struct Trending {
     /// Track symbol state for trend analysis (symbol -> SymbolState)
     /// Contains price history, volume, and signal timing
     symbol_states: Arc<Mutex<HashMap<String, SymbolState>>>,
+    /// Track recent volatility per symbol (last 60 ticks ≈ 1 hour)
+    /// Used to skip signals when volatility is too low
+    recent_volatility_tracker: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 impl Trending {
@@ -114,6 +117,7 @@ impl Trending {
             connection,
             last_signals: Arc::new(Mutex::new(HashMap::new())),
             symbol_states: Arc::new(Mutex::new(HashMap::new())),
+            recent_volatility_tracker: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -151,6 +155,7 @@ impl Trending {
         let connection = self.connection.clone();
         let last_signals = self.last_signals.clone();
         let symbol_states = self.symbol_states.clone();
+        let recent_volatility_tracker = self.recent_volatility_tracker.clone();
         
         // Spawn task for MarketTick events (signal generation)
         let event_bus_tick = event_bus.clone();
@@ -160,12 +165,18 @@ impl Trending {
         let connection_tick = connection.clone();
         let last_signals_tick = last_signals.clone();
         let symbol_states_tick = symbol_states.clone();
+        let recent_volatility_tracker_tick = recent_volatility_tracker.clone();
         tokio::spawn(async move {
             let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
             
             info!("TRENDING: Started, listening to MarketTick events");
             
             loop {
+                // Check shutdown flag before waiting for events
+                if shutdown_flag_tick.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+                
                 match market_tick_rx.recv().await {
                     Ok(tick) => {
                         if shutdown_flag_tick.load(AtomicOrdering::Relaxed) {
@@ -181,11 +192,21 @@ impl Trending {
                             &connection_tick,
                             &last_signals_tick,
                             &symbol_states_tick,
+                            &recent_volatility_tracker_tick,
                         ).await {
                             warn!(error = %e, symbol = %tick.symbol, "TRENDING: error processing market tick");
                         }
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Channel lagged - some messages were skipped
+                        warn!(skipped = skipped, "TRENDING: MarketTick channel lagged, some messages skipped");
+                        // Continue processing - don't break
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Channel closed - all senders dropped
+                        warn!("TRENDING: MarketTick channel closed, all senders dropped");
+                        break;
+                    }
                 }
             }
             
@@ -507,13 +528,13 @@ impl Trending {
         const SMA_PERIOD_SHORT: usize = 10;  // Short-term SMA (5-min equivalent)
         const SMA_PERIOD_MEDIUM: usize = 15; // Medium-term SMA (15-min equivalent)
         const SMA_PERIOD_LONG: usize = 20;   // Long-term SMA (1-hour equivalent)
-        // Reduced threshold from 1.5% to 0.02% for high-frequency trading
+        // Reduced threshold for high-frequency trading
         // High-frequency strategy: many small profits (50 cents per trade, 100+ trades/day)
         // Lower threshold allows more signals while still filtering noise
         // Works for all price scales (BTC $100k, altcoins $200) - percentage-based
-        // Real market deviations are typically 0.0000%-0.0031%, so 0.02% is more appropriate
-        // This allows detection of small but consistent price movements
-        const TREND_THRESHOLD_PCT: f64 = 0.02; // 0.02% threshold for high-frequency trend detection
+        // Real market deviations are typically 0.001-0.0035% (1-3.5 bps), so 0.005% (5 bps) is appropriate
+        // This allows detection of small but consistent price movements while filtering noise
+        const TREND_THRESHOLD_PCT: f64 = 0.005; // 0.005% threshold (5 bps) - adjusted for real market conditions
         const VOLUME_CONFIRMATION_PERIOD: usize = 10; // Period for volume analysis
         
         let prices = &state.prices;
@@ -587,6 +608,58 @@ impl Trending {
         None
     }
     
+    /// Update recent volatility tracker for a symbol
+    /// Calculates average volatility from last 60 ticks (≈ 1 hour)
+    /// Returns true if volatility is sufficient for trading, false otherwise
+    async fn update_recent_volatility(
+        symbol: &str,
+        symbol_states: &Arc<Mutex<HashMap<String, SymbolState>>>,
+        recent_volatility_tracker: &Arc<Mutex<HashMap<String, f64>>>,
+    ) -> bool {
+        const MIN_VOLATILITY_PCT: f64 = 0.5; // Minimum 0.5% volatility to generate signals
+        const VOLATILITY_WINDOW: usize = 60; // Last 60 ticks (≈ 1 hour)
+
+        let states = symbol_states.lock().await;
+        if let Some(state) = states.get(symbol) {
+            // Calculate volatility from last 60 ticks
+            if state.prices.len() >= VOLATILITY_WINDOW {
+                let recent_prices: Vec<_> = state.prices.iter().rev().take(VOLATILITY_WINDOW).collect();
+                let mut changes = Vec::new();
+
+                for i in 1..recent_prices.len() {
+                    let prev = recent_prices[i].price;
+                    let curr = recent_prices[i - 1].price;
+                    if !prev.is_zero() {
+                        let change = ((curr - prev) / prev).abs() * Decimal::from(100);
+                        if let Some(change_f64) = change.to_f64() {
+                            changes.push(change_f64);
+                        }
+                    }
+                }
+
+                if !changes.is_empty() {
+                    let avg_volatility: f64 = changes.iter().sum::<f64>() / changes.len() as f64;
+                    
+                    // Update tracker
+                    let mut tracker = recent_volatility_tracker.lock().await;
+                    tracker.insert(symbol.to_string(), avg_volatility);
+
+                    // Check if volatility is sufficient
+                    if avg_volatility < MIN_VOLATILITY_PCT {
+                        debug!(
+                            symbol = %symbol,
+                            volatility = avg_volatility,
+                            "TRENDING: Low volatility detected ({}%), skipping signals",
+                            avg_volatility
+                        );
+                        return false; // Volatility too low, skip signals
+                    }
+                }
+            }
+        }
+        true // Volatility OK or not enough data yet
+    }
+
     /// Process a market tick and generate trade signal if conditions are met
     /// 
     /// CRITICAL: Event flood prevention with sampling
@@ -609,6 +682,7 @@ impl Trending {
         connection: &Arc<Connection>,
         last_signals: &Arc<Mutex<HashMap<String, LastSignal>>>,
         symbol_states: &Arc<Mutex<HashMap<String, SymbolState>>>,
+        recent_volatility_tracker: &Arc<Mutex<HashMap<String, f64>>>,
     ) -> Result<()> {
         let now = Instant::now();
         
@@ -644,6 +718,20 @@ impl Trending {
                 symbol = %tick.symbol,
                 "TRENDING: Tick skipped (sampling: processing 1/10 ticks)"
             );
+            return Ok(());
+        }
+
+        // ✅ Real-time volatility check: Update and validate volatility
+        // Skip signals if recent volatility is too low (< 0.5%)
+        // This prevents trading in low-volatility markets where signals are less reliable
+        let volatility_ok = Self::update_recent_volatility(
+            &tick.symbol,
+            symbol_states,
+            recent_volatility_tracker,
+        ).await;
+        
+        if !volatility_ok {
+            // Volatility too low, skip signal generation
             return Ok(());
         }
         
@@ -904,10 +992,11 @@ impl Trending {
                     let details = if let Some(s) = state {
                         if s.prices.len() >= 25 {
                             // Analyze trend to get details with full information
-                            // Use same threshold as analyze_trend function (0.02%)
-                            let (trend_short, details_short) = Self::analyze_trend_timeframe_with_details(&s.prices, 10, 0.02);
-                            let (trend_medium, details_medium) = Self::analyze_trend_timeframe_with_details(&s.prices, 15, 0.02);
-                            let (trend_long, details_long) = Self::analyze_trend_timeframe_with_details(&s.prices, 20, 0.02);
+                            // Use same threshold as analyze_trend function
+                            const TREND_THRESHOLD: f64 = 0.005; // Match TREND_THRESHOLD_PCT from analyze_trend
+                            let (trend_short, details_short) = Self::analyze_trend_timeframe_with_details(&s.prices, 10, TREND_THRESHOLD);
+                            let (trend_medium, details_medium) = Self::analyze_trend_timeframe_with_details(&s.prices, 15, TREND_THRESHOLD);
+                            let (trend_long, details_long) = Self::analyze_trend_timeframe_with_details(&s.prices, 20, TREND_THRESHOLD);
                             
                             // Count consensus
                             let trends = vec![trend_short, trend_medium, trend_long];
@@ -1036,7 +1125,8 @@ impl Trending {
         
         // Require minimum momentum for signal confirmation
         // Reduced for high-frequency trading (many small profits)
-        const MIN_MOMENTUM_PCT: f64 = 0.1; // Minimum 0.1% momentum required (reduced from 0.5% for HFT)
+        // Real market momentum is typically 0.007-0.021%, so 0.01% (1 bps) is more appropriate
+        const MIN_MOMENTUM_PCT: f64 = 0.01; // Minimum 0.01% momentum required (1 bps - adjusted for real market conditions)
         
         match momentum {
             Some(mom) => {
@@ -1145,9 +1235,10 @@ impl Trending {
                     let states = symbol_states.lock().await;
                     if let Some(state) = states.get(&tick.symbol) {
                         // Calculate trend strength: count of timeframes agreeing on trend
-                        let (trend_short, _) = Self::analyze_trend_timeframe_with_details(&state.prices, 10, 0.02);
-                        let (trend_medium, _) = Self::analyze_trend_timeframe_with_details(&state.prices, 15, 0.02);
-                        let (trend_long, _) = Self::analyze_trend_timeframe_with_details(&state.prices, 20, 0.02);
+                        const TREND_THRESHOLD: f64 = 0.005; // Match TREND_THRESHOLD_PCT from analyze_trend
+                        let (trend_short, _) = Self::analyze_trend_timeframe_with_details(&state.prices, 10, TREND_THRESHOLD);
+                        let (trend_medium, _) = Self::analyze_trend_timeframe_with_details(&state.prices, 15, TREND_THRESHOLD);
+                        let (trend_long, _) = Self::analyze_trend_timeframe_with_details(&state.prices, 20, TREND_THRESHOLD);
                         
                         let trends = vec![trend_short, trend_medium, trend_long];
                         let long_count = trends.iter().filter(|&&t| t == Some(TrendSignal::Long)).count();

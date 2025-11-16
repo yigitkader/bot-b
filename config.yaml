@@ -23,7 +23,12 @@ max_margin_usd: 100.0     # Maximum margin per trade (USD) - dynamic margin rang
 #     Since we only have one position at a time, we can use all available funds (up to 100 USD limit)
 #   - "dynamic" or "trend_based": Scale margin based on trend strength, using available balance as base
 margin_strategy: "balance_based"   # Recommended: "balance_based" to use all available funds (up to max_margin_usd)
-min_quote_balance_usd: 120.0  # Minimum quote asset balance threshold (USD) - must be >= max_margin_usd (100) + commission buffer
+min_quote_balance_usd: 20.0  # Minimum quote asset balance threshold (USD) - legacy, not used for validation
+# Note: This value is NOT used for balance validation anymore
+# Dynamic logic: min_balance = min_margin_usd (10) + commission_buffer (5) = 15 USD
+# This allows trading with any balance >= 15 USD
+# The system will use all available balance (up to max_margin_usd) for margin
+# Example: 20 USD balance → use 20 USD margin (all available, up to max 100 USD)
 
 # ============================================================================
 # Trading Parameters
@@ -108,3 +113,22 @@ event_bus:
   order_update_buffer: 1000    # Buffer for OrderUpdate events
   position_update_buffer: 1000 # Buffer for PositionUpdate events
   balance_update_buffer: 1000  # Buffer for BalanceUpdate events
+
+# ============================================================================
+# Dynamic Symbol Selection (Automatic Ranking & Rotation)
+# ============================================================================
+dynamic_symbol_selection:
+  enabled: true                 # Enable dynamic symbol selection (automatic ranking)
+  max_symbols: 30               # Maximum symbols to track (CPU limit)
+  rotation_interval_minutes: 15 # How often to re-rank and update symbols (minutes)
+  
+  # Minimum requirements for symbol selection
+  min_volatility_pct: 1.5       # Minimum 24h price change % (volatility filter)
+  min_quote_volume: 1000000      # Minimum 24h quote volume (USD) - liquidity filter
+  min_trades_24h: 1000          # Minimum number of trades in 24h - activity filter
+  
+  # Scoring weights (higher = more important)
+  volatility_weight: 2.0        # Volatility weight (most important)
+  volume_weight: 1.0             # Volume weight (liquidity)
+  trades_weight: 0.5             # Trades count weight (activity)
+  spread_weight: 1.0             # Spread weight (market quality)

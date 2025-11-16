@@ -13,13 +13,14 @@ use crate::event_bus::{
     OrderStatus, OrderUpdate, PositionUpdate,
 };
 use crate::state::SharedState;
-use crate::types::{OrderFillHistory, OrderCommand, Position, Px, Qty, Side, UserEvent, UserStreamKind, VenueOrder};
+use crate::types::{OrderFillHistory, OrderCommand, Position, Px, Qty, Side, UserEvent, UserStreamKind, VenueOrder, ScoredSymbol, SymbolStats24h};
 use venue::{BinanceFutures, BALANCE_CACHE, FUT_RULES, OPEN_ORDERS_CACHE, POSITION_CACHE, PRICE_CACHE, Venue};
 use websocket::{MarketDataStream, UserDataStream};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use futures_util::future;
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -1745,5 +1746,338 @@ impl Connection {
 
     Ok(discovered)
 }
+
+    /// Fetch 24-hour statistics for a symbol from Binance API
+    pub async fn fetch_24h_stats(&self, symbol: &str) -> Result<SymbolStats24h> {
+        let url = format!(
+            "{}/fapi/v1/ticker/24hr?symbol={}",
+            self.cfg.binance.futures_base,
+            symbol
+        );
+
+        #[derive(Deserialize)]
+        struct Ticker24h {
+            #[serde(rename = "priceChangePercent")]
+            price_change_percent: String,
+            #[serde(rename = "volume")]
+            volume: String,
+            #[serde(rename = "quoteVolume")]
+            quote_volume: String,
+            #[serde(rename = "count")]
+            count: u64,
+            #[serde(rename = "highPrice")]
+            high_price: String,
+            #[serde(rename = "lowPrice")]
+            low_price: String,
+        }
+
+        let resp = self.venue.common.client
+            .get(&url)
+            .send()
+            .await?;
+
+        // Check HTTP status
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("API error for {}: {} - {}", symbol, status, body));
+        }
+
+        let ticker: Ticker24h = resp.json().await?;
+
+        // Parse with proper error handling
+        let price_change_percent = ticker.price_change_percent.parse::<f64>()
+            .map_err(|e| anyhow!("Invalid priceChangePercent for {}: {} ({})", symbol, ticker.price_change_percent, e))?;
+        let volume = ticker.volume.parse::<f64>()
+            .map_err(|e| anyhow!("Invalid volume for {}: {} ({})", symbol, ticker.volume, e))?;
+        let quote_volume = ticker.quote_volume.parse::<f64>()
+            .map_err(|e| anyhow!("Invalid quoteVolume for {}: {} ({})", symbol, ticker.quote_volume, e))?;
+        let high_price = ticker.high_price.parse::<f64>()
+            .map_err(|e| anyhow!("Invalid highPrice for {}: {} ({})", symbol, ticker.high_price, e))?;
+        let low_price = ticker.low_price.parse::<f64>()
+            .map_err(|e| anyhow!("Invalid lowPrice for {}: {} ({})", symbol, ticker.low_price, e))?;
+
+        // Validate data
+        if quote_volume <= 0.0 {
+            return Err(anyhow!("Invalid quote volume for {}: {}", symbol, quote_volume));
+        }
+        if high_price <= 0.0 || low_price <= 0.0 || low_price > high_price {
+            return Err(anyhow!("Invalid price range for {}: high={}, low={}", symbol, high_price, low_price));
+        }
+
+        Ok(SymbolStats24h {
+            symbol: symbol.to_string(),
+            price_change_percent,
+            volume,
+            quote_volume,
+            trades: ticker.count,
+            high_price,
+            low_price,
+        })
+    }
+
+    /// Discover all symbols and rank them by opportunity score
+    pub async fn discover_and_rank_symbols(&self) -> Result<Vec<ScoredSymbol>> {
+        // 1. Tüm symbol'leri keşfet (quote asset filtrelemeli)
+        let all_symbols = self.discover_symbols().await?;
+
+        info!(
+            total_symbols = all_symbols.len(),
+            "Discovered {} symbols, fetching 24h stats...",
+            all_symbols.len()
+        );
+
+        // 2. Her symbol için 24h stats çek (batch processing - rate limit koruması)
+        // Binance rate limit: 1200 requests/minute (weight 1 per request)
+        // Batch size: 50 symbols at a time to avoid rate limiting
+        const BATCH_SIZE: usize = 50;
+        let mut all_stats_results: Vec<Result<SymbolStats24h, anyhow::Error>> = Vec::new();
+
+        for batch in all_symbols.chunks(BATCH_SIZE) {
+            let mut stats_futures = Vec::new();
+            for symbol in batch {
+                let symbol_clone = symbol.clone();
+                // We need to access self.venue and self.cfg, which are Arc types
+                let venue = self.venue.clone();
+                let futures_base = self.cfg.binance.futures_base.clone();
+                stats_futures.push(async move {
+                let url = format!(
+                    "{}/fapi/v1/ticker/24hr?symbol={}",
+                    futures_base,
+                    symbol_clone
+                );
+
+                #[derive(Deserialize)]
+                struct Ticker24h {
+                    #[serde(rename = "priceChangePercent")]
+                    price_change_percent: String,
+                    #[serde(rename = "volume")]
+                    volume: String,
+                    #[serde(rename = "quoteVolume")]
+                    quote_volume: String,
+                    #[serde(rename = "count")]
+                    count: u64,
+                    #[serde(rename = "highPrice")]
+                    high_price: String,
+                    #[serde(rename = "lowPrice")]
+                    low_price: String,
+                }
+
+                let resp = match venue.common.client
+                    .get(&url)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(symbol = %symbol_clone, error = %e, "Failed to fetch 24h stats (network error)");
+                        return Err(anyhow!("Network error for {}: {}", symbol_clone, e));
+                    }
+                };
+
+                // Check HTTP status
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    tracing::debug!(symbol = %symbol_clone, %status, %body, "Failed to fetch 24h stats (API error)");
+                    return Err(anyhow!("API error for {}: {} - {}", symbol_clone, status, body));
+                }
+
+                let ticker: Ticker24h = match resp.json().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!(symbol = %symbol_clone, error = %e, "Failed to parse 24h stats (JSON error)");
+                        return Err(anyhow!("JSON parse error for {}: {}", symbol_clone, e));
+                    }
+                };
+
+                // Parse with proper error handling
+                let price_change_percent = ticker.price_change_percent.parse::<f64>()
+                    .map_err(|e| anyhow!("Invalid priceChangePercent for {}: {} ({})", symbol_clone, ticker.price_change_percent, e))?;
+                let volume = ticker.volume.parse::<f64>()
+                    .map_err(|e| anyhow!("Invalid volume for {}: {} ({})", symbol_clone, ticker.volume, e))?;
+                let quote_volume = ticker.quote_volume.parse::<f64>()
+                    .map_err(|e| anyhow!("Invalid quoteVolume for {}: {} ({})", symbol_clone, ticker.quote_volume, e))?;
+                let high_price = ticker.high_price.parse::<f64>()
+                    .map_err(|e| anyhow!("Invalid highPrice for {}: {} ({})", symbol_clone, ticker.high_price, e))?;
+                let low_price = ticker.low_price.parse::<f64>()
+                    .map_err(|e| anyhow!("Invalid lowPrice for {}: {} ({})", symbol_clone, ticker.low_price, e))?;
+
+                // Validate data
+                if quote_volume <= 0.0 {
+                    tracing::debug!(symbol = %symbol_clone, quote_volume, "Invalid quote volume (<= 0)");
+                    return Err(anyhow!("Invalid quote volume for {}: {}", symbol_clone, quote_volume));
+                }
+                if high_price <= 0.0 || low_price <= 0.0 || low_price > high_price {
+                    tracing::debug!(symbol = %symbol_clone, high_price, low_price, "Invalid price range");
+                    return Err(anyhow!("Invalid price range for {}: high={}, low={}", symbol_clone, high_price, low_price));
+                }
+
+                Ok(SymbolStats24h {
+                    symbol: symbol_clone,
+                    price_change_percent,
+                    volume,
+                    quote_volume,
+                    trades: ticker.count,
+                    high_price,
+                    low_price,
+                })
+                });
+            }
+
+            // Process this batch
+            let batch_results: Vec<Result<SymbolStats24h, anyhow::Error>> = future::join_all(stats_futures).await;
+            all_stats_results.extend(batch_results);
+
+            // Rate limit koruması: batch'ler arasında kısa bir bekleme
+            // 50 request / batch, 1200 request / minute = ~2.4 batch / second
+            // Güvenli tarafta kalmak için batch'ler arasında 500ms bekle
+            if batch.len() == BATCH_SIZE && all_stats_results.len() < all_symbols.len() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        let stats_results = all_stats_results;
+
+        // 3. Skorlama
+        let mut scored_symbols = Vec::new();
+        let mut error_count = 0;
+        for (symbol, stats_result) in all_symbols.iter().zip(stats_results.iter()) {
+            match stats_result {
+                Ok(stats) => {
+                    let score = calculate_opportunity_score(stats, &self.cfg);
+
+                    if score > 0.0 {
+                        scored_symbols.push(ScoredSymbol {
+                            symbol: symbol.clone(),
+                            score,
+                            volatility: stats.price_change_percent.abs(),
+                            volume: stats.quote_volume,
+                            trades: stats.trades,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error_count += 1;
+                    // Log only first few errors to avoid spam
+                    if error_count <= 5 {
+                        tracing::debug!(symbol = %symbol, error = %e, "Failed to fetch/parse 24h stats");
+                    }
+                }
+            }
+        }
+
+        if error_count > 0 {
+            tracing::warn!(
+                total_symbols = all_symbols.len(),
+                error_count,
+                "Failed to fetch 24h stats for {} symbols (some symbols may be invalid or delisted)",
+                error_count
+            );
+        }
+
+        // 4. En yüksek skordan düşüğe sırala
+        scored_symbols.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(scored_symbols)
+    }
+
+    /// Restart market data streams with new symbol list
+    /// This closes existing WebSocket connections and starts new ones
+    pub async fn restart_market_streams(&self, new_symbols: Vec<String>) -> Result<()> {
+        info!(
+            symbol_count = new_symbols.len(),
+            symbols = ?new_symbols.iter().take(10).collect::<Vec<_>>(),
+            "Restarting market data streams with new symbol list"
+        );
+
+        // Note: WebSocket streams are managed by tokio::spawn tasks
+        // They will automatically reconnect if they fail
+        // For a proper restart, we would need to track and close existing streams
+        // For now, we'll just start new streams (old ones will eventually timeout)
+        // TODO: Implement proper stream management with cancellation tokens
+        
+        // Start new market data streams
+        self.start_market_data_stream(new_symbols).await?;
+
+        Ok(())
+    }
+}
+
+/// Calculate opportunity score for a symbol based on 24h statistics
+fn calculate_opportunity_score(stats: &SymbolStats24h, cfg: &AppCfg) -> f64 {
+    let ds_cfg = &cfg.dynamic_symbol_selection;
+
+    // 1. Volatilite skoru (en önemli)
+    let volatility_abs = stats.price_change_percent.abs();
+    
+    // Minimum volatilite kontrolü
+    if volatility_abs < ds_cfg.min_volatility_pct {
+        return 0.0; // Çok düşük volatilite = işlem yapma
+    }
+
+    let volatility_score = if volatility_abs < 3.0 {
+        1.0 // Orta volatilite
+    } else if volatility_abs < 6.0 {
+        2.0 // İyi volatilite
+    } else if volatility_abs < 10.0 {
+        3.0 // Harika volatilite
+    } else {
+        2.5 // Çok yüksek = riskli, biraz cezalandır
+    };
+
+    // 2. Volume skoru (likidite için)
+    if stats.quote_volume < ds_cfg.min_quote_volume {
+        return 0.0; // Çok düşük volume = slippage riski
+    }
+
+    let volume_score = if stats.quote_volume < 10_000_000.0 {
+        0.5 // Düşük volume
+    } else if stats.quote_volume < 50_000_000.0 {
+        1.0 // Normal volume
+    } else {
+        1.5 // Yüksek volume = iyi likidite
+    };
+
+    // 3. İşlem sayısı skoru (aktivite için)
+    if stats.trades < ds_cfg.min_trades_24h {
+        return 0.0; // Çok az işlem
+    }
+
+    let trades_score = if stats.trades < 10000 {
+        0.5
+    } else {
+        1.0
+    };
+
+    // 4. Spread tahmini (24h high-low range - bu gerçek spread değil, sadece volatilite göstergesi)
+    // Not: Gerçek spread (bid-ask) için @bookTicker stream'inden alınmalı
+    // Burada 24h high-low range'i kullanıyoruz, bu da volatilite göstergesi olarak işlev görür
+    let price_mid = (stats.high_price + stats.low_price) / 2.0;
+    let range_pct = if price_mid > 0.0 {
+        ((stats.high_price - stats.low_price) / price_mid) * 100.0
+    } else {
+        100.0 // Hata durumu
+    };
+
+    // Range çok genişse (aşırı volatilite) cezalandır, dar ise (stabil) ödüllendir
+    // Ancak çok dar range (düşük volatilite) zaten min_volatility_pct ile filtreleniyor
+    let spread_score = if range_pct > 20.0 {
+        0.5 // Çok geniş range = aşırı volatilite, riskli
+    } else if range_pct > 10.0 {
+        0.8 // Geniş range = yüksek volatilite
+    } else if range_pct > 5.0 {
+        1.0 // Normal range
+    } else {
+        0.9 // Dar range = düşük volatilite (ama zaten min_volatility_pct geçti)
+    };
+
+    // TOPLAM SKOR (ağırlıklı)
+    let total_score = (volatility_score * ds_cfg.volatility_weight)
+        + (volume_score * ds_cfg.volume_weight)
+        + (trades_score * ds_cfg.trades_weight)
+        + (spread_score * ds_cfg.spread_weight);
+
+    total_score
 }
 

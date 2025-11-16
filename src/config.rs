@@ -89,6 +89,40 @@ pub struct EventBusCfg {
     pub balance_update_buffer: usize,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DynamicSymbolSelection {
+    /// Enable dynamic symbol selection (automatic ranking and rotation)
+    #[serde(default = "default_dynamic_symbol_selection_enabled")]
+    pub enabled: bool,
+    /// Maximum number of symbols to track simultaneously (CPU limit)
+    #[serde(default = "default_max_symbols")]
+    pub max_symbols: usize,
+    /// Rotation interval in minutes (how often to re-rank and update symbols)
+    #[serde(default = "default_rotation_interval_minutes")]
+    pub rotation_interval_minutes: u64,
+    /// Minimum volatility percentage (24h price change) to consider a symbol
+    #[serde(default = "default_min_volatility_pct")]
+    pub min_volatility_pct: f64,
+    /// Minimum quote volume (USD) to consider a symbol (likidity filter)
+    #[serde(default = "default_min_quote_volume")]
+    pub min_quote_volume: f64,
+    /// Minimum number of trades in 24h to consider a symbol
+    #[serde(default = "default_min_trades_24h")]
+    pub min_trades_24h: u64,
+    /// Weight for volatility in opportunity score calculation
+    #[serde(default = "default_volatility_weight")]
+    pub volatility_weight: f64,
+    /// Weight for volume in opportunity score calculation
+    #[serde(default = "default_volume_weight")]
+    pub volume_weight: f64,
+    /// Weight for trades count in opportunity score calculation
+    #[serde(default = "default_trades_weight")]
+    pub trades_weight: f64,
+    /// Weight for spread in opportunity score calculation
+    #[serde(default = "default_spread_weight")]
+    pub spread_weight: f64,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct BinanceCfg {
     pub api_key: String,
@@ -172,6 +206,8 @@ pub struct AppCfg {
     pub websocket: WebsocketCfg,
     #[serde(default)]
     pub event_bus: EventBusCfg,
+    #[serde(default)]
+    pub dynamic_symbol_selection: DynamicSymbolSelection,
 }
 
 impl Default for AppCfg {
@@ -199,6 +235,7 @@ impl Default for AppCfg {
             exec: ExecCfg::default(),
             websocket: WebsocketCfg::default(),
             event_bus: EventBusCfg::default(),
+            dynamic_symbol_selection: DynamicSymbolSelection::default(),
         }
     }
 }
@@ -333,6 +370,46 @@ fn default_trade_signal_buffer() -> usize {
 
 fn default_default_event_buffer() -> usize {
     1000
+}
+
+fn default_dynamic_symbol_selection_enabled() -> bool {
+    false // Default: disabled (use manual symbols or auto_discover_quote)
+}
+
+fn default_max_symbols() -> usize {
+    30 // Default: 30 symbols max (CPU limit)
+}
+
+fn default_rotation_interval_minutes() -> u64 {
+    15 // Default: rotate every 15 minutes
+}
+
+fn default_min_volatility_pct() -> f64 {
+    1.5 // Default: minimum 1.5% daily volatility
+}
+
+fn default_min_quote_volume() -> f64 {
+    1_000_000.0 // Default: minimum 1M USD volume
+}
+
+fn default_min_trades_24h() -> u64 {
+    1000 // Default: minimum 1000 trades in 24h
+}
+
+fn default_volatility_weight() -> f64 {
+    2.0 // Default: volatility is 2x important
+}
+
+fn default_volume_weight() -> f64 {
+    1.0 // Default: volume weight
+}
+
+fn default_trades_weight() -> f64 {
+    0.5 // Default: trades weight
+}
+
+fn default_spread_weight() -> f64 {
+    1.0 // Default: spread weight
 }
 
 // ============================================================================
@@ -555,16 +632,12 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         return Err(anyhow!("min_quote_balance_usd must be greater than 0"));
     }
 
-    // Validate max_margin_usd vs min_quote_balance_usd relationship
-    // The minimum balance must be at least as large as the maximum margin
-    // Otherwise, we might try to place orders larger than the available balance
-    if cfg.min_quote_balance_usd < cfg.max_margin_usd {
-        return Err(anyhow!(
-            "min_quote_balance_usd ({}) must be at least as large as max_margin_usd ({}) to ensure sufficient balance for trading",
-            cfg.min_quote_balance_usd,
-            cfg.max_margin_usd
-        ));
-    }
+    // Note: min_quote_balance_usd is NOT required to be >= max_margin_usd
+    // For small balances (< max_margin_usd), we use dynamic threshold:
+    // - Minimum balance = min_margin_usd + commission buffer (e.g., 10 + 5 = 15 USD)
+    // - The system will use all available balance (up to max_margin_usd) for margin
+    // - Example: 20 USD balance → use 20 USD margin (all available, up to max 100 USD)
+    // This allows trading with any balance >= min_margin_usd + commission buffer
 
     // ✅ CRITICAL: Validate that profitable trades are possible
     // For a trade to be profitable, take_profit_pct must exceed stop_loss_pct + total costs

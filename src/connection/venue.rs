@@ -603,41 +603,108 @@ pub fn from_config(
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/leverageBrackets?{}&signature={}", self.base, qs, sig);
         
-        match send_json::<Vec<LeverageBracketsResponse>>(
-            self.common
-                .client
-                .get(&url)
-                .header("X-MBX-APIKEY", &self.common.api_key)
-        ).await {
-            Ok(brackets) => {
-                // Find brackets for this symbol
-                if let Some(symbol_brackets) = brackets.iter().find(|b| b.symbol == sym) {
-                    // Max leverage is the highest initial_leverage in brackets
-                    let max_lev = symbol_brackets.brackets
-                        .iter()
-                        .map(|b| b.initial_leverage)
-                        .max()
-                        .unwrap_or(1);
-                    
-                    tracing::debug!(
-                        symbol = %sym,
-                        max_leverage = max_lev,
-                        "Fetched max leverage from Binance leverage brackets"
-                    );
-                    Some(max_lev)
+        // Try to fetch leverage brackets with better error handling
+        let resp = match self.common
+            .client
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    symbol = %sym,
+                    "Failed to send leverage brackets request (network error)"
+                );
+                return None;
+            }
+        };
+
+        // Check HTTP status
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::debug!(
+                error = %status,
+                body = %body,
+                symbol = %sym,
+                "Leverage brackets API returned error status"
+            );
+            return None;
+        }
+
+        // Try to parse response - handle both single symbol and array responses
+        match resp.json::<serde_json::Value>().await {
+            Ok(json) => {
+                // Handle different response formats:
+                // 1. Array of LeverageBracketsResponse: [{"symbol": "...", "brackets": [...]}]
+                // 2. Single object: {"symbol": "...", "brackets": [...]}
+                // 3. Array of brackets directly: [{"bracket": ..., "initialLeverage": ...}]
+                
+                // Try different response formats
+                let brackets_result: Result<Vec<LeverageBracketsResponse>, _> = if json.is_array() {
+                    // Try to parse as array of LeverageBracketsResponse
+                    serde_json::from_value::<Vec<LeverageBracketsResponse>>(json.clone())
+                        .or_else(|_| {
+                            // Try to parse as array of LeverageBracket (direct brackets) - wrap in LeverageBracketsResponse
+                            serde_json::from_value::<Vec<LeverageBracket>>(json.clone())
+                                .map(|brackets| vec![LeverageBracketsResponse {
+                                    symbol: sym.to_string(),
+                                    brackets,
+                                }])
+                        })
                 } else {
-                    warn!(
-                        symbol = %sym,
-                        "Symbol not found in leverage brackets response"
-                    );
-                    None
+                    // Try to parse as single LeverageBracketsResponse
+                    serde_json::from_value::<LeverageBracketsResponse>(json)
+                        .map(|r| vec![r])
+                };
+
+                match brackets_result {
+                    Ok(brackets_vec) => {
+                        // Find brackets for this symbol or use first if single symbol
+                        let symbol_brackets = match brackets_vec.iter()
+                            .find(|b| b.symbol.eq_ignore_ascii_case(sym))
+                            .or_else(|| brackets_vec.first())
+                        {
+                            Some(b) => b,
+                            None => {
+                                warn!(symbol = %sym, "No brackets found in response");
+                                return None;
+                            }
+                        };
+
+                        // Max leverage is the highest initial_leverage in brackets
+                        let max_lev = symbol_brackets.brackets
+                            .iter()
+                            .map(|b| b.initial_leverage)
+                            .max()
+                            .unwrap_or(1);
+                        
+                        tracing::debug!(
+                            symbol = %sym,
+                            max_leverage = max_lev,
+                            "Fetched max leverage from Binance leverage brackets"
+                        );
+                        Some(max_lev)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            symbol = %sym,
+                            "Failed to parse leverage brackets response (format may have changed)"
+                        );
+                        None
+                    }
                 }
             }
             Err(e) => {
-                warn!(
+                // JSON parse error
+                tracing::debug!(
                     error = %e,
                     symbol = %sym,
-                    "Failed to fetch leverage brackets, will use config max_leverage"
+                    "Failed to parse leverage brackets response as JSON"
                 );
                 None
             }
