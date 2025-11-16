@@ -11,6 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 
 /// Load historical data from CSV file (if exists)
 /// Format: timestamp,price,volume
@@ -550,5 +552,224 @@ async fn test_strategy_on_sideways() {
     // In sideways market, we expect fewer signals (or break-even)
     // This is expected behavior for trend-following strategy
     assert!(results.winning_trades + results.losing_trades >= 0, "Invalid trade count");
+}
+
+/// Binance Kline (Candlestick) data structure
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BinanceKline {
+    Array(Vec<String>), // Binance returns array of strings
+}
+
+/// Fetch historical kline data from Binance Futures API
+/// 
+/// # Arguments
+/// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
+/// * `interval` - Kline interval (e.g., "1m", "5m", "15m", "1h", "4h", "1d")
+/// * `start_time` - Start time in milliseconds (Unix timestamp)
+/// * `end_time` - End time in milliseconds (Unix timestamp)
+/// * `limit` - Maximum number of klines to return (max 1500)
+/// 
+/// # Returns
+/// Vector of MarketTick data points
+/// 
+/// # Binance Kline Format
+/// Each kline is an array: [Open time, Open, High, Low, Close, Volume, Close time, ...]
+async fn fetch_binance_klines(
+    symbol: &str,
+    interval: &str,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    limit: Option<u32>,
+) -> Result<Vec<MarketTick>, Box<dyn std::error::Error>> {
+    use reqwest::Client;
+    
+    let client = Client::new();
+    let base_url = "https://fapi.binance.com";
+    
+    // Build query parameters
+    let mut params = vec![
+        format!("symbol={}", symbol),
+        format!("interval={}", interval),
+    ];
+    
+    if let Some(start) = start_time {
+        params.push(format!("startTime={}", start));
+    }
+    
+    if let Some(end) = end_time {
+        params.push(format!("endTime={}", end));
+    }
+    
+    if let Some(lim) = limit {
+        params.push(format!("limit={}", lim.min(1500))); // Binance max limit is 1500
+    }
+    
+    let url = format!("{}/fapi/v1/klines?{}", base_url, params.join("&"));
+    
+    println!("📡 Fetching Binance historical data: {}", url);
+    
+    let response = client.get(&url).send().await?;
+    let status = response.status();
+    
+    if !status.is_success() {
+        let error_text = response.text().await?;
+        return Err(format!("Binance API error ({}): {}", status, error_text).into());
+    }
+    
+    // Parse JSON array of arrays
+    let klines: Vec<Vec<serde_json::Value>> = response.json().await?;
+    
+    let mut ticks = Vec::new();
+    
+    // Get the first kline's timestamp to use as base (for relative timestamps)
+    let first_timestamp_ms = if let Some(first_kline) = klines.first() {
+        first_kline[0].as_i64().unwrap_or(0)
+    } else {
+        0
+    };
+    
+    for (idx, kline) in klines.iter().enumerate() {
+        if kline.len() < 6 {
+            continue; // Skip invalid klines
+        }
+        
+        // Binance kline format: [Open time, Open, High, Low, Close, Volume, ...]
+        let open_time_ms = kline[0].as_i64().unwrap_or(0);
+        let open_price = Decimal::from_str(kline[1].as_str().unwrap_or("0"))?;
+        let high_price = Decimal::from_str(kline[2].as_str().unwrap_or("0"))?;
+        let low_price = Decimal::from_str(kline[3].as_str().unwrap_or("0"))?;
+        let close_price = Decimal::from_str(kline[4].as_str().unwrap_or("0"))?;
+        let volume = Decimal::from_str(kline[5].as_str().unwrap_or("0"))?;
+        
+        // Use close price as mid price, calculate bid/ask with small spread
+        let mid_price = close_price;
+        let spread = mid_price * Decimal::from_str("0.0001").unwrap(); // 0.01% spread
+        let bid = mid_price - spread / Decimal::from(2);
+        let ask = mid_price + spread / Decimal::from(2);
+        
+        // Convert milliseconds to Instant (relative to first timestamp)
+        // Use relative time from first kline to maintain proper ordering
+        let relative_time_ms = open_time_ms - first_timestamp_ms;
+        let tick_timestamp = Instant::now() + Duration::from_millis(relative_time_ms as u64);
+        
+        ticks.push(MarketTick {
+            symbol: symbol.to_string(),
+            bid: Px(bid),
+            ask: Px(ask),
+            mark_price: Some(Px(mid_price)),
+            volume: Some(volume),
+            timestamp: tick_timestamp,
+        });
+    }
+    
+    println!("✅ Fetched {} klines from Binance", ticks.len());
+    
+    Ok(ticks)
+}
+
+/// Test strategy with real Binance historical data
+/// 
+/// This test fetches real historical data from Binance API and runs backtest
+/// 
+/// # Usage
+/// ```bash
+/// cargo test test_strategy_with_binance_data -- --nocapture
+/// ```
+/// 
+/// # Parameters
+/// - Symbol: BTCUSDT (default)
+/// - Interval: 5m (5 minutes)
+/// - Duration: Last 7 days (1008 klines = 7 days * 24 hours * 6 klines/hour)
+/// 
+/// # Note
+/// This test requires internet connection to fetch data from Binance API
+#[tokio::test]
+#[ignore] // Ignore by default - requires internet connection
+async fn test_strategy_with_binance_data() {
+    use chrono::TimeZone;
+    
+    // Test parameters
+    let symbol = "BTCUSDT";
+    let interval = "5m"; // 5-minute candles
+    let days_back = 7; // Last 7 days
+    
+    // Calculate start and end times
+    let end_time = Utc::now();
+    let start_time = end_time - chrono::Duration::days(days_back);
+    
+    let start_time_ms = start_time.timestamp_millis();
+    let end_time_ms = end_time.timestamp_millis();
+    
+    println!("\n=== Binance Historical Data Backtest ===");
+    println!("Symbol: {}", symbol);
+    println!("Interval: {}", interval);
+    println!("Start Time: {}", start_time);
+    println!("End Time: {}", end_time);
+    println!("Duration: {} days", days_back);
+    
+    // Fetch historical data from Binance
+    let ticks = match fetch_binance_klines(
+        symbol,
+        interval,
+        Some(start_time_ms),
+        Some(end_time_ms),
+        Some(1008), // 7 days * 24 hours * 6 klines/hour (5m interval)
+    ).await {
+        Ok(ticks) => {
+            if ticks.is_empty() {
+                println!("⚠️  WARNING: No data fetched from Binance. Skipping test.");
+                return;
+            }
+            ticks
+        }
+        Err(e) => {
+            println!("❌ ERROR: Failed to fetch Binance data: {}. Skipping test.", e);
+            println!("   This test requires internet connection and Binance API access.");
+            return;
+        }
+    };
+    
+    println!("✅ Fetched {} ticks from Binance", ticks.len());
+    
+    // Load config or use minimal test config
+    let cfg = Arc::new(
+        app::config::load_config().unwrap_or_else(|_| {
+            // Minimal test config - relaxed for backtesting
+            let mut cfg = AppCfg::default();
+            cfg.trending.min_spread_bps = 0.1;
+            cfg.trending.max_spread_bps = 100.0;
+            // Use production cooldown settings for realistic backtest results
+            cfg.trending.hft_mode = true; // Enable HFT mode for more signals
+            cfg
+        })
+    );
+    
+    println!("\n=== Running Backtest on Binance Historical Data ===");
+    let results = run_backtest(symbol, ticks, cfg).await;
+    
+    println!("\n=== Backtest Results (Binance Historical Data) ===");
+    println!("Symbol: {}", symbol);
+    println!("Data Period: {} days", days_back);
+    println!("Interval: {}", interval);
+    println!("Winning Trades: {}", results.winning_trades);
+    println!("Losing Trades: {}", results.losing_trades);
+    println!("Total Trades: {}", results.winning_trades + results.losing_trades);
+    println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
+    println!("Win Rate: {:.2}%", results.win_rate * 100.0);
+    println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
+    println!("Max Drawdown: ${:.2}", results.max_drawdown);
+    println!("Profit Factor: {:.2}", results.profit_factor);
+    println!("Average Trade Duration: {:.1} ticks", results.average_trade_duration_ticks);
+    
+    // Basic validation
+    if results.winning_trades + results.losing_trades == 0 {
+        println!("⚠️  WARNING: No trades executed - strategy may need more data or different parameters");
+        return;
+    }
+    
+    println!("\n✅ Backtest completed successfully with real Binance data!");
+    println!("   Strategy executed {} trades on {} days of historical data", 
+        results.winning_trades + results.losing_trades, days_back);
 }
 

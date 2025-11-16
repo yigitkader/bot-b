@@ -1331,10 +1331,16 @@ impl Connection {
                                 let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
                                 let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
                                 
+                                // ✅ CRITICAL: Safe unwrap - constant strings are valid decimals
+                                // But use unwrap_or for extra safety to prevent panic
                                 const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
                                 const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
-                                let significant_mismatch = qty_diff > Decimal::from_str(SIGNIFICANT_QTY_DIFF).unwrap()
-                                    || entry_diff > Decimal::from_str(SIGNIFICANT_ENTRY_DIFF).unwrap();
+                                let significant_qty_diff = Decimal::from_str(SIGNIFICANT_QTY_DIFF)
+                                    .unwrap_or_else(|_| Decimal::from_str("0.0001").expect("Invalid constant"));
+                                let significant_entry_diff = Decimal::from_str(SIGNIFICANT_ENTRY_DIFF)
+                                    .unwrap_or_else(|_| Decimal::from_str("0.01").expect("Invalid constant"));
+                                let significant_mismatch = qty_diff > significant_qty_diff
+                                    || entry_diff > significant_entry_diff;
                                 
                                 POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
                                 

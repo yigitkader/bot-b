@@ -1670,10 +1670,12 @@ impl Ordering {
         // FUTURE: If hedge mode support is added with multiple positions per symbol, position_id
         // should be used to close specific positions. Until then, position_id is reserved for
         // future use and will be logged if provided.
-        if request.position_id.is_some() {
+        // ✅ CRITICAL: Safe unwrap - is_some() check ensures value exists
+        // But use if let for extra safety to prevent panic
+        if let Some(position_id) = &request.position_id {
             warn!(
                 symbol = %request.symbol,
-                position_id = %request.position_id.as_ref().unwrap(),
+                position_id = %position_id,
                 reason = ?request.reason,
                 "ORDERING: CloseRequest.position_id provided but not used - current implementation closes by symbol only"
             );

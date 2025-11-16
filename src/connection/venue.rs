@@ -457,21 +457,28 @@ pub fn from_config(
                 }
                 Err(e) => {
                     last_error = Some(e);
-                    // Check if error is "leverage not valid" - if so, try next lower value
-                    let error_str = last_error.as_ref().unwrap().to_string().to_lowercase();
-                    if error_str.contains("leverage") && (error_str.contains("not valid") || error_str.contains("-4028")) {
-                        // Continue to next lower leverage value
-                        tracing::debug!(
-                            symbol = %sym,
-                            attempted_leverage = lev,
-                            "Leverage {}x not valid for symbol, trying lower value",
-                            lev
-                        );
-                        continue;
+                    // ✅ CRITICAL: Safe unwrap - last_error is Some(e) just above
+                    // But use if let for extra safety to prevent panic
+                    if let Some(ref error) = last_error {
+                        let error_str = error.to_string().to_lowercase();
+                        if error_str.contains("leverage") && (error_str.contains("not valid") || error_str.contains("-4028")) {
+                            // Continue to next lower leverage value
+                            tracing::debug!(
+                                symbol = %sym,
+                                attempted_leverage = lev,
+                                "Leverage {}x not valid for symbol, trying lower value",
+                                lev
+                            );
+                            continue;
+                        } else {
+                            // Other error (network, auth, etc.) - return immediately
+                            warn!(symbol = %sym, leverage = lev, error = ?last_error, "Failed to set leverage (non-leverage error)");
+                            // Safe unwrap - last_error is Some(e) from above
+                            return Err(last_error.unwrap());
+                        }
                     } else {
-                        // Other error (network, auth, etc.) - return immediately
-                        warn!(symbol = %sym, leverage = lev, error = ?last_error, "Failed to set leverage (non-leverage error)");
-                        return Err(last_error.unwrap());
+                        // Should never happen, but defensive programming
+                        return Err(anyhow!("Unknown error setting leverage"));
                     }
                 }
             }

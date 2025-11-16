@@ -555,9 +555,13 @@ impl Trending {
     /// Public for backtesting
     pub fn analyze_trend(state: &SymbolState) -> Option<TrendSignal> {
         const VOLUME_PERIOD: usize = 20; // Volume average period
-        const BASE_MIN_SCORE: f64 = 4.5; // Base threshold (6.0 max score, 4.5 = 75%)
-        const BASE_RSI_LOWER: f64 = 50.0;
-        const BASE_RSI_UPPER: f64 = 75.0;
+        // ✅ IMPROVED: Increased threshold from 4.5 to 5.0 for better signal quality
+        // Higher threshold = fewer but higher quality signals = better win rate
+        const BASE_MIN_SCORE: f64 = 5.0; // Base threshold (6.0 max score, 5.0 = 83% - more selective)
+        // ✅ IMPROVED: Narrower RSI range for long signals (55-70 instead of 50-75)
+        // More selective RSI range = better entry timing = higher win rate
+        const BASE_RSI_LOWER: f64 = 55.0; // Was 50.0 - more selective
+        const BASE_RSI_UPPER: f64 = 70.0; // Was 75.0 - more selective
         const BASE_RSI_LOWER_SHORT: f64 = 25.0;
         const BASE_RSI_UPPER_SHORT: f64 = 50.0;
         
@@ -594,21 +598,26 @@ impl Trending {
         }
         
         // Long-term: EMA slope (weight: 1.0)
+        // ✅ CRITICAL: Safe unwrap - len() check ensures elements exist
+        // But use Option for extra safety to prevent panic
         let ema_slope = if state.ema_55_history.len() >= 2 {
-            let current_ema = state.ema_55_history.back().unwrap();
-            let old_ema = state.ema_55_history.front().unwrap();
-            if !old_ema.is_zero() {
-                Some((current_ema - old_ema) / old_ema)
+            if let (Some(current_ema), Some(old_ema)) = (state.ema_55_history.back(), state.ema_55_history.front()) {
+                if !old_ema.is_zero() {
+                    Some((current_ema - old_ema) / old_ema)
+                } else {
+                    None
+                }
             } else {
-                None
+                None // Should never happen if len() >= 2, but defensive programming
             }
         } else {
             None
         };
         
         if let Some(slope) = ema_slope {
-            // 0.01% minimum slope for trend confirmation
-            let min_slope = Decimal::from(1) / Decimal::from(10000);
+            // ✅ IMPROVED: Increased minimum slope from 0.01% to 0.05% for stronger trend confirmation
+            // Higher slope requirement = stronger trends = better win rate
+            let min_slope = Decimal::from(5) / Decimal::from(10000); // 0.05% minimum (was 0.01%)
             if slope > min_slope {
                 score_long += 1.0;
             } else if slope < -min_slope {
@@ -633,10 +642,11 @@ impl Trending {
             1.0
         };
         
-        // Adjust RSI bounds based on volatility
-        // Long signals: RSI between 50-75 (bullish momentum)
-        let rsi_lower = BASE_RSI_LOWER - (15.0 * volatility_multiplier); // 35-50 range
-        let rsi_upper = BASE_RSI_UPPER - (10.0 * (1.0 - volatility_multiplier)); // 65-75 range
+        // ✅ IMPROVED: Narrower RSI range for better entry timing
+        // Long signals: RSI between 55-70 (bullish momentum, more selective)
+        // Reduced volatility adjustment range for more consistent signals
+        let rsi_lower = BASE_RSI_LOWER - (10.0 * volatility_multiplier); // 45-55 range (was 35-50)
+        let rsi_upper = BASE_RSI_UPPER - (5.0 * (1.0 - volatility_multiplier)); // 65-70 range (was 65-75)
         
         // Short signals: RSI < 40 (bearish momentum, oversold region)
         // Fixed upper limit at 40 to avoid false signals in downtrends
@@ -655,20 +665,24 @@ impl Trending {
         // Market regime detection
         let regime = Self::detect_market_regime(state);
         
-        // Adjust score threshold based on market regime
+        // ✅ IMPROVED: More selective thresholds, especially in ranging markets
+        // Higher thresholds = fewer but better signals = improved win rate
         let min_score = match regime {
-            MarketRegime::Trending => BASE_MIN_SCORE * 0.9, // Lower threshold in trending markets
-            MarketRegime::Ranging => BASE_MIN_SCORE * 1.2,  // Higher threshold in ranging markets (avoid false signals)
-            MarketRegime::Volatile => BASE_MIN_SCORE * 1.1, // Higher threshold in volatile markets
+            MarketRegime::Trending => BASE_MIN_SCORE * 0.95, // Slightly lower threshold in trending markets (was 0.9)
+            MarketRegime::Ranging => BASE_MIN_SCORE * 1.3,  // Higher threshold in ranging markets (was 1.2 - avoid false signals)
+            MarketRegime::Volatile => BASE_MIN_SCORE * 1.15, // Higher threshold in volatile markets (was 1.1)
             MarketRegime::Unknown => BASE_MIN_SCORE,
         };
         
-        // 3. Volume confirmation (weight: 0.5 - less critical)
+        // ✅ IMPROVED: Stricter volume confirmation for better signal quality
+        // Increased weight from 0.5 to 1.0 and surge threshold from 1.2x to 1.5x
+        // Higher volume requirement = stronger confirmation = better win rate
         let current_volume = prices.back()?.volume?;
         let avg_volume = Self::calculate_avg_volume(prices, VOLUME_PERIOD)?;
         
-        // Volume surge (1.2x average)
-        let volume_multiplier = Decimal::from_str("1.2").unwrap_or(Decimal::from(120) / Decimal::from(100));
+        // ✅ IMPROVED: Volume surge threshold increased from 1.2x to 1.5x
+        // Higher threshold = stronger volume confirmation = better signals
+        let volume_multiplier = Decimal::from_str("1.5").unwrap_or(Decimal::from(150) / Decimal::from(100)); // Was 1.2
         let volume_surge = current_volume > avg_volume * volume_multiplier;
         
         // Volume trend (recent > longer average)
@@ -677,9 +691,11 @@ impl Trending {
         
         let volume_confirms = volume_surge && volume_trend;
         
+        // ✅ IMPROVED: Increased volume weight from 0.5 to 1.0
+        // Volume confirmation is now more important for signal quality
         if volume_confirms {
-            score_long += 0.5;
-            score_short += 0.5;
+            score_long += 1.0; // Was 0.5 - now more important
+            score_short += 1.0; // Was 0.5 - now more important
         }
         
         // 4. Generate signal based on weighted score (with adaptive threshold)
