@@ -400,10 +400,32 @@ impl Trending {
     /// Public for backtesting
     pub fn update_indicators(state: &mut SymbolState, new_price: Decimal) {
         // Update EMAs incrementally
-        // ✅ CRITICAL: Pass prices list for SMA bootstrap calculation
-        state.ema_9 = Some(Self::update_ema(state.ema_9, new_price, 9, &state.prices));
-        state.ema_21 = Some(Self::update_ema(state.ema_21, new_price, 21, &state.prices));
-        state.ema_55 = Some(Self::update_ema(state.ema_55, new_price, 55, &state.prices));
+        // ✅ CRITICAL FIX: Only set Some() if we have enough prices for proper bootstrap
+        // Problem: Previously always set Some(), even with wrong values (just new_price)
+        // This caused EMA_55 to be initialized with wrong value, then incremental updates
+        // continued with wrong starting point, leading to incorrect trend analysis
+        // Solution: Only set Some() when prices.len() >= period (proper bootstrap possible)
+        
+        // EMA_9: Need 9 prices for bootstrap
+        if state.prices.len() >= 9 {
+            state.ema_9 = Some(Self::update_ema(state.ema_9, new_price, 9, &state.prices));
+        } else {
+            state.ema_9 = None; // Not enough prices yet
+        }
+        
+        // EMA_21: Need 21 prices for bootstrap
+        if state.prices.len() >= 21 {
+            state.ema_21 = Some(Self::update_ema(state.ema_21, new_price, 21, &state.prices));
+        } else {
+            state.ema_21 = None; // Not enough prices yet
+        }
+        
+        // EMA_55: Need 55 prices for bootstrap
+        if state.prices.len() >= 55 {
+            state.ema_55 = Some(Self::update_ema(state.ema_55, new_price, 55, &state.prices));
+        } else {
+            state.ema_55 = None; // Not enough prices yet
+        }
         
         // Track EMA_55 history for slope calculation
         if let Some(ema_55) = state.ema_55 {
@@ -555,6 +577,14 @@ impl Trending {
     /// Public for backtesting
     pub fn analyze_trend(state: &SymbolState) -> Option<TrendSignal> {
         const VOLUME_PERIOD: usize = 20; // Volume average period
+        const EMA_SLOW_PERIOD: usize = 55; // EMA_55 period (slowest EMA, requires most data)
+        // ✅ CRITICAL FIX: Minimum price points = max(VOLUME_PERIOD, EMA_SLOW_PERIOD)
+        // Problem: EMA_55 requires 55 price points for proper bootstrap, but code only checked VOLUME_PERIOD (20)
+        // This caused trend analysis to fail silently when EMA_55 was None
+        // Solution: Check for max(VOLUME_PERIOD, EMA_SLOW_PERIOD) to ensure all EMAs can initialize
+        // Note: EMA_SLOW_PERIOD (55) > VOLUME_PERIOD (20), so MIN_PRICE_POINTS = 55
+        const MIN_PRICE_POINTS: usize = EMA_SLOW_PERIOD; // 55 price points required (max of VOLUME_PERIOD and EMA_SLOW_PERIOD)
+        
         // ✅ OPTIMIZED: Best parameter from systematic testing (120 combinations tested)
         // Optimization tested: BASE_MIN_SCORE [4.5-5.1], trend_strength [0.5-0.7], SL [1.5-2.0]x, TP [4.0-5.0]x
         // Current best: BASE=5.0, trend=0.7 provides good balance (38.46% win rate, +$6.23 PnL in previous tests)
@@ -569,18 +599,24 @@ impl Trending {
         
         let prices = &state.prices;
         
-        // Need enough prices and indicator data
-        if prices.len() < VOLUME_PERIOD {
+        // ✅ CRITICAL FIX: Check for minimum price points required for all indicators
+        // Need enough prices for: volume average (20) AND EMA_55 bootstrap (55)
+        if prices.len() < MIN_PRICE_POINTS {
             debug!(
                 symbol = %state.symbol,
                 prices_len = prices.len(),
-                required = VOLUME_PERIOD,
-                "TRENDING: Not enough price data for analysis"
+                required = MIN_PRICE_POINTS,
+                volume_period = VOLUME_PERIOD,
+                ema_slow_period = EMA_SLOW_PERIOD,
+                "TRENDING: Not enough price data for analysis (need {} points for EMA_55 bootstrap)",
+                MIN_PRICE_POINTS
             );
             return None;
         }
         
-        // Need EMAs to be initialized
+        // ✅ CRITICAL FIX: Check if EMAs are properly initialized
+        // EMA_55 requires 55 price points for bootstrap (SMA calculation)
+        // If EMA_55 is None, it means we don't have enough data yet
         let ema_fast = state.ema_9?;
         let ema_mid = state.ema_21?;
         let ema_slow = state.ema_55?;
