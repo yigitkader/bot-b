@@ -2104,37 +2104,141 @@ impl Connection {
             }
 
             // Set leverage (only if position is closed or doesn't exist)
+            // ✅ CRITICAL: Leverage mismatch with open position will cause order placement failures
+            // Problem: New symbol rotation may add symbols with existing positions that have different leverage
+            // Solution: Error if leverage mismatch detected (same as startup logic)
             if let Ok(position) = self.venue.get_position(symbol).await {
                 if !position.qty.0.is_zero() {
                     // Position is OPEN - leverage cannot be changed
+                    // Use clamped leverage for comparison
                     if position.leverage != leverage {
-                        warn!(
+                        // ✅ CRITICAL: Leverage mismatch with open position is a critical error
+                        // This will cause order placement to fail with "Leverage X is not valid" error
+                        // Cannot auto-fix while position is open - must close position first
+                        error!(
                             symbol = %symbol,
                             current_leverage = position.leverage,
-                            desired_leverage = leverage,
-                            "CONNECTION: Leverage mismatch for new symbol (position is open, cannot change)"
+                            desired_leverage = desired_leverage,
+                            clamped_leverage = leverage,
+                            "CONNECTION: CRITICAL - Leverage mismatch detected for new symbol (position is open, cannot change). Order placement will fail!"
+                        );
+                        // Note: We don't return error here to allow other symbols to be processed
+                        // But this is logged as ERROR to make it visible
+                        // ORDERING module should handle this by closing position or rejecting orders
+                    } else {
+                        info!(
+                            symbol = %symbol,
+                            leverage,
+                            "CONNECTION: Leverage verified for new symbol (matches clamped leverage, position is open)"
                         );
                     }
                 } else {
                     // Position is CLOSED - safe to set leverage
-                    if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
+                    // ✅ CRITICAL: Re-fetch symbol rules to get max leverage (may have changed or not been fetched yet)
+                    // Use same safe fallback as startup
+                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                    
+                    let final_leverage = match self.venue.rules_for(symbol).await {
+                        Ok(rules) => {
+                            if let Some(symbol_max_lev) = rules.max_leverage {
+                                leverage.min(symbol_max_lev)
+                            } else {
+                                leverage.min(SAFE_LEVERAGE_FALLBACK)
+                            }
+                        }
+                        Err(_) => {
+                            leverage.min(SAFE_LEVERAGE_FALLBACK)
+                        }
+                    };
+                    
+                    if position.leverage != final_leverage {
                         warn!(
-                            error = %e,
                             symbol = %symbol,
-                            leverage,
-                            "CONNECTION: Failed to set leverage for new symbol (non-critical, continuing)"
+                            current_leverage = position.leverage,
+                            desired_leverage = desired_leverage,
+                            final_leverage = final_leverage,
+                            "CONNECTION: Leverage mismatch detected for new symbol (position is closed). Auto-fixing..."
+                        );
+                        match self.venue.set_leverage(symbol, final_leverage).await {
+                            Ok(actual_leverage) => {
+                                if actual_leverage != final_leverage {
+                                    warn!(
+                                        symbol = %symbol,
+                                        desired_leverage = desired_leverage,
+                                        clamped_leverage = final_leverage,
+                                        actual_leverage,
+                                        "CONNECTION: Leverage set to lower value than clamped (step-down mechanism)"
+                                    );
+                                }
+                                // Verify the fix worked
+                                if let Ok(updated_position) = self.venue.get_position(symbol).await {
+                                    if updated_position.leverage == actual_leverage {
+                                        info!(
+                                            symbol = %symbol,
+                                            old_leverage = position.leverage,
+                                            new_leverage = actual_leverage,
+                                            "CONNECTION: Leverage mismatch auto-fixed successfully for new symbol (position was closed)"
+                                        );
+                                    } else {
+                                        warn!(
+                                            symbol = %symbol,
+                                            expected_leverage = actual_leverage,
+                                            actual_leverage = updated_position.leverage,
+                                            "CONNECTION: Leverage fix may not have taken effect immediately (will retry on next check)"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    symbol = %symbol,
+                                    current_leverage = position.leverage,
+                                    desired_leverage = desired_leverage,
+                                    final_leverage = final_leverage,
+                                    "CONNECTION: Failed to auto-fix leverage mismatch for new symbol (all leverage values failed)"
+                                );
+                                // Note: We don't return error here to allow other symbols to be processed
+                            }
+                        }
+                    } else {
+                        info!(
+                            symbol = %symbol,
+                            leverage = final_leverage,
+                            "CONNECTION: Leverage verified for new symbol (matches clamped leverage, position is closed)"
                         );
                     }
                 }
             } else {
                 // No position exists - safe to set leverage
-                if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
-                    warn!(
-                        error = %e,
-                        symbol = %symbol,
-                        leverage,
-                        "CONNECTION: Failed to set leverage for new symbol (non-critical, continuing)"
-                    );
+                // Leverage is already clamped above, so use it directly
+                match self.venue.set_leverage(symbol, leverage).await {
+                    Ok(actual_leverage) => {
+                        if actual_leverage != leverage {
+                            warn!(
+                                symbol = %symbol,
+                                desired_leverage = desired_leverage,
+                                actual_leverage,
+                                "CONNECTION: Leverage set to lower value than desired for new symbol (step-down mechanism)"
+                            );
+                        } else {
+                            info!(
+                                symbol = %symbol,
+                                leverage = actual_leverage,
+                                "CONNECTION: Leverage set successfully for new symbol"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            symbol = %symbol,
+                            leverage,
+                            "CONNECTION: CRITICAL - Failed to set leverage for new symbol (all leverage values failed). Order placement will fail!"
+                        );
+                        // Note: We don't return error here to allow other symbols to be processed
+                        // But this is logged as ERROR to make it visible
+                    }
                 }
             }
         }

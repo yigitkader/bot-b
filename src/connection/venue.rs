@@ -1199,28 +1199,33 @@ pub fn refresh_rules_for(&self, sym: &str) {
             let current_qty = current_pos.qty.0;
 
             // ✅ CRITICAL: Early absolute limit check before attempting to close
-            // Check if position has grown beyond 2x initial before even trying to close
+            // Check if position has grown beyond 1.5x initial before even trying to close
+            // Position büyümesi infinite loop'a yol açabilir - 1.5x'den fazla büyürse abort et
+            const MAX_POSITION_MULTIPLIER: f64 = 1.5; // 1.5x = 50% growth - abort threshold
             let early_position_multiplier = if initial_qty.abs() > Decimal::ZERO {
                 current_qty.abs() / initial_qty.abs()
             } else {
                 Decimal::ZERO
             };
             
-            if early_position_multiplier > Decimal::from(2) {
-                let multiplier_f64 = early_position_multiplier.to_f64().unwrap_or(0.0);
+            let early_multiplier_f64 = early_position_multiplier.to_f64().unwrap_or(0.0);
+            if early_multiplier_f64 > MAX_POSITION_MULTIPLIER {
                 tracing::error!(
                     symbol = %sym,
                     attempt = attempt + 1,
                     initial_qty = %initial_qty,
                     current_qty = %current_qty,
-                    position_multiplier = multiplier_f64,
-                    "POSITION CONTROL LOST (EARLY CHECK): Position is {}x initial size before close attempt. Aborting immediately to prevent infinite loop.",
-                    multiplier_f64
+                    position_multiplier = early_multiplier_f64,
+                    max_multiplier = MAX_POSITION_MULTIPLIER,
+                    "POSITION CONTROL LOST (EARLY CHECK): Position is {:.2}x initial size (exceeds {:.2}x limit) before close attempt. Aborting immediately to prevent infinite loop and excessive risk.",
+                    early_multiplier_f64,
+                    MAX_POSITION_MULTIPLIER
                 );
                 return Err(anyhow!(
-                    "Position control lost: position is {}x initial size ({}) before close attempt. Aborting immediately. Manual intervention required.",
-                    multiplier_f64,
-                    current_qty
+                    "Position control lost: position is {:.2}x initial size ({}) before close attempt, exceeding {:.2}x limit. Aborting immediately. Manual intervention required.",
+                    early_multiplier_f64,
+                    current_qty,
+                    MAX_POSITION_MULTIPLIER
                 ));
             }
 
@@ -1328,18 +1333,19 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         let position_grew_from_attempt = verify_qty.abs() > current_qty.abs();
                         let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
 
-                        // ✅ CRITICAL: Absolute limit check - abort immediately if position > 2x initial
+                        // ✅ CRITICAL: Absolute limit check - abort immediately if position > 1.5x initial
+                        // Position büyümesi infinite loop'a yol açabilir - 1.5x'den fazla büyürse abort et
                         // This prevents infinite loops in volatile markets where position keeps growing
-                        let max_position_multiplier = Decimal::from(2);
+                        // Example: Position 0.5 BTC → NEW order fills +0.3 BTC → Position 0.8 BTC (1.6x) → ABORT
+                        const MAX_POSITION_MULTIPLIER: f64 = 1.5; // 1.5x = 50% growth - abort threshold
                         let position_multiplier = if initial_qty.abs() > Decimal::ZERO {
                             verify_qty.abs() / initial_qty.abs()
                         } else {
                             Decimal::ZERO
                         };
                         
-                        if position_multiplier > max_position_multiplier {
-                            let multiplier_f64 = position_multiplier.to_f64().unwrap_or(0.0);
-                            let max_multiplier_f64 = max_position_multiplier.to_f64().unwrap_or(2.0);
+                        let multiplier_f64 = position_multiplier.to_f64().unwrap_or(0.0);
+                        if multiplier_f64 > MAX_POSITION_MULTIPLIER {
                             tracing::error!(
                                 symbol = %sym,
                                 attempt = attempt + 1,
@@ -1347,16 +1353,16 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 current_qty_at_attempt = %current_qty,
                                 verify_qty = %verify_qty,
                                 position_multiplier = multiplier_f64,
-                                max_multiplier = max_multiplier_f64,
-                                "POSITION CONTROL LOST: Position grew to {}x initial size (exceeds {}x limit). Aborting immediately to prevent infinite loop and excessive risk.",
+                                max_multiplier = MAX_POSITION_MULTIPLIER,
+                                "POSITION CONTROL LOST: Position grew to {:.2}x initial size (exceeds {:.2}x limit). Aborting immediately to prevent infinite loop and excessive risk.",
                                 multiplier_f64,
-                                max_multiplier_f64
+                                MAX_POSITION_MULTIPLIER
                             );
                             return Err(anyhow!(
-                                "Position control lost: position grew to {}x initial size ({}), exceeding {}x limit. Aborting immediately. Manual intervention required.",
+                                "Position control lost: position grew to {:.2}x initial size ({}), exceeding {:.2}x limit. Aborting immediately. Manual intervention required.",
                                 multiplier_f64,
                                 verify_qty,
-                                max_multiplier_f64
+                                MAX_POSITION_MULTIPLIER
                             ));
                         }
 

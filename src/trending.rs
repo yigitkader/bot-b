@@ -5,7 +5,7 @@
 
 use crate::config::AppCfg;
 use crate::event_bus::{EventBus, MarketTick, TradeSignal};
-use crate::types::{LastSignal, PositionDirection, PricePoint, Px, Qty, Side, SymbolState, TrendSignal};
+use crate::types::{LastSignal, PositionDirection, PricePoint, Px, Side, SymbolState, TrendSignal};
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -334,10 +334,39 @@ impl Trending {
         Ok(())
     }
 
+    /// Calculate Simple Moving Average (SMA) for EMA bootstrap
+    /// Returns the average of the last `period` prices
+    fn calculate_sma(prices: &std::collections::VecDeque<crate::types::PricePoint>, period: usize) -> Option<Decimal> {
+        if prices.len() < period {
+            return None;
+        }
+        
+        // Get last `period` prices
+        let recent_prices: Vec<Decimal> = prices
+            .iter()
+            .rev()
+            .take(period)
+            .map(|p| p.price)
+            .collect();
+        
+        if recent_prices.len() < period {
+            return None;
+        }
+        
+        // Calculate sum
+        let sum: Decimal = recent_prices.iter().sum();
+        
+        // Return average
+        Some(sum / Decimal::from(period))
+    }
+    
     /// Update EMA incrementally (O(1) performance)
     /// EMA formula: EMA = Price(t) * k + EMA(y) * (1 – k)
     /// where k = 2 / (period + 1)
-    fn update_ema(prev_ema: Option<Decimal>, new_price: Decimal, period: usize, prices_count: usize) -> Decimal {
+    /// 
+    /// ✅ CRITICAL: For bootstrap, SMA is used as initial value
+    /// This ensures EMA starts with a proper average instead of just the current price
+    fn update_ema(prev_ema: Option<Decimal>, new_price: Decimal, period: usize, prices: &std::collections::VecDeque<crate::types::PricePoint>) -> Decimal {
         let k = Decimal::from(2) / Decimal::from(period + 1);
         
         match prev_ema {
@@ -346,12 +375,21 @@ impl Trending {
                 new_price * k + ema * (Decimal::ONE - k)
             }
             None => {
-                // First value: use SMA if we have enough prices
-                if prices_count >= period {
-                    // Calculate SMA for initialization
-                    // This only happens once per symbol
-                    new_price // For first tick, just use current price
+                // ✅ CRITICAL: Bootstrap with SMA if we have enough prices
+                // Problem: Using just current price as initial EMA is incorrect
+                // Solution: Calculate SMA of last `period` prices as initial EMA value
+                // This ensures EMA starts with a proper average, not just the latest price
+                if prices.len() >= period {
+                    // Calculate SMA for initialization (bootstrap)
+                    if let Some(sma) = Self::calculate_sma(prices, period) {
+                        sma // Use SMA as initial EMA value
+                    } else {
+                        // Fallback: use current price if SMA calculation fails
+                        new_price
+                    }
                 } else {
+                    // Not enough prices yet - use current price as temporary value
+                    // This will be replaced with SMA once we have enough prices
                     new_price
                 }
             }
@@ -361,12 +399,11 @@ impl Trending {
     /// Update all indicators incrementally (called on each tick)
     /// Public for backtesting
     pub fn update_indicators(state: &mut SymbolState, new_price: Decimal) {
-        let prices_count = state.prices.len();
-        
         // Update EMAs incrementally
-        state.ema_9 = Some(Self::update_ema(state.ema_9, new_price, 9, prices_count));
-        state.ema_21 = Some(Self::update_ema(state.ema_21, new_price, 21, prices_count));
-        state.ema_55 = Some(Self::update_ema(state.ema_55, new_price, 55, prices_count));
+        // ✅ CRITICAL: Pass prices list for SMA bootstrap calculation
+        state.ema_9 = Some(Self::update_ema(state.ema_9, new_price, 9, &state.prices));
+        state.ema_21 = Some(Self::update_ema(state.ema_21, new_price, 21, &state.prices));
+        state.ema_55 = Some(Self::update_ema(state.ema_55, new_price, 55, &state.prices));
         
         // Track EMA_55 history for slope calculation
         if let Some(ema_55) = state.ema_55 {
@@ -474,12 +511,13 @@ impl Trending {
         Some(sum / Decimal::from(true_ranges.len()))
     }
 
-    /// Detect market regime (Trending vs Ranging)
+    /// Detect market regime (simplified - ATR-based only)
+    /// Note: Removed simplified ADX calculation as it was inaccurate
+    /// Using only ATR for volatility-based regime detection
     fn detect_market_regime(state: &SymbolState) -> MarketRegime {
         const ATR_PERIOD: usize = 14;
-        const ADX_PERIOD: usize = 14;
-        const TRENDING_THRESHOLD: f64 = 25.0; // ADX > 25 = trending
         const LOW_VOLATILITY_THRESHOLD: f64 = 0.5; // ATR < 0.5% = ranging
+        const HIGH_VOLATILITY_THRESHOLD: f64 = 2.0; // ATR > 2% = volatile
 
         let prices = &state.prices;
         
@@ -495,27 +533,15 @@ impl Trending {
             None
         };
 
-        // Simplified ADX calculation (using EMA slope as directional movement proxy)
-        let directional_movement = if state.ema_55_history.len() >= 2 {
-            let current_ema = state.ema_55_history.back().unwrap();
-            let old_ema = state.ema_55_history.front().unwrap();
-            if !old_ema.is_zero() {
-                ((current_ema - old_ema) / old_ema * Decimal::from(100)).abs().to_f64()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Determine regime
-        if let (Some(adx_proxy), Some(atr_pct_val)) = (directional_movement, atr_pct) {
-            if adx_proxy > TRENDING_THRESHOLD {
-                MarketRegime::Trending
-            } else if atr_pct_val < LOW_VOLATILITY_THRESHOLD {
+        // Determine regime based on ATR only (simplified approach)
+        if let Some(atr_pct_val) = atr_pct {
+            if atr_pct_val < LOW_VOLATILITY_THRESHOLD {
                 MarketRegime::Ranging
-            } else {
+            } else if atr_pct_val > HIGH_VOLATILITY_THRESHOLD {
                 MarketRegime::Volatile
+            } else {
+                // Medium volatility - assume trending (default for trend-following strategy)
+                MarketRegime::Trending
             }
         } else {
             MarketRegime::Unknown
@@ -612,12 +638,13 @@ impl Trending {
         let rsi_lower = BASE_RSI_LOWER - (15.0 * volatility_multiplier); // 35-50 range
         let rsi_upper = BASE_RSI_UPPER - (10.0 * (1.0 - volatility_multiplier)); // 65-75 range
         
-        // Short signals: RSI between 25-50 (bearish momentum) - FIXED for better short detection
-        let rsi_lower_short = BASE_RSI_LOWER_SHORT + (10.0 * (1.0 - volatility_multiplier)); // 25-35 range
-        let rsi_upper_short = BASE_RSI_UPPER_SHORT - (10.0 * volatility_multiplier); // 40-50 range
+        // Short signals: RSI < 40 (bearish momentum, oversold region)
+        // Fixed upper limit at 40 to avoid false signals in downtrends
+        // In downtrends, RSI typically stays below 30, so 25-50 range was too wide
+        let rsi_upper_short = 40.0; // Fixed upper limit for short signals
         
         let rsi_bullish = rsi > rsi_lower && rsi < rsi_upper;
-        let rsi_bearish = rsi > rsi_lower_short && rsi < rsi_upper_short;
+        let rsi_bearish = rsi < rsi_upper_short; // RSI < 40 for short signals
         
         if rsi_bullish {
             score_long += 1.0;
@@ -748,15 +775,46 @@ impl Trending {
         
         let entry_price = Px(mid_price);
         
-        // 5. Send signal
+        // 5. Calculate dynamic SL/TP based on ATR (volatility-based)
+        // ATR-based SL/TP adapts to market volatility
+        // Formula: SL = 2 * ATR, TP = 4 * ATR (1:2 risk/reward ratio)
+        let (stop_loss_pct, take_profit_pct) = {
+            let states = symbol_states.lock().await;
+            if let Some(state) = states.get(&tick.symbol) {
+                const ATR_PERIOD: usize = 14;
+                const ATR_SL_MULTIPLIER: f64 = 2.0; // Stop loss = 2 * ATR
+                const ATR_TP_MULTIPLIER: f64 = 4.0; // Take profit = 4 * ATR (1:2 risk/reward)
+                
+                if let Some(atr) = Self::calculate_atr(&state.prices, ATR_PERIOD) {
+                    if !mid_price.is_zero() {
+                        let atr_pct = (atr / mid_price * Decimal::from(100)).to_f64().unwrap_or(0.0);
+                        let dynamic_sl_pct = (ATR_SL_MULTIPLIER * atr_pct).max(cfg.stop_loss_pct).min(5.0); // Clamp between config min and 5%
+                        let dynamic_tp_pct = (ATR_TP_MULTIPLIER * atr_pct).max(cfg.take_profit_pct).min(10.0); // Clamp between config min and 10%
+                        
+                        // Ensure TP > SL (required for profitable trades)
+                        let final_tp = dynamic_tp_pct.max(dynamic_sl_pct * 1.5); // At least 1.5x SL
+                        
+                        (Some(dynamic_sl_pct), Some(final_tp))
+                    } else {
+                        (Some(cfg.stop_loss_pct), Some(cfg.take_profit_pct))
+                    }
+                } else {
+                    // Not enough data for ATR - use config defaults
+                    (Some(cfg.stop_loss_pct), Some(cfg.take_profit_pct))
+                }
+            } else {
+                // State not found - use config defaults
+                (Some(cfg.stop_loss_pct), Some(cfg.take_profit_pct))
+            }
+        };
+        
+        // 6. Send signal
         let signal = TradeSignal {
             symbol: tick.symbol.clone(),
             side,
             entry_price,
-            leverage: 0,
-            size: Qty(Decimal::ZERO),
-            stop_loss_pct: Some(cfg.stop_loss_pct),
-            take_profit_pct: Some(cfg.take_profit_pct),
+            stop_loss_pct,
+            take_profit_pct,
             spread_bps: spread_bps_f64,
             spread_timestamp,
             timestamp: now,

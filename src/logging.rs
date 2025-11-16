@@ -322,8 +322,8 @@ impl Logging {
                             symbol = %signal.symbol,
                             side = ?signal.side,
                             entry_price = %signal.entry_price.0,
-                            size = %signal.size.0,
-                            leverage = signal.leverage,
+                            // NOTE: size and leverage are calculated by ORDERING, not provided by TRENDING
+                            // These fields were removed from TradeSignal to maintain clear separation of concerns
                             "LOGGING: TradeSignal received"
                         );
                     }

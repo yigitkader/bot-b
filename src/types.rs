@@ -3,7 +3,7 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ============================================================================
 // Core Domain Types
@@ -219,10 +219,10 @@ pub struct TradeSignal {
     pub symbol: String,
     pub side: Side,
     pub entry_price: Px,
-    pub leverage: u32,
-    pub size: Qty,
-    pub stop_loss_pct: Option<f64>, // Optional stop loss percentage
-    pub take_profit_pct: Option<f64>, // Optional take profit percentage
+    /// Stop loss percentage (optional)
+    pub stop_loss_pct: Option<f64>,
+    /// Take profit percentage (optional)
+    pub take_profit_pct: Option<f64>,
     /// Spread in basis points when signal was generated (for validation at order placement)
     pub spread_bps: f64,
     /// Timestamp when spread was measured (for staleness check)
@@ -230,6 +230,14 @@ pub struct TradeSignal {
     pub spread_timestamp: Instant, // Not serialized, only for runtime use
     #[serde(skip)]
     pub timestamp: Instant, // Not serialized, only for runtime use
+    // NOTE: leverage and size are NOT part of TradeSignal
+    // These are calculated by ORDERING module based on:
+    // - Available balance
+    // - Margin strategy (fixed/balance_based/dynamic)
+    // - Symbol's max leverage
+    // - Risk limits (min/max margin, max position notional)
+    // TRENDING's responsibility: Only generate signals (long/short) with entry price
+    // ORDERING's responsibility: Calculate leverage, margin, notional, and position size
 }
 
 /// Close request event - published by FOLLOW_ORDERS
@@ -398,6 +406,20 @@ pub struct OrderingState {
     /// This tracks balance reservations atomically with state checks
     /// Prevents double-spend by ensuring only one thread can reserve balance at a time
     pub reserved_margin: Decimal,
+    /// Circuit breaker state for order rejections
+    /// Prevents Binance ban by stopping order placement after too many rejections
+    pub circuit_breaker: CircuitBreakerState,
+}
+
+/// Circuit breaker state to prevent excessive order rejections
+#[derive(Clone, Debug)]
+pub struct CircuitBreakerState {
+    /// Number of consecutive order rejections
+    pub reject_count: u32,
+    /// Timestamp when circuit breaker was last triggered
+    pub last_trigger_time: Option<Instant>,
+    /// Whether circuit breaker is currently open (blocking orders)
+    pub is_open: bool,
 }
 
 impl OrderingState {
@@ -408,6 +430,72 @@ impl OrderingState {
             last_order_update_timestamp: None,
             last_position_update_timestamp: None,
             reserved_margin: Decimal::ZERO,
+            circuit_breaker: CircuitBreakerState {
+                reject_count: 0,
+                last_trigger_time: None,
+                is_open: false,
+            },
+        }
+    }
+}
+
+impl CircuitBreakerState {
+    pub fn new() -> Self {
+        Self {
+            reject_count: 0,
+            last_trigger_time: None,
+            is_open: false,
+        }
+    }
+    
+    /// Check if circuit breaker should block orders
+    /// Returns true if circuit breaker is open (should block orders)
+    pub fn should_block(&self) -> bool {
+        if !self.is_open {
+            return false;
+        }
+        
+        // Check if cooldown period has passed (5 minutes)
+        if let Some(last_trigger) = self.last_trigger_time {
+            let elapsed = Instant::now().duration_since(last_trigger);
+            if elapsed > Duration::from_secs(300) { // 5 minutes cooldown
+                return false; // Cooldown passed, allow orders again
+            }
+        }
+        
+        true // Circuit breaker is open and cooldown not passed
+    }
+    
+    /// Record an order rejection and check if circuit breaker should open
+    /// Returns true if circuit breaker should open (threshold exceeded)
+    pub fn record_rejection(&mut self) -> bool {
+        self.reject_count += 1;
+        
+        const REJECT_THRESHOLD: u32 = 5; // Open circuit after 5 consecutive rejections
+        
+        if self.reject_count >= REJECT_THRESHOLD {
+            self.is_open = true;
+            self.last_trigger_time = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Reset circuit breaker (called after successful order)
+    pub fn reset(&mut self) {
+        self.reject_count = 0;
+        self.is_open = false;
+        self.last_trigger_time = None;
+    }
+    
+    /// Reset circuit breaker if cooldown period has passed
+    pub fn reset_if_cooldown_passed(&mut self) {
+        if let Some(last_trigger) = self.last_trigger_time {
+            let elapsed = Instant::now().duration_since(last_trigger);
+            if elapsed > Duration::from_secs(300) { // 5 minutes cooldown
+                self.reset();
+            }
         }
     }
 }
