@@ -123,6 +123,20 @@ pub trait Venue: Send + Sync {
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)>;
     async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>>;
     async fn get_position(&self, sym: &str) -> Result<Position>;
+    /// Get all open positions from exchange
+    /// Returns Vec<(symbol, position)> for all positions with non-zero qty
+    async fn get_all_positions(&self) -> Result<Vec<(String, Position)>>;
+    /// Place trailing stop market order
+    /// activation_price: Price at which trailing stop activates
+    /// callback_rate: Trailing stop callback rate (0.001 = 0.1%, Binance expects percentage 0.1)
+    /// quantity: Position quantity to close
+    async fn place_trailing_stop_order(
+        &self,
+        symbol: &str,
+        activation_price: Px,
+        callback_rate: f64, // 0.001 = 0.1%
+        quantity: Qty,
+    ) -> Result<String>;
     async fn available_balance(&self, asset: &str) -> Result<Decimal>;
 }
 
@@ -973,6 +987,111 @@ pub fn refresh_rules_for(&self, sym: &str) {
         }
 
         Ok(res)
+    }
+
+    /// Fetch all open positions from exchange
+    /// Returns Vec<(symbol, position)> for all positions with non-zero qty
+    /// Used for order monitoring fallback and position reconciliation
+    pub async fn fetch_all_positions(&self) -> Result<Vec<(String, Position)>> {
+        let qs = format!(
+            "timestamp={}&recvWindow={}",
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!(
+            "{}/fapi/v2/positionRisk?{}&signature={}",
+            self.base, qs, sig
+        );
+        
+        let positions: Vec<FutPosition> = send_json(
+            self.common
+                .client
+                .get(url)
+                .header("X-MBX-APIKEY", &self.common.api_key),
+        )
+        .await?;
+
+        let mut result = Vec::new();
+        
+        for pos in positions {
+            let qty = Decimal::from_str(&pos.position_amt).unwrap_or(Decimal::ZERO);
+            
+            // Only include positions with non-zero qty
+            if !qty.is_zero() {
+                let symbol = pos.symbol.clone();
+                let entry = Decimal::from_str(&pos.entry_price)?;
+                let leverage = pos.leverage.parse::<u32>().unwrap_or(1);
+                let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
+                let liq_px = if liq > Decimal::ZERO {
+                    Some(Px(liq))
+                } else {
+                    None
+                };
+                
+                let position = Position {
+                    symbol: symbol.clone(),
+                    qty: Qty(qty),
+                    entry: Px(entry),
+                    leverage,
+                    liq_px,
+                };
+                
+                result.push((symbol, position));
+            }
+        }
+        
+        Ok(result)
+    }
+
+    /// Place trailing stop market order
+    /// activation_price: Price at which trailing stop activates
+    /// callback_rate: Trailing stop callback rate (0.001 = 0.1%, Binance expects percentage 0.1)
+    /// quantity: Position quantity to close
+    pub async fn place_trailing_stop_order(
+        &self,
+        sym: &str,
+        activation_price: Px,
+        callback_rate: f64, // 0.001 = 0.1%
+        qty: Qty,
+    ) -> Result<String> {
+        let rules = self.rules_for(sym).await?;
+        let qty_str = format_decimal_fixed(qty.0, rules.qty_precision);
+        let activation_price_str = format_decimal_fixed(activation_price.0, rules.price_precision);
+        
+        // Binance expects callback rate as percentage (0.1 not 0.001)
+        // Example: callback_rate = 0.001 (0.1%) → callback_rate_pct = 0.1
+        let callback_rate_pct = callback_rate * 100.0;
+        
+        let mut params = vec![
+            format!("symbol={}", sym),
+            "type=TRAILING_STOP_MARKET".to_string(),
+            format!("activationPrice={}", activation_price_str),
+            format!("callbackRate={}", callback_rate_pct),
+            format!("quantity={}", qty_str),
+            "reduceOnly=true".to_string(),
+            format!("timestamp={}", BinanceCommon::ts()),
+            format!("recvWindow={}", self.common.recv_window_ms),
+        ];
+        
+        if self.hedge_mode {
+            // Determine position side from quantity sign
+            let position_side = if qty.0.is_sign_positive() {
+                "LONG"
+            } else {
+                "SHORT"
+            };
+            params.push(format!("positionSide={}", position_side));
+        }
+        
+        let qs = params.join("&");
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
+        
+        let resp = ensure_success(self.common.client.post(&url).send().await?).await?;
+        let order: FutPlacedOrder = resp.json().await?;
+        
+        Ok(order.order_id.to_string())
     }
 
 /// Get current margin type for a symbol
@@ -2243,6 +2362,20 @@ impl Venue for BinanceFutures {
         self.fetch_position(sym).await
     }
 
+    async fn get_all_positions(&self) -> Result<Vec<(String, Position)>> {
+        BinanceFutures::fetch_all_positions(self).await
+    }
+
+    async fn place_trailing_stop_order(
+        &self,
+        symbol: &str,
+        activation_price: Px,
+        callback_rate: f64,
+        quantity: Qty,
+    ) -> Result<String> {
+        BinanceFutures::place_trailing_stop_order(self, symbol, activation_price, callback_rate, quantity).await
+    }
+
     async fn available_balance(&self, asset: &str) -> Result<Decimal> {
     // Call BinanceFutures::available_balance method (not trait method to avoid recursion)
         BinanceFutures::available_balance(self, asset).await
@@ -2453,6 +2586,32 @@ async fn ensure_success(resp: Response) -> Result<Response> {
     if status.is_success() {
         Ok(resp)
     } else {
+        // ✅ NEW: Handle 429 Too Many Requests with Retry-After header
+        if status == 429 {
+            let retry_after = resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            
+            if let Some(seconds) = retry_after {
+                tracing::warn!(
+                    status = %status,
+                    retry_after_seconds = seconds,
+                    "Binance API rate limit exceeded (429), waiting {} seconds before retry",
+                    seconds
+                );
+                // Wait for retry-after duration
+                tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            } else {
+                // No retry-after header, use default 1 second
+                tracing::warn!(
+                    status = %status,
+                    "Binance API rate limit exceeded (429), no Retry-After header, waiting 1 second"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        
         let body = resp.text().await.unwrap_or_default();
         
         // ✅ CRITICAL: Some Binance errors are not actual errors but informational messages
@@ -2473,6 +2632,9 @@ async fn ensure_success(resp: Response) -> Result<Response> {
             // Leverage errors are expected - system will automatically try lower leverage
             // Log as WARN instead of ERROR to reduce noise
             tracing::warn!(%status, %body, "binance api error (leverage not valid - will try lower)");
+        } else if status == 429 {
+            // 429 already logged above with retry-after info
+            // Don't log again as ERROR
         } else {
             tracing::error!(%status, %body, "binance api error");
         }

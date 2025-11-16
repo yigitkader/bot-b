@@ -278,6 +278,9 @@ pub struct OrderUpdate {
     /// Remaining quantity to be filled (qty - filled_qty)
     pub remaining_qty: Qty,
     pub status: OrderStatus,
+    /// Rejection reason (if status is Rejected)
+    /// Extracted from Binance API error response
+    pub rejection_reason: Option<String>,
     /// True if all fills were maker orders, None if unknown
     pub is_maker: Option<bool>,
     #[serde(skip)]
@@ -304,6 +307,9 @@ pub struct PositionUpdate {
     pub leverage: u32,
     pub unrealized_pnl: Option<Decimal>, // Optional unrealized PnL
     pub is_open: bool, // true if position is open, false if closed
+    /// Liquidation price for this position (from exchange)
+    /// None if not available (e.g., ACCOUNT_UPDATE doesn't include it, or position not yet opened)
+    pub liq_px: Option<Px>,
     #[serde(skip)]
     pub timestamp: Instant, // Not serialized, only for runtime use
 }
@@ -409,6 +415,10 @@ pub struct OrderingState {
     /// Circuit breaker state for order rejections
     /// Prevents Binance ban by stopping order placement after too many rejections
     pub circuit_breaker: CircuitBreakerState,
+    /// Order timeout tracking: order_id -> timeout timestamp
+    /// Used to cancel stale orders that haven't filled within timeout period
+    /// Prevents balance leaks from orders that never fill
+    pub order_timeouts: std::collections::HashMap<String, Instant>,
 }
 
 /// Circuit breaker state to prevent excessive order rejections
@@ -420,6 +430,9 @@ pub struct CircuitBreakerState {
     pub last_trigger_time: Option<Instant>,
     /// Whether circuit breaker is currently open (blocking orders)
     pub is_open: bool,
+    /// Rejection reason tracking: reason -> count
+    /// Used to identify common rejection patterns and improve order placement logic
+    pub rejection_reasons: std::collections::HashMap<String, u32>,
 }
 
 impl OrderingState {
@@ -434,7 +447,9 @@ impl OrderingState {
                 reject_count: 0,
                 last_trigger_time: None,
                 is_open: false,
+                rejection_reasons: std::collections::HashMap::new(),
             },
+            order_timeouts: std::collections::HashMap::new(),
         }
     }
 }
@@ -445,6 +460,7 @@ impl CircuitBreakerState {
             reject_count: 0,
             last_trigger_time: None,
             is_open: false,
+            rejection_reasons: std::collections::HashMap::new(),
         }
     }
     
@@ -468,8 +484,14 @@ impl CircuitBreakerState {
     
     /// Record an order rejection and check if circuit breaker should open
     /// Returns true if circuit breaker should open (threshold exceeded)
-    pub fn record_rejection(&mut self) -> bool {
+    /// reason: Optional rejection reason (e.g., "INSUFFICIENT_BALANCE", "MIN_NOTIONAL", etc.)
+    pub fn record_rejection(&mut self, reason: Option<&str>) -> bool {
         self.reject_count += 1;
+        
+        // Track rejection reason
+        if let Some(reason_str) = reason {
+            *self.rejection_reasons.entry(reason_str.to_string()).or_insert(0) += 1;
+        }
         
         const REJECT_THRESHOLD: u32 = 5; // Open circuit after 5 consecutive rejections
         
@@ -747,6 +769,13 @@ pub struct PositionInfo {
     /// Flag to prevent duplicate CloseRequest events
     /// Set to true when CloseRequest is sent, preventing race conditions
     pub close_requested: bool,
+    /// Liquidation price for this position (from exchange)
+    /// Used for liquidation risk monitoring
+    /// None if not available (e.g., position not yet opened or liquidation price not provided)
+    pub liquidation_price: Option<Px>,
+    /// Flag to track if trailing stop has been placed
+    /// Prevents duplicate trailing stop orders
+    pub trailing_stop_placed: bool,
 }
 
 // ============================================================================

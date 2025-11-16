@@ -4,6 +4,7 @@
 // Publishes CloseRequest events
 
 use crate::config::AppCfg;
+use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
 use crate::types::{PositionDirection, PositionInfo, Px, Qty};
 use anyhow::{anyhow, Result};
@@ -15,13 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// FOLLOW_ORDERS module - position tracking and TP/SL control
 pub struct FollowOrders {
     cfg: Arc<AppCfg>,
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
+    connection: Arc<Connection>,
     positions: Arc<RwLock<HashMap<String, PositionInfo>>>,
     tp_sl_from_signals: Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
 }
@@ -31,11 +33,13 @@ impl FollowOrders {
         cfg: Arc<AppCfg>,
         event_bus: Arc<EventBus>,
         shutdown_flag: Arc<AtomicBool>,
+        connection: Arc<Connection>,
     ) -> Self {
         Self {
             cfg,
             event_bus,
             shutdown_flag,
+            connection,
             positions: Arc::new(RwLock::new(HashMap::new())),
             tp_sl_from_signals: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -148,6 +152,7 @@ impl FollowOrders {
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
         let cfg_tick = cfg.clone();
+        let connection_tick = self.connection.clone();
         tokio::spawn(async move {
             let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
             
@@ -160,7 +165,7 @@ impl FollowOrders {
                             break;
                         }
                         
-                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &event_bus_tick, &cfg_tick).await {
+                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &event_bus_tick, &cfg_tick, &connection_tick).await {
                             warn!(error = %e, symbol = %tick.symbol, "FOLLOW_ORDERS: error checking TP/SL");
                         }
                     }
@@ -253,6 +258,8 @@ impl FollowOrders {
                 opened_at: Instant::now(),
                 is_maker: None, // Will be updated from OrderUpdate when order is filled
                 close_requested: false, // Initialize to false - will be set when CloseRequest is sent
+                liquidation_price: update.liq_px, // ✅ NEW: Store liquidation price for risk monitoring
+                trailing_stop_placed: false, // ✅ NEW: Initialize trailing stop flag
             });
             
             info!(
@@ -299,6 +306,7 @@ impl FollowOrders {
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         event_bus: &Arc<EventBus>,
         cfg: &Arc<AppCfg>,
+        connection: &Arc<Connection>,
     ) -> Result<()> {
         // ✅ CRITICAL: Fast early check - position must exist to process TP/SL
         // Performance: If no position, return immediately (no expensive PnL calculations)
@@ -417,9 +425,149 @@ impl FollowOrders {
         let net_pnl_pct_f64 = net_pnl_pct.to_f64().unwrap_or(0.0);
         let gross_pnl_pct_f64 = gross_pnl_pct.to_f64().unwrap_or(0.0);
         
-        // Check take profit (using net PnL - commission included)
+        // ✅ NEW: Liquidation risk monitoring
+        if let Some(liquidation_price) = position.liquidation_price {
+            let liquidation_distance_pct = match position.direction {
+                PositionDirection::Long => {
+                    // Long: liquidation_price < current_price
+                    // Distance = (current_price - liquidation_price) / liquidation_price * 100
+                    if liquidation_price.0 > Decimal::ZERO {
+                        let distance = ((current_price_val - liquidation_price.0) / liquidation_price.0) * Decimal::from(100);
+                        distance.to_f64().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    }
+                }
+                PositionDirection::Short => {
+                    // Short: liquidation_price > current_price
+                    // Distance = (liquidation_price - current_price) / current_price * 100
+                    if current_price_val > Decimal::ZERO {
+                        let distance = ((liquidation_price.0 - current_price_val) / current_price_val) * Decimal::from(100);
+                        distance.to_f64().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            
+            // Warning at 10% distance
+            if liquidation_distance_pct < 10.0 && liquidation_distance_pct >= 5.0 {
+                warn!(
+                    symbol = %tick.symbol,
+                    liquidation_distance_pct,
+                    liquidation_price = %liquidation_price.0,
+                    current_price = %current_price_val,
+                    "CRITICAL: Position close to liquidation! Distance: {:.2}%",
+                    liquidation_distance_pct
+                );
+            }
+            
+            // Auto-close at 5% distance
+            if liquidation_distance_pct < 5.0 {
+                error!(
+                    symbol = %tick.symbol,
+                    liquidation_distance_pct,
+                    liquidation_price = %liquidation_price.0,
+                    current_price = %current_price_val,
+                    "CRITICAL: Liquidation risk too high ({}%), auto-closing position",
+                    liquidation_distance_pct
+                );
+                
+                // Send CloseRequest with Manual reason
+                let position_removed = {
+                    let mut positions_guard = positions.write().await;
+                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
+                        pos.close_requested = true;
+                        positions_guard.remove(&tick.symbol).is_some()
+                    } else {
+                        false
+                    }
+                };
+                
+                if position_removed {
+                    let close_request = CloseRequest {
+                        symbol: tick.symbol.clone(),
+                        position_id: None,
+                        reason: CloseReason::Manual,
+                        current_bid: Some(tick.bid),
+                        current_ask: Some(tick.ask),
+                        timestamp: Instant::now(),
+                    };
+                    
+                    if let Err(e) = event_bus.close_request_tx.send(close_request) {
+                        error!(
+                            error = ?e,
+                            symbol = %tick.symbol,
+                            "FOLLOW_ORDERS: Failed to send CloseRequest for liquidation risk"
+                        );
+                    } else {
+                        info!(
+                            symbol = %tick.symbol,
+                            liquidation_distance_pct,
+                            "FOLLOW_ORDERS: Auto-closed position due to liquidation risk"
+                        );
+                    }
+                }
+                
+                return Ok(()); // Exit early - position will be closed
+            }
+        }
+        
+        // ✅ NEW: Trailing stop placement when TP threshold is reached
         if let Some(tp_pct) = position.take_profit_pct {
             if net_pnl_pct_f64 >= tp_pct {
+                // TP threshold reached - check if trailing stop should be placed
+                if cfg.trending.use_trailing_stop && !position.trailing_stop_placed {
+                    // Calculate TP price (activation price for trailing stop)
+                    let tp_price = match position.direction {
+                        PositionDirection::Long => {
+                            // Long: TP = entry * (1 + tp_pct / 100)
+                            position.entry_price.0 * (Decimal::from(1) + Decimal::from_str(&format!("{}", tp_pct / 100.0)).unwrap_or(Decimal::ZERO))
+                        }
+                        PositionDirection::Short => {
+                            // Short: TP = entry * (1 - tp_pct / 100)
+                            position.entry_price.0 * (Decimal::from(1) - Decimal::from_str(&format!("{}", tp_pct / 100.0)).unwrap_or(Decimal::ZERO))
+                        }
+                    };
+                    
+                    // Place trailing stop order
+                    match connection.place_trailing_stop_order(
+                        &position.symbol,
+                        Px(tp_price),
+                        cfg.trending.trailing_stop_callback_rate,
+                        position.qty,
+                    ).await {
+                        Ok(order_id) => {
+                            info!(
+                                symbol = %position.symbol,
+                                order_id = %order_id,
+                                activation_price = %tp_price,
+                                callback_rate = cfg.trending.trailing_stop_callback_rate,
+                                "FOLLOW_ORDERS: Trailing stop placed at TP threshold - position will be managed by trailing stop"
+                            );
+                            
+                            // Mark as placed
+                            let mut positions_guard = positions.write().await;
+                            if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
+                                pos.trailing_stop_placed = true;
+                            }
+                            
+                            // ✅ CRITICAL: Do NOT send CloseRequest when trailing stop is placed
+                            // Trailing stop will manage the position closure automatically
+                            // Return early to prevent immediate CloseRequest
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                symbol = %position.symbol,
+                                "FOLLOW_ORDERS: Failed to place trailing stop order, falling back to immediate close"
+                            );
+                            // Fall through to normal TP close if trailing stop placement fails
+                        }
+                    }
+                }
+                
                 // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
                 // Race condition prevention (Layer 2 - Atomic Remove):
                 // - Multiple threads can reach here if they all pass early check (close_requested flag)

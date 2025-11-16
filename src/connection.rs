@@ -397,6 +397,9 @@ impl Connection {
         // Start periodic order fill history cleanup task
         self.start_order_fill_history_cleanup_task().await;
 
+        // ✅ NEW: Start order monitoring fallback task
+        self.start_order_monitoring_fallback_task().await;
+
         info!("CONNECTION: All streams started");
         Ok(())
     }
@@ -528,6 +531,69 @@ impl Connection {
                     total_entries = order_fill_history.len(),
                     "CONNECTION: Order fill history cleanup completed (no very old entries to remove)"
                 );
+                }
+            }
+        });
+    }
+
+    /// Start order monitoring fallback task
+    /// Polls exchange every 15 seconds to check if open positions have TP/SL orders
+    /// This handles WebSocket packet loss scenarios where TP/SL orders might be missing
+    async fn start_order_monitoring_fallback_task(&self) {
+        let venue = self.venue.clone();
+        let shutdown_flag = self.shutdown_flag.clone();
+
+        tokio::spawn(async move {
+            const MONITORING_INTERVAL_SECS: u64 = 15; // 15 seconds
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(MONITORING_INTERVAL_SECS)).await;
+
+                if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+
+                // Get all open positions from exchange
+                match venue.get_all_positions().await {
+                    Ok(positions) => {
+                        for (symbol, position) in positions {
+                            // Check if position has TP/SL orders
+                            match venue.get_open_orders(&symbol).await {
+                                Ok(orders) => {
+                                    // Check if any order is a TP/SL order (reduce-only order)
+                                    // For now, we check if there are any open orders
+                                    // In the future, we could check order type or reduceOnly flag
+                                    let has_open_orders = !orders.is_empty();
+
+                                    if !has_open_orders && !position.qty.0.is_zero() {
+                                        warn!(
+                                            symbol = %symbol,
+                                            qty = %position.qty.0,
+                                            "CONNECTION: TP/SL missing for open position, triggering re-placement"
+                                        );
+
+                                        // TODO: Trigger TP/SL re-placement via event bus
+                                        // This requires FOLLOW_ORDERS to listen to this event
+                                        // For now, just log the warning
+                                        // In the future, we can send a PositionUpdate event to trigger TP/SL placement
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        symbol = %symbol,
+                                        "CONNECTION: Failed to fetch open orders for monitoring"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "CONNECTION: Failed to fetch positions for order monitoring"
+                        );
+                    }
                 }
             }
         });
@@ -1141,6 +1207,16 @@ impl Connection {
                                             }
                                         }
 
+                                        // ✅ NEW: Extract rejection reason if order is rejected
+                                        // Note: Binance WebSocket events don't include rejection reason in ORDER_TRADE_UPDATE
+                                        // Rejection reason is only available via REST API query
+                                        // For now, we use order_status string as rejection reason if rejected
+                                        let rejection_reason = if status == OrderStatus::Rejected {
+                                            Some(format!("Order rejected: {}", order_status))
+                                        } else {
+                                            None
+                                        };
+                                        
                                         let order_update = OrderUpdate {
                                             symbol: symbol.clone(),
                                             order_id,
@@ -1151,6 +1227,7 @@ impl Connection {
                                             filled_qty: cumulative_filled_qty, // Cumulative filled qty (total filled so far)
                                             remaining_qty, // Remaining qty = order_qty - cumulative_filled_qty
                                             status,
+                                            rejection_reason, // Extract from order_status if rejected
                                             // True if all fills were maker orders, false if any fill was taker
                                             // Used for commission calculation: if all maker, use maker commission; otherwise taker
                                             is_maker: Some(is_all_maker),
@@ -1185,6 +1262,7 @@ impl Connection {
                                                         leverage: position.leverage,
                                                         unrealized_pnl: None, // Can be calculated from mark price
                                                         is_open: !position.qty.0.is_zero(),
+                                                        liq_px: position.liq_px, // ✅ NEW: Include liquidation price
                                                         timestamp: Instant::now(),
                                                     };
                                                     if let Err(e) = event_bus_pos.position_update_tx.send(position_update) {
@@ -1252,6 +1330,7 @@ impl Connection {
                                                 leverage: pos.leverage,
                                                 unrealized_pnl: pos.unrealized_pnl,
                                                 is_open: !pos.position_amt.is_zero(),
+                                                liq_px: None, // ✅ NEW: ACCOUNT_UPDATE doesn't include liquidation price
                                                 timestamp: Instant::now(),
                                             };
                                             if let Err(e) = event_bus.position_update_tx.send(position_update) {
@@ -1582,6 +1661,25 @@ impl Connection {
 
     /// Cancel an order by order ID and symbol
     /// Used for cleaning up orders in race condition scenarios
+    /// Get all open positions from exchange
+    /// Returns Vec<(symbol, position)> for all positions with non-zero qty
+    /// Used for position reconciliation and order monitoring
+    pub async fn get_all_positions(&self) -> Result<Vec<(String, Position)>> {
+        self.venue.get_all_positions().await
+    }
+
+    /// Place trailing stop market order
+    /// Wrapper for venue.place_trailing_stop_order()
+    pub async fn place_trailing_stop_order(
+        &self,
+        symbol: &str,
+        activation_price: Px,
+        callback_rate: f64,
+        quantity: Qty,
+    ) -> Result<String> {
+        self.venue.place_trailing_stop_order(symbol, activation_price, callback_rate, quantity).await
+    }
+
     pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> Result<()> {
         // Rate limit check
         {

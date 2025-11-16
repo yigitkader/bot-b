@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
         cfg.clone(),
         event_bus.clone(),
         shutdown_flag.clone(),
+        connection.clone(),
     );
     follow_orders.start().await?;
     

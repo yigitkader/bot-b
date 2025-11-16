@@ -46,6 +46,16 @@ pub struct TrendingCfg {
     /// When false (and hft_mode=true), volume confirmation is optional
     #[serde(default = "default_require_volume_confirmation")]
     pub require_volume_confirmation: bool,
+    /// Enable trailing stop loss (places trailing stop when TP threshold is reached)
+    /// When true, trailing stop order is placed when take profit threshold is reached
+    /// Trailing stop follows price movement to lock in profits
+    #[serde(default = "default_use_trailing_stop")]
+    pub use_trailing_stop: bool,
+    /// Trailing stop callback rate (0.001 = 0.1%)
+    /// Binance expects percentage (0.1 not 0.001)
+    /// Example: 0.001 = 0.1% callback rate
+    #[serde(default = "default_trailing_stop_callback_rate")]
+    pub trailing_stop_callback_rate: f64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -296,6 +306,14 @@ fn default_hft_mode() -> bool {
 
 fn default_require_volume_confirmation() -> bool {
     false // Default: Volume confirmation not required in HFT mode
+}
+
+fn default_use_trailing_stop() -> bool {
+    false // Default: Trailing stop disabled (can be enabled in config)
+}
+
+fn default_trailing_stop_callback_rate() -> f64 {
+    0.001 // Default: 0.1% callback rate (0.001 = 0.1%)
 }
 
 fn default_min_margin_usd() -> f64 {

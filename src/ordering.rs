@@ -629,7 +629,191 @@ impl Ordering {
             }
         });
 
+        // ✅ NEW: Start periodic position reconciliation task
+        Self::start_position_reconciliation_task(
+            connection.clone(),
+            shared_state.clone(),
+            event_bus.clone(),
+            shutdown_flag.clone(),
+        );
+
         Ok(())
+    }
+
+    /// Start periodic position reconciliation task
+    /// Fetches all positions from exchange every 30 seconds and reconciles with internal state
+    /// This ensures state consistency and handles cases where WebSocket events are missed
+    fn start_position_reconciliation_task(
+        connection: Arc<Connection>,
+        shared_state: Arc<SharedState>,
+        event_bus: Arc<EventBus>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) {
+        tokio::spawn(async move {
+            const RECONCILIATION_INTERVAL_SECS: u64 = 30; // 30 seconds
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(RECONCILIATION_INTERVAL_SECS)).await;
+
+                if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                    break;
+                }
+
+                // Fetch all positions from exchange
+                match connection.get_all_positions().await {
+                    Ok(exchange_positions) => {
+                        // Collect exchange symbols before loop (exchange_positions is moved in loop)
+                        let exchange_symbols: Vec<String> = exchange_positions.iter().map(|(sym, _)| sym.clone()).collect();
+                        
+                        let mut state_guard = shared_state.ordering_state.lock().await;
+
+                        // Compare with internal state
+                        for (symbol, exchange_pos) in exchange_positions {
+                            if let Some(internal_pos) = &state_guard.open_position {
+                                if internal_pos.symbol == symbol {
+                                    // Compare qty and entry_price
+                                    let qty_diff = (internal_pos.qty.0 - exchange_pos.qty.0).abs();
+                                    let entry_diff = (internal_pos.entry_price.0 - exchange_pos.entry.0).abs();
+                                    
+                                    // Epsilon for comparison (1 basis point for price, 0.000001 for qty)
+                                    let epsilon_qty = Decimal::new(1, 6); // 0.000001
+                                    const EPSILON_PRICE_PCT: f64 = 0.01; // 0.01% = 1 basis point
+                                    
+                                    let price_diff_pct = if internal_pos.entry_price.0 > Decimal::ZERO {
+                                        (entry_diff / internal_pos.entry_price.0) * Decimal::from(100)
+                                    } else {
+                                        entry_diff
+                                    };
+                                    
+                                    let price_diff_pct_f64 = price_diff_pct.to_f64().unwrap_or(0.0);
+                                    
+                                    if qty_diff >= epsilon_qty || price_diff_pct_f64 >= EPSILON_PRICE_PCT {
+                                        warn!(
+                                            symbol = %symbol,
+                                            internal_qty = %internal_pos.qty.0,
+                                            exchange_qty = %exchange_pos.qty.0,
+                                            internal_entry = %internal_pos.entry_price.0,
+                                            exchange_entry = %exchange_pos.entry.0,
+                                            qty_diff = %qty_diff,
+                                            price_diff_pct = price_diff_pct_f64,
+                                            "ORDERING: Position mismatch detected, updating state"
+                                        );
+
+                                        // Update internal state to match exchange
+                                        state_guard.open_position = Some(OpenPosition {
+                                            symbol: symbol.clone(),
+                                            direction: if exchange_pos.qty.0.is_sign_positive() {
+                                                PositionDirection::Long
+                                            } else {
+                                                PositionDirection::Short
+                                            },
+                                            qty: exchange_pos.qty,
+                                            entry_price: exchange_pos.entry,
+                                        });
+
+                                        // Publish state update event
+                                        let state_to_publish = state_guard.clone();
+                                        drop(state_guard);
+                                        Self::publish_ordering_state_update(&state_to_publish, &event_bus);
+                                        
+                                        // Re-acquire lock for next iteration
+                                        state_guard = shared_state.ordering_state.lock().await;
+                                    }
+                                } else {
+                                    // Exchange has position but internal state has different symbol
+                                    // This shouldn't happen, but handle it gracefully
+                                    warn!(
+                                        symbol = %symbol,
+                                        internal_symbol = %internal_pos.symbol,
+                                        "ORDERING: Exchange has position for different symbol - triggering reconciliation"
+                                    );
+
+                                    // Trigger position update event
+                                    let position_update = PositionUpdate {
+                                        symbol: symbol.clone(),
+                                        qty: exchange_pos.qty,
+                                        entry_price: exchange_pos.entry,
+                                        leverage: exchange_pos.leverage,
+                                        unrealized_pnl: None,
+                                        is_open: true,
+                                        liq_px: exchange_pos.liq_px,
+                                        timestamp: Instant::now(),
+                                    };
+
+                                    drop(state_guard);
+                                    if let Err(e) = event_bus.position_update_tx.send(position_update) {
+                                        error!(
+                                            error = ?e,
+                                            symbol = %symbol,
+                                            "ORDERING: Failed to send PositionUpdate for reconciliation"
+                                        );
+                                    }
+                                    
+                                    // Re-acquire lock for next iteration
+                                    state_guard = shared_state.ordering_state.lock().await;
+                                }
+                            } else {
+                                // Exchange has position but internal state doesn't
+                                // This shouldn't happen, but handle it gracefully
+                                warn!(
+                                    symbol = %symbol,
+                                    "ORDERING: Exchange has position but internal state doesn't - triggering reconciliation"
+                                );
+
+                                // Trigger position update event
+                                let position_update = PositionUpdate {
+                                    symbol: symbol.clone(),
+                                    qty: exchange_pos.qty,
+                                    entry_price: exchange_pos.entry,
+                                    leverage: exchange_pos.leverage,
+                                    unrealized_pnl: None,
+                                    is_open: true,
+                                    liq_px: exchange_pos.liq_px,
+                                    timestamp: Instant::now(),
+                                };
+
+                                drop(state_guard);
+                                if let Err(e) = event_bus.position_update_tx.send(position_update) {
+                                    error!(
+                                        error = ?e,
+                                        symbol = %symbol,
+                                        "ORDERING: Failed to send PositionUpdate for reconciliation"
+                                    );
+                                }
+                                
+                                // Re-acquire lock for next iteration
+                                state_guard = shared_state.ordering_state.lock().await;
+                            }
+                        }
+
+                        // Check for orphaned internal positions (internal has but exchange doesn't)
+                        if let Some(internal_pos) = &state_guard.open_position {
+                            let exchange_has = exchange_symbols.iter().any(|sym| sym == &internal_pos.symbol);
+                            if !exchange_has {
+                                warn!(
+                                    symbol = %internal_pos.symbol,
+                                    "ORDERING: Internal state has position but exchange doesn't - clearing state"
+                                );
+
+                                // Clear internal state
+                                state_guard.open_position = None;
+
+                                // Publish state update event
+                                let state_to_publish = state_guard.clone();
+                                drop(state_guard);
+                                Self::publish_ordering_state_update(&state_to_publish, &event_bus);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "ORDERING: Failed to fetch positions for reconciliation"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Start background task for balance reservation leak detection
@@ -770,11 +954,24 @@ impl Ordering {
         // Get balance and margin limits
         let available_balance = {
             let balance_store = shared_state.balance_store.read().await;
-            if cfg.quote_asset.to_uppercase() == "USDT" {
+            let balance = if cfg.quote_asset.to_uppercase() == "USDT" {
                 balance_store.usdt
             } else {
                 balance_store.usdc
-            }
+            };
+            
+            // ✅ DEBUG: Log balance check for troubleshooting
+            debug!(
+                symbol = %signal.symbol,
+                quote_asset = %cfg.quote_asset,
+                available_balance = %balance,
+                usdt_balance = %balance_store.usdt,
+                usdc_balance = %balance_store.usdc,
+                last_updated = ?balance_store.last_updated,
+                "ORDERING: Balance check for trade signal"
+            );
+            
+            balance
         };
         
         let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
@@ -1569,7 +1766,73 @@ impl Ordering {
                     "ORDERING: Order placed successfully"
                 );
 
-                // Release balance AFTER state is updated
+                // ✅ NEW: Register timeout and spawn timeout task
+                let order_id_timeout = order_id.clone();
+                let symbol_timeout = signal.symbol.clone();
+                let connection_timeout = connection.clone();
+                let shared_state_timeout = shared_state.clone();
+                let required_margin_timeout = required_margin;
+
+                // Register timeout in state
+                {
+                    let mut state_guard = shared_state_timeout.ordering_state.lock().await;
+                    state_guard.order_timeouts.insert(
+                        order_id_timeout.clone(),
+                        Instant::now() + Duration::from_secs(30), // 30 seconds timeout
+                    );
+                }
+
+                // Spawn timeout task
+                tokio::spawn(async move {
+                    const ORDER_TIMEOUT_SECS: u64 = 30;
+                    
+                    tokio::time::sleep(Duration::from_secs(ORDER_TIMEOUT_SECS)).await;
+                    
+                    // Check if order is still open
+                    let mut state_guard = shared_state_timeout.ordering_state.lock().await;
+                    
+                    // Check if order still exists and hasn't been filled
+                    if let Some(open_order) = &state_guard.open_order {
+                        if open_order.order_id == order_id_timeout {
+                            // Order still open after timeout - cancel it
+                            warn!(
+                                order_id = %order_id_timeout,
+                                symbol = %symbol_timeout,
+                                timeout_secs = ORDER_TIMEOUT_SECS,
+                                "ORDERING: Order timeout - canceling stale order"
+                            );
+                            
+                            // Update reserved_margin before canceling (balance will be released when OrderUpdate arrives)
+                            state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin_timeout);
+                            
+                            // Clear order from state (OrderUpdate will handle balance release)
+                            state_guard.open_order = None;
+                            
+                            // Remove timeout entry
+                            state_guard.order_timeouts.remove(&order_id_timeout);
+                            
+                            // Release lock before async cancel call
+                            drop(state_guard);
+                            
+                            // Cancel order (OrderUpdate will handle balance release)
+                            if let Err(e) = connection_timeout.cancel_order(&order_id_timeout, &symbol_timeout).await {
+                                error!(
+                                    error = %e,
+                                    order_id = %order_id_timeout,
+                                    "ORDERING: Failed to cancel timed-out order"
+                                );
+                            }
+                        } else {
+                            // Order already filled/canceled - remove timeout entry
+                            state_guard.order_timeouts.remove(&order_id_timeout);
+                        }
+                    } else {
+                        // Order already removed - remove timeout entry
+                        state_guard.order_timeouts.remove(&order_id_timeout);
+                    }
+                });
+
+                // Release balance AFTER state is updated and timeout task spawned
                 balance_reservation.release().await;
             } else {
                 // Another thread placed an order/position while we were making the network call
@@ -1847,6 +2110,9 @@ impl Ordering {
             if order.order_id == update.order_id {
                 match update.status {
                     crate::event_bus::OrderStatus::Filled => {
+                        // ✅ NEW: Clear timeout entry when order is filled
+                        state_guard.order_timeouts.remove(&update.order_id);
+                        
                         // Check if OrderUpdate is newer than existing position
                         //
                         // Scenario: PositionUpdate arrives first and creates position with timestamp T1
@@ -1987,6 +2253,9 @@ impl Ordering {
                         }
                     }
                     crate::event_bus::OrderStatus::Canceled => {
+                        // ✅ NEW: Clear timeout entry when order is canceled
+                        state_guard.order_timeouts.remove(&update.order_id);
+                        
                         // Order canceled, clear state
                         state_guard.open_order = None;
 
@@ -2006,6 +2275,9 @@ impl Ordering {
                     }
                     crate::event_bus::OrderStatus::Expired
                     | crate::event_bus::OrderStatus::ExpiredInMatch => {
+                        // ✅ NEW: Clear timeout entry when order is expired
+                        state_guard.order_timeouts.remove(&update.order_id);
+                        
                         // Order expired, clear state (similar to canceled)
                         state_guard.open_order = None;
 
@@ -2020,6 +2292,9 @@ impl Ordering {
                         );
                     }
                     crate::event_bus::OrderStatus::Rejected => {
+                        // ✅ NEW: Clear timeout entry when order is rejected
+                        state_guard.order_timeouts.remove(&update.order_id);
+                        
                         // Order rejected, clear state
                         state_guard.open_order = None;
 
@@ -2027,7 +2302,9 @@ impl Ordering {
                         state_guard.last_order_update_timestamp = Some(update.timestamp);
 
                         // ✅ CRITICAL: Record rejection and check circuit breaker
-                        let should_open_circuit = state_guard.circuit_breaker.record_rejection();
+                        // Extract rejection reason from OrderUpdate
+                        let rejection_reason = update.rejection_reason.as_deref();
+                        let should_open_circuit = state_guard.circuit_breaker.record_rejection(rejection_reason);
                         
                         if should_open_circuit {
                             error!(
