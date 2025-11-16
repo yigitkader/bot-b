@@ -271,6 +271,9 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         price_precision: p_prec,
         qty_precision: q_prec,
         min_notional,
+        // TODO: Fetch max_leverage from /fapi/v1/leverageBrackets endpoint
+        // For now, set to None (will use config max_leverage instead)
+        max_leverage: None,
     }
 }
 
@@ -398,37 +401,84 @@ pub fn from_config(
         })
     }
 
-/// Set leverage (per symbol)
+/// Set leverage (per symbol) with automatic step-down on error
+/// If leverage is rejected, tries lower values (100 -> 75 -> 50 -> 25 -> 20 -> 10 -> 5 -> 1)
+/// Returns the actual leverage value that was successfully set
 /// Must be set explicitly for each symbol at startup
 /// Uses /fapi/v1/leverage endpoint for per-symbol leverage
-    pub async fn set_leverage(&self, sym: &str, leverage: u32) -> Result<()> {
-        let params = vec![
-            format!("symbol={}", sym),
-            format!("leverage={}", leverage),
-            format!("timestamp={}", BinanceCommon::ts()),
-            format!("recvWindow={}", self.common.recv_window_ms),
-        ];
-        let qs = params.join("&");
-        let sig = self.common.sign(&qs);
-        let url = format!("{}/fapi/v1/leverage?{}&signature={}", self.base, qs, sig);
+    pub async fn set_leverage(&self, sym: &str, leverage: u32) -> Result<u32> {
+        // Try leverage values in descending order if initial attempt fails
+        // Common valid leverage values: 1, 2, 3, 5, 10, 20, 25, 50, 75, 100
+        let leverage_candidates = if leverage > 100 {
+            vec![100, 75, 50, 25, 20, 10, 5, 1]
+        } else if leverage > 50 {
+            vec![leverage, 50, 25, 20, 10, 5, 1]
+        } else if leverage > 25 {
+            vec![leverage, 25, 20, 10, 5, 1]
+        } else if leverage > 10 {
+            vec![leverage, 20, 10, 5, 1]
+        } else {
+            vec![leverage, 5, 1]
+        };
+        
+        let mut last_error = None;
+        
+        for &lev in &leverage_candidates {
+            let params = vec![
+                format!("symbol={}", sym),
+                format!("leverage={}", lev),
+                format!("timestamp={}", BinanceCommon::ts()),
+                format!("recvWindow={}", self.common.recv_window_ms),
+            ];
+            let qs = params.join("&");
+            let sig = self.common.sign(&qs);
+            let url = format!("{}/fapi/v1/leverage?{}&signature={}", self.base, qs, sig);
 
-        match send_void(
-            self.common
-                .client
-                .post(&url)
-                .header("X-MBX-APIKEY", &self.common.api_key),
-        )
+            match send_void(
+                self.common
+                    .client
+                    .post(&url)
+                    .header("X-MBX-APIKEY", &self.common.api_key),
+            )
             .await
-        {
-            Ok(_) => {
-                info!(%sym, leverage, "leverage set successfully");
-                Ok(())
-            }
-            Err(e) => {
-                warn!(%sym, leverage, error = %e, "failed to set leverage");
-                Err(e)
+            {
+                Ok(_) => {
+                    if lev < leverage {
+                        warn!(
+                            symbol = %sym,
+                            desired_leverage = leverage,
+                            actual_leverage = lev,
+                            "Leverage set to lower value than desired (symbol max leverage may be lower)"
+                        );
+                    } else {
+                        info!(symbol = %sym, leverage = lev, "Leverage set successfully");
+                    }
+                    return Ok(lev);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    // Check if error is "leverage not valid" - if so, try next lower value
+                    let error_str = last_error.as_ref().unwrap().to_string().to_lowercase();
+                    if error_str.contains("leverage") && (error_str.contains("not valid") || error_str.contains("-4028")) {
+                        // Continue to next lower leverage value
+                        tracing::debug!(
+                            symbol = %sym,
+                            attempted_leverage = lev,
+                            "Leverage {}x not valid for symbol, trying lower value",
+                            lev
+                        );
+                        continue;
+                    } else {
+                        // Other error (network, auth, etc.) - return immediately
+                        warn!(symbol = %sym, leverage = lev, error = ?last_error, "Failed to set leverage (non-leverage error)");
+                        return Err(last_error.unwrap());
+                    }
+                }
             }
         }
+        
+        // All leverage values failed
+        Err(last_error.unwrap_or_else(|| anyhow!("All leverage values failed for symbol {}", sym)))
     }
 
 /// Set position side mode (enable/disable hedge mode)
@@ -460,8 +510,19 @@ pub fn from_config(
                 Ok(())
             }
             Err(e) => {
-                warn!(dual_side = dual, error = %e, "failed to set position side mode");
-                Err(e)
+                // ✅ CRITICAL: Binance returns -4059 "No need to change position side" when already set correctly
+                // This is not an error - the position side is already in the desired state
+                let error_str = e.to_string();
+                if error_str.contains("-4059") || error_str.contains("No need to change position side") {
+                    info!(
+                        dual_side = dual,
+                        "position side mode already set correctly (no change needed)"
+                    );
+                    Ok(()) // Treat as success
+                } else {
+                    warn!(dual_side = dual, error = %e, "failed to set position side mode");
+                    Err(e)
+                }
             }
         }
     }
@@ -491,13 +552,99 @@ pub fn from_config(
                 Ok(())
             }
             Err(e) => {
-                warn!(%sym, margin_type = %margin_type, error = %e, "failed to set margin type");
-                Err(e)
+                // ✅ CRITICAL: Binance returns -4046 "No need to change margin type" when already set correctly
+                // This is not an error - the margin type is already in the desired state
+                let error_str = e.to_string();
+                if error_str.contains("-4046") || error_str.contains("No need to change margin type") {
+                    info!(
+                        %sym,
+                        margin_type = %margin_type,
+                        "margin type already set correctly (no change needed)"
+                    );
+                    Ok(()) // Treat as success
+                } else {
+                    warn!(%sym, margin_type = %margin_type, error = %e, "failed to set margin type");
+                    Err(e)
+                }
             }
         }
     }
 
-/// Get per-symbol metadata (tick_size, step_size)
+    /// Fetch max leverage for a symbol from Binance leverage brackets API
+    /// Returns None if API call fails (will use safe fallback instead of config max_leverage)
+    /// ✅ CRITICAL: This endpoint requires authentication (signature + API key)
+    async fn fetch_max_leverage(&self, sym: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct LeverageBracket {
+            bracket: u32,
+            #[serde(rename = "initialLeverage")]
+            initial_leverage: u32,
+            #[serde(rename = "notionalCap")]
+            notional_cap: String,
+            #[serde(rename = "notionalFloor")]
+            notional_floor: String,
+            #[serde(rename = "maintMarginRatio")]
+            maint_margin_ratio: String,
+        }
+        
+        #[derive(Deserialize)]
+        struct LeverageBracketsResponse {
+            symbol: String,
+            brackets: Vec<LeverageBracket>,
+        }
+        
+        // ✅ CRITICAL: This endpoint requires authentication
+        // Build authenticated request with signature
+        let qs = format!(
+            "timestamp={}&recvWindow={}",
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/leverageBrackets?{}&signature={}", self.base, qs, sig);
+        
+        match send_json::<Vec<LeverageBracketsResponse>>(
+            self.common
+                .client
+                .get(&url)
+                .header("X-MBX-APIKEY", &self.common.api_key)
+        ).await {
+            Ok(brackets) => {
+                // Find brackets for this symbol
+                if let Some(symbol_brackets) = brackets.iter().find(|b| b.symbol == sym) {
+                    // Max leverage is the highest initial_leverage in brackets
+                    let max_lev = symbol_brackets.brackets
+                        .iter()
+                        .map(|b| b.initial_leverage)
+                        .max()
+                        .unwrap_or(1);
+                    
+                    tracing::debug!(
+                        symbol = %sym,
+                        max_leverage = max_lev,
+                        "Fetched max leverage from Binance leverage brackets"
+                    );
+                    Some(max_lev)
+                } else {
+                    warn!(
+                        symbol = %sym,
+                        "Symbol not found in leverage brackets response"
+                    );
+                    None
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    symbol = %sym,
+                    "Failed to fetch leverage brackets, will use config max_leverage"
+                );
+                None
+            }
+        }
+    }
+
+/// Get per-symbol metadata (tick_size, step_size, max_leverage)
 /// Does not use global fallback - real rules required for each symbol
 /// Using fallback can cause LOT_SIZE and PRICE_FILTER errors
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
@@ -527,7 +674,13 @@ pub fn from_config(
                         return Ok(existing.clone());
                     }
 
-                    let rules = Arc::new(rules_from_fut_symbol(sym_rec));
+                    // Fetch max leverage from leverage brackets API
+                    let max_leverage = self.fetch_max_leverage(sym).await;
+                    
+                    let mut rules = rules_from_fut_symbol(sym_rec);
+                    rules.max_leverage = max_leverage;
+                    
+                    let rules = Arc::new(rules);
                     FUT_RULES.insert(sym.to_string(), rules.clone());
                     return Ok(rules);
                 }
@@ -1936,7 +2089,22 @@ async fn ensure_success(resp: Response) -> Result<Response> {
         Ok(resp)
     } else {
         let body = resp.text().await.unwrap_or_default();
-        tracing::error!(%status, %body, "binance api error");
+        
+        // ✅ CRITICAL: Some Binance errors are not actual errors but informational messages
+        // -4046: "No need to change margin type" - margin type already set correctly
+        // -4059: "No need to change position side" - position side already set correctly
+        // These are handled as success in set_margin_type and set_position_side_dual
+        // Log them at DEBUG level instead of ERROR to reduce log noise
+        let is_benign_error = body.contains("-4046") || body.contains("-4059")
+            || body.contains("No need to change margin type")
+            || body.contains("No need to change position side");
+        
+        if is_benign_error {
+            tracing::debug!(%status, %body, "binance api response (benign - already set correctly)");
+        } else {
+            tracing::error!(%status, %body, "binance api error");
+        }
+        
         Err(anyhow!("binance api error: {} - {}", status, body))
     }
 }

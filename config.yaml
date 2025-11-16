@@ -13,14 +13,22 @@ mode: "futures"       # "spot" | "futures"
 # ============================================================================
 # Order Size Limits
 # ============================================================================
-max_usd_per_order: 100.0  # Maximum margin per trade (USD)
-min_usd_per_order: 10.0   # Minimum margin per trade (USD)
-min_quote_balance_usd: 1.0  # Minimum quote asset balance threshold (USD)
+max_usd_per_order: 100.0  # Maximum margin per trade (USD) - legacy, use min_margin_usd/max_margin_usd
+min_usd_per_order: 10.0   # Minimum margin per trade (USD) - legacy, use min_margin_usd
+min_margin_usd: 10.0      # Minimum margin per trade (USD) - dynamic margin range lower bound
+max_margin_usd: 100.0     # Maximum margin per trade (USD) - dynamic margin range upper bound
+# Margin calculation strategy:
+#   - "fixed": Use max_usd_per_order (clamped to [min_margin_usd, max_margin_usd])
+#   - "balance_based" or "max_balance": Use all available balance (up to max_margin_usd)
+#     Since we only have one position at a time, we can use all available funds (up to 100 USD limit)
+#   - "dynamic" or "trend_based": Scale margin based on trend strength, using available balance as base
+margin_strategy: "balance_based"   # Recommended: "balance_based" to use all available funds (up to max_margin_usd)
+min_quote_balance_usd: 120.0  # Minimum quote asset balance threshold (USD) - must be >= max_margin_usd (100) + commission buffer
 
 # ============================================================================
 # Trading Parameters
 # ============================================================================
-leverage: 20  # Leverage for futures (20x-50x supported with isolated margin)
+leverage: 100  # Leverage for futures (100x max for HFT strategy - will be clamped to symbol max if lower)
 
 # Price/quantity precision (for quantization)
 # Can be auto-fetched from exchangeInfo, but kept here for determinism
@@ -30,15 +38,30 @@ qty_step: 0.001
 # ============================================================================
 # Take Profit / Stop Loss (for FOLLOW_ORDERS module)
 # ============================================================================
-take_profit_pct: 5.0   # Take profit percentage (default: 5%)
-stop_loss_pct: 2.0      # Stop loss percentage (default: 2%)
+# HFT Strategy: Target 0.5$ profit per trade
+# With 100x leverage and 10-100 USD margin:
+# - Min notional: 10 * 100 = 1000 USD
+# - Max notional: 100 * 100 = 10000 USD
+# - Target profit: 0.5 USD = 0.05% of 1000 USD (worst case)
+# - Total costs breakdown:
+#   * Commission: 2 * 0.04% = 0.08% (entry + exit)
+#   * Spread: ~0.01% (average of min/max spread bps)
+#   * Slippage: 0.01% (conservative estimate)
+#   * Total costs: ~0.10%
+# - Minimum TP%: SL% (0.08%) + costs (0.10%) = 0.18%
+# - Recommended TP%: 0.2% (safety margin for profitability)
+take_profit_pct: 0.2    # Take profit percentage (0.2% for HFT - ensures profitability after all costs)
+stop_loss_pct: 0.08     # Stop loss percentage (0.08% for HFT - tighter than traditional)
 
 # ============================================================================
 # Trend Analysis (for TRENDING module)
 # ============================================================================
 trending:
-  min_spread_bps: 5.0   # Minimum spread to generate signal (bps)
+  min_spread_bps: 0.01  # Minimum spread to generate signal (bps) - Binance major pairs (BTC/ETH) have spreads ~0.01-0.03 bps
   max_spread_bps: 200.0 # Maximum spread to generate signal (bps)
+  signal_cooldown_seconds: 5  # Cooldown between signals for same symbol (reduced for high-frequency trading)
+  hft_mode: true  # High-frequency trading mode: allows signals without volume confirmation
+  require_volume_confirmation: false  # Require volume confirmation for trend signals (false = optional in HFT mode)
 
 # ============================================================================
 # Binance API Configuration
@@ -54,9 +77,9 @@ binance:
 # Risk Management
 # ============================================================================
 risk:
-  max_leverage: 50  # Maximum leverage limit
-  use_isolated_margin: true  # Use isolated margin (required for 20x-50x leverage)
-  max_position_notional_usd: 1000.0  # Maximum position notional (USD)
+  max_leverage: 100  # Maximum leverage limit (100x for HFT strategy)
+  use_isolated_margin: true  # Use isolated margin (required for high leverage)
+  max_position_notional_usd: 10000.0  # Maximum position notional (USD) - must be >= max_margin_usd (100) * leverage (100) = 10000
   maker_commission_pct: 0.02  # Maker commission rate (percentage, e.g., 0.02 for 0.02%)
   taker_commission_pct: 0.04  # Taker commission rate (percentage, e.g., 0.04 for 0.04%)
 
@@ -74,3 +97,14 @@ websocket:
 exec:
   tif: "post_only"  # Time in force: "gtc" | "ioc" | "post_only"
   default_leverage: 20  # Default leverage (fallback if not set per symbol)
+
+# ============================================================================
+# Event Bus Configuration
+# ============================================================================
+event_bus:
+  market_tick_buffer: 1000      # Buffer for MarketTick events (high frequency)
+  trade_signal_buffer: 1000    # Buffer for TradeSignal events
+  close_request_buffer: 1000   # Buffer for CloseRequest events
+  order_update_buffer: 1000    # Buffer for OrderUpdate events
+  position_update_buffer: 1000 # Buffer for PositionUpdate events
+  balance_update_buffer: 1000  # Buffer for BalanceUpdate events

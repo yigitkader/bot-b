@@ -18,6 +18,7 @@ use venue::{BinanceFutures, BALANCE_CACHE, FUT_RULES, OPEN_ORDERS_CACHE, POSITIO
 use websocket::{MarketDataStream, UserDataStream};
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use futures_util::future;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -154,6 +155,7 @@ impl Connection {
     pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
 
         // Set hedge mode according to config (must be done before any orders)
+        // Note: set_position_side_dual handles -4059 "No need to change" as success
         let hedge_mode = self.cfg.binance.hedge_mode;
         if let Err(e) = self.venue.set_position_side_dual(hedge_mode).await {
             warn!(
@@ -162,17 +164,64 @@ impl Connection {
                 "CONNECTION: Failed to set hedge mode, continuing anyway (may cause issues)"
             );
         } else {
-            info!(
+            debug!(
                 hedge_mode,
-                "CONNECTION: Hedge mode set successfully"
+                "CONNECTION: Hedge mode configured (may already be set correctly)"
             );
         }
 
-        let leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage);
+        let desired_leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage);
         let use_isolated_margin = self.cfg.risk.use_isolated_margin;
 
         for symbol in &symbols {
+            // ✅ CRITICAL: Clamp leverage to symbol's max leverage (if available)
+            // Fetch symbol rules to get max leverage
+            let leverage = match self.venue.rules_for(symbol).await {
+                Ok(rules) => {
+                    if let Some(symbol_max_lev) = rules.max_leverage {
+                        // Symbol has max leverage - clamp to it
+                        let clamped = desired_leverage.min(symbol_max_lev);
+                        if clamped < desired_leverage {
+                            warn!(
+                                symbol = %symbol,
+                                desired_leverage,
+                                symbol_max_leverage = symbol_max_lev,
+                                final_leverage = clamped,
+                                "CONNECTION: Leverage clamped to symbol max leverage"
+                            );
+                        }
+                        clamped
+                    } else {
+                        // No symbol max leverage - use safe fallback instead of config max
+                        // Config max (100x) might be too high for some symbols
+                        const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                        let clamped = desired_leverage.min(SAFE_LEVERAGE_FALLBACK);
+                        if clamped < desired_leverage {
+                            warn!(
+                                symbol = %symbol,
+                                desired_leverage,
+                                safe_fallback = SAFE_LEVERAGE_FALLBACK,
+                                final_leverage = clamped,
+                                "CONNECTION: Leverage brackets not available, using safe fallback (50x) instead of config max"
+                            );
+                        }
+                        clamped
+                    }
+                }
+                Err(e) => {
+                    // Failed to fetch rules - use safe fallback instead of config max
+                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                    warn!(
+                        error = %e,
+                        symbol = %symbol,
+                        safe_fallback = SAFE_LEVERAGE_FALLBACK,
+                        "CONNECTION: Failed to fetch symbol rules, using safe fallback (50x) instead of config max"
+                    );
+                    desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
+                }
+            };
             // Set margin type (isolated or cross)
+            // Note: set_margin_type handles -4046 "No need to change" as success
             if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {
                 error!(
                     error = %e,
@@ -186,107 +235,159 @@ impl Connection {
                     e
                 ));
             } else {
-                info!(
+                debug!(
                     symbol = %symbol,
                     isolated = use_isolated_margin,
-                    "CONNECTION: Margin type set successfully for symbol"
+                    "CONNECTION: Margin type configured for symbol (may already be set correctly)"
                 );
             }
 
             if let Ok(position) = self.venue.get_position(symbol).await {
                 if !position.qty.0.is_zero() {
+                    // Position is OPEN - leverage cannot be changed
+                    // Use clamped leverage for comparison
                     if position.leverage != leverage {
                         error!(
                             symbol = %symbol,
                             current_leverage = position.leverage,
-                            config_leverage = leverage,
+                            desired_leverage = leverage,
                             "CONNECTION: CRITICAL - Leverage mismatch detected but position is open! Cannot auto-fix. Please close position manually and restart bot."
                         );
                         return Err(anyhow!(
-                            "Leverage mismatch for symbol {}: exchange has {}x but config requires {}x. Cannot change leverage while position is open. Please close position manually and restart bot.",
+                            "Leverage mismatch for symbol {}: exchange has {}x but config requires {}x (clamped to {}x). Cannot change leverage while position is open. Please close position manually and restart bot.",
                             symbol,
                             position.leverage,
+                            desired_leverage,
                             leverage
                         ));
                     } else {
                         info!(
                             symbol = %symbol,
                             leverage,
-                            "CONNECTION: Leverage verified (matches config, position is open)"
+                            "CONNECTION: Leverage verified (matches clamped leverage, position is open)"
                         );
                     }
                 } else {
                     // Position is CLOSED - safe to set leverage
-                    if position.leverage != leverage {
+                    // ✅ CRITICAL: Re-fetch symbol rules to get max leverage (may have changed or not been fetched yet)
+                    // Use same safe fallback as above
+                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                    
+                    let final_leverage = match self.venue.rules_for(symbol).await {
+                        Ok(rules) => {
+                            if let Some(symbol_max_lev) = rules.max_leverage {
+                                leverage.min(symbol_max_lev)
+                            } else {
+                                // Use safe fallback instead of config max
+                                leverage.min(SAFE_LEVERAGE_FALLBACK)
+                            }
+                        }
+                        Err(_) => {
+                            // Use safe fallback instead of config max
+                            leverage.min(SAFE_LEVERAGE_FALLBACK)
+                        }
+                    };
+                    
+                    if position.leverage != final_leverage {
                         warn!(
                             symbol = %symbol,
                             current_leverage = position.leverage,
-                            config_leverage = leverage,
+                            desired_leverage = leverage,
+                            final_leverage = final_leverage,
                             "CONNECTION: Leverage mismatch detected (position is closed). Auto-fixing..."
                         );
-                        if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
-                            error!(
-                                error = %e,
-                                symbol = %symbol,
-                                current_leverage = position.leverage,
-                                config_leverage = leverage,
-                                "CONNECTION: Failed to auto-fix leverage mismatch for symbol"
-                            );
-                            return Err(anyhow!(
-                                "Failed to set leverage for symbol {} (was {}x, need {}x): {}",
-                                symbol,
-                                position.leverage,
-                                leverage,
-                                e
-                            ));
-                        }
-                        // Verify the fix worked
-                        if let Ok(updated_position) = self.venue.get_position(symbol).await {
-                            if updated_position.leverage == leverage {
-                                info!(
+                        match self.venue.set_leverage(symbol, final_leverage).await {
+                            Ok(actual_leverage) => {
+                                // Leverage set successfully (may be lower than final_leverage due to step-down)
+                                if actual_leverage != final_leverage {
+                                    warn!(
+                                        symbol = %symbol,
+                                        desired_leverage = leverage,
+                                        clamped_leverage = final_leverage,
+                                        actual_leverage,
+                                        "CONNECTION: Leverage set to lower value than clamped (step-down mechanism)"
+                                    );
+                                }
+                                // Verify the fix worked
+                                if let Ok(updated_position) = self.venue.get_position(symbol).await {
+                                    if updated_position.leverage == actual_leverage {
+                                        info!(
+                                            symbol = %symbol,
+                                            old_leverage = position.leverage,
+                                            new_leverage = actual_leverage,
+                                            "CONNECTION: Leverage mismatch auto-fixed successfully (position was closed)"
+                                        );
+                                    } else {
+                                        warn!(
+                                            symbol = %symbol,
+                                            expected_leverage = actual_leverage,
+                                            actual_leverage = updated_position.leverage,
+                                            "CONNECTION: Leverage fix may not have taken effect immediately (will retry on next check)"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
                                     symbol = %symbol,
-                                    old_leverage = position.leverage,
-                                    new_leverage = leverage,
-                                    "CONNECTION: Leverage mismatch auto-fixed successfully (position was closed)"
+                                    current_leverage = position.leverage,
+                                    desired_leverage = leverage,
+                                    final_leverage = final_leverage,
+                                    "CONNECTION: Failed to auto-fix leverage mismatch for symbol (all leverage values failed)"
                                 );
-                            } else {
-                                warn!(
-                                    symbol = %symbol,
-                                    expected_leverage = leverage,
-                                    actual_leverage = updated_position.leverage,
-                                    "CONNECTION: Leverage fix may not have taken effect immediately (will retry on next check)"
-                                );
+                                return Err(anyhow!(
+                                    "Failed to set leverage for symbol {} (was {}x, need {}x, clamped to {}x): {}",
+                                    symbol,
+                                    position.leverage,
+                                    leverage,
+                                    final_leverage,
+                                    e
+                                ));
                             }
                         }
                     } else {
                         info!(
                             symbol = %symbol,
-                            leverage,
-                            "CONNECTION: Leverage verified (matches config, position is closed)"
+                            leverage = final_leverage,
+                            "CONNECTION: Leverage verified (matches clamped leverage, position is closed)"
                         );
                     }
                 }
             } else {
                 // No position exists - safe to set leverage
+                // Leverage is already clamped above (in the for loop), so use it directly
                 // Set leverage (for new positions or to ensure it's set correctly)
-                if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
-                    error!(
-                        error = %e,
-                        symbol = %symbol,
-                        leverage,
-                        "CONNECTION: CRITICAL - Failed to set leverage for symbol. Cannot continue with incorrect leverage."
-                    );
-                    return Err(anyhow!(
-                        "Failed to set leverage for symbol {}: {}",
-                        symbol,
-                        e
-                    ));
-                } else {
-                    info!(
-                        symbol = %symbol,
-                        leverage,
-                        "CONNECTION: Leverage set successfully for symbol"
-                    );
+                match self.venue.set_leverage(symbol, leverage).await {
+                    Ok(actual_leverage) => {
+                        if actual_leverage != leverage {
+                            warn!(
+                                symbol = %symbol,
+                                desired_leverage = leverage,
+                                actual_leverage,
+                                "CONNECTION: Leverage set to lower value than desired (step-down mechanism)"
+                            );
+                        } else {
+                            info!(
+                                symbol = %symbol,
+                                leverage = actual_leverage,
+                                "CONNECTION: Leverage set successfully for symbol"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            symbol = %symbol,
+                            leverage,
+                            "CONNECTION: CRITICAL - Failed to set leverage for symbol (all leverage values failed). Cannot continue with incorrect leverage."
+                        );
+                        return Err(anyhow!(
+                            "Failed to set leverage for symbol {}: {}",
+                            symbol,
+                            e
+                        ));
+                    }
                 }
             }
         }
@@ -601,196 +702,171 @@ impl Connection {
                             // Wait a bit for ACCOUNT_UPDATE events to arrive (Binance sends them after reconnect)
                             tokio::time::sleep(Duration::from_secs(2)).await;
 
-                            info!("CONNECTION: Validating state after WebSocket reconnect (comparing REST API with WebSocket cache)");
+                            info!(
+                                symbol_count = symbols_clone.len(),
+                                "CONNECTION: Validating state after WebSocket reconnect (comparing REST API with WebSocket cache)"
+                            );
 
-                            // Validate positions for each symbol
-                            for symbol in &symbols_clone {
-                                // Fetch position from REST API
-                                match venue_clone.get_position(symbol).await {
-                                    Ok(rest_position) => {
-                                        // Compare with WebSocket cache
-                                        if let Some(ws_position) = POSITION_CACHE.get(symbol) {
-                                            let ws_pos = ws_position.value();
+                            // Add overall timeout to prevent hanging (15 seconds max - reduced for faster validation)
+                            let validation_timeout = Duration::from_secs(15);
+                            let validation_start = Instant::now();
+                            let total_symbols = symbols_clone.len();
 
-                                            // Check if quantities match (with small tolerance for floating point)
-                                            let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
-                                            let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
+                            info!(
+                                total_symbols,
+                                "CONNECTION: Starting parallel validation for {} symbols",
+                                total_symbols
+                            );
 
-                                            // ✅ CRITICAL: REST API is source of truth after reconnect
-                                            // Always update cache with REST API data to ensure state consistency
-                                            // Log level varies based on difference magnitude for debugging
-                                            
-                                            // Determine if this is a significant mismatch (for logging)
-                                            const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
-                                            const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
-                                            let significant_mismatch = qty_diff > Decimal::from_str(SIGNIFICANT_QTY_DIFF).unwrap()
-                                                || entry_diff > Decimal::from_str(SIGNIFICANT_ENTRY_DIFF).unwrap();
+                            // ✅ PARALLEL VALIDATION: Validate all symbols concurrently
+                            // This is much faster than sequential validation (37 symbols × 2 API calls = 74 sequential calls would take minutes)
+                            // With parallel validation, all symbols are validated simultaneously (limited by tokio's concurrency)
+                            let symbol_timeout = Duration::from_secs(3); // Reduced timeout for parallel execution
+                            
+                            // Create validation tasks for all symbols
+                            let validation_tasks: Vec<_> = symbols_clone.iter().map(|symbol| {
+                                let symbol = symbol.clone();
+                                let venue_clone = venue_clone.clone();
+                                let symbol_timeout = symbol_timeout;
+                                
+                                tokio::spawn(async move {
+                                    // Validate position
+                                    let position_result = tokio::time::timeout(
+                                        symbol_timeout,
+                                        venue_clone.get_position(&symbol)
+                                    ).await;
+                                    
+                                    // Validate orders
+                                    let orders_result = tokio::time::timeout(
+                                        symbol_timeout,
+                                        venue_clone.get_open_orders(&symbol)
+                                    ).await;
+                                    
+                                    (symbol, position_result, orders_result)
+                                })
+                            }).collect();
 
-                                            // ✅ ALWAYS update cache with REST API data (REST API is source of truth)
-                                            // This ensures state consistency after reconnect
-                                            POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
-
-                                            if significant_mismatch {
-                                                // Significant mismatch - log warning
-                                                warn!(
-                                                    symbol = %symbol,
-                                                    rest_qty = %rest_position.qty.0,
-                                                    ws_qty = %ws_pos.qty.0,
-                                                    qty_diff = %qty_diff,
-                                                    rest_entry = %rest_position.entry.0,
-                                                    ws_entry = %ws_pos.entry.0,
-                                                    entry_diff = %entry_diff,
-                                                    "CONNECTION: Position mismatch detected after reconnect (REST vs WebSocket), cache updated with REST API data (source of truth)"
-                                                );
-                                            } else if qty_diff > Decimal::from_str("0.000001").unwrap_or_default() 
-                                                || entry_diff > Decimal::from_str("0.001").unwrap_or_default() {
-                                                // Small differences - log at debug level
-                                                debug!(
-                                                    symbol = %symbol,
-                                                    qty_diff = %qty_diff,
-                                                    entry_diff = %entry_diff,
-                                                    "CONNECTION: Small position difference detected after reconnect, cache updated with REST API data"
-                                                );
-                                            } else {
-                                                // No difference - cache already matches REST API
-                                                debug!(
-                                                    symbol = %symbol,
-                                                    "CONNECTION: Position cache matches REST API after reconnect"
-                                                );
-                                            }
-                                        } else if !rest_position.qty.0.is_zero() {
-                                            // REST API shows position but WebSocket cache doesn't
-                                            // Add missing position to cache
-                                            warn!(
-                                                symbol = %symbol,
-                                                rest_qty = %rest_position.qty.0,
-                                                "CONNECTION: Position exists in REST API but missing from WebSocket cache after reconnect, adding to cache"
-                                            );
-
-                                            // Add missing position to cache
-                                            POSITION_CACHE.insert(symbol.to_string(), rest_position.clone());
-
-                                            info!(
-                                                symbol = %symbol,
-                                                "CONNECTION: Missing position added to cache from REST API"
-                                            );
-                                        } else {
-                                            // REST API shows no position - remove from cache if exists
-                                            if POSITION_CACHE.contains_key(symbol) {
-                                                warn!(
-                                                    symbol = %symbol,
-                                                    "CONNECTION: Position removed from REST API but exists in WebSocket cache, removing from cache"
-                                                );
-                                                POSITION_CACHE.remove(symbol);
-
-                                                info!(
-                                                    symbol = %symbol,
-                                                    "CONNECTION: Stale position removed from cache"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Failed to fetch position - log but don't fail
-                                        debug!(
-                                            symbol = %symbol,
-                                            error = %e,
-                                            "CONNECTION: Failed to fetch position for validation after reconnect"
-                                        );
-                                    }
+                            // Wait for all validation tasks with overall timeout
+                            let validation_future = future::join_all(validation_tasks);
+                            let validation_results = match tokio::time::timeout(validation_timeout, validation_future).await {
+                                Ok(results) => results,
+                                Err(_) => {
+                                    warn!(
+                                        total_symbols,
+                                        elapsed_secs = validation_start.elapsed().as_secs(),
+                                        "CONNECTION: Validation timeout reached, cancelling remaining tasks"
+                                    );
+                                    // Return partial results - tasks that completed before timeout
+                                    vec![]
                                 }
+                            };
 
-                                // Validate open orders
-                                match venue_clone.get_open_orders(symbol).await {
-                                    Ok(rest_orders) => {
-                                        // ✅ CRITICAL: REST API is source of truth after reconnect
-                                        // Always update cache with REST API data to ensure state consistency
+                            // Process validation results
+                            let mut validated_count = 0;
+                            for result in validation_results {
+                                match result {
+                                    Ok((symbol, position_result, orders_result)) => {
+                                        // Process position validation
+                                        match position_result {
+                                            Ok(Ok(rest_position)) => {
+                                                // Compare with WebSocket cache
+                                                if let Some(ws_position) = POSITION_CACHE.get(&symbol) {
+                                                    let ws_pos = ws_position.value();
+                                                    let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
+                                                    let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
+                                                    
+                                                    const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
+                                                    const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
+                                                    let significant_mismatch = qty_diff > Decimal::from_str(SIGNIFICANT_QTY_DIFF).unwrap()
+                                                        || entry_diff > Decimal::from_str(SIGNIFICANT_ENTRY_DIFF).unwrap();
+                                                    
+                                                    POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
+                                                    
+                                                    if significant_mismatch {
+                                                        warn!(
+                                                            symbol = %symbol,
+                                                            rest_qty = %rest_position.qty.0,
+                                                            ws_qty = %ws_pos.qty.0,
+                                                            qty_diff = %qty_diff,
+                                                            "CONNECTION: Position mismatch detected after reconnect, cache updated"
+                                                        );
+                                                    }
+                                                } else if !rest_position.qty.0.is_zero() {
+                                                    POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
+                                                    warn!(
+                                                        symbol = %symbol,
+                                                        rest_qty = %rest_position.qty.0,
+                                                        "CONNECTION: Position exists in REST API but missing from WebSocket cache, added to cache"
+                                                    );
+                                                } else if POSITION_CACHE.contains_key(&symbol) {
+                                                    POSITION_CACHE.remove(&symbol);
+                                                }
+                                                validated_count += 1;
+                                            }
+                                            Ok(Err(_)) | Err(_) => {
+                                                // Failed or timeout - skip silently for parallel execution
+                                            }
+                                        }
                                         
-                                        // Compare with WebSocket cache
-                                        if let Some(ws_orders) = OPEN_ORDERS_CACHE.get(symbol) {
-                                            let ws_orders_vec = ws_orders.value();
-
-                                            // Check if order counts match
-                                            let count_mismatch = rest_orders.len() != ws_orders_vec.len();
-                                            
-                                            // Check for missing orders in WebSocket cache
-                                            let mut missing_orders = Vec::new();
-                                            for rest_order in &rest_orders {
-                                                if !ws_orders_vec.iter().any(|o| o.order_id == rest_order.order_id) {
-                                                    missing_orders.push(rest_order.order_id.clone());
+                                        // Process orders validation
+                                        match orders_result {
+                                            Ok(Ok(rest_orders)) => {
+                                                let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
+                                                    crate::types::VenueOrder {
+                                                        order_id: o.order_id.clone(),
+                                                        side: o.side,
+                                                        price: o.price,
+                                                        qty: o.qty,
+                                                    }
+                                                }).collect();
+                                                
+                                                if let Some(ws_orders) = OPEN_ORDERS_CACHE.get(&symbol) {
+                                                    let ws_orders_vec = ws_orders.value();
+                                                    let count_mismatch = rest_orders.len() != ws_orders_vec.len();
+                                                    
+                                                    if count_mismatch {
+                                                        warn!(
+                                                            symbol = %symbol,
+                                                            rest_order_count = rest_orders.len(),
+                                                            ws_order_count = ws_orders_vec.len(),
+                                                            "CONNECTION: Open orders mismatch detected after reconnect, cache updated"
+                                                        );
+                                                    }
+                                                } else if !rest_orders.is_empty() {
+                                                    warn!(
+                                                        symbol = %symbol,
+                                                        rest_order_count = rest_orders.len(),
+                                                        "CONNECTION: Open orders exist in REST API but missing from WebSocket cache, cache updated"
+                                                    );
                                                 }
+                                                
+                                                OPEN_ORDERS_CACHE.insert(symbol.clone(), rest_orders_vec);
                                             }
-
-                                            // ✅ ALWAYS update cache with REST API data (REST API is source of truth)
-                                            // This ensures state consistency after reconnect
-                                            let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
-                                                crate::types::VenueOrder {
-                                                    order_id: o.order_id.clone(),
-                                                    side: o.side,
-                                                    price: o.price,
-                                                    qty: o.qty,
-                                                }
-                                            }).collect();
-                                            OPEN_ORDERS_CACHE.insert(symbol.to_string(), rest_orders_vec);
-
-                                            if count_mismatch || !missing_orders.is_empty() {
-                                                warn!(
-                                                    symbol = %symbol,
-                                                    rest_order_count = rest_orders.len(),
-                                                    ws_order_count = ws_orders_vec.len(),
-                                                    missing_order_ids = ?missing_orders,
-                                                    "CONNECTION: Open orders mismatch detected after reconnect (REST vs WebSocket), cache updated with REST API data (source of truth)"
-                                                );
-                                            } else {
-                                                debug!(
-                                                    symbol = %symbol,
-                                                    "CONNECTION: Open orders cache matches REST API after reconnect"
-                                                );
-                                            }
-                                        } else if !rest_orders.is_empty() {
-                                            // REST API shows orders but WebSocket cache doesn't
-                                            // ✅ Add missing orders to cache
-                                            let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
-                                                crate::types::VenueOrder {
-                                                    order_id: o.order_id.clone(),
-                                                    side: o.side,
-                                                    price: o.price,
-                                                    qty: o.qty,
-                                                }
-                                            }).collect();
-                                            OPEN_ORDERS_CACHE.insert(symbol.to_string(), rest_orders_vec);
-                                            
-                                            warn!(
-                                                symbol = %symbol,
-                                                rest_order_count = rest_orders.len(),
-                                                "CONNECTION: Open orders exist in REST API but missing from WebSocket cache after reconnect, cache updated with REST API data"
-                                            );
-                                        } else {
-                                            // REST API shows no orders - remove from cache if exists
-                                            if OPEN_ORDERS_CACHE.contains_key(symbol) {
-                                                OPEN_ORDERS_CACHE.remove(symbol);
-                                                debug!(
-                                                    symbol = %symbol,
-                                                    "CONNECTION: No open orders in REST API, removed stale orders from cache"
-                                                );
+                                            Ok(Err(_)) | Err(_) => {
+                                                // Failed or timeout - skip silently
                                             }
                                         }
                                     }
-                                    Err(e) => {
-                                        // Failed to fetch orders - log but don't fail
-                                        debug!(
-                                            symbol = %symbol,
-                                            error = %e,
-                                            "CONNECTION: Failed to fetch open orders for validation after reconnect"
-                                        );
+                                    Err(_) => {
+                                        // Task join error - skip
                                     }
                                 }
                             }
 
-                            // Validate balance (USDT/USDC)
+                            // Validate balance (USDT/USDC) - with timeout
+                            let balance_timeout = Duration::from_secs(5);
                             for asset in &["USDT", "USDC"] {
-                                match venue_clone.available_balance(asset).await {
-                                    Ok(rest_balance) => {
+                                // Check overall timeout
+                                if validation_start.elapsed() > validation_timeout {
+                                    warn!(
+                                        asset = %asset,
+                                        "CONNECTION: Validation timeout reached, skipping balance validation"
+                                    );
+                                    break;
+                                }
+                                
+                                match tokio::time::timeout(balance_timeout, venue_clone.available_balance(asset)).await {
+                                    Ok(Ok(rest_balance)) => {
                                         // Compare with WebSocket cache
                                         if let Some(ws_balance) = BALANCE_CACHE.get(*asset) {
                                             let balance_diff = (rest_balance - *ws_balance.value()).abs();
@@ -813,7 +889,7 @@ impl Connection {
                                             );
                                         }
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         // Failed to fetch balance - log but don't fail
                                         debug!(
                                             asset = %asset,
@@ -821,10 +897,49 @@ impl Connection {
                                             "CONNECTION: Failed to fetch balance for validation after reconnect"
                                         );
                                     }
+                                    Err(_) => {
+                                        // Timeout - log warning
+                                        warn!(
+                                            asset = %asset,
+                                            timeout_secs = balance_timeout.as_secs(),
+                                            "CONNECTION: Balance validation timeout, skipping"
+                                        );
+                                    }
                                 }
                             }
 
-                            info!("CONNECTION: State validation after reconnect completed");
+                            let elapsed_secs = validation_start.elapsed().as_secs();
+                            let success_rate = if total_symbols > 0 {
+                                (validated_count as f64 / total_symbols as f64) * 100.0
+                            } else {
+                                0.0
+                            };
+                            
+                            if validated_count == total_symbols {
+                                info!(
+                                    validated_count,
+                                    total_symbols,
+                                    elapsed_secs,
+                                    success_rate = format!("{:.1}%", success_rate),
+                                    "CONNECTION: State validation after reconnect completed successfully (validated {}/{} symbols in {}s, {:.1}% success rate)",
+                                    validated_count,
+                                    total_symbols,
+                                    elapsed_secs,
+                                    success_rate
+                                );
+                            } else {
+                                warn!(
+                                    validated_count,
+                                    total_symbols,
+                                    elapsed_secs,
+                                    success_rate = format!("{:.1}%", success_rate),
+                                    "CONNECTION: State validation after reconnect completed partially (validated {}/{} symbols in {}s, {:.1}% success rate) - some symbols may have timed out or failed",
+                                    validated_count,
+                                    total_symbols,
+                                    elapsed_secs,
+                                    success_rate
+                                );
+                            }
                         });
                     });
 
@@ -1457,6 +1572,7 @@ impl Connection {
     /// Discover symbols based on config criteria
     /// Filters symbols by:
     /// - Quote asset (USDC or USDT based on config)
+    /// - Balance availability (only include quote assets with available balance)
     /// - Status (must be TRADING)
     /// - Contract type (must be PERPETUAL)
     /// Returns list of discovered symbol names
@@ -1464,20 +1580,118 @@ impl Connection {
     let quote_asset_upper = self.cfg.quote_asset.to_uppercase();
     let allow_usdt = self.cfg.allow_usdt_quote;
 
-    // Determine which quote assets to include
-    let mut allowed_quotes = vec![quote_asset_upper.clone()];
-    if allow_usdt && quote_asset_upper != "USDT" {
-        allowed_quotes.push("USDT".to_string());
+    // ✅ CRITICAL: Check balance availability before including quote assets
+    // If balance is zero or insufficient, exclude that quote asset from discovery
+    // This prevents discovering symbols we cannot trade with
+    // 
+    // IMPORTANT: Use min_usd_per_order (not min_quote_balance_usd) for balance check
+    // - min_usd_per_order: Minimum margin required (e.g., 10 USD)
+    // - min_quote_balance_usd: Safety threshold for order placement (e.g., 120 USD)
+    // - User can trade with minimum margin (10 USD), leverage will increase notional
+    // - Balance check only needs to ensure minimum margin is available
+    let min_required_balance = Decimal::from_str(
+        &self.cfg.min_usd_per_order.to_string()
+    ).unwrap_or(Decimal::from(10)); // Default to 10 USD if conversion fails
+    
+    let mut usdt_balance = Decimal::ZERO;
+    let mut usdc_balance = Decimal::ZERO;
+    
+    // Fetch balances to check availability
+    match self.fetch_balance("USDT").await {
+        Ok(bal) => usdt_balance = bal,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "CONNECTION: Failed to fetch USDT balance, excluding USDT symbols from discovery"
+            );
+        }
     }
-    if allow_usdt && quote_asset_upper != "USDC" {
+    
+    match self.fetch_balance("USDC").await {
+        Ok(bal) => usdc_balance = bal,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "CONNECTION: Failed to fetch USDC balance, excluding USDC symbols from discovery"
+            );
+        }
+    }
+    
+    let has_usdt_balance = usdt_balance >= min_required_balance;
+    let has_usdc_balance = usdc_balance >= min_required_balance;
+    
+    // Determine which quote assets to include based on balance availability
+    let mut allowed_quotes = Vec::new();
+    
+    // Include primary quote asset only if balance is available
+    if quote_asset_upper == "USDT" {
+        if has_usdt_balance {
+            allowed_quotes.push("USDT".to_string());
+        } else {
+            warn!(
+                usdt_balance = %usdt_balance,
+                min_required_balance = %min_required_balance,
+                "CONNECTION: USDT balance insufficient (need {} for minimum margin), excluding USDT symbols from discovery",
+                min_required_balance
+            );
+        }
+    } else if quote_asset_upper == "USDC" {
+        if has_usdc_balance {
+            allowed_quotes.push("USDC".to_string());
+        } else {
+            warn!(
+                usdc_balance = %usdc_balance,
+                min_required_balance = %min_required_balance,
+                "CONNECTION: USDC balance insufficient (need {} for minimum margin), excluding USDC symbols from discovery",
+                min_required_balance
+            );
+        }
+    } else {
+        // Unknown quote asset - include it anyway (let other filters handle it)
+        allowed_quotes.push(quote_asset_upper.clone());
+    }
+    
+    // Include additional quote assets only if balance is available and allowed
+    if allow_usdt && quote_asset_upper != "USDT" && has_usdt_balance {
+        allowed_quotes.push("USDT".to_string());
+    } else if allow_usdt && quote_asset_upper != "USDT" && !has_usdt_balance {
+        warn!(
+            usdt_balance = %usdt_balance,
+            min_required_balance = %min_required_balance,
+            "CONNECTION: USDT balance insufficient (need {} for minimum margin), excluding USDT symbols from discovery (allow_usdt_quote=true but no balance)",
+            min_required_balance
+        );
+    }
+    
+    if allow_usdt && quote_asset_upper != "USDC" && has_usdc_balance {
         allowed_quotes.push("USDC".to_string());
+    } else if allow_usdt && quote_asset_upper != "USDC" && !has_usdc_balance {
+        warn!(
+            usdc_balance = %usdc_balance,
+            min_required_balance = %min_required_balance,
+            "CONNECTION: USDC balance insufficient (need {} for minimum margin), excluding USDC symbols from discovery (allow_usdt_quote=true but no balance)",
+            min_required_balance
+        );
+    }
+    
+    if allowed_quotes.is_empty() {
+        return Err(anyhow!(
+            "No quote assets available for trading. USDT balance: {} (min required: {} for minimum margin), USDC balance: {} (min required: {} for minimum margin). Please ensure sufficient balance for at least one minimum margin trade.",
+            usdt_balance,
+            min_required_balance,
+            usdc_balance,
+            min_required_balance
+        ));
     }
 
     info!(
         quote_asset = %self.cfg.quote_asset,
         allow_usdt,
         allowed_quotes = ?allowed_quotes,
-        "CONNECTION: Discovering symbols with quote asset filter"
+        usdt_balance = %usdt_balance,
+        usdc_balance = %usdc_balance,
+        min_required_balance = %min_required_balance,
+        "CONNECTION: Discovering symbols with quote asset filter (balance-aware, using min_usd_per_order for check)"
     );
 
     // Fetch all symbol metadata

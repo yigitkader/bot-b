@@ -65,12 +65,21 @@ impl EventBus {
     /// let event_bus = EventBus::new_with_config(&cfg);
     /// ```
     pub fn new_with_config(cfg: &crate::config::EventBusCfg) -> Self {
-        let (market_tick_tx, _) = broadcast::channel(cfg.market_tick_buffer);
-        let (trade_signal_tx, _) = broadcast::channel(cfg.trade_signal_buffer);
-        let (close_request_tx, _) = broadcast::channel(cfg.close_request_buffer);
-        let (order_update_tx, _) = broadcast::channel(cfg.order_update_buffer);
-        let (position_update_tx, _) = broadcast::channel(cfg.position_update_buffer);
-        let (balance_update_tx, _) = broadcast::channel(cfg.balance_update_buffer);
+        // ✅ CRITICAL: Broadcast channel capacity cannot be zero
+        // Ensure minimum capacity of 1 to prevent panic
+        let market_tick_buffer = cfg.market_tick_buffer.max(1);
+        let trade_signal_buffer = cfg.trade_signal_buffer.max(1);
+        let close_request_buffer = cfg.close_request_buffer.max(1);
+        let order_update_buffer = cfg.order_update_buffer.max(1);
+        let position_update_buffer = cfg.position_update_buffer.max(1);
+        let balance_update_buffer = cfg.balance_update_buffer.max(1);
+        
+        let (market_tick_tx, _) = broadcast::channel(market_tick_buffer);
+        let (trade_signal_tx, _) = broadcast::channel(trade_signal_buffer);
+        let (close_request_tx, _) = broadcast::channel(close_request_buffer);
+        let (order_update_tx, _) = broadcast::channel(order_update_buffer);
+        let (position_update_tx, _) = broadcast::channel(position_update_buffer);
+        let (balance_update_tx, _) = broadcast::channel(balance_update_buffer);
         let (ordering_state_update_tx, _) = broadcast::channel(1000); // Buffer for state updates
         let (order_fill_history_update_tx, _) = broadcast::channel(1000); // Buffer for fill history updates
         let (log_event_tx, _) = mpsc::unbounded_channel();

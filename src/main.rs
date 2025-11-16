@@ -29,14 +29,42 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Create logs directory if it doesn't exist
+    std::fs::create_dir_all("logs")?;
+    
+    // Clear previous log file (truncate on open)
+    let _log_file = std::fs::File::create("logs/console.log")?;
+    drop(_log_file); // Close file before using it
+    
+    // Initialize logging with both console and file output
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .compact()
-        .with_ansi(true)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+    
+    // Create file appender (truncates file on each run)
+    let file_appender = tracing_appender::rolling::never("logs", "console.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    
+    // Create layers: one for console, one for file
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(true)
+                .with_writer(std::io::stdout) // Console output
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false) // No ANSI codes in file
+                .with_writer(non_blocking) // File output
+        )
         .init();
+    
+    // Keep guard alive for the duration of the program
+    // Note: _guard will be dropped at end of main, but that's OK since we're shutting down
+    let _file_guard = _guard;
 
     // Load configuration
     let cfg = Arc::new(load_config()?);

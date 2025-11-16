@@ -8,7 +8,6 @@ use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, EventBus, OrderUpdate, PositionUpdate, TradeSignal};
 use crate::state::{OpenOrder, OpenPosition, OrderingState, SharedState};
 use crate::types::{PositionDirection, Qty, Tif};
-use rust_decimal::prelude::ToPrimitive;
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -520,6 +519,15 @@ impl Ordering {
             );
             return Ok(());
         }
+        
+        debug!(
+            symbol = %signal.symbol,
+            side = ?signal.side,
+            notional = %notional,
+            required_margin = %required_margin,
+            leverage,
+            "ORDERING: Processing TradeSignal - validation passed"
+        );
 
         // ✅ CRITICAL: Check minimum quote balance when opening positions
         // This ensures we have sufficient balance for both margin AND closing commission.
@@ -537,10 +545,11 @@ impl Ordering {
             };
 
             if available_balance < min_quote_balance {
-                warn!(
+                debug!(
                     symbol = %signal.symbol,
                     available_balance = %available_balance,
                     min_quote_balance = %min_quote_balance,
+                    required_margin = %required_margin,
                     "ORDERING: Ignoring TradeSignal - available balance below minimum quote balance threshold"
                 );
                 return Ok(());
@@ -619,8 +628,10 @@ impl Ordering {
 
             // 5. Position check - ensure no open position/order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
-                warn!(
+                debug!(
                     symbol = %signal.symbol,
+                    has_position = state_guard.open_position.is_some(),
+                    has_order = state_guard.open_order.is_some(),
                     "ORDERING: Ignoring TradeSignal - already have open position/order"
                 );
                 return Ok(());
@@ -643,9 +654,19 @@ impl Ordering {
                 }
                 None => {
                     // Insufficient balance or reservation failed
-                    warn!(
+                    let available_balance = {
+                        let balance_store = shared_state.balance_store.read().await;
+                        if cfg.quote_asset.to_uppercase() == "USDT" {
+                            balance_store.usdt
+                        } else {
+                            balance_store.usdc
+                        }
+                    };
+                    debug!(
                         symbol = %signal.symbol,
                         required_margin = %required_margin,
+                        available_balance = %available_balance,
+                        quote_asset = %cfg.quote_asset,
                         "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
                     );
                     return Ok(());
@@ -689,9 +710,24 @@ impl Ordering {
             let mut order_id_result: Option<String> = None;
 
             for attempt in 0..MAX_RETRIES {
+                debug!(
+                    symbol = %signal.symbol,
+                    side = ?signal.side,
+                    attempt = attempt + 1,
+                    max_retries = MAX_RETRIES,
+                    "ORDERING: Attempting to place order"
+                );
+                
                 match connection.send_order(command.clone()).await {
                     Ok(id) => {
                         // Keep balance reserved until state is updated
+                        info!(
+                            symbol = %signal.symbol,
+                            order_id = %id,
+                            side = ?signal.side,
+                            attempt = attempt + 1,
+                            "ORDERING: Order placed successfully"
+                        );
                         order_id_result = Some(id);
                         break; // Success, exit retry loop
                     }

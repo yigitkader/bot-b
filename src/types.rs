@@ -120,6 +120,9 @@ pub struct SymbolRules {
     pub price_precision: usize,
     pub qty_precision: usize,
     pub min_notional: Decimal,
+    /// Maximum leverage allowed for this symbol (from exchange)
+    /// None if not available (will use config max_leverage instead)
+    pub max_leverage: Option<u32>,
 }
 
 /// Symbol metadata from exchange

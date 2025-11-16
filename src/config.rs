@@ -37,6 +37,15 @@ pub struct TrendingCfg {
     pub max_spread_bps: f64,
     #[serde(default = "default_signal_cooldown_seconds")]
     pub signal_cooldown_seconds: u64,
+    /// High-frequency trading mode: allows signals without volume confirmation
+    /// When true, trend signals are generated even if volume doesn't confirm (more aggressive)
+    #[serde(default = "default_hft_mode")]
+    pub hft_mode: bool,
+    /// Require volume confirmation for trend signals
+    /// When true, signals are blocked if volume doesn't confirm the trend
+    /// When false (and hft_mode=true), volume confirmation is optional
+    #[serde(default = "default_require_volume_confirmation")]
+    pub require_volume_confirmation: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -115,10 +124,28 @@ pub struct AppCfg {
     pub quote_asset: String,
     #[serde(default = "default_allow_usdt_quote")]
     pub allow_usdt_quote: bool,
+    /// Maximum margin per trade (USD) - legacy, use min_margin_usd/max_margin_usd instead
+    /// Kept for backward compatibility, but will be clamped to [min_margin_usd, max_margin_usd]
     #[serde(default = "default_max_usd_per_order")]
     pub max_usd_per_order: f64,
+    /// Minimum margin per trade (USD) - legacy, use min_margin_usd instead
     #[serde(default = "default_min_usd_per_order")]
     pub min_usd_per_order: f64,
+    /// Minimum margin per trade (USD) - dynamic margin range lower bound
+    /// Used for dynamic margin calculation: margin will be clamped to [min_margin_usd, max_margin_usd]
+    #[serde(default = "default_min_margin_usd")]
+    pub min_margin_usd: f64,
+    /// Maximum margin per trade (USD) - dynamic margin range upper bound
+    /// Used for dynamic margin calculation: margin will be clamped to [min_margin_usd, max_margin_usd]
+    #[serde(default = "default_max_margin_usd")]
+    pub max_margin_usd: f64,
+    /// Margin calculation strategy: "fixed" | "dynamic" | "trend_based" | "balance_based" | "max_balance"
+    /// - "fixed": Always use max_usd_per_order (or clamped to [min_margin_usd, max_margin_usd])
+    /// - "dynamic" | "trend_based": Scale margin based on trend strength, using available balance as base
+    /// - "balance_based" | "max_balance": Use all available balance (up to max_margin_usd)
+    ///   Since we only have one position at a time, we can use all available funds (up to max_margin_usd limit)
+    #[serde(default = "default_margin_strategy")]
+    pub margin_strategy: String,
     #[serde(default = "default_min_quote_balance_usd")]
     pub min_quote_balance_usd: f64,
     /// Explicit leverage setting (optional)
@@ -157,6 +184,9 @@ impl Default for AppCfg {
             allow_usdt_quote: default_allow_usdt_quote(),
             max_usd_per_order: default_max_usd_per_order(),
             min_usd_per_order: default_min_usd_per_order(),
+            min_margin_usd: default_min_margin_usd(),
+            max_margin_usd: default_max_margin_usd(),
+            margin_strategy: default_margin_strategy(),
             min_quote_balance_usd: default_min_quote_balance_usd(),
             leverage: None,
             price_tick: default_price_tick(),
@@ -206,7 +236,27 @@ fn default_max_spread_bps() -> f64 {
 }
 
 fn default_signal_cooldown_seconds() -> u64 {
-    30 // Default: 30 seconds cooldown between signals for same symbol
+    5 // Default: 5 seconds cooldown between signals for same symbol (optimized for high-frequency trading)
+}
+
+fn default_hft_mode() -> bool {
+    true // Default: HFT mode enabled for high-frequency trading
+}
+
+fn default_require_volume_confirmation() -> bool {
+    false // Default: Volume confirmation not required in HFT mode
+}
+
+fn default_min_margin_usd() -> f64 {
+    10.0 // Minimum margin: 10 USD
+}
+
+fn default_max_margin_usd() -> f64 {
+    100.0 // Maximum margin: 100 USD
+}
+
+fn default_margin_strategy() -> String {
+    "fixed".to_string() // Default: Fixed margin (use max_usd_per_order)
 }
 
 fn default_tif() -> String {
@@ -459,7 +509,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // Order size validation
+    // Order size validation (legacy)
     if cfg.max_usd_per_order <= cfg.min_usd_per_order {
         return Err(anyhow!(
             "max_usd_per_order ({}) must be greater than min_usd_per_order ({})",
@@ -471,41 +521,125 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         return Err(anyhow!("min_usd_per_order must be greater than 0"));
     }
 
+    // Dynamic margin range validation
+    if cfg.min_margin_usd <= 0.0 {
+        return Err(anyhow!("min_margin_usd must be greater than 0"));
+    }
+    if cfg.max_margin_usd <= cfg.min_margin_usd {
+        return Err(anyhow!(
+            "max_margin_usd ({}) must be greater than min_margin_usd ({})",
+            cfg.max_margin_usd,
+            cfg.min_margin_usd
+        ));
+    }
+    // Clamp max_usd_per_order to [min_margin_usd, max_margin_usd] range
+    if cfg.max_usd_per_order < cfg.min_margin_usd || cfg.max_usd_per_order > cfg.max_margin_usd {
+        return Err(anyhow!(
+            "max_usd_per_order ({}) must be within [min_margin_usd ({}), max_margin_usd ({})] range",
+            cfg.max_usd_per_order,
+            cfg.min_margin_usd,
+            cfg.max_margin_usd
+        ));
+    }
+    // Validate margin strategy
+    let valid_strategies = ["fixed", "dynamic", "trend_based", "balance_based", "max_balance"];
+    if !valid_strategies.contains(&cfg.margin_strategy.as_str()) {
+        return Err(anyhow!(
+            "margin_strategy must be one of: 'fixed', 'dynamic', 'trend_based', 'balance_based', 'max_balance', got '{}'",
+            cfg.margin_strategy
+        ));
+    }
+
     // Minimum quote balance validation
     if cfg.min_quote_balance_usd <= 0.0 {
         return Err(anyhow!("min_quote_balance_usd must be greater than 0"));
     }
 
-    // Validate max_usd_per_order vs min_quote_balance_usd relationship
-    // The minimum balance must be at least as large as the maximum order size
+    // Validate max_margin_usd vs min_quote_balance_usd relationship
+    // The minimum balance must be at least as large as the maximum margin
     // Otherwise, we might try to place orders larger than the available balance
-    if cfg.min_quote_balance_usd < cfg.max_usd_per_order {
+    if cfg.min_quote_balance_usd < cfg.max_margin_usd {
         return Err(anyhow!(
-            "min_quote_balance_usd ({}) must be at least as large as max_usd_per_order ({}) to ensure sufficient balance for trading",
+            "min_quote_balance_usd ({}) must be at least as large as max_margin_usd ({}) to ensure sufficient balance for trading",
             cfg.min_quote_balance_usd,
-            cfg.max_usd_per_order
+            cfg.max_margin_usd
         ));
     }
 
-    // Validate that profitable trades are possible
-    // For a trade to be profitable, take_profit_pct must exceed stop_loss_pct + total commission
-    // Total commission = entry commission + exit commission (worst case: both taker fees)
-    // Entry commission: taker_commission_pct
-    // Exit commission (TP): taker_commission_pct (on exit price)
-    // Exit commission (SL): taker_commission_pct (on exit price)
-    // Worst case total commission ≈ 2 * taker_commission_pct (entry + exit)
-    // We need: take_profit_pct > stop_loss_pct + (2 * taker_commission_pct)
+    // ✅ CRITICAL: Validate that profitable trades are possible
+    // For a trade to be profitable, take_profit_pct must exceed stop_loss_pct + total costs
+    // Total costs = entry commission + exit commission + spread + slippage
+    // 
+    // Mathematical model:
+    // - Entry commission: taker_commission_pct (worst case: market order)
+    // - Exit commission (TP): taker_commission_pct (on exit price)
+    // - Exit commission (SL): taker_commission_pct (on exit price)
+    // - Spread cost: average spread (bps) / 10000 (convert to percentage)
+    // - Slippage: estimated 0.01% for liquid pairs (conservative)
+    //
+    // Worst case total cost = 2 * taker_commission_pct + spread_pct + slippage_pct
+    // We need: take_profit_pct > stop_loss_pct + total_cost
+    //
+    // For HFT with 0.5$ profit target:
+    // - Margin: 10-100 USD
+    // - Leverage: 100x (max)
+    // - Notional: 1000-10000 USD
+    // - Target profit: 0.5 USD = 0.05% of 1000 USD notional (worst case)
+    // - This means TP% must be at least 0.05% + costs
     let total_commission_pct = 2.0 * cfg.risk.taker_commission_pct;
-    let min_required_tp = cfg.stop_loss_pct + total_commission_pct;
+    
+    // Estimate spread cost: average spread in bps / 10000
+    // Default: assume 0.02% spread (2 bps) for major pairs
+    let avg_spread_bps = (cfg.trending.min_spread_bps + cfg.trending.max_spread_bps) / 2.0;
+    let spread_pct = avg_spread_bps / 10000.0;
+    
+    // Slippage estimate: 0.01% for liquid pairs (conservative)
+    const SLIPPAGE_PCT: f64 = 0.01;
+    
+    // Total cost = commission + spread + slippage
+    let total_cost_pct = total_commission_pct + spread_pct + SLIPPAGE_PCT;
+    
+    // Minimum required TP = SL% + total costs
+    let min_required_tp = cfg.stop_loss_pct + total_cost_pct;
+    
     if cfg.take_profit_pct <= min_required_tp {
         return Err(anyhow!(
-            "take_profit_pct ({}) must be greater than stop_loss_pct ({}) + total commission ({}). Current: {} <= {}. Profitable trades would be impossible.",
+            "take_profit_pct ({}) must be greater than stop_loss_pct ({}) + total costs ({}). \
+             Total costs breakdown: commission={}%, spread={}%, slippage={}%. \
+             Current: {} <= {}. Profitable trades would be impossible. \
+             For HFT with 0.5$ profit target, consider: TP% >= {}%",
             cfg.take_profit_pct,
             cfg.stop_loss_pct,
+            total_cost_pct,
             total_commission_pct,
+            spread_pct,
+            SLIPPAGE_PCT,
             cfg.take_profit_pct,
+            min_required_tp,
             min_required_tp
         ));
+    }
+    
+    // Additional validation for HFT strategy (0.5$ profit target)
+    // With 100x leverage and 10-100 USD margin:
+    // - Min notional: 10 * 100 = 1000 USD
+    // - Max notional: 100 * 100 = 10000 USD
+    // - Target profit: 0.5 USD
+    // - Min profit %: 0.5 / 10000 = 0.005% (worst case, max notional)
+    // - Max profit %: 0.5 / 1000 = 0.05% (best case, min notional)
+    // 
+    // For consistency, TP% should be at least 0.05% to achieve 0.5$ profit on min notional
+    // But this is too small - we need TP% to cover costs + profit
+    // Recommended: TP% >= 0.1% for HFT strategy (allows 0.5$ profit after costs)
+    const MIN_HFT_TP_PCT: f64 = 0.1;
+    if cfg.take_profit_pct < MIN_HFT_TP_PCT {
+        eprintln!(
+            "⚠️  WARNING: take_profit_pct ({}) is very small for HFT strategy (target: 0.5$ profit). \
+             Recommended: TP% >= {}% to ensure profitability after costs. \
+             Current TP% may not achieve 0.5$ profit target consistently.",
+            cfg.take_profit_pct,
+            MIN_HFT_TP_PCT
+        );
     }
 
     // Validate trending spread configuration
