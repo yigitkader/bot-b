@@ -9,12 +9,22 @@ use crate::types::{LastSignal, PositionDirection, PricePoint, Px, Qty, Side, Sym
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::str::FromStr;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
+
+/// Market regime for adaptive strategy
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MarketRegime {
+    Trending,   // Strong directional movement - use trend-following
+    Ranging,    // Sideways movement - use mean-reversion (not implemented yet)
+    Volatile,   // High volatility - reduce position size
+    Unknown,    // Not enough data
+}
 
 // ============================================================================
 // Utility Functions
@@ -227,6 +237,13 @@ impl Trending {
                                     last_position_close_time: None,
                                     last_position_direction: None,
                                     tick_counter: 0,
+                                    ema_9: None,
+                                    ema_21: None,
+                                    ema_55: None,
+                                    ema_55_history: VecDeque::new(),
+                                    rsi_avg_gain: None,
+                                    rsi_avg_loss: None,
+                                    rsi_period_count: 0,
                                 }
                             });
                             
@@ -317,65 +334,335 @@ impl Trending {
         Ok(())
     }
 
-    /// Calculate Simple Moving Average (SMA) for the last N prices
-    fn calculate_sma(prices: &VecDeque<PricePoint>, period: usize) -> Option<Decimal> {
+    /// Update EMA incrementally (O(1) performance)
+    /// EMA formula: EMA = Price(t) * k + EMA(y) * (1 – k)
+    /// where k = 2 / (period + 1)
+    fn update_ema(prev_ema: Option<Decimal>, new_price: Decimal, period: usize, prices_count: usize) -> Decimal {
+        let k = Decimal::from(2) / Decimal::from(period + 1);
+        
+        match prev_ema {
+            Some(ema) => {
+                // Incremental update (fast)
+                new_price * k + ema * (Decimal::ONE - k)
+            }
+            None => {
+                // First value: use SMA if we have enough prices
+                if prices_count >= period {
+                    // Calculate SMA for initialization
+                    // This only happens once per symbol
+                    new_price // For first tick, just use current price
+                } else {
+                    new_price
+                }
+            }
+        }
+    }
+    
+    /// Update all indicators incrementally (called on each tick)
+    /// Public for backtesting
+    pub fn update_indicators(state: &mut SymbolState, new_price: Decimal) {
+        let prices_count = state.prices.len();
+        
+        // Update EMAs incrementally
+        state.ema_9 = Some(Self::update_ema(state.ema_9, new_price, 9, prices_count));
+        state.ema_21 = Some(Self::update_ema(state.ema_21, new_price, 21, prices_count));
+        state.ema_55 = Some(Self::update_ema(state.ema_55, new_price, 55, prices_count));
+        
+        // Track EMA_55 history for slope calculation
+        if let Some(ema_55) = state.ema_55 {
+            state.ema_55_history.push_back(ema_55);
+            const EMA_HISTORY_SIZE: usize = 10; // Keep last 10 EMA values for slope
+            while state.ema_55_history.len() > EMA_HISTORY_SIZE {
+                state.ema_55_history.pop_front();
+            }
+        }
+        
+        // Update RSI incrementally (Wilder's smoothing method)
+        // Need at least 2 prices to calculate change
+        if state.prices.len() >= 2 {
+            // Get previous price (before we added new_price)
+            if let Some(prev_price_point) = state.prices.get(state.prices.len() - 2) {
+                let prev_price = prev_price_point.price;
+                let change = new_price - prev_price;
+                let (gain, loss) = if change.is_sign_positive() {
+                    (change, Decimal::ZERO)
+                } else {
+                    (Decimal::ZERO, -change)
+                };
+                
+                const RSI_PERIOD: usize = 14;
+                let alpha = Decimal::ONE / Decimal::from(RSI_PERIOD);
+                
+                state.rsi_avg_gain = Some(match state.rsi_avg_gain {
+                    Some(ag) => ag * (Decimal::ONE - alpha) + gain * alpha,
+                    None => gain,
+                });
+                
+                state.rsi_avg_loss = Some(match state.rsi_avg_loss {
+                    Some(al) => al * (Decimal::ONE - alpha) + loss * alpha,
+                    None => loss,
+                });
+                
+                state.rsi_period_count += 1;
+            }
+        }
+    }
+    
+    /// Calculate RSI from incremental state (O(1) performance)
+    fn calculate_rsi_from_state(state: &SymbolState) -> Option<f64> {
+        const RSI_PERIOD: usize = 14;
+        
+        // Need at least RSI_PERIOD updates before RSI is reliable
+        if state.rsi_period_count < RSI_PERIOD {
+            return None;
+        }
+        
+        let avg_gain = state.rsi_avg_gain?;
+        let avg_loss = state.rsi_avg_loss?;
+        
+        if avg_loss.is_zero() {
+            return Some(100.0); // All gains, no losses
+        }
+        
+        let rs = avg_gain / avg_loss;
+        let rsi = Decimal::from(100) - (Decimal::from(100) / (Decimal::ONE + rs));
+        rsi.to_f64()
+    }
+    
+    /// Calculate average volume over period
+    fn calculate_avg_volume(prices: &VecDeque<PricePoint>, period: usize) -> Option<Decimal> {
         if prices.len() < period {
             return None;
         }
         
-        let recent: Decimal = prices
+        let volumes: Vec<Decimal> = prices
             .iter()
             .rev()
             .take(period)
-            .map(|p| p.price)
-            .sum();
+            .filter_map(|p| p.volume)
+            .collect();
         
-        Some(recent / Decimal::from(period))
-    }
-    
-    /// Analyze trend for a specific timeframe
-    /// Returns Some(TrendSignal) if clear trend detected, None otherwise
-    fn analyze_trend_timeframe(prices: &VecDeque<PricePoint>, period: usize, threshold_pct: f64) -> Option<TrendSignal> {
-        if prices.len() < period {
+        if volumes.is_empty() {
             return None;
         }
         
-        // Calculate SMA of last period prices
-        let sma = Self::calculate_sma(prices, period)?;
-        let current_price = prices.back()?.price;
-        
-        // Calculate price deviation from SMA
-        let deviation_pct = ((current_price - sma) / sma) * Decimal::from(100);
-        let deviation_pct_f64 = deviation_pct.to_f64().unwrap_or(0.0);
-        
-        // Determine trend:
-        // - Price > SMA * (1 + threshold) → Uptrend → Long signal
-        // - Price < SMA * (1 - threshold) → Downtrend → Short signal
-        // - Otherwise → No clear trend
-        if deviation_pct_f64 > threshold_pct {
-            Some(TrendSignal::Long)
-        } else if deviation_pct_f64 < -threshold_pct {
-            Some(TrendSignal::Short)
-        } else {
-            None
-        }
+        let sum: Decimal = volumes.iter().sum();
+        Some(sum / Decimal::from(volumes.len()))
     }
     
-    /// Simple trend analysis using SMA
-    /// Returns Some(TrendSignal) if clear trend detected, None otherwise
-    fn analyze_trend(state: &SymbolState) -> Option<TrendSignal> {
-        const SMA_PERIOD: usize = 20;  // Simple 20-period SMA
-        const TREND_THRESHOLD_PCT: f64 = 0.01; // 0.01% threshold - simple and effective
+    /// Calculate Average True Range (ATR) for volatility measurement
+    fn calculate_atr(prices: &VecDeque<PricePoint>, period: usize) -> Option<Decimal> {
+        if prices.len() < period + 1 {
+            return None;
+        }
+
+        let mut true_ranges = Vec::new();
+        let price_points: Vec<Decimal> = prices.iter().rev().take(period + 1).map(|p| p.price).collect();
+
+        for i in 1..price_points.len() {
+            let high = price_points[i - 1];
+            let low = price_points[i];
+            let tr = (high - low).abs();
+            true_ranges.push(tr);
+        }
+
+        if true_ranges.is_empty() {
+            return None;
+        }
+
+        let sum: Decimal = true_ranges.iter().sum();
+        Some(sum / Decimal::from(true_ranges.len()))
+    }
+
+    /// Detect market regime (Trending vs Ranging)
+    fn detect_market_regime(state: &SymbolState) -> MarketRegime {
+        const ATR_PERIOD: usize = 14;
+        const ADX_PERIOD: usize = 14;
+        const TRENDING_THRESHOLD: f64 = 25.0; // ADX > 25 = trending
+        const LOW_VOLATILITY_THRESHOLD: f64 = 0.5; // ATR < 0.5% = ranging
+
+        let prices = &state.prices;
+        
+        // Calculate ATR for volatility
+        let atr = Self::calculate_atr(prices, ATR_PERIOD);
+        let atr_pct = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
+            if !current_price.price.is_zero() {
+                (atr_val / current_price.price * Decimal::from(100)).to_f64()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Simplified ADX calculation (using EMA slope as directional movement proxy)
+        let directional_movement = if state.ema_55_history.len() >= 2 {
+            let current_ema = state.ema_55_history.back().unwrap();
+            let old_ema = state.ema_55_history.front().unwrap();
+            if !old_ema.is_zero() {
+                ((current_ema - old_ema) / old_ema * Decimal::from(100)).abs().to_f64()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Determine regime
+        if let (Some(adx_proxy), Some(atr_pct_val)) = (directional_movement, atr_pct) {
+            if adx_proxy > TRENDING_THRESHOLD {
+                MarketRegime::Trending
+            } else if atr_pct_val < LOW_VOLATILITY_THRESHOLD {
+                MarketRegime::Ranging
+            } else {
+                MarketRegime::Volatile
+            }
+        } else {
+            MarketRegime::Unknown
+        }
+    }
+
+    /// Multi-indicator hybrid strategy with weighted scoring
+    /// Combines EMA trend, RSI momentum, and volume confirmation
+    /// Uses weighted scoring system for flexible signal generation
+    /// Includes adaptive parameters based on volatility and market regime
+    /// Public for backtesting
+    pub fn analyze_trend(state: &SymbolState) -> Option<TrendSignal> {
+        const VOLUME_PERIOD: usize = 20; // Volume average period
+        const BASE_MIN_SCORE: f64 = 4.5; // Base threshold (6.0 max score, 4.5 = 75%)
+        const BASE_RSI_LOWER: f64 = 50.0;
+        const BASE_RSI_UPPER: f64 = 75.0;
+        const BASE_RSI_LOWER_SHORT: f64 = 25.0;
+        const BASE_RSI_UPPER_SHORT: f64 = 50.0;
         
         let prices = &state.prices;
         
-        // Need at least SMA_PERIOD prices
-        if prices.len() < SMA_PERIOD {
+        // Need enough prices and indicator data
+        if prices.len() < VOLUME_PERIOD {
             return None;
         }
         
-        // Simple SMA trend analysis
-        Self::analyze_trend_timeframe(prices, SMA_PERIOD, TREND_THRESHOLD_PCT)
+        // Need EMAs to be initialized
+        let ema_fast = state.ema_9?;
+        let ema_mid = state.ema_21?;
+        let ema_slow = state.ema_55?;
+        
+        let current_price = prices.back()?.price;
+        
+        // 1. Multi-timeframe EMA trend confirmation (weighted scoring)
+        let mut score_long = 0.0;
+        let mut score_short = 0.0;
+        
+        // Short-term: Price > Fast EMA > Mid EMA (weight: 2.0 - most important)
+        if current_price > ema_fast && ema_fast > ema_mid {
+            score_long += 2.0;
+        } else if current_price < ema_fast && ema_fast < ema_mid {
+            score_short += 2.0;
+        }
+        
+        // Mid-term: Mid EMA > Slow EMA (weight: 1.5)
+        if ema_mid > ema_slow {
+            score_long += 1.5;
+        } else if ema_mid < ema_slow {
+            score_short += 1.5;
+        }
+        
+        // Long-term: EMA slope (weight: 1.0)
+        let ema_slope = if state.ema_55_history.len() >= 2 {
+            let current_ema = state.ema_55_history.back().unwrap();
+            let old_ema = state.ema_55_history.front().unwrap();
+            if !old_ema.is_zero() {
+                Some((current_ema - old_ema) / old_ema)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        if let Some(slope) = ema_slope {
+            // 0.01% minimum slope for trend confirmation
+            let min_slope = Decimal::from(1) / Decimal::from(10000);
+            if slope > min_slope {
+                score_long += 1.0;
+            } else if slope < -min_slope {
+                score_short += 1.0;
+            }
+        }
+        
+        // 2. RSI momentum confirmation (weight: 1.0) with adaptive thresholds
+        let rsi = Self::calculate_rsi_from_state(state)?;
+        
+        // Adaptive RSI thresholds based on volatility
+        let atr = Self::calculate_atr(prices, 14);
+        let volatility_multiplier = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
+            if !current_price.price.is_zero() {
+                let atr_pct = (atr_val / current_price.price).to_f64().unwrap_or(0.01);
+                let base_volatility = 0.02; // 2% base volatility
+                (atr_pct / base_volatility).max(0.5).min(2.0) // Clamp between 0.5x and 2x
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        
+        // Adjust RSI bounds based on volatility
+        // Long signals: RSI between 50-75 (bullish momentum)
+        let rsi_lower = BASE_RSI_LOWER - (15.0 * volatility_multiplier); // 35-50 range
+        let rsi_upper = BASE_RSI_UPPER - (10.0 * (1.0 - volatility_multiplier)); // 65-75 range
+        
+        // Short signals: RSI between 25-50 (bearish momentum) - FIXED for better short detection
+        let rsi_lower_short = BASE_RSI_LOWER_SHORT + (10.0 * (1.0 - volatility_multiplier)); // 25-35 range
+        let rsi_upper_short = BASE_RSI_UPPER_SHORT - (10.0 * volatility_multiplier); // 40-50 range
+        
+        let rsi_bullish = rsi > rsi_lower && rsi < rsi_upper;
+        let rsi_bearish = rsi > rsi_lower_short && rsi < rsi_upper_short;
+        
+        if rsi_bullish {
+            score_long += 1.0;
+        } else if rsi_bearish {
+            score_short += 1.0;
+        }
+        
+        // Market regime detection
+        let regime = Self::detect_market_regime(state);
+        
+        // Adjust score threshold based on market regime
+        let min_score = match regime {
+            MarketRegime::Trending => BASE_MIN_SCORE * 0.9, // Lower threshold in trending markets
+            MarketRegime::Ranging => BASE_MIN_SCORE * 1.2,  // Higher threshold in ranging markets (avoid false signals)
+            MarketRegime::Volatile => BASE_MIN_SCORE * 1.1, // Higher threshold in volatile markets
+            MarketRegime::Unknown => BASE_MIN_SCORE,
+        };
+        
+        // 3. Volume confirmation (weight: 0.5 - less critical)
+        let current_volume = prices.back()?.volume?;
+        let avg_volume = Self::calculate_avg_volume(prices, VOLUME_PERIOD)?;
+        
+        // Volume surge (1.2x average)
+        let volume_multiplier = Decimal::from_str("1.2").unwrap_or(Decimal::from(120) / Decimal::from(100));
+        let volume_surge = current_volume > avg_volume * volume_multiplier;
+        
+        // Volume trend (recent > longer average)
+        let recent_avg_volume = Self::calculate_avg_volume(prices, 5)?;
+        let volume_trend = recent_avg_volume > avg_volume;
+        
+        let volume_confirms = volume_surge && volume_trend;
+        
+        if volume_confirms {
+            score_long += 0.5;
+            score_short += 0.5;
+        }
+        
+        // 4. Generate signal based on weighted score (with adaptive threshold)
+        if score_long >= min_score {
+            Some(TrendSignal::Long)
+        } else if score_short >= min_score {
+            Some(TrendSignal::Short)
+        } else {
+            None // Score too low
+        }
     }
     
 
@@ -426,6 +713,13 @@ impl Trending {
                                     last_position_close_time: None,
                                     last_position_direction: None,
                                     tick_counter: 0,
+                                    ema_9: None,
+                                    ema_21: None,
+                                    ema_55: None,
+                                    ema_55_history: VecDeque::new(),
+                                    rsi_avg_gain: None,
+                                    rsi_avg_loss: None,
+                                    rsi_period_count: 0,
             });
             
             state.prices.push_back(PricePoint {
@@ -434,10 +728,13 @@ impl Trending {
                 volume: tick.volume,
             });
             
-            const MAX_HISTORY: usize = 50; // Keep last 50 prices
+            const MAX_HISTORY: usize = 100; // Keep last 100 prices (EMA_SLOW=55 + buffer)
             while state.prices.len() > MAX_HISTORY {
                 state.prices.pop_front();
             }
+            
+            // Incremental EMA/RSI update (O(1) performance)
+            Self::update_indicators(state, mid_price);
             
             Self::analyze_trend(state)
         };

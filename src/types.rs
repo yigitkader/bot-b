@@ -613,6 +613,16 @@ pub struct SymbolState {
     pub last_position_direction: Option<PositionDirection>,
     /// Tick counter for sampling (event flood prevention)
     pub tick_counter: u32,
+    /// EMA values (incremental calculation for performance)
+    pub ema_9: Option<Decimal>,
+    pub ema_21: Option<Decimal>,
+    pub ema_55: Option<Decimal>,
+    /// EMA slope history for long-term trend detection
+    pub ema_55_history: std::collections::VecDeque<Decimal>,
+    /// RSI state (Wilder's smoothing method)
+    pub rsi_avg_gain: Option<Decimal>,
+    pub rsi_avg_loss: Option<Decimal>,
+    pub rsi_period_count: usize,
 }
 
 /// Trend signal direction

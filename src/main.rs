@@ -11,6 +11,7 @@ mod ordering;
 mod follow_orders;
 mod balance;
 mod logging;
+mod metrics;
 
 use crate::balance::Balance;
 use crate::config::{load_config, AppCfg};
