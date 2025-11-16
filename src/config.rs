@@ -665,7 +665,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
 
     // ✅ CRITICAL: Validate that profitable trades are possible
     // For a trade to be profitable, take_profit_pct must exceed stop_loss_pct + total costs
-    // Total costs = entry commission + exit commission + spread + slippage
+    // Total costs = entry commission + exit commission + spread + slippage + funding rate
     // 
     // Mathematical model:
     // - Entry commission: taker_commission_pct (worst case: market order)
@@ -673,8 +673,10 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     // - Exit commission (SL): taker_commission_pct (on exit price)
     // - Spread cost: average spread (bps) / 10000 (convert to percentage)
     // - Slippage: estimated 0.01% for liquid pairs (conservative)
+    // - Funding rate: estimated 0.01% per 8 hours (perpetual futures)
+    //   For HFT, average trade duration is short (< 1 hour), but we include it for safety
     //
-    // Worst case total cost = 2 * taker_commission_pct + spread_pct + slippage_pct
+    // Worst case total cost = 2 * taker_commission_pct + spread_pct + slippage_pct + funding_rate_pct
     // We need: take_profit_pct > stop_loss_pct + total_cost
     //
     // For HFT with 0.5$ profit target:
@@ -693,8 +695,14 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     // Slippage estimate: 0.01% for liquid pairs (conservative)
     const SLIPPAGE_PCT: f64 = 0.01;
     
-    // Total cost = commission + spread + slippage
-    let total_cost_pct = total_commission_pct + spread_pct + SLIPPAGE_PCT;
+    // Funding rate estimate: 0.01% per 8 hours (typical for perpetual futures)
+    // For HFT, average trade duration is short (< 1 hour), but we include it for safety
+    // Conservative estimate: assume 1 hour average trade duration = 0.01% / 8 = 0.00125%
+    // For simplicity, use 0.01% as worst case (if trade lasts full 8 hours)
+    const ESTIMATED_FUNDING_RATE_PCT: f64 = 0.01; // 0.01% per 8 hours (worst case)
+    
+    // Total cost = commission + spread + slippage + funding rate
+    let total_cost_pct = total_commission_pct + spread_pct + SLIPPAGE_PCT + ESTIMATED_FUNDING_RATE_PCT;
     
     // Minimum required TP = SL% + total costs
     let min_required_tp = cfg.stop_loss_pct + total_cost_pct;
@@ -702,7 +710,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.take_profit_pct <= min_required_tp {
         return Err(anyhow!(
             "take_profit_pct ({}) must be greater than stop_loss_pct ({}) + total costs ({}). \
-             Total costs breakdown: commission={}%, spread={}%, slippage={}%. \
+             Total costs breakdown: commission={}%, spread={}%, slippage={}%, funding_rate={}%. \
              Current: {} <= {}. Profitable trades would be impossible. \
              For HFT with 0.5$ profit target, consider: TP% >= {}%",
             cfg.take_profit_pct,
@@ -711,6 +719,7 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             total_commission_pct,
             spread_pct,
             SLIPPAGE_PCT,
+            ESTIMATED_FUNDING_RATE_PCT,
             cfg.take_profit_pct,
             min_required_tp,
             min_required_tp

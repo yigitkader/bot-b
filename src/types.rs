@@ -455,10 +455,10 @@ impl CircuitBreakerState {
             return false;
         }
         
-        // Check if cooldown period has passed (5 minutes)
+        // Check if cooldown period has passed (1 minute - HFT optimized)
         if let Some(last_trigger) = self.last_trigger_time {
             let elapsed = Instant::now().duration_since(last_trigger);
-            if elapsed > Duration::from_secs(300) { // 5 minutes cooldown
+            if elapsed > Duration::from_secs(60) { // 1 minute cooldown (HFT optimized, was 5 minutes)
                 return false; // Cooldown passed, allow orders again
             }
         }
@@ -493,7 +493,7 @@ impl CircuitBreakerState {
     pub fn reset_if_cooldown_passed(&mut self) {
         if let Some(last_trigger) = self.last_trigger_time {
             let elapsed = Instant::now().duration_since(last_trigger);
-            if elapsed > Duration::from_secs(300) { // 5 minutes cooldown
+            if elapsed > Duration::from_secs(60) { // 1 minute cooldown (HFT optimized, was 5 minutes)
                 self.reset();
             }
         }

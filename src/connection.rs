@@ -153,6 +153,56 @@ impl Connection {
         }
     }
 
+    /// Get clamped leverage for a symbol
+    /// Clamps desired leverage to symbol's max leverage (if available) or safe fallback (50x)
+    /// This centralizes leverage clamping logic to avoid duplication
+    async fn get_clamped_leverage(&self, symbol: &str, desired_leverage: u32) -> u32 {
+        const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+        
+        match self.venue.rules_for(symbol).await {
+            Ok(rules) => {
+                if let Some(symbol_max_lev) = rules.max_leverage {
+                    // Symbol has max leverage - clamp to it
+                    let clamped = desired_leverage.min(symbol_max_lev);
+                    if clamped < desired_leverage {
+                        warn!(
+                            symbol = %symbol,
+                            desired_leverage,
+                            symbol_max_leverage = symbol_max_lev,
+                            final_leverage = clamped,
+                            "CONNECTION: Leverage clamped to symbol max leverage"
+                        );
+                    }
+                    clamped
+                } else {
+                    // No symbol max leverage - use safe fallback instead of config max
+                    // Config max (100x) might be too high for some symbols
+                    let clamped = desired_leverage.min(SAFE_LEVERAGE_FALLBACK);
+                    if clamped < desired_leverage {
+                        warn!(
+                            symbol = %symbol,
+                            desired_leverage,
+                            safe_fallback = SAFE_LEVERAGE_FALLBACK,
+                            final_leverage = clamped,
+                            "CONNECTION: Leverage brackets not available, using safe fallback (50x) instead of config max"
+                        );
+                    }
+                    clamped
+                }
+            }
+            Err(e) => {
+                // Failed to fetch rules - use safe fallback instead of config max
+                warn!(
+                    error = %e,
+                    symbol = %symbol,
+                    safe_fallback = SAFE_LEVERAGE_FALLBACK,
+                    "CONNECTION: Failed to fetch symbol rules, using safe fallback (50x) instead of config max"
+                );
+                desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
+            }
+        }
+    }
+
     pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
 
         // Set hedge mode according to config (must be done before any orders)
@@ -176,51 +226,8 @@ impl Connection {
 
         for symbol in &symbols {
             // ✅ CRITICAL: Clamp leverage to symbol's max leverage (if available)
-            // Fetch symbol rules to get max leverage
-            let leverage = match self.venue.rules_for(symbol).await {
-                Ok(rules) => {
-                    if let Some(symbol_max_lev) = rules.max_leverage {
-                        // Symbol has max leverage - clamp to it
-                        let clamped = desired_leverage.min(symbol_max_lev);
-                        if clamped < desired_leverage {
-                            warn!(
-                                symbol = %symbol,
-                                desired_leverage,
-                                symbol_max_leverage = symbol_max_lev,
-                                final_leverage = clamped,
-                                "CONNECTION: Leverage clamped to symbol max leverage"
-                            );
-                        }
-                        clamped
-                    } else {
-                        // No symbol max leverage - use safe fallback instead of config max
-                        // Config max (100x) might be too high for some symbols
-                        const SAFE_LEVERAGE_FALLBACK: u32 = 50;
-                        let clamped = desired_leverage.min(SAFE_LEVERAGE_FALLBACK);
-                        if clamped < desired_leverage {
-                            warn!(
-                                symbol = %symbol,
-                                desired_leverage,
-                                safe_fallback = SAFE_LEVERAGE_FALLBACK,
-                                final_leverage = clamped,
-                                "CONNECTION: Leverage brackets not available, using safe fallback (50x) instead of config max"
-                            );
-                        }
-                        clamped
-                    }
-                }
-                Err(e) => {
-                    // Failed to fetch rules - use safe fallback instead of config max
-                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
-                    warn!(
-                        error = %e,
-                        symbol = %symbol,
-                        safe_fallback = SAFE_LEVERAGE_FALLBACK,
-                        "CONNECTION: Failed to fetch symbol rules, using safe fallback (50x) instead of config max"
-                    );
-                    desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
-                }
-            };
+            // Use centralized clamping function to avoid code duplication
+            let leverage = self.get_clamped_leverage(symbol, desired_leverage).await;
             // Set margin type (isolated or cross)
             // Note: set_margin_type handles -4046 "No need to change" as success
             if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {
@@ -271,23 +278,8 @@ impl Connection {
                 } else {
                     // Position is CLOSED - safe to set leverage
                     // ✅ CRITICAL: Re-fetch symbol rules to get max leverage (may have changed or not been fetched yet)
-                    // Use same safe fallback as above
-                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
-                    
-                    let final_leverage = match self.venue.rules_for(symbol).await {
-                        Ok(rules) => {
-                            if let Some(symbol_max_lev) = rules.max_leverage {
-                                leverage.min(symbol_max_lev)
-                            } else {
-                                // Use safe fallback instead of config max
-                                leverage.min(SAFE_LEVERAGE_FALLBACK)
-                            }
-                        }
-                        Err(_) => {
-                            // Use safe fallback instead of config max
-                            leverage.min(SAFE_LEVERAGE_FALLBACK)
-                        }
-                    };
+                    // Use centralized clamping function to ensure consistency
+                    let final_leverage = self.get_clamped_leverage(symbol, leverage).await;
                     
                     if position.leverage != final_leverage {
                         warn!(
@@ -414,8 +406,12 @@ impl Connection {
         let shutdown_flag = self.shutdown_flag.clone();
 
         tokio::spawn(async move {
-        const CLEANUP_INTERVAL_SECS: u64 = 3600; // Every hour
-        const MAX_AGE_SECS: u64 = 86400; // 24 hours (very conservative, memory leak prevention only)
+        // ✅ CRITICAL: Reduced cleanup interval from 1 hour to 10 minutes for HFT
+        // HFT requires faster cleanup to prevent memory accumulation
+        const CLEANUP_INTERVAL_SECS: u64 = 600; // 10 minutes (HFT optimized, was 1 hour)
+        // ✅ CRITICAL: Reduced max age from 24 hours to 1 hour for HFT
+        // 24 hours is too long for HFT - filled orders should be cleaned up faster
+        const MAX_AGE_SECS: u64 = 3600; // 1 hour (HFT optimized, was 24 hours)
 
         loop {
             tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
@@ -432,18 +428,18 @@ impl Connection {
                 // This caused memory leak: 100 orders/day × 30 days = 3000 entries (only cleaned after 24 hours)
                 //
                 // Solution: Three-tier cleanup strategy
-                // 1. Force remove very old entries (24+ hours) - prevents leaks from stale cache
-                // 2. Remove filled/cancelled orders after short delay (5 minutes) - prevents accumulation
+                // 1. Force remove very old entries (1+ hour) - prevents leaks from stale cache (HFT optimized)
+                // 2. Remove filled/cancelled orders after short delay (30 seconds) - prevents accumulation (HFT optimized)
                 // 3. Keep active orders (in cache) - protects ongoing orders
                 let age = now.duration_since(history.last_update);
                 let age_secs = age.as_secs();
 
                 // Step 1: AGE CHECK FIRST (prevents leak even if cache is stale)
-                // If entry is very old (24+ hours), force remove to prevent memory leak
+                // If entry is very old (1+ hour), force remove to prevent memory leak (HFT optimized)
                 // This handles cases where:
                 // - Order was filled/cancelled but WebSocket update delayed
                 // - Cache still shows order as "open" but history is very old
-                // - Order has been open for more than 24 hours (unlikely but possible)
+                // - Order has been open for more than 1 hour (unlikely but possible)
                 if age_secs > MAX_AGE_SECS {
                     // Very old entry - force remove regardless of cache status
                     // This prevents memory leaks from stale cache or very long-lived orders
@@ -469,14 +465,19 @@ impl Connection {
                 } else {
                     // Order NOT in cache (filled/cancelled) - remove after short delay
                     // This prevents memory leak from accumulating filled order histories
-                    const SHORT_DELAY_SECS: u64 = 300; // 5 minutes - enough time for late-arriving events
+                    // ✅ CRITICAL: Reduced from 5 minutes to 30 seconds for HFT
+                    // - Order fill olduktan 1 saniye sonra cache'den çıkar
+                    // - WebSocket events genellikle < 1 saniye içinde gelir
+                    // - 30 saniye late-arriving events için yeterli buffer
+                    // - HFT için 5 dakika çok uzun (memory leak riski)
+                    const SHORT_DELAY_SECS: u64 = 30; // 30 seconds - enough time for late-arriving events (HFT optimized)
                     
                     if age_secs > SHORT_DELAY_SECS {
-                        // Order not in cache and history is older than 5 minutes - remove it
+                        // Order not in cache and history is older than 30 seconds - remove it
                         // This handles:
                         // - Orders that were filled/cancelled (not in cache)
-                        // - Late-arriving WebSocket events (5 minutes is enough buffer)
-                        // - Prevents accumulation of filled order histories
+                        // - Late-arriving WebSocket events (30 seconds is enough buffer for HFT)
+                        // - Prevents accumulation of filled order histories (memory leak prevention)
                         debug!(
                             order_id = %order_id,
                             history_age_secs = age_secs,
@@ -485,7 +486,7 @@ impl Connection {
                         );
                         false // Remove - order is filled/cancelled
                     } else {
-                        // Order not in cache but history is very recent (< 5 minutes)
+                        // Order not in cache but history is very recent (< 30 seconds)
                         // Keep for now - may receive late-arriving fill events or order may be closing
                         // Will be cleaned up on next cleanup cycle if still inactive
                         true // Keep - recent entry, may receive late events
@@ -569,8 +570,11 @@ impl Connection {
 
             tokio::spawn(async move {
                 // Exponential backoff configuration
+                // ✅ CRITICAL: Reduced max delay from 60s to 10s for HFT
+                // HFT requires fast reconnection - 60 seconds is too long
+                // Exponential backoff sequence: 1s → 2s → 4s → 8s → 10s (max)
                 const INITIAL_DELAY_SECS: u64 = 1;
-                const MAX_DELAY_SECS: u64 = 60;
+                const MAX_DELAY_SECS: u64 = 10; // 10 seconds max (HFT optimized, was 60s)
                 let mut connection_retry_delay = INITIAL_DELAY_SECS;
                 let mut stream_retry_delay = INITIAL_DELAY_SECS;
 
@@ -2075,23 +2079,9 @@ impl Connection {
         let use_isolated_margin = self.cfg.risk.use_isolated_margin;
 
         for symbol in &new_symbols {
-            // Clamp leverage to symbol's max leverage (if available)
-            let leverage = match self.venue.rules_for(symbol).await {
-                Ok(rules) => {
-                    if let Some(symbol_max_lev) = rules.max_leverage {
-                        desired_leverage.min(symbol_max_lev)
-                    } else {
-                        // Use safe fallback instead of config max
-                        const SAFE_LEVERAGE_FALLBACK: u32 = 50;
-                        desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
-                    }
-                }
-                Err(_) => {
-                    // Use safe fallback instead of config max
-                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
-                    desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
-                }
-            };
+            // ✅ CRITICAL: Clamp leverage to symbol's max leverage (if available)
+            // Use centralized clamping function to avoid code duplication
+            let leverage = self.get_clamped_leverage(symbol, desired_leverage).await;
 
             // Set margin type (isolated or cross)
             if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {

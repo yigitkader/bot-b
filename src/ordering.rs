@@ -780,57 +780,13 @@ impl Ordering {
         let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
         let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
         
-        // ✅ CRITICAL: Commission buffer must be reserved BEFORE margin calculation
-        // Commission buffer: Small buffer for entry + exit commission + slippage
-        // Commission is calculated from notional (margin × leverage), not from margin itself
-        // For small balances (20 USD margin, 100x leverage = 2000 USD notional):
-        //   - Commission ≈ 0.1% × 2000 = 2 USD (entry + exit)
-        //   - Buffer: 5 USD (safety margin for commission + slippage)
-        // This prevents liquidity crisis where order cannot be closed due to insufficient balance
-        let commission_buffer = Decimal::from(5);
-        
-        // Calculate usable balance (available balance minus commission buffer)
-        // This ensures we always have enough balance to close the position
-        let usable_balance = available_balance.saturating_sub(commission_buffer);
-        
-        // Calculate margin: Use available balance (10 <= margin <= 100 USD)
-        // ✅ CRITICAL: Commission buffer is already subtracted from usable_balance
-        let margin_usd = match cfg.margin_strategy.as_str() {
-            "fixed" => {
-                // Fixed: use max_usd_per_order (clamped to [min_margin_usd, max_margin_usd])
-                // Also respect usable_balance (after commission buffer)
-                Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(max_margin)
-                    .max(min_margin)
-                    .min(max_margin)
-                    .min(usable_balance) // Never exceed usable balance (after commission buffer)
-            }
-            "balance_based" | "max_balance" | "dynamic" | "trend_based" | _ => {
-                // Balance-based: Use usable balance (up to max_margin_usd)
-                // ✅ CRITICAL: Commission buffer is already subtracted, so we can use all usable_balance
-                if usable_balance >= min_margin {
-                    usable_balance.min(max_margin)
-                } else {
-                    // Usable balance too low (after commission buffer)
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        usable_balance = %usable_balance,
-                        commission_buffer = %commission_buffer,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
-                    );
-                    return Ok(());
-                }
-            }
-        };
-        
-        // Fetch symbol rules to get max leverage
+        // Fetch symbol rules to get max leverage (needed for commission buffer calculation)
         let rules = match connection.rules_for(&signal.symbol).await {
             Ok(r) => r,
             Err(e) => {
-            warn!(
+                warn!(
                     error = %e,
-                symbol = %signal.symbol,
+                    symbol = %signal.symbol,
                     "ORDERING: Failed to fetch symbol rules, skipping order"
                 );
                 return Ok(());
@@ -854,8 +810,210 @@ impl Ordering {
             "ORDERING: Using coin's max leverage"
         );
         
-        // Calculate notional: margin × leverage
+        // ✅ CRITICAL: Commission buffer calculation based on notional
+        // Problem: Commission is calculated from notional (margin × leverage), not from margin itself
+        // Solution: Two-stage calculation - estimate margin first, then calculate accurate commission buffer
+        //
+        // Stage 1: Estimate margin without commission buffer (for initial commission calculation)
+        let estimated_margin = match cfg.margin_strategy.as_str() {
+            "fixed" => {
+                Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(max_margin)
+                    .max(min_margin)
+                    .min(max_margin)
+                    .min(available_balance) // Use available balance (no commission buffer yet)
+            }
+            "balance_based" | "max_balance" => {
+                if available_balance >= min_margin {
+                    available_balance.min(max_margin)
+                } else {
+                    // Available balance too low
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
+                    );
+                    return Ok(());
+                }
+            }
+            "dynamic" | "trend_based" => {
+                // Dynamic/Trend-based: Estimate margin based on spread quality
+                // Use same logic as final margin calculation but without commission buffer
+                if available_balance < min_margin {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
+                    );
+                    return Ok(());
+                }
+                
+                // Calculate spread quality (same as final calculation)
+                let min_spread_bps = cfg.trending.min_spread_bps;
+                let max_spread_bps = cfg.trending.max_spread_bps;
+                let spread_range = max_spread_bps - min_spread_bps;
+                
+                let spread_quality = if spread_range > 0.0 {
+                    let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
+                    normalized.max(0.0).min(1.0)
+                } else {
+                    0.5
+                };
+                
+                let base_margin = available_balance.min(max_margin);
+                let dynamic_margin = base_margin * Decimal::from_str(&spread_quality.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.5").unwrap_or(Decimal::from(50) / Decimal::from(100)));
+                
+                dynamic_margin.max(min_margin).min(max_margin).min(available_balance)
+            }
+            _ => {
+                // Default: Use balance-based strategy (fallback)
+                if available_balance >= min_margin {
+                    available_balance.min(max_margin)
+                } else {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        
+        // Calculate estimated notional for commission buffer calculation
         let leverage_decimal = Decimal::from(leverage);
+        let estimated_notional = estimated_margin * leverage_decimal;
+        
+        // Calculate commission buffer based on notional (entry + exit commission)
+        // Commission rate: taker commission (worst case) for both entry and exit
+        let taker_commission_rate = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+            .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO)) / Decimal::from(100);
+        
+        // Total commission = entry (0.04%) + exit (0.04%) = 0.08% of notional
+        let total_commission_rate = taker_commission_rate * Decimal::from(2);
+        let calculated_commission_buffer = estimated_notional * total_commission_rate;
+        
+        // Minimum commission buffer: 2 USD (safety margin for small positions)
+        let min_commission_buffer = Decimal::from(2);
+        
+        // Use max of calculated commission and min buffer
+        let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
+        
+        // Stage 2: Calculate usable balance (available balance minus commission buffer)
+        // This ensures we always have enough balance to close the position
+        let usable_balance = available_balance.saturating_sub(commission_buffer);
+        
+        // Calculate final margin: Use usable balance (10 <= margin <= 100 USD)
+        // ✅ CRITICAL: Commission buffer is already subtracted from usable_balance
+        let margin_usd = match cfg.margin_strategy.as_str() {
+            "fixed" => {
+                // Fixed: use max_usd_per_order (clamped to [min_margin_usd, max_margin_usd])
+                // Also respect usable_balance (after commission buffer)
+                Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(max_margin)
+                    .max(min_margin)
+                    .min(max_margin)
+                    .min(usable_balance) // Never exceed usable balance (after commission buffer)
+            }
+            "balance_based" | "max_balance" => {
+                // Balance-based: Use usable balance (up to max_margin_usd)
+                // ✅ CRITICAL: Commission buffer is already subtracted, so we can use all usable_balance
+                if usable_balance >= min_margin {
+                    usable_balance.min(max_margin)
+                } else {
+                    // Usable balance too low (after commission buffer)
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        usable_balance = %usable_balance,
+                        commission_buffer = %commission_buffer,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
+                    );
+                    return Ok(());
+                }
+            }
+            "dynamic" | "trend_based" => {
+                // Dynamic/Trend-based: Adjust margin based on signal quality (spread-based)
+                // Lower spread = higher liquidity = safer = higher margin
+                // Higher spread = lower liquidity = riskier = lower margin
+                //
+                // Spread quality calculation:
+                // - Normalize spread to 0.0-1.0 range (min_spread = 1.0, max_spread = 0.0)
+                // - Use this as margin multiplier
+                // - Minimum margin: min_margin, Maximum margin: max_margin
+                if usable_balance < min_margin {
+                    // Usable balance too low (after commission buffer)
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        usable_balance = %usable_balance,
+                        commission_buffer = %commission_buffer,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
+                    );
+                    return Ok(());
+                }
+                
+                // Calculate spread quality (0.0 = worst, 1.0 = best)
+                // Lower spread = better quality = higher margin
+                let min_spread_bps = cfg.trending.min_spread_bps;
+                let max_spread_bps = cfg.trending.max_spread_bps;
+                let spread_range = max_spread_bps - min_spread_bps;
+                
+                let spread_quality = if spread_range > 0.0 {
+                    // Normalize: spread closer to min = higher quality (closer to 1.0)
+                    // spread closer to max = lower quality (closer to 0.0)
+                    let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
+                    // Clamp to [0.0, 1.0]
+                    normalized.max(0.0).min(1.0)
+                } else {
+                    // No spread range - use default quality (0.5 = medium)
+                    0.5
+                };
+                
+                // Calculate dynamic margin: base margin * spread quality
+                // Base margin is usable_balance (up to max_margin)
+                let base_margin = usable_balance.min(max_margin);
+                let dynamic_margin = base_margin * Decimal::from_str(&spread_quality.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.5").unwrap_or(Decimal::from(50) / Decimal::from(100)));
+                
+                // Ensure margin is within bounds [min_margin, max_margin]
+                let final_margin = dynamic_margin.max(min_margin).min(max_margin).min(usable_balance);
+                
+                debug!(
+                    symbol = %signal.symbol,
+                    spread_bps = signal.spread_bps,
+                    spread_quality = spread_quality,
+                    base_margin = %base_margin,
+                    dynamic_margin = %final_margin,
+                    "ORDERING: Dynamic margin calculated based on spread quality"
+                );
+                
+                final_margin
+            }
+            _ => {
+                // Default: Use balance-based strategy (fallback)
+                if usable_balance >= min_margin {
+                    usable_balance.min(max_margin)
+                } else {
+                    // Usable balance too low (after commission buffer)
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        usable_balance = %usable_balance,
+                        commission_buffer = %commission_buffer,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        
+        // Calculate final notional: margin × leverage
         let notional = margin_usd
             .checked_mul(leverage_decimal)
             .ok_or_else(|| {
@@ -1102,9 +1260,9 @@ impl Ordering {
             // This prevents borrow checker issues when moving balance_store into BalanceReservation
             let balance_store_clone = shared_state.balance_store.clone();
             
-            let reservation = {
-                // Acquire balance_store write lock inside ordering_state lock
+            // ✅ CRITICAL: Acquire balance_store write lock INSIDE ordering_state lock
                 // This nested lock is safe because lock order is consistent: ordering_state -> balance_store
+            // Both locks are held simultaneously - prevents race condition
                 let mut balance_store_guard = shared_state.balance_store.write().await;
                 
                 // Check available balance (atomic with reservation)
@@ -1118,12 +1276,14 @@ impl Ordering {
                     quote_asset = %cfg.quote_asset,
                         "ORDERING: Ignoring TradeSignal - insufficient balance (atomic check)"
                 );
+                // Both locks released here (balance_store_guard and state_guard)
                 return Ok(());
             }
 
                 // ✅ CRITICAL: Reserve balance atomically (using already-acquired lock)
                 // This prevents race condition: state check + balance reservation is atomic
-                match BalanceReservation::new_with_lock(
+            // Both ordering_state and balance_store locks are held - no other thread can interfere
+            let reservation = match BalanceReservation::new_with_lock(
                     balance_store_clone,
                     &mut balance_store_guard,
                 &cfg.quote_asset,
@@ -1133,12 +1293,13 @@ impl Ordering {
                 ) {
                 Some(reservation) => {
                     // Track reserved margin in ordering_state for additional safety
+                    // This update happens while BOTH locks are held - truly atomic
                     state_guard.reserved_margin += required_margin;
                     reservation
                 }
                 None => {
-                        // Reservation failed (another thread reserved it between check and reserve)
-                        // This should be rare because we hold both locks, but handle it gracefully
+                    // Reservation failed (should be rare because we hold both locks)
+                    // This can happen if try_reserve() fails internally (edge case)
                     debug!(
                         symbol = %signal.symbol,
                         required_margin = %required_margin,
@@ -1146,10 +1307,14 @@ impl Ordering {
                         quote_asset = %cfg.quote_asset,
                             "ORDERING: Ignoring TradeSignal - balance reservation failed (insufficient balance)"
                     );
+                    // Both locks released here (balance_store_guard and state_guard)
                     return Ok(());
-                    }
                 }
             };
+            
+            // Drop balance_store_guard explicitly to make it clear when lock is released
+            // ordering_state lock (state_guard) is still held until end of block
+            drop(balance_store_guard);
 
             // Lock released here - balance is reserved, state is checked
             reservation
@@ -1169,66 +1334,7 @@ impl Ordering {
         // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
         // Missing releases cause balance leaks and prevent future orders from being placed.
 
-        // Step 2: Real-time spread validation (BEFORE order placement)
-        // ✅ CRITICAL: Re-check spread immediately before order placement
-        // Even though we checked spread staleness (1 second max), spread can still change
-        // Low liquidity coins can see spread jump from 0.01% to 200% in milliseconds
-        // This final check prevents slippage from stale or changed spreads
-        match connection.get_current_prices(&signal.symbol).await {
-            Ok((current_bid, current_ask)) => {
-                // Calculate current spread
-                if !current_bid.0.is_zero() {
-                    let current_spread_bps = ((current_ask.0 - current_bid.0) / current_bid.0) * Decimal::from(10000);
-                    let current_spread_bps_f64 = current_spread_bps.to_f64().unwrap_or(0.0);
-                    
-                    // Validate current spread against thresholds
-                    let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
-                    let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
-                    
-                    if current_spread_bps_f64 < min_acceptable_spread_bps || current_spread_bps_f64 > max_acceptable_spread_bps {
-                        warn!(
-                            symbol = %signal.symbol,
-                            current_spread_bps = current_spread_bps_f64,
-                            signal_spread_bps = signal.spread_bps,
-                            min_spread_bps = min_acceptable_spread_bps,
-                            max_spread_bps = max_acceptable_spread_bps,
-                            "ORDERING: Current spread ({:.2} bps) outside acceptable range, aborting order placement to prevent slippage",
-                            current_spread_bps_f64
-                        );
-                        // Release balance reservation
-                        balance_reservation.release().await;
-                        return Ok(());
-                    }
-                    
-                    // Log if spread changed significantly (for monitoring)
-                    let spread_change = (current_spread_bps_f64 - signal.spread_bps).abs();
-                    if spread_change > 10.0 {
-                        // Spread changed by more than 10 bps
-                        warn!(
-                            symbol = %signal.symbol,
-                            signal_spread_bps = signal.spread_bps,
-                            current_spread_bps = current_spread_bps_f64,
-                            spread_change_bps = spread_change,
-                            "ORDERING: Spread changed significantly since signal generation ({} bps -> {} bps), but still within acceptable range",
-                            signal.spread_bps,
-                            current_spread_bps_f64
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                // Failed to get current prices - log warning but proceed with order
-                // This is a safety check, not a hard requirement
-                // If price cache is empty or REST API fails, we still try to place order
-                warn!(
-                    error = %e,
-                    symbol = %signal.symbol,
-                    "ORDERING: Failed to get current prices for spread validation, proceeding with order placement (using signal spread)"
-                );
-            }
-        }
-
-        // Step 3: IMMEDIATELY place order (after real-time spread validation)
+        // Step 2: IMMEDIATELY place order (before spread can change)
         // This minimizes the window where another thread can interfere
         // Real-time spread validation ensures we don't place orders with bad spreads
         //
@@ -1356,7 +1462,95 @@ impl Ordering {
             }
         };
 
-        // Step 3: Update state atomically (re-acquire lock for state update)
+        // Step 3: Post-order spread validation (AFTER order placement)
+        // ✅ CRITICAL: Validate spread immediately after order placement
+        // This prevents the gap between validation and placement where spread can change
+        // If spread changed significantly, cancel the order to prevent slippage
+        match connection.get_current_prices(&signal.symbol).await {
+            Ok((current_bid, current_ask)) => {
+                // Calculate current spread
+                if !current_bid.0.is_zero() {
+                    let current_spread_bps = ((current_ask.0 - current_bid.0) / current_bid.0) * Decimal::from(10000);
+                    let current_spread_bps_f64 = current_spread_bps.to_f64().unwrap_or(0.0);
+                    
+                    // Validate current spread against thresholds
+                    let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
+                    let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
+                    
+                    if current_spread_bps_f64 < min_acceptable_spread_bps || current_spread_bps_f64 > max_acceptable_spread_bps {
+                        warn!(
+                            symbol = %signal.symbol,
+                            order_id = %order_id,
+                            current_spread_bps = current_spread_bps_f64,
+                            signal_spread_bps = signal.spread_bps,
+                            min_spread_bps = min_acceptable_spread_bps,
+                            max_spread_bps = max_acceptable_spread_bps,
+                            "ORDERING: Spread changed after order placement ({} bps -> {} bps), canceling order to prevent slippage",
+                            signal.spread_bps,
+                            current_spread_bps_f64
+                        );
+                        
+                        // Cancel order immediately - spread is no longer acceptable
+                        match connection.cancel_order(&order_id, &signal.symbol).await {
+                            Ok(()) => {
+                                info!(
+                                    symbol = %signal.symbol,
+                                    order_id = %order_id,
+                                    "ORDERING: Successfully canceled order due to spread change"
+                                );
+                                // Update reserved_margin in ordering_state
+                                {
+                                    let mut state_guard = shared_state.ordering_state.lock().await;
+                                    state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                                }
+                                balance_reservation.release().await;
+                                return Ok(());
+                            }
+                            Err(cancel_err) => {
+                                // Cancel failed - order may have already filled
+                                // This is acceptable - order was placed with acceptable spread at that moment
+                                warn!(
+                                    error = %cancel_err,
+                                    symbol = %signal.symbol,
+                                    order_id = %order_id,
+                                    "ORDERING: Failed to cancel order after spread change (order may have already filled)"
+                                );
+                                // Continue with order - it was placed with acceptable spread at that moment
+                            }
+                        }
+                    } else {
+                        // Spread is still acceptable - log if it changed significantly
+                        let spread_change = (current_spread_bps_f64 - signal.spread_bps).abs();
+                        if spread_change > 10.0 {
+                            // Spread changed by more than 10 bps but still within acceptable range
+                            warn!(
+                                symbol = %signal.symbol,
+                                order_id = %order_id,
+                                signal_spread_bps = signal.spread_bps,
+                                current_spread_bps = current_spread_bps_f64,
+                                spread_change_bps = spread_change,
+                                "ORDERING: Spread changed after order placement ({} bps -> {} bps), but still within acceptable range",
+                                signal.spread_bps,
+                                current_spread_bps_f64
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Failed to get current prices - log warning but proceed with order
+                // This is a safety check, not a hard requirement
+                // If price cache is empty or REST API fails, we still proceed with order
+                warn!(
+                    error = %e,
+                    symbol = %signal.symbol,
+                    order_id = %order_id,
+                    "ORDERING: Failed to get current prices for post-order spread validation, proceeding with order (order was placed with acceptable spread at that moment)"
+                );
+            }
+        }
+
+        // Step 4: Update state atomically (re-acquire lock for state update)
         // ✅ CRITICAL: With Reserve-Before-Check pattern, this double-check is primarily a safety net
         // The balance reservation prevents other threads from even starting the order placement process
         // However, we still double-check state here as a safety measure in case of edge cases
@@ -1863,7 +2057,7 @@ impl Ordering {
                                 symbol = %update.symbol,
                                 order_id = %update.order_id,
                                 reject_count = state_guard.circuit_breaker.reject_count,
-                                "ORDERING: CRITICAL - Circuit breaker OPENED after {} consecutive rejections. Order placement will be blocked for 5 minutes to prevent Binance ban.",
+                                "ORDERING: CRITICAL - Circuit breaker OPENED after {} consecutive rejections. Order placement will be blocked for 1 minute to prevent Binance ban.",
                                 state_guard.circuit_breaker.reject_count
                             );
                         } else {

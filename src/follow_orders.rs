@@ -304,11 +304,21 @@ impl FollowOrders {
         // Performance: If no position, return immediately (no expensive PnL calculations)
         // Responsibility: FOLLOW_ORDERS only processes when position is tracked
         // This is a fast read-only check, so do it first
+        //
+        // Race condition prevention (Layer 1 - Early Check):
+        // - Check close_requested flag BEFORE expensive PnL calculations
+        // - If flag is true, another thread is already processing close - skip this tick
+        // - This prevents duplicate PnL calculations and reduces lock contention
+        // - Note: This is a read lock, so multiple threads can check simultaneously
+        // - The flag is set in Layer 2 (atomic remove), so this is a fast pre-filter
         let position = {
             let positions_read = positions.read().await;
             match positions_read.get(&tick.symbol) {
                 Some(pos) => {
-                    // If close already requested, skip this tick (already processing close)
+                    // ✅ CRITICAL: Early check for close_requested flag (read lock, fast)
+                    // If another thread already set this flag, skip expensive PnL calculations
+                    // This is the first line of defense against race conditions
+                    // Performance: Avoids expensive calculations when close is already in progress
                     if pos.close_requested {
                         return Ok(());
                     }
@@ -411,25 +421,39 @@ impl FollowOrders {
         if let Some(tp_pct) = position.take_profit_pct {
             if net_pnl_pct_f64 >= tp_pct {
                 // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
-                // This prevents race condition where multiple ticks trigger duplicate CloseRequests
-                // Atomic operation: remove position and verify it was removed
+                // Race condition prevention (Layer 2 - Atomic Remove):
+                // - Multiple threads can reach here if they all pass early check (close_requested flag)
+                // - Atomic operation: acquire write lock → check position exists → set flag → remove
+                // - Only ONE thread can successfully remove the position (HashMap::remove() is atomic)
+                // - Threads that fail to remove (position already removed) skip CloseRequest
+                //
+                // Thread safety guarantee:
+                // - Thread A: get_mut() → pos found, close_requested = true, remove() → true → CloseRequest sent ✓
+                // - Thread B: get_mut() → pos found (if A hasn't removed yet), close_requested = true, remove() → false (A already removed) → skip ✓
+                // - Thread C: get_mut() → None (A already removed) → skip ✓
+                //
+                // Result: Only ONE CloseRequest is sent, even if multiple threads trigger TP/SL simultaneously
                 let position_removed = {
                     let mut positions_guard = positions.write().await;
-                    // Double-check: position might have been removed by another thread
+                    // Double-check: position might have been removed by another thread between read and write lock
                     if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
-                        // Mark as close_requested to prevent duplicate requests
+                        // Mark as close_requested to prevent duplicate requests (defensive, already checked in early check)
                         pos.close_requested = true;
-                        // Remove position from tracking
+                        // ✅ CRITICAL: Atomic remove - only ONE thread can successfully remove
+                        // HashMap::remove() returns Some(value) if key existed, None if key didn't exist
+                        // This ensures only the first thread to call remove() gets true
                         positions_guard.remove(&tick.symbol).is_some()
                     } else {
-                        // Position already removed by another thread
+                        // Position already removed by another thread (between read lock and write lock)
                         false
                     }
                 };
 
                 // Only send CloseRequest if position was successfully removed
+                // This ensures only ONE thread sends CloseRequest, even if multiple threads trigger TP/SL
                 if !position_removed {
                     // Position was already removed by another thread - skip
+                    // This is expected behavior in high-frequency scenarios where multiple ticks arrive simultaneously
                     debug!(
                         symbol = %tick.symbol,
                         net_pnl_pct = net_pnl_pct_f64,
@@ -493,25 +517,39 @@ impl FollowOrders {
         if let Some(sl_pct) = position.stop_loss_pct {
             if net_pnl_pct_f64 <= -sl_pct {
                 // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
-                // This prevents race condition where multiple ticks trigger duplicate CloseRequests
-                // Atomic operation: remove position and verify it was removed
+                // Race condition prevention (Layer 2 - Atomic Remove):
+                // - Multiple threads can reach here if they all pass early check (close_requested flag)
+                // - Atomic operation: acquire write lock → check position exists → set flag → remove
+                // - Only ONE thread can successfully remove the position (HashMap::remove() is atomic)
+                // - Threads that fail to remove (position already removed) skip CloseRequest
+                //
+                // Thread safety guarantee:
+                // - Thread A: get_mut() → pos found, close_requested = true, remove() → true → CloseRequest sent ✓
+                // - Thread B: get_mut() → pos found (if A hasn't removed yet), close_requested = true, remove() → false (A already removed) → skip ✓
+                // - Thread C: get_mut() → None (A already removed) → skip ✓
+                //
+                // Result: Only ONE CloseRequest is sent, even if multiple threads trigger TP/SL simultaneously
                 let position_removed = {
                     let mut positions_guard = positions.write().await;
-                    // Double-check: position might have been removed by another thread
+                    // Double-check: position might have been removed by another thread between read and write lock
                     if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
-                        // Mark as close_requested to prevent duplicate requests
+                        // Mark as close_requested to prevent duplicate requests (defensive, already checked in early check)
                         pos.close_requested = true;
-                        // Remove position from tracking
+                        // ✅ CRITICAL: Atomic remove - only ONE thread can successfully remove
+                        // HashMap::remove() returns Some(value) if key existed, None if key didn't exist
+                        // This ensures only the first thread to call remove() gets true
                         positions_guard.remove(&tick.symbol).is_some()
                     } else {
-                        // Position already removed by another thread
+                        // Position already removed by another thread (between read lock and write lock)
                         false
                     }
                 };
 
                 // Only send CloseRequest if position was successfully removed
+                // This ensures only ONE thread sends CloseRequest, even if multiple threads trigger TP/SL
                 if !position_removed {
                     // Position was already removed by another thread - skip
+                    // This is expected behavior in high-frequency scenarios where multiple ticks arrive simultaneously
                     debug!(
                         symbol = %tick.symbol,
                         net_pnl_pct = net_pnl_pct_f64,
