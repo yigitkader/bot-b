@@ -12,7 +12,9 @@ mod follow_orders;
 mod balance;
 mod logging;
 mod metrics;
+mod ai_analyzer;
 
+use crate::ai_analyzer::AiAnalyzer;
 use crate::balance::Balance;
 use crate::config::{load_config, AppCfg};
 use crate::connection::Connection;
@@ -179,6 +181,13 @@ async fn main() -> Result<()> {
         shutdown_flag.clone(),
     );
     logging.start().await?;
+    
+    // Initialize AI_ANALYZER module (intelligent log analysis and error detection)
+    let ai_analyzer = AiAnalyzer::new(
+        event_bus.clone(),
+        shutdown_flag.clone(),
+    );
+    ai_analyzer.start().await?;
     
     info!("All modules started, waiting for shutdown signal...");
     

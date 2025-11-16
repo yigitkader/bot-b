@@ -110,7 +110,7 @@ exec:
 # Event Bus Configuration
 # ============================================================================
 event_bus:
-  market_tick_buffer: 1000      # Buffer for MarketTick events (high frequency)
+  market_tick_buffer: 10000     # Buffer for MarketTick events (high frequency) - increased to handle channel lagging
   trade_signal_buffer: 1000    # Buffer for TradeSignal events
   close_request_buffer: 1000   # Buffer for CloseRequest events
   order_update_buffer: 1000    # Buffer for OrderUpdate events

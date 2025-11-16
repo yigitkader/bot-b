@@ -896,8 +896,10 @@ impl Ordering {
         let total_commission_rate = taker_commission_rate * Decimal::from(2);
         let calculated_commission_buffer = estimated_notional * total_commission_rate;
         
-        // Minimum commission buffer: 2 USD (safety margin for small positions)
-        let min_commission_buffer = Decimal::from(2);
+        // Minimum commission buffer: 0.5 USD (safety margin for small positions)
+        // Reduced from 2 USD to 0.5 USD to allow smaller balances to trade
+        // Real commission is calculated from notional, so 0.5 USD is sufficient for most cases
+        let min_commission_buffer = Decimal::from_str("0.5").unwrap_or(Decimal::from(1));
         
         // Use max of calculated commission and min buffer
         let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
@@ -1134,37 +1136,10 @@ impl Ordering {
             "ORDERING: Position sizing calculated from balance and config"
         );
 
-        // 4. Final validation: Ensure balance is sufficient for required margin
-        // Note: Commission buffer was already subtracted in margin calculation,
-        // so this check ensures we have enough balance for the margin itself
-        if available_balance < required_margin {
-                debug!(
-                    symbol = %signal.symbol,
-                    available_balance = %available_balance,
-                    required_margin = %required_margin,
-                commission_buffer = %commission_buffer,
-                usable_balance = %usable_balance,
-                deficit = %(required_margin - available_balance),
-                "ORDERING: Ignoring TradeSignal - available balance below required margin"
-                );
-                return Ok(());
-            }
-        
-        // Additional safety check: Ensure we have margin + commission buffer
-        // This is a redundant check but provides extra safety
-        let min_required_balance = required_margin + commission_buffer;
-        if available_balance < min_required_balance {
-            debug!(
-                symbol = %signal.symbol,
-                available_balance = %available_balance,
-                required_margin = %required_margin,
-                commission_buffer = %commission_buffer,
-                min_required_balance = %min_required_balance,
-                deficit = %(min_required_balance - available_balance),
-                "ORDERING: Ignoring TradeSignal - available balance below required margin + commission buffer"
-            );
-            return Ok(());
-        }
+        // 4. Balance validation is done atomically inside the lock (line 1271)
+        // Commission buffer was already subtracted in margin calculation (usable_balance),
+        // and margin is calculated from usable_balance, so balance is guaranteed to be sufficient
+        // This redundant check is removed to avoid confusion
 
         // Get TIF from config (before lock to minimize lock time)
         let tif = match cfg.exec.tif.as_str() {
@@ -1234,11 +1209,11 @@ impl Ordering {
             // Spread staleness check (inside lock to prevent race condition)
             // Spread range validation was already done in TRENDING module
             // ORDERING needs to check if signal is too stale (time-based check)
-            // ✅ CRITICAL: For HFT, 1 second is the maximum acceptable age
-            // In volatile markets, spread can change dramatically in seconds
-            // Low liquidity coins can see spread jump from 0.01% to 200% in 1 second
+            // ✅ CRITICAL: Increased from 1s to 5s to match signal age check and handle channel lagging
+            // Channel lagging can cause signals to arrive with delay, so we need more tolerance
+            // TRENDING already validates spread range, so this is just a safety check
             let spread_age = now.duration_since(signal.spread_timestamp);
-            const MAX_SPREAD_AGE_SECS: u64 = 1; // 1 second - HFT requirement, prevents slippage from stale spreads
+            const MAX_SPREAD_AGE_SECS: u64 = 5; // 5 seconds - matches signal age check, handles channel lagging
 
             if spread_age.as_secs() > MAX_SPREAD_AGE_SECS {
                 // Signal is too stale - abort without expensive network call

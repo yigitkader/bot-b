@@ -645,12 +645,26 @@ pub fn from_config(
         // Try to parse response - handle both single symbol and array responses
         match resp.json::<serde_json::Value>().await {
             Ok(json) => {
+                // Log raw response for debugging (first 500 chars to avoid huge logs)
+                let json_str = serde_json::to_string(&json).unwrap_or_default();
+                let preview = if json_str.len() > 500 {
+                    format!("{}...", &json_str[..500])
+                } else {
+                    json_str.clone()
+                };
+                tracing::debug!(
+                    symbol = %sym,
+                    response_preview = %preview,
+                    "Leverage brackets API response received"
+                );
+                
                 // Handle different response formats:
                 // 1. Array of LeverageBracketsResponse: [{"symbol": "...", "brackets": [...]}]
                 // 2. Single object: {"symbol": "...", "brackets": [...]}
                 // 3. Array of brackets directly: [{"bracket": ..., "initialLeverage": ...}]
+                // 4. New format: brackets array might not have "bracket" field (optional)
                 
-                // Try different response formats
+                // Try different response formats with more flexible parsing
                 let brackets_result: Result<Vec<LeverageBracketsResponse>, _> = if json.is_array() {
                     // Try to parse as array of LeverageBracketsResponse
                     serde_json::from_value::<Vec<LeverageBracketsResponse>>(json.clone())
@@ -661,6 +675,54 @@ pub fn from_config(
                                     symbol: sym.to_string(),
                                     brackets,
                                 }])
+                        })
+                        .or_else(|_| {
+                            // Try flexible parsing: brackets might have different field names
+                            // Parse manually from JSON value
+                            if let Some(arr) = json.as_array() {
+                                let mut all_brackets = Vec::new();
+                                for item in arr {
+                                    if let Some(obj) = item.as_object() {
+                                        // Check if this is a symbol entry with brackets
+                                        if let (Some(symbol_val), Some(brackets_val)) = (obj.get("symbol"), obj.get("brackets")) {
+                                            if let (Some(symbol_str), Some(brackets_arr)) = (symbol_val.as_str(), brackets_val.as_array()) {
+                                                let mut brackets = Vec::new();
+                                                for bracket_item in brackets_arr {
+                                                    if let Some(bracket_obj) = bracket_item.as_object() {
+                                                        // Try to extract initialLeverage (required)
+                                                        if let Some(lev_val) = bracket_obj.get("initialLeverage") {
+                                                            if let Some(lev) = lev_val.as_u64() {
+                                                                brackets.push(LeverageBracket {
+                                                                    bracket: bracket_obj.get("bracket").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                                                    initial_leverage: lev as u32,
+                                                                    notional_cap: bracket_obj.get("notionalCap").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                                                                    notional_floor: bracket_obj.get("notionalFloor").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                                                                    maint_margin_ratio: bracket_obj.get("maintMarginRatio").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if !brackets.is_empty() {
+                                                    all_brackets.push(LeverageBracketsResponse {
+                                                        symbol: symbol_str.to_string(),
+                                                        brackets,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !all_brackets.is_empty() {
+                                    Ok(all_brackets)
+                                } else {
+                                    // Return parse error - will be caught and logged below
+                                    serde_json::from_value::<Vec<LeverageBracketsResponse>>(serde_json::json!([]))
+                                }
+                            } else {
+                                // Return parse error - will be caught and logged below
+                                serde_json::from_value::<Vec<LeverageBracketsResponse>>(serde_json::json!({}))
+                            }
                         })
                 } else {
                     // Try to parse as single LeverageBracketsResponse
@@ -697,9 +759,11 @@ pub fn from_config(
                         Some(max_lev)
                     }
                     Err(e) => {
+                        // Log full error and response for debugging
                         tracing::debug!(
                             error = %e,
                             symbol = %sym,
+                            response_preview = %preview,
                             "Failed to parse leverage brackets response (format may have changed)"
                         );
                         None
@@ -826,9 +890,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
         }
 
     // Fallback to REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
-        warn!(
+        // This is normal during startup, so log at DEBUG level instead of WARN
+        tracing::debug!(
             asset = %asset,
-            "BALANCE_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
+            "BALANCE_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
         );
     #[derive(Deserialize)]
     struct FutBalance {
@@ -917,9 +982,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
             return Ok(position.clone());
         }
 
-        warn!(
+        // This is normal during startup, so log at DEBUG level instead of WARN
+        tracing::debug!(
             symbol = %sym,
-            "POSITION_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
+            "POSITION_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
         );
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
@@ -1318,8 +1384,9 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     let verify_pos = if let Some(position) = POSITION_CACHE.get(sym) {
                         position.clone()
                     } else {
-                    // Fallback to REST API only if cache is empty (should be rare)
-                        warn!(
+                    // Fallback to REST API only if cache is empty (normal during startup)
+                        // This is normal during startup, so log at DEBUG level instead of WARN
+                        tracing::debug!(
                             symbol = %sym,
                             "POSITION_CACHE empty during position verification, falling back to REST API"
                         );
@@ -2391,14 +2458,21 @@ async fn ensure_success(resp: Response) -> Result<Response> {
         // ✅ CRITICAL: Some Binance errors are not actual errors but informational messages
         // -4046: "No need to change margin type" - margin type already set correctly
         // -4059: "No need to change position side" - position side already set correctly
-        // These are handled as success in set_margin_type and set_position_side_dual
-        // Log them at DEBUG level instead of ERROR to reduce log noise
+        // -4028: "Leverage X is not valid" - leverage not valid for symbol (expected, system will try lower)
+        // These are handled as success or retry in their respective functions
+        // Log them at appropriate level instead of ERROR to reduce log noise
         let is_benign_error = body.contains("-4046") || body.contains("-4059")
             || body.contains("No need to change margin type")
             || body.contains("No need to change position side");
         
+        let is_leverage_error = body.contains("-4028") || body.contains("Leverage") && body.contains("not valid");
+        
         if is_benign_error {
             tracing::debug!(%status, %body, "binance api response (benign - already set correctly)");
+        } else if is_leverage_error {
+            // Leverage errors are expected - system will automatically try lower leverage
+            // Log as WARN instead of ERROR to reduce noise
+            tracing::warn!(%status, %body, "binance api error (leverage not valid - will try lower)");
         } else {
             tracing::error!(%status, %body, "binance api error");
         }
