@@ -668,22 +668,177 @@ async fn fetch_binance_klines(
     Ok(ticks)
 }
 
-/// Test strategy with real Binance historical data
+/// Test strategy with real Binance historical data for multiple symbols
 /// 
-/// This test fetches real historical data from Binance API and runs backtest
+/// This test fetches real historical data from Binance API for different price-level coins
+/// and runs backtest to validate strategy across different market conditions
+/// 
+/// # Test Symbols (Different Price Levels)
+/// - High price: BTCUSDT (~$100k) - Low volatility, high liquidity
+/// - Medium price: ETHUSDT (~$3k) - Medium volatility, high liquidity  
+/// - Low price: SOLUSDT (~$100-200) - High volatility, good liquidity
+/// - Very low price: DOGEUSDT (~$0.1-0.2) - Very high volatility, good liquidity
 /// 
 /// # Usage
 /// ```bash
-/// cargo test test_strategy_with_binance_data -- --nocapture
+/// cargo test test_strategy_with_multiple_binance_symbols -- --ignored --nocapture
 /// ```
 /// 
 /// # Parameters
-/// - Symbol: BTCUSDT (default)
 /// - Interval: 5m (5 minutes)
 /// - Duration: Last 7 days (1008 klines = 7 days * 24 hours * 6 klines/hour)
 /// 
 /// # Note
 /// This test requires internet connection to fetch data from Binance API
+#[tokio::test]
+#[ignore] // Ignore by default - requires internet connection
+async fn test_strategy_with_multiple_binance_symbols() {
+    use chrono::TimeZone;
+    
+    // ✅ CRITICAL: Test multiple symbols with different price levels and volatility
+    // This ensures strategy works across different market conditions
+    let test_symbols = vec![
+        ("BTCUSDT", "High price (~$100k), Low volatility"),
+        ("ETHUSDT", "Medium price (~$3k), Medium volatility"),
+        ("SOLUSDT", "Low price (~$100-200), High volatility"),
+        ("DOGEUSDT", "Very low price (~$0.1-0.2), Very high volatility"),
+    ];
+    
+    let interval = "5m"; // 5-minute candles
+    let days_back = 7; // Last 7 days
+    
+    // Calculate start and end times
+    let end_time = Utc::now();
+    let start_time = end_time - chrono::Duration::days(days_back);
+    
+    let start_time_ms = start_time.timestamp_millis();
+    let end_time_ms = end_time.timestamp_millis();
+    
+    println!("\n{}", "=".repeat(80));
+    println!("=== Multi-Symbol Binance Historical Data Backtest ===");
+    println!("Testing {} symbols with different price levels and volatility", test_symbols.len());
+    println!("Interval: {}", interval);
+    println!("Start Time: {}", start_time);
+    println!("End Time: {}", end_time);
+    println!("Duration: {} days per symbol", days_back);
+    println!("{}\n", "=".repeat(80));
+    
+    // Load config once (shared across all symbols)
+    let cfg = Arc::new(
+        app::config::load_config().unwrap_or_else(|_| {
+            // Minimal test config - relaxed for backtesting
+            let mut cfg = AppCfg::default();
+            cfg.trending.min_spread_bps = 0.1;
+            cfg.trending.max_spread_bps = 100.0;
+            // Use production cooldown settings for realistic backtest results
+            cfg.trending.hft_mode = true; // Enable HFT mode for more signals
+            cfg
+        })
+    );
+    
+    // Track aggregate results across all symbols
+    let mut total_winning_trades = 0u64;
+    let mut total_losing_trades = 0u64;
+    let mut total_pnl = Decimal::ZERO;
+    let mut symbol_results: Vec<(String, BacktestResults)> = Vec::new();
+    
+    // Test each symbol
+    for (symbol, description) in &test_symbols {
+        println!("\n{}", "=".repeat(80));
+        println!("Testing: {} - {}", symbol, description);
+        println!("{}", "=".repeat(80));
+        
+        // Fetch historical data from Binance
+        let ticks = match fetch_binance_klines(
+            symbol,
+            interval,
+            Some(start_time_ms),
+            Some(end_time_ms),
+            Some(1008), // 7 days * 24 hours * 6 klines/hour (5m interval)
+        ).await {
+            Ok(ticks) => {
+                if ticks.is_empty() {
+                    println!("⚠️  WARNING: No data fetched for {}. Skipping.", symbol);
+                    continue;
+                }
+                ticks
+            }
+            Err(e) => {
+                println!("❌ ERROR: Failed to fetch {} data: {}. Skipping.", symbol, e);
+                continue;
+            }
+        };
+        
+        println!("✅ Fetched {} ticks from Binance for {}", ticks.len(), symbol);
+        
+        // Run backtest for this symbol
+        println!("\n=== Running Backtest for {} ===", symbol);
+        let results = run_backtest(symbol, ticks, cfg.clone()).await;
+        
+        // Store results
+        symbol_results.push((symbol.to_string(), results.clone()));
+        
+        // Aggregate results
+        total_winning_trades += results.winning_trades;
+        total_losing_trades += results.losing_trades;
+        total_pnl += results.total_pnl;
+        
+        // Print per-symbol results
+        println!("\n=== Backtest Results for {} ===", symbol);
+        println!("Description: {}", description);
+        println!("Winning Trades: {}", results.winning_trades);
+        println!("Losing Trades: {}", results.losing_trades);
+        println!("Total Trades: {}", results.winning_trades + results.losing_trades);
+        println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
+        println!("Win Rate: {:.2}%", results.win_rate * 100.0);
+        println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
+        println!("Max Drawdown: ${:.2}", results.max_drawdown);
+        println!("Profit Factor: {:.2}", results.profit_factor);
+        println!("Average Trade Duration: {:.1} ticks", results.average_trade_duration_ticks);
+        
+        if results.winning_trades + results.losing_trades == 0 {
+            println!("⚠️  WARNING: No trades executed for {} - strategy may need different parameters", symbol);
+        }
+    }
+    
+    // Print aggregate results
+    println!("\n{}", "=".repeat(80));
+    println!("=== Aggregate Results (All Symbols) ===");
+    println!("{}", "=".repeat(80));
+    println!("Total Symbols Tested: {}", symbol_results.len());
+    println!("Total Winning Trades: {}", total_winning_trades);
+    println!("Total Losing Trades: {}", total_losing_trades);
+    println!("Total Trades: {}", total_winning_trades + total_losing_trades);
+    println!("Total PnL (All Symbols): ${:.2}", total_pnl.to_f64().unwrap_or(0.0));
+    
+    if total_winning_trades + total_losing_trades > 0 {
+        let aggregate_win_rate = (total_winning_trades as f64) / ((total_winning_trades + total_losing_trades) as f64) * 100.0;
+        println!("Aggregate Win Rate: {:.2}%", aggregate_win_rate);
+    }
+    
+    // Print per-symbol summary
+    println!("\n=== Per-Symbol Summary ===");
+    for (symbol, results) in &symbol_results {
+        println!("{}: {} trades, ${:.2} PnL, {:.1}% win rate", 
+            symbol,
+            results.winning_trades + results.losing_trades,
+            results.total_pnl.to_f64().unwrap_or(0.0),
+            results.win_rate * 100.0
+        );
+    }
+    
+    println!("\n✅ Multi-symbol backtest completed successfully!");
+    println!("   Strategy tested across {} symbols with different price levels and volatility", symbol_results.len());
+}
+
+/// Test strategy with real Binance historical data (single symbol - BTCUSDT)
+/// 
+/// This is a simpler version for quick testing with just BTC
+/// 
+/// # Usage
+/// ```bash
+/// cargo test test_strategy_with_binance_data -- --ignored --nocapture
+/// ```
 #[tokio::test]
 #[ignore] // Ignore by default - requires internet connection
 async fn test_strategy_with_binance_data() {
