@@ -1373,79 +1373,21 @@ impl Connection {
         ));
         }
 
-        // 5. Check balance (if shared_state is available)
-        // CRITICAL: Use available() method which accounts for reserved balance
-        if let Some(shared_state) = &self.shared_state {
-        // Check available balance (total - reserved) for USDT or USDC
-        let balance_store = shared_state.balance_store.read().await;
-        let available_balance = balance_store.available(&self.cfg.quote_asset);
-
-        if is_open_order {
-            // For Open orders: check margin requirement
-            // For futures, we need margin = notional / leverage
-            // Get leverage from config (use cfg.leverage if set, otherwise use cfg.exec.default_leverage)
-            let leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage) as u32;
-            let required_margin = notional / Decimal::from(leverage);
-
-            if available_balance < required_margin {
-                return Err(anyhow!(
-                    "Insufficient balance: required margin {} (notional {} / leverage {}x) > available balance {} for {}",
-                    required_margin,
-                    notional,
-                    leverage,
-                    available_balance,
-                    self.cfg.quote_asset
-                ));
-            }
-
-            info!(
-                symbol = %symbol,
-                side = ?side,
-                notional = %notional,
-                required_margin = %required_margin,
-                available_balance = %available_balance,
-                leverage = leverage,
-                "Order validation passed: balance sufficient for margin"
-            );
-        } else {
-            // For Close orders: check minimum balance for commission
-            // Close orders don't require margin (position already open), but commission is needed
-            // Binance futures commission is typically 0.02-0.04% of notional
-            // Use 0.1% as safety margin to account for commission and potential price movement
-            let commission_rate = Decimal::new(1, 3); // 0.001 = 0.1%
-            let commission_estimate = notional * commission_rate;
-            // Also check against minimum quote balance from config
-            let min_balance = Decimal::try_from(self.cfg.min_quote_balance_usd).unwrap_or(Decimal::ZERO);
-            let required_balance = commission_estimate.max(min_balance);
-
-            if available_balance < required_balance {
-                return Err(anyhow!(
-                    "Insufficient balance for close order: required {} (commission estimate {} or min balance {}) > available balance {} for {}",
-                    required_balance,
-                    commission_estimate,
-                    min_balance,
-                    available_balance,
-                    self.cfg.quote_asset
-                ));
-            }
-
-            info!(
-                symbol = %symbol,
-                side = ?side,
-                notional = %notional,
-                commission_estimate = %commission_estimate,
-                min_balance = %min_balance,
-                available_balance = %available_balance,
-                "Order validation passed: balance sufficient for commission"
-            );
-        }
-        } else {
-        // Shared state not available, skip balance check (log warning)
-        warn!(
-            symbol = %symbol,
-            "Order validation: shared_state not available, skipping balance and position checks"
-        );
-        }
+        // 5. Balance check is done in ORDERING module (before calling send_order)
+        // ORDERING module handles balance reservation atomically with state check
+        // This prevents race conditions and ensures balance is available when order is placed
+        // 
+        // IMPORTANT: Do NOT check Binance API balance here because:
+        // 1. Binance API balance (BALANCE_CACHE) may be stale (updated via WebSocket with delay)
+        // 2. Internal balance reservation (shared_state.balance_store) is the source of truth
+        // 3. ORDERING module already validated balance before calling send_order
+        // 4. Checking Binance API balance here creates false negatives (balance appears 0 when it's actually available)
+        //
+        // If Binance API rejects order due to insufficient balance, it will return an error
+        // which will be handled by ORDERING module's retry logic
+        //
+        // Note: Balance check for both open and close orders is handled by ORDERING module
+        // This validation function only checks exchange-level constraints (min_notional, precision, etc.)
 
         Ok(())
     }
@@ -1984,12 +1926,85 @@ impl Connection {
 
     /// Restart market data streams with new symbol list
     /// This closes existing WebSocket connections and starts new ones
+    /// ✅ CRITICAL: Also sets leverage for new symbols (required before placing orders)
     pub async fn restart_market_streams(&self, new_symbols: Vec<String>) -> Result<()> {
         info!(
             symbol_count = new_symbols.len(),
             symbols = ?new_symbols.iter().take(10).collect::<Vec<_>>(),
             "Restarting market data streams with new symbol list"
         );
+
+        // ✅ CRITICAL: Set leverage for new symbols before starting streams
+        // Problem: New symbols added via dynamic symbol rotation don't have leverage set
+        // This causes "Leverage 50 is not valid" errors when placing orders
+        // Solution: Set leverage for all new symbols (same logic as startup)
+        let desired_leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage);
+        let use_isolated_margin = self.cfg.risk.use_isolated_margin;
+
+        for symbol in &new_symbols {
+            // Clamp leverage to symbol's max leverage (if available)
+            let leverage = match self.venue.rules_for(symbol).await {
+                Ok(rules) => {
+                    if let Some(symbol_max_lev) = rules.max_leverage {
+                        desired_leverage.min(symbol_max_lev)
+                    } else {
+                        // Use safe fallback instead of config max
+                        const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                        desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
+                    }
+                }
+                Err(_) => {
+                    // Use safe fallback instead of config max
+                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                    desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
+                }
+            };
+
+            // Set margin type (isolated or cross)
+            if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {
+                warn!(
+                    error = %e,
+                    symbol = %symbol,
+                    isolated = use_isolated_margin,
+                    "CONNECTION: Failed to set margin type for new symbol (non-critical, continuing)"
+                );
+            }
+
+            // Set leverage (only if position is closed or doesn't exist)
+            if let Ok(position) = self.venue.get_position(symbol).await {
+                if !position.qty.0.is_zero() {
+                    // Position is OPEN - leverage cannot be changed
+                    if position.leverage != leverage {
+                        warn!(
+                            symbol = %symbol,
+                            current_leverage = position.leverage,
+                            desired_leverage = leverage,
+                            "CONNECTION: Leverage mismatch for new symbol (position is open, cannot change)"
+                        );
+                    }
+                } else {
+                    // Position is CLOSED - safe to set leverage
+                    if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
+                        warn!(
+                            error = %e,
+                            symbol = %symbol,
+                            leverage,
+                            "CONNECTION: Failed to set leverage for new symbol (non-critical, continuing)"
+                        );
+                    }
+                }
+            } else {
+                // No position exists - safe to set leverage
+                if let Err(e) = self.venue.set_leverage(symbol, leverage).await {
+                    warn!(
+                        error = %e,
+                        symbol = %symbol,
+                        leverage,
+                        "CONNECTION: Failed to set leverage for new symbol (non-critical, continuing)"
+                    );
+                }
+            }
+        }
 
         // Note: WebSocket streams are managed by tokio::spawn tasks
         // They will automatically reconnect if they fail

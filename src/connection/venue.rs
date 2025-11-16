@@ -2060,6 +2060,31 @@ pub fn validate_and_format_order_params(
         let qty_rounded =
             qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
 
+    // ✅ CRITICAL: Check if qty_rounded is zero after rounding
+    // Problem: If qty_precision is too small, rounding can make quantity zero
+    // Example: qty_quantized = 227197.118, qty_precision = 0 → qty_rounded = 227197 (OK)
+    //          qty_quantized = 0.001, qty_precision = 0 → qty_rounded = 0 (BAD)
+    // Solution: If qty_rounded is zero but qty_quantized is not, use qty_quantized instead
+    // This prevents "below min notional after validation (0 < 100)" errors
+    let qty_rounded = if qty_rounded.is_zero() && !qty_quantized.is_zero() {
+        // qty_rounded is zero but qty_quantized is not - rounding precision issue
+        // Use qty_quantized but ensure it's still quantized to step_size
+        // Re-quantize to ensure it's still a multiple of step_size
+        let re_quantized = quantize_decimal(qty_quantized, rules.step_size);
+        if re_quantized.is_zero() {
+            // Even re-quantized is zero - this is a real problem
+            return Err(anyhow!(
+                "Quantity becomes zero after quantization: qty_quantized={}, step_size={}, qty_precision={}",
+                qty_quantized,
+                rules.step_size,
+                qty_precision
+            ));
+        }
+        re_quantized
+    } else {
+        qty_rounded
+    };
+
     // 3. Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);
         let qty_str = format_decimal_fixed(qty_rounded, qty_precision);

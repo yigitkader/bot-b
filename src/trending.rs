@@ -646,12 +646,9 @@ impl Trending {
 
                     // Check if volatility is sufficient
                     if avg_volatility < MIN_VOLATILITY_PCT {
-                        debug!(
-                            symbol = %symbol,
-                            volatility = avg_volatility,
-                            "TRENDING: Low volatility detected ({}%), skipping signals",
-                            avg_volatility
-                        );
+                        // Don't log every low volatility check - only log occasionally to avoid spam
+                        // Low volatility is expected for many symbols, logging every check is excessive
+                        // Use trace level for detailed debugging if needed
                         return false; // Volatility too low, skip signals
                     }
                 }
@@ -714,10 +711,8 @@ impl Trending {
         
         if !should_process {
             // Skip this tick (90% of ticks are skipped)
-            debug!(
-                symbol = %tick.symbol,
-                "TRENDING: Tick skipped (sampling: processing 1/10 ticks)"
-            );
+            // Don't log every skip - this would spam logs (90% of ticks are skipped)
+            // Sampling is working as intended, no need to log each skip
             return Ok(());
         }
 
@@ -750,12 +745,7 @@ impl Trending {
             if has_position || has_order {
                 // Position or order already exists, skip signal generation
                 // This ensures we only have one position/order at a time
-                debug!(
-                    symbol = %tick.symbol,
-                    has_position,
-                    has_order,
-                    "TRENDING: Skipping signal generation - position or order already exists"
-                );
+                // Don't log every skip - this is expected behavior and creates log spam
                 return Ok(());
             }
         }
@@ -791,12 +781,8 @@ impl Trending {
                 // Still in cooldown - skip early (no trend analysis)
                 // Note: We can't do direction check here because we don't have signal direction yet
                 // Direction check will be done after trend analysis (if cooldown passed)
-                debug!(
-                    symbol = %tick.symbol,
-                    elapsed_secs = elapsed.as_secs(),
-                    cooldown_secs = POSITION_CLOSE_COOLDOWN_SECS,
-                    "TRENDING: Skipping signal generation - position close cooldown active (early exit, no trend analysis)"
-                );
+                // Don't log every cooldown skip - this is expected behavior
+                // Cooldown prevents signal spam, logging every skip creates excessive log spam
                 return Ok(());
             }
             
@@ -804,13 +790,7 @@ impl Trending {
             if last_direction.is_none() {
                 const EXTENDED_COOLDOWN_SECS: u64 = POSITION_CLOSE_COOLDOWN_SECS * 2; // 10 seconds
                 if elapsed < &Duration::from_secs(EXTENDED_COOLDOWN_SECS) {
-                    debug!(
-                        symbol = %tick.symbol,
-                        last_direction = ?last_direction,
-                        elapsed_secs = elapsed.as_secs(),
-                        extended_cooldown_secs = EXTENDED_COOLDOWN_SECS,
-                        "TRENDING: Skipping signal generation - extended cooldown active for unknown direction (early exit, no trend analysis)"
-                    );
+                    // Don't log every cooldown skip - this is expected behavior
                     return Ok(());
                 }
             }
@@ -826,13 +806,8 @@ impl Trending {
                 // Check cooldown period - if still in cooldown, skip expensive trend analysis
                 if elapsed < Duration::from_secs(cooldown_seconds) {
                     // Still in cooldown, skip signal generation (early exit, no trend analysis)
-                    debug!(
-                        symbol = %tick.symbol,
-                        elapsed_secs = elapsed.as_secs(),
-                        cooldown_seconds,
-                        last_signal_side = ?last_signal.side,
-                        "TRENDING: Skipping signal generation - signal cooldown active"
-                    );
+                    // Don't log every cooldown skip - this is expected behavior
+                    // Cooldown prevents signal spam, logging every skip creates excessive log spam
                     return Ok(());
                 }
                 // Cooldown passed, continue with trend analysis
@@ -919,11 +894,8 @@ impl Trending {
         };
         
         // Generate signal only if clear trend is detected
-        debug!(
-            symbol = %tick.symbol,
-            trend_signal = ?trend_signal,
-            "TRENDING: Trend analysis completed, checking if signal should be generated"
-        );
+        // Don't log every trend analysis - only log when signal is actually generated
+        // This reduces log spam significantly (trend analysis happens for every processed tick)
         
         // ✅ Volume confirmation check (config-based)
         // If require_volume_confirmation=true, block signal if volume doesn't confirm
@@ -1204,14 +1176,16 @@ impl Trending {
         // Strategy: Use available balance (up to max_margin_usd), scaled by trend strength if enabled
         // Since we only have one position at a time, we can use all available balance (up to limit)
         
-        // First, get available balance
+        // ✅ CRITICAL: Get AVAILABLE balance (total - reserved), not total balance
+        // Problem: TRENDING was checking total balance, not available balance
+        // This caused race condition where multiple signals were generated simultaneously
+        // because they all saw the same total balance, ignoring reserved balance
+        //
+        // Solution: Use BalanceStore::available() which returns (total - reserved)
+        // This ensures only one signal can be generated at a time (when balance is available)
         let available_balance = {
             let balance_store = shared_state.balance_store.read().await;
-            if cfg.quote_asset.to_uppercase() == "USDT" {
-                balance_store.usdt
-            } else {
-                balance_store.usdc
-            }
+            balance_store.available(&cfg.quote_asset)
         };
         
         let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
