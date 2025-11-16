@@ -69,7 +69,21 @@ pub struct WebsocketCfg {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct EventBusCfg {
     /// Buffer size for MarketTick events (high frequency, needs larger buffer)
-    /// With 100 symbols at 1 tick/sec = 100 ticks/sec, 1000 buffer = ~10 seconds (sufficient for most use cases)
+    /// 
+    /// **CRITICAL**: MarketTick events are high-frequency and can cause buffer overflow if subscribers are slow.
+    /// 
+    /// Buffer size calculation:
+    /// - 100 symbols × 1 tick/sec = 100 events/sec
+    /// - 1000 buffer = ~10 seconds (may be insufficient if subscribers lag)
+    /// - 10000 buffer = ~100 seconds (recommended for high-frequency trading)
+    /// 
+    /// **Warning**: When buffer is full, new events are dropped (RecvError::Lagged).
+    /// Subscribers should handle lag gracefully and process events quickly.
+    /// 
+    /// **Recommendation**: 
+    /// - Normal operation: 5000-10000
+    /// - High-frequency trading: 10000-20000
+    /// - Very slow subscribers: Consider increasing further or optimizing subscriber performance
     #[serde(default = "default_market_tick_buffer")]
     pub market_tick_buffer: usize,
     /// Buffer size for TradeSignal events
@@ -361,7 +375,17 @@ fn default_stop_loss_pct() -> f64 {
 }
 
 fn default_market_tick_buffer() -> usize {
-    1000 // Reduced from 10000 - 1000 is sufficient for most use cases
+    // ✅ CRITICAL: MarketTick events are high-frequency (100 symbols × 1 tick/sec = 100 events/sec)
+    // Buffer size calculation:
+    // - 100 events/sec × 10 seconds = 1000 events (minimum for normal operation)
+    // - 100 events/sec × 100 seconds = 10000 events (recommended for high-frequency trading)
+    // - With slow subscribers or network delays, buffer can fill up quickly
+    // - When buffer is full, new events are dropped (RecvError::Lagged)
+    // - Larger buffer prevents event loss during subscriber lag spikes
+    //
+    // Recommendation: Use 10000 for high-frequency trading, 5000 for normal operation
+    // This provides ~100 seconds of buffer at 100 events/sec, or ~50 seconds at 200 events/sec
+    10000 // Increased from 1000 to handle high-frequency events and subscriber lag
 }
 
 fn default_trade_signal_buffer() -> usize {

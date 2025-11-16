@@ -252,6 +252,7 @@ impl FollowOrders {
                 take_profit_pct,
                 opened_at: Instant::now(),
                 is_maker: None, // Will be updated from OrderUpdate when order is filled
+                close_requested: false, // Initialize to false - will be set when CloseRequest is sent
             });
             
             info!(
@@ -282,23 +283,45 @@ impl FollowOrders {
 
     /// Check TP/SL for a market tick
     /// If TP or SL is triggered, send CloseRequest
+    /// 
+    /// ✅ CRITICAL: Race condition prevention
+    /// - Check close_requested flag BEFORE calculating PnL
+    /// - Remove position and set flag BEFORE sending CloseRequest
+    /// - Only send CloseRequest if position was successfully removed
+    /// This prevents duplicate CloseRequest events when multiple ticks arrive simultaneously
+    /// 
+    /// Performance & Responsibility:
+    /// - If position doesn't exist: Return immediately (no expensive calculations)
+    /// - If position exists: Check TP/SL and send CloseRequest if triggered
+    /// - This ensures FOLLOW_ORDERS only processes ticks when position is tracked
     async fn check_tp_sl(
         tick: &MarketTick,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         event_bus: &Arc<EventBus>,
         cfg: &Arc<AppCfg>,
     ) -> Result<()> {
-        let positions_read = positions.read().await;
-        
-        let position = match positions_read.get(&tick.symbol) {
-            Some(pos) => pos.clone(),
-            None => {
-                // No position for this symbol
-                return Ok(());
+        // ✅ CRITICAL: Fast early check - position must exist to process TP/SL
+        // Performance: If no position, return immediately (no expensive PnL calculations)
+        // Responsibility: FOLLOW_ORDERS only processes when position is tracked
+        // This is a fast read-only check, so do it first
+        let position = {
+            let positions_read = positions.read().await;
+            match positions_read.get(&tick.symbol) {
+                Some(pos) => {
+                    // If close already requested, skip this tick (already processing close)
+                    if pos.close_requested {
+                        return Ok(());
+                    }
+                    pos.clone()
+                }
+                None => {
+                    // No position for this symbol - return immediately
+                    // Performance: Skip all expensive calculations (PnL, commission, etc.)
+                    // This is expected behavior - FOLLOW_ORDERS waits for position to be tracked
+                    return Ok(());
+                }
             }
         };
-        
-        drop(positions_read);
         let current_price = tick.mark_price.unwrap_or_else(|| {
             Px((tick.bid.0 + tick.ask.0) / Decimal::from(2))
         });
@@ -319,41 +342,59 @@ impl FollowOrders {
         
 
         
-        // ✅ CRITICAL: Skip TP/SL check if is_maker is None
-        // Problem: position.is_maker may be None if OrderUpdate hasn't arrived yet
-        // If TP/SL triggers before OrderUpdate, wrong commission is used
-        // Example: Maker order (0.02%) but None → taker (0.04%) used → early SL trigger!
+        // ✅ CRITICAL: Use conservative commission estimate when is_maker is None
+        // Problem: position.is_maker may be None if OrderUpdate hasn't arrived yet (100-500ms delay)
+        // During this delay, fast price movements can cause SL to be missed
+        // Example: Price drops 1% in 100ms → SL should trigger, but TP/SL check is skipped!
         //
-        // Previous solution: Use conservative taker commission when None
-        // Problem: Still risks early SL trigger if order is actually maker
+        // Solution: Use conservative taker commission (higher) when is_maker is None
+        // This ensures:
+        // - SL triggers EARLIER (safer - prevents larger losses)
+        // - TP triggers LATER (slightly less optimal, but safer)
+        // - No delay in TP/SL checks (critical for fast markets)
         //
-        // Better solution: Skip TP/SL check until OrderUpdate arrives with is_maker info
-        // This is safer because:
-        // - OrderUpdate usually arrives very quickly (few hundred ms)
-        // - Waiting a few ticks is safer than risking wrong commission calculation
-        // - Prevents premature TP/SL triggers due to incorrect commission
-        if position.is_maker.is_none() {
-            debug!(
-                symbol = %tick.symbol,
-                "FOLLOW_ORDERS: Skipping TP/SL check - waiting for OrderUpdate with is_maker info. OrderUpdate should arrive soon (typically < 500ms)."
-            );
-            return Ok(());
-        }
-
-        let leverage_decimal = Decimal::from(position.leverage);
-        let gross_pnl_pct = price_change_pct * leverage_decimal;
+        // Timeout: If OrderUpdate doesn't arrive within 2 seconds, log warning
+        // This prevents indefinite waiting and helps identify issues
+        const MAX_WAIT_FOR_ORDER_UPDATE_MS: u64 = 2000; // 2 seconds
+        let position_age_ms = position.opened_at.elapsed().as_millis() as u64;
         
-        // ✅ Entry commission calculation (is_maker is guaranteed to be Some at this point)
-        let entry_commission_pct = if position.is_maker.unwrap() {
-            // Maker order - use maker commission
-            Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
-                .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+        let entry_commission_pct = if let Some(is_maker) = position.is_maker {
+            // OrderUpdate arrived - use actual commission
+            if is_maker {
+                // Maker order - use maker commission
+                Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
+            } else {
+                // Taker order - use taker commission
+                Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
+                    .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+            }
         } else {
-            // Taker order - use taker commission
+            // OrderUpdate hasn't arrived yet - use conservative taker commission
+            // This ensures SL triggers earlier (safer) and TP triggers later (acceptable)
+            if position_age_ms > MAX_WAIT_FOR_ORDER_UPDATE_MS {
+                warn!(
+                    symbol = %tick.symbol,
+                    position_age_ms,
+                    max_wait_ms = MAX_WAIT_FOR_ORDER_UPDATE_MS,
+                    "FOLLOW_ORDERS: OrderUpdate with is_maker info delayed > {}ms, using conservative taker commission estimate. This may cause slightly early SL triggers or late TP triggers.",
+                    MAX_WAIT_FOR_ORDER_UPDATE_MS
+                );
+            } else {
+                debug!(
+                    symbol = %tick.symbol,
+                    position_age_ms,
+                    "FOLLOW_ORDERS: Using conservative taker commission estimate (OrderUpdate pending, typically arrives < 500ms)"
+                );
+            }
+            // Use taker commission (higher) - conservative estimate
             Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
                 .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
         };
 
+        let leverage_decimal = Decimal::from(position.leverage);
+        let gross_pnl_pct = price_change_pct * leverage_decimal;
+        
         let exit_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
             .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
 
@@ -369,6 +410,35 @@ impl FollowOrders {
         // Check take profit (using net PnL - commission included)
         if let Some(tp_pct) = position.take_profit_pct {
             if net_pnl_pct_f64 >= tp_pct {
+                // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
+                // This prevents race condition where multiple ticks trigger duplicate CloseRequests
+                // Atomic operation: remove position and verify it was removed
+                let position_removed = {
+                    let mut positions_guard = positions.write().await;
+                    // Double-check: position might have been removed by another thread
+                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
+                        // Mark as close_requested to prevent duplicate requests
+                        pos.close_requested = true;
+                        // Remove position from tracking
+                        positions_guard.remove(&tick.symbol).is_some()
+                    } else {
+                        // Position already removed by another thread
+                        false
+                    }
+                };
+
+                // Only send CloseRequest if position was successfully removed
+                if !position_removed {
+                    // Position was already removed by another thread - skip
+                    debug!(
+                        symbol = %tick.symbol,
+                        net_pnl_pct = net_pnl_pct_f64,
+                        tp_pct,
+                        "FOLLOW_ORDERS: Take profit triggered but position already removed by another thread (race condition prevented)"
+                    );
+                    return Ok(());
+                }
+
                 let close_request = CloseRequest {
                     symbol: tick.symbol.clone(),
                     position_id: None,
@@ -385,15 +455,10 @@ impl FollowOrders {
                                 symbol = %tick.symbol,
                                 net_pnl_pct = net_pnl_pct_f64,
                                 tp_pct,
-                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position will retry on next tick"
+                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position already removed from tracking"
                             );
-                            // Don't remove position from tracking - retry later when ORDERING is back
+                            // Position already removed - can't retry on next tick
                             return Ok(());
-                        }
-
-                        {
-                            let mut positions_guard = positions.write().await;
-                            positions_guard.remove(&tick.symbol);
                         }
                         
                         info!(
@@ -415,9 +480,9 @@ impl FollowOrders {
                             symbol = %tick.symbol,
                             net_pnl_pct = net_pnl_pct_f64,
                             tp_pct,
-                            "FOLLOW_ORDERS: CloseRequest failed for take profit, position will retry on next tick"
+                            "FOLLOW_ORDERS: CloseRequest failed for take profit, position already removed from tracking"
                         );
-                        return Ok(());
+                        // Position already removed - can't retry on next tick
                     }
                 }
                 return Ok(());
@@ -427,6 +492,35 @@ impl FollowOrders {
         // Check stop loss (using net PnL - commission included)
         if let Some(sl_pct) = position.stop_loss_pct {
             if net_pnl_pct_f64 <= -sl_pct {
+                // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
+                // This prevents race condition where multiple ticks trigger duplicate CloseRequests
+                // Atomic operation: remove position and verify it was removed
+                let position_removed = {
+                    let mut positions_guard = positions.write().await;
+                    // Double-check: position might have been removed by another thread
+                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
+                        // Mark as close_requested to prevent duplicate requests
+                        pos.close_requested = true;
+                        // Remove position from tracking
+                        positions_guard.remove(&tick.symbol).is_some()
+                    } else {
+                        // Position already removed by another thread
+                        false
+                    }
+                };
+
+                // Only send CloseRequest if position was successfully removed
+                if !position_removed {
+                    // Position was already removed by another thread - skip
+                    debug!(
+                        symbol = %tick.symbol,
+                        net_pnl_pct = net_pnl_pct_f64,
+                        sl_pct,
+                        "FOLLOW_ORDERS: Stop loss triggered but position already removed by another thread (race condition prevented)"
+                    );
+                    return Ok(());
+                }
+
                 let close_request = CloseRequest {
                     symbol: tick.symbol.clone(),
                     position_id: None,
@@ -443,15 +537,10 @@ impl FollowOrders {
                                 symbol = %tick.symbol,
                                 net_pnl_pct = net_pnl_pct_f64,
                                 sl_pct,
-                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position will retry on next tick"
+                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position already removed from tracking"
                             );
-                            // Don't remove position from tracking - retry later when ORDERING is back
+                            // Position already removed - can't retry on next tick
                             return Ok(());
-                        }
-
-                        {
-                            let mut positions_guard = positions.write().await;
-                            positions_guard.remove(&tick.symbol);
                         }
                         
                         info!(
@@ -473,9 +562,9 @@ impl FollowOrders {
                             symbol = %tick.symbol,
                             net_pnl_pct = net_pnl_pct_f64,
                             sl_pct,
-                            "FOLLOW_ORDERS: CloseRequest failed for stop loss, position will retry on next tick"
+                            "FOLLOW_ORDERS: CloseRequest failed for stop loss, position already removed from tracking"
                         );
-                        return Ok(());
+                        // Position already removed - can't retry on next tick
                     }
                 }
                 return Ok(());

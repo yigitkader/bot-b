@@ -1198,6 +1198,32 @@ pub fn refresh_rules_for(&self, sym: &str) {
             };
             let current_qty = current_pos.qty.0;
 
+            // ✅ CRITICAL: Early absolute limit check before attempting to close
+            // Check if position has grown beyond 2x initial before even trying to close
+            let early_position_multiplier = if initial_qty.abs() > Decimal::ZERO {
+                current_qty.abs() / initial_qty.abs()
+            } else {
+                Decimal::ZERO
+            };
+            
+            if early_position_multiplier > Decimal::from(2) {
+                let multiplier_f64 = early_position_multiplier.to_f64().unwrap_or(0.0);
+                tracing::error!(
+                    symbol = %sym,
+                    attempt = attempt + 1,
+                    initial_qty = %initial_qty,
+                    current_qty = %current_qty,
+                    position_multiplier = multiplier_f64,
+                    "POSITION CONTROL LOST (EARLY CHECK): Position is {}x initial size before close attempt. Aborting immediately to prevent infinite loop.",
+                    multiplier_f64
+                );
+                return Err(anyhow!(
+                    "Position control lost: position is {}x initial size ({}) before close attempt. Aborting immediately. Manual intervention required.",
+                    multiplier_f64,
+                    current_qty
+                ));
+            }
+
             if current_qty.is_zero() {
             // Pozisyon tamamen kapatıldı
                 if attempt > 0 {
@@ -1302,6 +1328,38 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         let position_grew_from_attempt = verify_qty.abs() > current_qty.abs();
                         let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
 
+                        // ✅ CRITICAL: Absolute limit check - abort immediately if position > 2x initial
+                        // This prevents infinite loops in volatile markets where position keeps growing
+                        let max_position_multiplier = Decimal::from(2);
+                        let position_multiplier = if initial_qty.abs() > Decimal::ZERO {
+                            verify_qty.abs() / initial_qty.abs()
+                        } else {
+                            Decimal::ZERO
+                        };
+                        
+                        if position_multiplier > max_position_multiplier {
+                            let multiplier_f64 = position_multiplier.to_f64().unwrap_or(0.0);
+                            let max_multiplier_f64 = max_position_multiplier.to_f64().unwrap_or(2.0);
+                            tracing::error!(
+                                symbol = %sym,
+                                attempt = attempt + 1,
+                                initial_qty = %initial_qty,
+                                current_qty_at_attempt = %current_qty,
+                                verify_qty = %verify_qty,
+                                position_multiplier = multiplier_f64,
+                                max_multiplier = max_multiplier_f64,
+                                "POSITION CONTROL LOST: Position grew to {}x initial size (exceeds {}x limit). Aborting immediately to prevent infinite loop and excessive risk.",
+                                multiplier_f64,
+                                max_multiplier_f64
+                            );
+                            return Err(anyhow!(
+                                "Position control lost: position grew to {}x initial size ({}), exceeding {}x limit. Aborting immediately. Manual intervention required.",
+                                multiplier_f64,
+                                verify_qty,
+                                max_multiplier_f64
+                            ));
+                        }
+
                         if position_grew_from_attempt || position_grew_from_initial {
                         // Position büyümesi tespit edildi - büyüme yüzdesini hesapla
                             let growth_from_initial = if initial_qty.abs() > Decimal::ZERO {
@@ -1317,6 +1375,23 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         // Position growth detection with abort mechanism
                             if growth_from_initial > MAX_ACCEPTABLE_GROWTH_PCT {
                                 growth_event_count += 1;
+
+                            // ✅ CRITICAL: If growth events exceed threshold, log critical warning
+                            // This indicates position is growing faster than we can close it
+                                const CRITICAL_GROWTH_THRESHOLD: u32 = 3;
+                                if growth_event_count > CRITICAL_GROWTH_THRESHOLD && growth_event_count <= MAX_RETRIES_ON_GROWTH {
+                                    tracing::error!(
+                                        symbol = %sym,
+                                        attempt = attempt + 1,
+                                        growth_events = growth_event_count,
+                                        initial_qty = %initial_qty,
+                                        current_qty_at_attempt = %current_qty,
+                                        verify_qty = %verify_qty,
+                                        growth_pct = growth_from_initial,
+                                        "CRITICAL: Position growth events exceeded threshold ({}). Position is growing faster than we can close. Using aggressive MARKET close.",
+                                        CRITICAL_GROWTH_THRESHOLD
+                                    );
+                                }
 
                             // Too many growth events - abort to prevent infinite loop
                                 if growth_event_count > MAX_RETRIES_ON_GROWTH {
@@ -1461,6 +1536,21 @@ pub fn refresh_rules_for(&self, sym: &str) {
 
                     if is_min_notional_error(&e) && !limit_fallback_attempted
                     {
+                        // ✅ CRITICAL: Invalidate cache immediately on MIN_NOTIONAL error
+                        // This ensures limit fallback uses fresh rules
+                        warn!(symbol = %sym, "MIN_NOTIONAL error detected in flatten_position, invalidating rules cache");
+                        self.refresh_rules_for(sym);
+                        
+                        // Re-fetch rules with fresh data
+                        let rules = match self.rules_for(sym).await {
+                            Ok(fresh_rules) => fresh_rules,
+                            Err(e2) => {
+                                warn!(symbol = %sym, error = %e2, "failed to refresh rules after MIN_NOTIONAL error, using existing rules");
+                                // Continue with existing rules if refresh fails
+                                rules.clone()
+                            }
+                        };
+                        
                         let (best_bid, best_ask) = {
                         // Try WebSocket cache first (fastest, most up-to-date)
                             if let Some(price_update) = PRICE_CACHE.get(sym) {
@@ -1760,17 +1850,58 @@ impl Venue for BinanceFutures {
         };
 
         for attempt in 0..=MAX_RETRIES {
+            // ✅ CRITICAL: Before retrying, check if previous order exists to prevent duplicates
+            // Problem: If first request times out but Binance received it, retry would create duplicate order
+            // Solution: Check if order with base clientOrderId exists before retrying
+            if attempt > 0 {
+                // Check if previous order exists (query by origClientOrderId)
+                match self.query_order_by_client_id(sym, &base_client_order_id).await {
+                    Ok(Some(existing_order)) => {
+                        // Previous order exists - return it instead of creating duplicate
+                        info!(
+                            %sym,
+                            base_client_order_id = %base_client_order_id,
+                            existing_order_id = existing_order.order_id,
+                            attempt,
+                            "Previous order found with base clientOrderId, returning existing order to prevent duplicate"
+                        );
+                        return Ok((existing_order.order_id.to_string(), existing_order.client_order_id));
+                    }
+                    Ok(None) => {
+                        // Order doesn't exist - safe to retry
+                        tracing::debug!(
+                            %sym,
+                            base_client_order_id = %base_client_order_id,
+                            attempt,
+                            "No existing order found with base clientOrderId, proceeding with retry"
+                        );
+                    }
+                    Err(e) => {
+                        // Query failed - log warning but continue with retry (better to retry than skip)
+                        warn!(
+                            %sym,
+                            base_client_order_id = %base_client_order_id,
+                            attempt,
+                            error = %e,
+                            "Failed to query order by clientOrderId, proceeding with retry (may create duplicate if order exists)"
+                        );
+                    }
+                }
+            }
+
             // ✅ CRITICAL: Generate unique clientOrderId for each retry attempt
-            // Problem: If first request times out but Binance received it, retry with same clientOrderId
-            // would create duplicate order (even though Binance has idempotency, it's risky)
-            // Solution: Append attempt number to base clientOrderId for each retry
+            // Use timestamp + random suffix for retries to ensure uniqueness
+            // Format: "{base}-{timestamp}-{random}" (e.g., "1234567890-1234567890123-abc")
             let unique_client_order_id = if attempt == 0 {
                 // First attempt: use original clientOrderId
                 base_client_order_id.clone()
             } else {
-                // Retry attempts: append attempt number to ensure uniqueness
-                // Format: "{base}-{attempt}" (e.g., "1234567890-1", "1234567890-2")
-                format!("{}-{}", base_client_order_id, attempt)
+                // Retry attempts: append timestamp + random suffix to ensure uniqueness
+                // This is more unique than just "-1", "-2" and prevents collisions
+                let retry_timestamp = BinanceCommon::ts();
+                // Use last 6 digits of timestamp as random component (simple but effective)
+                let random_suffix = retry_timestamp % 1000000;
+                format!("{}-{}-{}", base_client_order_id, retry_timestamp, random_suffix)
             };
 
             // Build params with unique clientOrderId for this attempt
@@ -1860,17 +1991,21 @@ impl Venue for BinanceFutures {
                             || body_lower.contains("min_notional")
                             || body_lower.contains("below min notional");
 
+                        // ✅ CRITICAL: Invalidate cache immediately on rules-related errors
+                        // This must happen regardless of retry attempts, as the cache is stale
                         if should_refresh_rules {
-                            if attempt < MAX_RETRIES {
-                                let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
-                                    "precision error (-1111)"
-                                } else {
-                                    "MIN_NOTIONAL error (-1013)"
-                                };
-                                warn!(%sym, attempt = attempt + 1, error_type, "rules cache invalidated, refreshing rules and retrying");
+                            let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
+                                "precision error (-1111)"
+                            } else {
+                                "MIN_NOTIONAL error (-1013)"
+                            };
+                            
+                            // Always invalidate cache when rules-related errors occur
+                            warn!(%sym, error_type, "rules-related error detected, invalidating cache immediately");
+                            self.refresh_rules_for(sym);
 
-                            // Cache'i invalidate et
-                                self.refresh_rules_for(sym);
+                            if attempt < MAX_RETRIES {
+                                warn!(%sym, attempt = attempt + 1, error_type, "refreshing rules and retrying");
 
                             // Fresh rules çek
                                 match self.rules_for(sym).await {
@@ -1912,12 +2047,7 @@ impl Venue for BinanceFutures {
                                     }
                                 }
                             } else {
-                                let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
-                                    "precision error (-1111)"
-                                } else {
-                                    "MIN_NOTIONAL error (-1013)"
-                                };
-                                error!(%sym, attempt, error_type, "after max retries, symbol should be quarantined");
+                                error!(%sym, attempt, error_type, "after max retries, symbol should be quarantined (cache invalidated)");
                                 return Err(anyhow!(
                                     "binance api error: {} - {} ({}, max retries)",
                                     status,
@@ -2040,7 +2170,70 @@ impl Venue for BinanceFutures {
 }
 
 impl BinanceFutures {
-pub fn validate_and_format_order_params(
+    /// Query order by clientOrderId (origClientOrderId)
+    /// Returns Some(order) if order exists, None if not found, Err on API error
+    /// Used to check if previous order exists before retrying to prevent duplicates
+    pub async fn query_order_by_client_id(
+        &self,
+        sym: &str,
+        client_order_id: &str,
+    ) -> Result<Option<FutPlacedOrder>> {
+        let qs = format!(
+            "symbol={}&origClientOrderId={}&timestamp={}&recvWindow={}",
+            sym,
+            client_order_id,
+            BinanceCommon::ts(),
+            self.common.recv_window_ms
+        );
+        let sig = self.common.sign(&qs);
+        let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
+
+        match self
+            .common
+            .client
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.common.api_key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.json::<FutPlacedOrder>().await {
+                        Ok(order) => Ok(Some(order)),
+                        Err(e) => {
+                            // JSON parse error - treat as order not found
+                            tracing::debug!(
+                                %sym,
+                                client_order_id = %client_order_id,
+                                error = %e,
+                                "Failed to parse order query response, treating as order not found"
+                            );
+                            Ok(None)
+                        }
+                    }
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    let body_lower = body.to_lowercase();
+                    
+                    // Check if error is "order not found" (-2013)
+                    if body_lower.contains("-2013") || body_lower.contains("order does not exist") {
+                        // Order doesn't exist - this is expected, return None
+                        Ok(None)
+                    } else {
+                        // Other error - return error
+                        Err(anyhow!("binance api error querying order: {} - {}", status, body))
+                    }
+                }
+            }
+            Err(e) => {
+                // Network error - return error (caller will handle)
+                Err(e.into())
+            }
+        }
+    }
+
+    pub fn validate_and_format_order_params(
         px: Px,
         qty: Qty,
         rules: &SymbolRules,

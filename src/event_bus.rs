@@ -100,6 +100,13 @@ impl EventBus {
     /// Create a new EventBus with default buffer sizes.
     ///
     /// This constructor uses default buffer sizes (10000 for MarketTick, 1000 for others).
+    /// 
+    /// **Note**: MarketTick buffer is set to 10000 by default to handle high-frequency events.
+    /// If you experience buffer overflow (events dropped), consider:
+    /// - Increasing `event_bus.market_tick_buffer` in config.yaml
+    /// - Optimizing subscriber performance (process events faster)
+    /// - Reducing number of symbols being tracked
+    /// 
     /// For custom buffer sizes, use `new_with_config()` instead.
     ///
     /// # Returns

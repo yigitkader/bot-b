@@ -427,13 +427,16 @@ impl Connection {
             let now = Instant::now();
             let initial_count = order_fill_history.len();
             order_fill_history.retain(|order_id, history| {
-                // ✅ CRITICAL: Age check FIRST to prevent memory leaks
-                // Problem: If cache is stale (WebSocket lag), order may appear "open" in cache
-                // but history is very old. If we check cache first, we might keep stale entries forever.
+                // ✅ CRITICAL: Fixed memory leak - remove filled orders after short delay
+                // Problem: Previous code kept entries even when orders were filled/cancelled (not in cache)
+                // This caused memory leak: 100 orders/day × 30 days = 3000 entries (only cleaned after 24 hours)
                 //
-                // Solution: Check age FIRST. If very old, force remove regardless of cache status.
-                // Only check cache for recent entries (to protect active orders).
+                // Solution: Three-tier cleanup strategy
+                // 1. Force remove very old entries (24+ hours) - prevents leaks from stale cache
+                // 2. Remove filled/cancelled orders after short delay (5 minutes) - prevents accumulation
+                // 3. Keep active orders (in cache) - protects ongoing orders
                 let age = now.duration_since(history.last_update);
+                let age_secs = age.as_secs();
 
                 // Step 1: AGE CHECK FIRST (prevents leak even if cache is stale)
                 // If entry is very old (24+ hours), force remove to prevent memory leak
@@ -441,35 +444,52 @@ impl Connection {
                 // - Order was filled/cancelled but WebSocket update delayed
                 // - Cache still shows order as "open" but history is very old
                 // - Order has been open for more than 24 hours (unlikely but possible)
-                if age.as_secs() > MAX_AGE_SECS {
+                if age_secs > MAX_AGE_SECS {
                     // Very old entry - force remove regardless of cache status
                     // This prevents memory leaks from stale cache or very long-lived orders
                     warn!(
                         order_id = %order_id,
-                        history_age_secs = age.as_secs(),
-                        history_age_hours = age.as_secs() / 3600,
-                        "CONNECTION: Order fill history is very old ({} hours), force removing to prevent memory leak (cache check skipped for old entries)",
-                        age.as_secs() / 3600
+                        history_age_secs = age_secs,
+                        history_age_hours = age_secs / 3600,
+                        "CONNECTION: Order fill history is very old ({} hours), force removing to prevent memory leak",
+                        age_secs / 3600
                     );
-                    false // FORCE REMOVE - prevent memory leak
-                } else {
+                    return false; // FORCE REMOVE - prevent memory leak
+                }
 
-                // Step 2: CACHE CHECK (only for recent entries)
-                // If entry is recent, check if order is still active in cache
-                // This protects active orders from being cleaned up prematurely
+                // Step 2: CACHE CHECK (for recent entries)
+                // Check if order is still active in cache
                 let is_in_cache = OPEN_ORDERS_CACHE.iter().any(|entry| {
                     entry.value().iter().any(|o| o.order_id == *order_id)
                 });
 
                 if is_in_cache {
                     // Order is in cache and history is recent - keep it (active order)
-                    true // Keep
+                    true // Keep - order is still active
                 } else {
-                    // Not in cache and history is recent - keep for now
-                    // May receive late-arriving fill events or order may be closing
-                    // Will be cleaned up on next cleanup cycle if still inactive
-                    true // Keep (recent entry, may receive late events)
-                }
+                    // Order NOT in cache (filled/cancelled) - remove after short delay
+                    // This prevents memory leak from accumulating filled order histories
+                    const SHORT_DELAY_SECS: u64 = 300; // 5 minutes - enough time for late-arriving events
+                    
+                    if age_secs > SHORT_DELAY_SECS {
+                        // Order not in cache and history is older than 5 minutes - remove it
+                        // This handles:
+                        // - Orders that were filled/cancelled (not in cache)
+                        // - Late-arriving WebSocket events (5 minutes is enough buffer)
+                        // - Prevents accumulation of filled order histories
+                        debug!(
+                            order_id = %order_id,
+                            history_age_secs = age_secs,
+                            "CONNECTION: Order fill history not in cache (filled/cancelled), removing after {} seconds delay",
+                            age_secs
+                        );
+                        false // Remove - order is filled/cancelled
+                    } else {
+                        // Order not in cache but history is very recent (< 5 minutes)
+                        // Keep for now - may receive late-arriving fill events or order may be closing
+                        // Will be cleaned up on next cleanup cycle if still inactive
+                        true // Keep - recent entry, may receive late events
+                    }
                 }
             });
 
@@ -605,11 +625,31 @@ impl Connection {
                                                 "CONNECTION: No MarketTick subscribers, skipping event"
                                             );
                                         } else {
-                                            if let Err(_) = event_bus.market_tick_tx.send(market_tick) {
-                                                tracing::debug!(
-                                                    symbol = %price_update.symbol,
-                                                    "CONNECTION: MarketTick send failed (no receivers)"
-                                                );
+                                            // ✅ CRITICAL: Handle buffer overflow gracefully
+                                            // Problem: If buffer is full, send() returns error and event is dropped
+                                            // Solution: Log warning when buffer is full to detect backpressure
+                                            // Subscribers will receive RecvError::Lagged and handle it
+                                            match event_bus.market_tick_tx.send(market_tick) {
+                                                Ok(receiver_count) => {
+                                                    // Successfully sent - receiver_count indicates how many subscribers received it
+                                                    // If receiver_count is 0, no subscribers are listening (not an error, just no consumers)
+                                                    if receiver_count == 0 {
+                                                        tracing::debug!(
+                                                            symbol = %price_update.symbol,
+                                                            "CONNECTION: MarketTick sent but no subscribers (normal if modules haven't started yet)"
+                                                        );
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    // Buffer is full - event was dropped
+                                                    // This indicates subscribers are lagging behind
+                                                    // Subscribers will receive RecvError::Lagged and handle it
+                                                    warn!(
+                                                        symbol = %price_update.symbol,
+                                                        receiver_count = event_bus.market_tick_tx.receiver_count(),
+                                                        "CONNECTION: MarketTick buffer full - event dropped! Subscribers are lagging. Consider increasing event_bus.market_tick_buffer in config.yaml or optimizing subscriber performance."
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -669,6 +709,7 @@ impl Connection {
         let shutdown_flag = self.shutdown_flag.clone();
         let venue = self.venue.clone();
         let order_fill_history = self.order_fill_history.clone();
+        let shared_state_for_validation = self.shared_state.clone();
 
         info!(
         reconnect_delay_ms = self.cfg.websocket.reconnect_delay_ms,
@@ -693,175 +734,174 @@ impl Connection {
                     // Extra validation can catch missed events
                     let venue_for_validation = venue.clone();
                     let symbols_for_validation = symbols.clone();
+                    let shared_state_for_validation_clone = shared_state_for_validation.clone();
                     stream.set_on_reconnect(move || {
                         info!("CONNECTION: WebSocket reconnected - Binance will automatically send state updates via ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events");
 
                         // Spawn background validation task
                         let venue_clone = venue_for_validation.clone();
                         let symbols_clone = symbols_for_validation.clone();
+                        let shared_state_for_validation = shared_state_for_validation_clone.clone();
                         tokio::spawn(async move {
                             // Wait a bit for ACCOUNT_UPDATE events to arrive (Binance sends them after reconnect)
                             tokio::time::sleep(Duration::from_secs(2)).await;
 
                             info!(
                                 symbol_count = symbols_clone.len(),
-                                "CONNECTION: Validating state after WebSocket reconnect (comparing REST API with WebSocket cache)"
+                                "CONNECTION: Validating state after WebSocket reconnect (priority-based validation)"
                             );
 
-                            // Add overall timeout to prevent hanging (15 seconds max - reduced for faster validation)
-                            let validation_timeout = Duration::from_secs(15);
-                            let validation_start = Instant::now();
+                            // ✅ PRIORITY-BASED VALIDATION: Validate symbols in priority order
+                            // Problem: Validating all 37 symbols takes ~15 seconds, blocking new trade signals
+                            // Solution: Validate high-priority symbols first (active positions), then others in background
+                            //
+                            // Priority 1: Symbols with open positions/orders (validate immediately, ~1-5 symbols)
+                            // Priority 2: Symbols with cached positions (validate next, ~5-10 symbols)
+                            // Priority 3: All other symbols (validate in background, non-blocking)
+                            //
+                            // This ensures critical state is validated quickly (< 2 seconds) while
+                            // non-critical validation happens in background without blocking trading
+
+                            // Get priority symbols from shared state
+                            let (priority_symbols, cached_symbols, remaining_symbols) = {
+                                let mut priority = Vec::new();
+                                let mut cached = Vec::new();
+                                
+                                // Priority 1: Symbols with open positions/orders (from shared_state)
+                                if let Some(shared_state) = &shared_state_for_validation {
+                                    let ordering_state = shared_state.ordering_state.lock().await;
+                                    if let Some(position) = &ordering_state.open_position {
+                                        priority.push(position.symbol.clone());
+                                    }
+                                    if let Some(order) = &ordering_state.open_order {
+                                        if !priority.contains(&order.symbol) {
+                                            priority.push(order.symbol.clone());
+                                        }
+                                    }
+                                }
+                                
+                                // Priority 2: Symbols with cached positions (from POSITION_CACHE)
+                                for entry in POSITION_CACHE.iter() {
+                                    let symbol = entry.key().clone();
+                                    if !priority.contains(&symbol) {
+                                        cached.push(symbol);
+                                    }
+                                }
+                                
+                                // Priority 3: All other symbols
+                                let remaining: Vec<String> = symbols_clone.iter()
+                                    .filter(|s| !priority.contains(s) && !cached.contains(s))
+                                    .cloned()
+                                    .collect();
+                                
+                                (priority, cached, remaining)
+                            };
+
                             let total_symbols = symbols_clone.len();
+                            let priority_count = priority_symbols.len();
+                            let cached_count = cached_symbols.len();
+                            let remaining_count = remaining_symbols.len();
 
                             info!(
                                 total_symbols,
-                                "CONNECTION: Starting parallel validation for {} symbols",
-                                total_symbols
+                                priority_count,
+                                cached_count,
+                                remaining_count,
+                                "CONNECTION: Priority-based validation - Priority: {} symbols, Cached: {} symbols, Remaining: {} symbols",
+                                priority_count,
+                                cached_count,
+                                remaining_count
                             );
 
-                            // ✅ PARALLEL VALIDATION: Validate all symbols concurrently
-                            // This is much faster than sequential validation (37 symbols × 2 API calls = 74 sequential calls would take minutes)
-                            // With parallel validation, all symbols are validated simultaneously (limited by tokio's concurrency)
-                            let symbol_timeout = Duration::from_secs(3); // Reduced timeout for parallel execution
-                            
-                            // Create validation tasks for all symbols
-                            let validation_tasks: Vec<_> = symbols_clone.iter().map(|symbol| {
-                                let symbol = symbol.clone();
-                                let venue_clone = venue_clone.clone();
-                                let symbol_timeout = symbol_timeout;
-                                
-                                tokio::spawn(async move {
-                                    // Validate position
-                                    let position_result = tokio::time::timeout(
-                                        symbol_timeout,
-                                        venue_clone.get_position(&symbol)
-                                    ).await;
-                                    
-                                    // Validate orders
-                                    let orders_result = tokio::time::timeout(
-                                        symbol_timeout,
-                                        venue_clone.get_open_orders(&symbol)
-                                    ).await;
-                                    
-                                    (symbol, position_result, orders_result)
-                                })
-                            }).collect();
+                            let symbol_timeout = Duration::from_secs(3);
+                            let validation_start = Instant::now();
 
-                            // Wait for all validation tasks with overall timeout
-                            let validation_future = future::join_all(validation_tasks);
-                            let validation_results = match tokio::time::timeout(validation_timeout, validation_future).await {
-                                Ok(results) => results,
-                                Err(_) => {
-                                    warn!(
-                                        total_symbols,
-                                        elapsed_secs = validation_start.elapsed().as_secs(),
-                                        "CONNECTION: Validation timeout reached, cancelling remaining tasks"
-                                    );
-                                    // Return partial results - tasks that completed before timeout
-                                    vec![]
+                            // Helper function to validate a batch of symbols
+                            let validate_symbols_batch = {
+                                let venue = venue_clone.clone();
+                                let timeout = symbol_timeout;
+                                move |symbols: Vec<String>| {
+                                    let venue = venue.clone();
+                                    
+                                    symbols.into_iter().map(move |symbol| {
+                                        let venue = venue.clone();
+                                        let symbol_clone = symbol.clone();
+                                        
+                                        tokio::spawn(async move {
+                                            // Validate position
+                                            let position_result = tokio::time::timeout(
+                                                timeout,
+                                                venue.get_position(&symbol_clone)
+                                            ).await;
+                                            
+                                            // Validate orders
+                                            let orders_result = tokio::time::timeout(
+                                                timeout,
+                                                venue.get_open_orders(&symbol_clone)
+                                            ).await;
+                                            
+                                            (symbol_clone, position_result, orders_result)
+                                        })
+                                    }).collect::<Vec<_>>()
                                 }
                             };
 
-                            // Process validation results
+                            // Priority 1: Validate active positions/orders immediately (blocking)
                             let mut validated_count = 0;
-                            for result in validation_results {
-                                match result {
-                                    Ok((symbol, position_result, orders_result)) => {
-                                        // Process position validation
-                                        match position_result {
-                                            Ok(Ok(rest_position)) => {
-                                                // Compare with WebSocket cache
-                                                if let Some(ws_position) = POSITION_CACHE.get(&symbol) {
-                                                    let ws_pos = ws_position.value();
-                                                    let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
-                                                    let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
-                                                    
-                                                    const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
-                                                    const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
-                                                    let significant_mismatch = qty_diff > Decimal::from_str(SIGNIFICANT_QTY_DIFF).unwrap()
-                                                        || entry_diff > Decimal::from_str(SIGNIFICANT_ENTRY_DIFF).unwrap();
-                                                    
-                                                    POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
-                                                    
-                                                    if significant_mismatch {
-                                                        warn!(
-                                                            symbol = %symbol,
-                                                            rest_qty = %rest_position.qty.0,
-                                                            ws_qty = %ws_pos.qty.0,
-                                                            qty_diff = %qty_diff,
-                                                            "CONNECTION: Position mismatch detected after reconnect, cache updated"
-                                                        );
-                                                    }
-                                                } else if !rest_position.qty.0.is_zero() {
-                                                    POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
-                                                    warn!(
-                                                        symbol = %symbol,
-                                                        rest_qty = %rest_position.qty.0,
-                                                        "CONNECTION: Position exists in REST API but missing from WebSocket cache, added to cache"
-                                                    );
-                                                } else if POSITION_CACHE.contains_key(&symbol) {
-                                                    POSITION_CACHE.remove(&symbol);
-                                                }
-                                                validated_count += 1;
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                // Failed or timeout - skip silently for parallel execution
-                                            }
-                                        }
-                                        
-                                        // Process orders validation
-                                        match orders_result {
-                                            Ok(Ok(rest_orders)) => {
-                                                let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
-                                                    crate::types::VenueOrder {
-                                                        order_id: o.order_id.clone(),
-                                                        side: o.side,
-                                                        price: o.price,
-                                                        qty: o.qty,
-                                                    }
-                                                }).collect();
-                                                
-                                                if let Some(ws_orders) = OPEN_ORDERS_CACHE.get(&symbol) {
-                                                    let ws_orders_vec = ws_orders.value();
-                                                    let count_mismatch = rest_orders.len() != ws_orders_vec.len();
-                                                    
-                                                    if count_mismatch {
-                                                        warn!(
-                                                            symbol = %symbol,
-                                                            rest_order_count = rest_orders.len(),
-                                                            ws_order_count = ws_orders_vec.len(),
-                                                            "CONNECTION: Open orders mismatch detected after reconnect, cache updated"
-                                                        );
-                                                    }
-                                                } else if !rest_orders.is_empty() {
-                                                    warn!(
-                                                        symbol = %symbol,
-                                                        rest_order_count = rest_orders.len(),
-                                                        "CONNECTION: Open orders exist in REST API but missing from WebSocket cache, cache updated"
-                                                    );
-                                                }
-                                                
-                                                OPEN_ORDERS_CACHE.insert(symbol.clone(), rest_orders_vec);
-                                            }
-                                            Ok(Err(_)) | Err(_) => {
-                                                // Failed or timeout - skip silently
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // Task join error - skip
-                                    }
-                                }
+                            if !priority_symbols.is_empty() {
+                                info!(
+                                    priority_count,
+                                    "CONNECTION: Validating priority symbols (active positions/orders) - {} symbols",
+                                    priority_count
+                                );
+                                let priority_tasks = validate_symbols_batch(priority_symbols);
+                                let priority_results = future::join_all(priority_tasks).await;
+                                validated_count += Self::process_validation_results(priority_results, &venue_clone).await;
+                            }
+
+                            // Priority 2: Validate cached symbols (blocking, but fast)
+                            if !cached_symbols.is_empty() {
+                                info!(
+                                    cached_count,
+                                    "CONNECTION: Validating cached symbols - {} symbols",
+                                    cached_count
+                                );
+                                let cached_tasks = validate_symbols_batch(cached_symbols);
+                                let cached_results = future::join_all(cached_tasks).await;
+                                validated_count += Self::process_validation_results(cached_results, &venue_clone).await;
+                            }
+
+                            // Priority 3: Validate remaining symbols in background (non-blocking)
+                            if !remaining_symbols.is_empty() {
+                                info!(
+                                    remaining_count,
+                                    "CONNECTION: Starting background validation for {} remaining symbols (non-blocking)",
+                                    remaining_count
+                                );
+                                let venue_bg = venue_clone.clone();
+                                tokio::spawn(async move {
+                                    let remaining_tasks = validate_symbols_batch(remaining_symbols);
+                                    let remaining_results = future::join_all(remaining_tasks).await;
+                                    let bg_validated = Self::process_validation_results(remaining_results, &venue_bg).await;
+                                    info!(
+                                        validated_count = bg_validated,
+                                        total_remaining = remaining_count,
+                                        "CONNECTION: Background validation completed (validated {}/{} symbols)",
+                                        bg_validated,
+                                        remaining_count
+                                    );
+                                });
                             }
 
                             // Validate balance (USDT/USDC) - with timeout
                             let balance_timeout = Duration::from_secs(5);
+                            const MAX_BALANCE_VALIDATION_TIME: Duration = Duration::from_secs(10); // Max 10 seconds for balance validation
                             for asset in &["USDT", "USDC"] {
                                 // Check overall timeout
-                                if validation_start.elapsed() > validation_timeout {
+                                if validation_start.elapsed() > MAX_BALANCE_VALIDATION_TIME {
                                     warn!(
                                         asset = %asset,
-                                        "CONNECTION: Validation timeout reached, skipping balance validation"
+                                        "CONNECTION: Balance validation timeout reached, skipping"
                                     );
                                     break;
                                 }
@@ -910,37 +950,26 @@ impl Connection {
                             }
 
                             let elapsed_secs = validation_start.elapsed().as_secs();
-                            let success_rate = if total_symbols > 0 {
-                                (validated_count as f64 / total_symbols as f64) * 100.0
+                            let priority_success_rate = if priority_count > 0 {
+                                (validated_count as f64 / (priority_count + cached_count) as f64) * 100.0
                             } else {
-                                0.0
+                                100.0
                             };
                             
-                            if validated_count == total_symbols {
-                                info!(
-                                    validated_count,
-                                    total_symbols,
-                                    elapsed_secs,
-                                    success_rate = format!("{:.1}%", success_rate),
-                                    "CONNECTION: State validation after reconnect completed successfully (validated {}/{} symbols in {}s, {:.1}% success rate)",
-                                    validated_count,
-                                    total_symbols,
-                                    elapsed_secs,
-                                    success_rate
-                                );
-                            } else {
-                                warn!(
-                                    validated_count,
-                                    total_symbols,
-                                    elapsed_secs,
-                                    success_rate = format!("{:.1}%", success_rate),
-                                    "CONNECTION: State validation after reconnect completed partially (validated {}/{} symbols in {}s, {:.1}% success rate) - some symbols may have timed out or failed",
-                                    validated_count,
-                                    total_symbols,
-                                    elapsed_secs,
-                                    success_rate
-                                );
-                            }
+                            info!(
+                                validated_count,
+                                priority_count,
+                                cached_count,
+                                remaining_count,
+                                elapsed_secs,
+                                success_rate = format!("{:.1}%", priority_success_rate),
+                                "CONNECTION: Priority validation completed (validated {}/{} priority symbols in {}s, {:.1}% success rate). Background validation running for {} remaining symbols.",
+                                validated_count,
+                                priority_count + cached_count,
+                                elapsed_secs,
+                                priority_success_rate,
+                                remaining_count
+                            );
                         });
                     });
 
@@ -1278,6 +1307,107 @@ impl Connection {
         Ok(())
     }
 
+    /// Process validation results for a batch of symbols
+    /// Returns the number of successfully validated symbols
+    async fn process_validation_results(
+        results: Vec<Result<(String, Result<Result<Position, anyhow::Error>, tokio::time::error::Elapsed>, Result<Result<Vec<VenueOrder>, anyhow::Error>, tokio::time::error::Elapsed>), tokio::task::JoinError>>,
+        _venue: &Arc<BinanceFutures>,
+    ) -> usize {
+        let mut validated_count = 0;
+        
+        for result in results {
+            match result {
+                Ok((symbol, position_result, orders_result)) => {
+                    // Process position validation
+                    match position_result {
+                        Ok(Ok(rest_position)) => {
+                            // Compare with WebSocket cache
+                            if let Some(ws_position) = POSITION_CACHE.get(&symbol) {
+                                let ws_pos = ws_position.value();
+                                let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
+                                let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
+                                
+                                const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
+                                const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
+                                let significant_mismatch = qty_diff > Decimal::from_str(SIGNIFICANT_QTY_DIFF).unwrap()
+                                    || entry_diff > Decimal::from_str(SIGNIFICANT_ENTRY_DIFF).unwrap();
+                                
+                                POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
+                                
+                                if significant_mismatch {
+                                    warn!(
+                                        symbol = %symbol,
+                                        rest_qty = %rest_position.qty.0,
+                                        ws_qty = %ws_pos.qty.0,
+                                        qty_diff = %qty_diff,
+                                        "CONNECTION: Position mismatch detected after reconnect, cache updated"
+                                    );
+                                }
+                            } else if !rest_position.qty.0.is_zero() {
+                                POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
+                                warn!(
+                                    symbol = %symbol,
+                                    rest_qty = %rest_position.qty.0,
+                                    "CONNECTION: Position exists in REST API but missing from WebSocket cache, added to cache"
+                                );
+                            } else if POSITION_CACHE.contains_key(&symbol) {
+                                POSITION_CACHE.remove(&symbol);
+                            }
+                            validated_count += 1;
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            // Failed or timeout - skip silently for parallel execution
+                        }
+                    }
+                    
+                    // Process orders validation
+                    match orders_result {
+                        Ok(Ok(rest_orders)) => {
+                            let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
+                                crate::types::VenueOrder {
+                                    order_id: o.order_id.clone(),
+                                    side: o.side,
+                                    price: o.price,
+                                    qty: o.qty,
+                                }
+                            }).collect();
+                            
+                            if let Some(ws_orders) = OPEN_ORDERS_CACHE.get(&symbol) {
+                                let ws_orders_vec = ws_orders.value();
+                                let count_mismatch = rest_orders.len() != ws_orders_vec.len();
+                                
+                                if count_mismatch {
+                                    warn!(
+                                        symbol = %symbol,
+                                        rest_order_count = rest_orders.len(),
+                                        ws_order_count = ws_orders_vec.len(),
+                                        "CONNECTION: Open orders mismatch detected after reconnect, cache updated"
+                                    );
+                                }
+                            } else if !rest_orders.is_empty() {
+                                warn!(
+                                    symbol = %symbol,
+                                    rest_order_count = rest_orders.len(),
+                                    "CONNECTION: Open orders exist in REST API but missing from WebSocket cache, cache updated"
+                                );
+                            }
+                            
+                            OPEN_ORDERS_CACHE.insert(symbol.clone(), rest_orders_vec);
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            // Failed or timeout - skip silently
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Task join error - skip
+                }
+            }
+        }
+        
+        validated_count
+    }
+
     /// Send order command (used by ORDERING module)
     /// Returns order ID on success
     /// Performs validation before sending: rules, min_notional, balance
@@ -1453,16 +1583,19 @@ impl Connection {
     }
 
     /// Start background task to periodically refresh symbol rules
-    /// Refreshes rules every hour (or on shutdown) to pick up Binance rule changes
+    /// Refreshes rules every 15 minutes (or on shutdown) to pick up Binance rule changes
+    /// Also invalidates cache immediately on precision/MIN_NOTIONAL errors
     async fn start_rules_refresh_task(&self) {
     let shutdown_flag = self.shutdown_flag.clone();
 
     tokio::spawn(async move {
-        const REFRESH_INTERVAL_HOURS: u64 = 1;
-        const REFRESH_INTERVAL_SECS: u64 = REFRESH_INTERVAL_HOURS * 3600;
+        // ✅ Reduced from 1 hour to 15 minutes for faster rule updates
+        // Cache is also invalidated immediately on precision/MIN_NOTIONAL errors
+        const REFRESH_INTERVAL_MINUTES: u64 = 15;
+        const REFRESH_INTERVAL_SECS: u64 = REFRESH_INTERVAL_MINUTES * 60;
 
         info!(
-        interval_hours = REFRESH_INTERVAL_HOURS,
+        interval_minutes = REFRESH_INTERVAL_MINUTES,
         "CONNECTION: Started symbol rules refresh task"
         );
 

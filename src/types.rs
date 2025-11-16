@@ -394,6 +394,10 @@ pub struct OrderingState {
     pub last_order_update_timestamp: Option<Instant>,
     /// Timestamp of the last PositionUpdate event that modified state
     pub last_position_update_timestamp: Option<Instant>,
+    /// Reserved margin (balance reserved but order not yet placed)
+    /// This tracks balance reservations atomically with state checks
+    /// Prevents double-spend by ensuring only one thread can reserve balance at a time
+    pub reserved_margin: Decimal,
 }
 
 impl OrderingState {
@@ -403,6 +407,7 @@ impl OrderingState {
             open_order: None,
             last_order_update_timestamp: None,
             last_position_update_timestamp: None,
+            reserved_margin: Decimal::ZERO,
         }
     }
 }
@@ -641,6 +646,9 @@ pub struct PositionInfo {
     pub take_profit_pct: Option<f64>,
     pub opened_at: Instant,
     pub is_maker: Option<bool>,
+    /// Flag to prevent duplicate CloseRequest events
+    /// Set to true when CloseRequest is sent, preventing race conditions
+    pub close_requested: bool,
 }
 
 // ============================================================================

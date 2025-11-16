@@ -23,12 +23,15 @@ max_margin_usd: 100.0     # Maximum margin per trade (USD) - dynamic margin rang
 #     Since we only have one position at a time, we can use all available funds (up to 100 USD limit)
 #   - "dynamic" or "trend_based": Scale margin based on trend strength, using available balance as base
 margin_strategy: "balance_based"   # Recommended: "balance_based" to use all available funds (up to max_margin_usd)
+# ✅ Margin Strategy: Use available balance (10 <= margin <= 100 USD)
+# Examples:
+#   - Balance = 20 USD → margin = 20 USD ✅ (20 >= 10, 20 <= 100)
+#   - Balance = 5 USD → reject ❌ (5 < 10, below min_margin)
+#   - Balance = 150 USD → margin = 100 USD ✅ (150 > 100, capped at max_margin)
+# Minimum balance requirement: min_margin_usd (10) + commission_buffer (5) = 15 USD
+# This ensures we can open a position AND close it with commission
+# Example: 20 USD balance → use 20 USD margin ✅ (20 >= 15, sufficient for margin + commission)
 min_quote_balance_usd: 20.0  # Minimum quote asset balance threshold (USD) - legacy, not used for validation
-# Note: This value is NOT used for balance validation anymore
-# Dynamic logic: min_balance = min_margin_usd (10) + commission_buffer (5) = 15 USD
-# This allows trading with any balance >= 15 USD
-# The system will use all available balance (up to max_margin_usd) for margin
-# Example: 20 USD balance → use 20 USD margin (all available, up to max 100 USD)
 
 # ============================================================================
 # Trading Parameters
@@ -73,8 +76,8 @@ trending:
 # ============================================================================
 binance:
   futures_base: "https://fapi.binance.com"
-  api_key: ""
-  secret_key: ""
+  api_key: "6WkI51B0dbz9gbtRm5PphsWYFmr3oaoagJECl0UiGX13ySnLxXlhuEoR5brk74ZU"
+  secret_key: "8N3PxGEp1CTrirTbmkM42mHaNTo5jbyamUFgatfeueHHkH5RBsDgGLCh3b6Ki3nw"
   recv_window_ms: 5000
   hedge_mode: false  # Hedge mode (dual-side position) - default: false (one-way mode)
 

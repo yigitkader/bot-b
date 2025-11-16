@@ -14,18 +14,62 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Quantize decimal value to step (floor to nearest step multiple)
+fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
+    if step.is_zero() || step.is_sign_negative() {
+        return value;
+    }
+
+    let ratio = value / step;
+    let floored = ratio.floor();
+    let result = floored * step;
+    let step_scale = step.scale();
+    let normalized = result.normalize();
+
+    // Round to step's scale first
+    let rounded = normalized.round_dp_with_strategy(
+        step_scale,
+        rust_decimal::RoundingStrategy::ToNegativeInfinity,
+    );
+
+    // Double-check quantization - ensure result is a multiple of step
+    let re_quantized_ratio = rounded / step;
+    let re_quantized_floor = re_quantized_ratio.floor();
+    let final_result = re_quantized_floor * step;
+
+    // Final normalization and rounding
+    final_result.normalize().round_dp_with_strategy(
+        step_scale,
+        rust_decimal::RoundingStrategy::ToNegativeInfinity,
+    )
+}
 
 // ============================================================================
 // Balance Reservation Guard (RAII Pattern)
 // ============================================================================
+
+/// Cleanup message sent when BalanceReservation is dropped without explicit release
+struct BalanceCleanupMessage {
+    balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
+    asset: String,
+    amount: Decimal,
+    order_id: Option<String>,
+    allocation_timestamp: Instant,
+}
 
 /// RAII guard for balance reservation
 /// Automatically releases balance when dropped (if not explicitly released)
 /// Prevents memory leaks from forgotten balance releases
 ///
 /// CRITICAL: Always call release() explicitly before returning from function
-/// Drop trait will warn if balance is dropped without explicit release
+/// Drop trait will send cleanup message to background task for async release
 struct BalanceReservation {
     balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
     asset: String,
@@ -36,6 +80,9 @@ struct BalanceReservation {
     order_id: Option<String>,
     /// Timestamp when reservation was allocated (for leak tracking)
     allocation_timestamp: Instant,
+    /// Cleanup sender for async release on drop
+    /// None if already released or if cleanup channel is not available
+    cleanup_tx: Option<mpsc::UnboundedSender<BalanceCleanupMessage>>,
 }
 
 impl BalanceReservation {
@@ -45,6 +92,7 @@ impl BalanceReservation {
         balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
         asset: &str,
         amount: Decimal,
+        cleanup_tx: Option<mpsc::UnboundedSender<BalanceCleanupMessage>>,
     ) -> Option<Self> {
         let mut store = balance_store.write().await;
 
@@ -59,6 +107,7 @@ impl BalanceReservation {
                 released: false,
                 order_id: None, // Will be set after order is placed
                 allocation_timestamp: Instant::now(),
+                cleanup_tx,
             })
         } else {
             None
@@ -73,6 +122,8 @@ impl BalanceReservation {
             let mut store = self.balance_store.write().await;
             store.release(&self.asset, self.amount);
             self.released = true;
+            // Clear cleanup_tx to prevent sending cleanup message on drop
+            self.cleanup_tx = None;
 
             debug!(
                 asset = %self.asset,
@@ -87,24 +138,53 @@ impl BalanceReservation {
 impl Drop for BalanceReservation {
     fn drop(&mut self) {
         // CRITICAL: Drop cannot be async, so we cannot release balance here directly
-        // Doing async cleanup in Drop is an anti-pattern that can cause:
-        // - Deadlocks during program shutdown
-        // - Expensive runtime creation
-        // - Unpredictable behavior
-        //
-        // Instead, we only log a warning. The leak detection task will handle cleanup.
+        // Solution: Send cleanup message to background task for async release
+        // This ensures balance is released even on panic or early return
         if !self.released {
             let allocation_age = Instant::now().duration_since(self.allocation_timestamp);
-            tracing::error!(
-                asset = %self.asset,
-                amount = %self.amount,
-                order_id = ?self.order_id,
-                allocation_age_secs = allocation_age.as_secs(),
-                "CRITICAL: Balance reservation dropped without explicit release! Order ID: {:?}, Allocation age: {}s. Manual intervention may be required. Leak detection task will attempt auto-fix.",
-                self.order_id,
-                allocation_age.as_secs()
-            );
-            // Balance will remain reserved until leak detection task fixes it
+            
+            // Try to send cleanup message to background task
+            if let Some(cleanup_tx) = self.cleanup_tx.take() {
+                let cleanup_msg = BalanceCleanupMessage {
+                    balance_store: self.balance_store.clone(),
+                    asset: self.asset.clone(),
+                    amount: self.amount,
+                    order_id: self.order_id.clone(),
+                    allocation_timestamp: self.allocation_timestamp,
+                };
+                
+                if cleanup_tx.send(cleanup_msg).is_ok() {
+                    tracing::warn!(
+                        asset = %self.asset,
+                        amount = %self.amount,
+                        order_id = ?self.order_id,
+                        allocation_age_secs = allocation_age.as_secs(),
+                        "Balance reservation dropped without explicit release - cleanup task will release it"
+                    );
+                } else {
+                    // Cleanup channel closed (shutdown) - log error
+                    tracing::error!(
+                        asset = %self.asset,
+                        amount = %self.amount,
+                        order_id = ?self.order_id,
+                        allocation_age_secs = allocation_age.as_secs(),
+                        "CRITICAL: Balance reservation dropped without release AND cleanup channel closed! Order ID: {:?}, Allocation age: {}s. Leak detection task will attempt auto-fix.",
+                        self.order_id,
+                        allocation_age.as_secs()
+                    );
+                }
+            } else {
+                // No cleanup channel available - log error
+                tracing::error!(
+                    asset = %self.asset,
+                    amount = %self.amount,
+                    order_id = ?self.order_id,
+                    allocation_age_secs = allocation_age.as_secs(),
+                    "CRITICAL: Balance reservation dropped without release! Order ID: {:?}, Allocation age: {}s. Leak detection task will attempt auto-fix.",
+                    self.order_id,
+                    allocation_age.as_secs()
+                );
+            }
         }
     }
 }
@@ -120,6 +200,8 @@ pub struct Ordering {
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
     shared_state: Arc<SharedState>,
+    /// Cleanup channel sender for async balance release on drop
+    balance_cleanup_tx: Arc<mpsc::UnboundedSender<BalanceCleanupMessage>>,
 }
 
 impl Ordering {
@@ -159,13 +241,69 @@ impl Ordering {
         shutdown_flag: Arc<AtomicBool>,
         shared_state: Arc<SharedState>,
     ) -> Self {
+        // Create cleanup channel for async balance release
+        let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
+        
+        // Start background cleanup task
+        let balance_store_for_cleanup = shared_state.balance_store.clone();
+        let shutdown_flag_for_cleanup = shutdown_flag.clone();
+        tokio::spawn(Self::balance_cleanup_task(cleanup_rx, balance_store_for_cleanup, shutdown_flag_for_cleanup));
+        
         Self {
             cfg,
             connection,
             event_bus,
             shutdown_flag,
             shared_state,
+            balance_cleanup_tx: Arc::new(cleanup_tx),
         }
+    }
+    
+    /// Background task that handles async balance release when BalanceReservation is dropped
+    /// This ensures balance is released even on panic or early return
+    async fn balance_cleanup_task(
+        mut cleanup_rx: mpsc::UnboundedReceiver<BalanceCleanupMessage>,
+        balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) {
+        info!("ORDERING: Balance cleanup task started");
+        
+        loop {
+            tokio::select! {
+                // Handle cleanup messages (primary branch - process immediately)
+                msg = cleanup_rx.recv() => {
+                    match msg {
+                        Some(cleanup_msg) => {
+                            let allocation_age = Instant::now().duration_since(cleanup_msg.allocation_timestamp);
+                            
+                            // Release balance asynchronously
+                            let mut store = balance_store.write().await;
+                            store.release(&cleanup_msg.asset, cleanup_msg.amount);
+                            
+                            tracing::info!(
+                                asset = %cleanup_msg.asset,
+                                amount = %cleanup_msg.amount,
+                                order_id = ?cleanup_msg.order_id,
+                                allocation_age_secs = allocation_age.as_secs(),
+                                "ORDERING: Balance reservation released by cleanup task (was dropped without explicit release)"
+                            );
+                        }
+                        None => {
+                            // Channel closed
+                            break;
+                        }
+                    }
+                }
+                // Check for shutdown periodically
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if shutdown_flag.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        info!("ORDERING: Balance cleanup task stopped");
     }
 
     /// Check if an error is permanent (should not retry)
@@ -242,6 +380,7 @@ impl Ordering {
         let connection_trade = connection.clone();
         let shutdown_flag_trade = shutdown_flag.clone();
         let cfg_trade = cfg.clone();
+        let cleanup_tx_trade = self.balance_cleanup_tx.clone();
         tokio::spawn(async move {
             let mut trade_signal_rx = event_bus_trade.subscribe_trade_signal();
 
@@ -260,6 +399,7 @@ impl Ordering {
                             &state_trade,
                             &cfg_trade,
                             &event_bus_trade,
+                            Some(cleanup_tx_trade.clone()),
                         )
                         .await
                         {
@@ -444,6 +584,7 @@ impl Ordering {
         shared_state: &Arc<SharedState>,
         cfg: &Arc<AppCfg>,
         event_bus: &Arc<EventBus>,
+        cleanup_tx: Option<Arc<mpsc::UnboundedSender<BalanceCleanupMessage>>>,
     ) -> Result<()> {
         // 1. Signal validity check - timestamp age
         let now = Instant::now();
@@ -471,45 +612,96 @@ impl Ordering {
             return Ok(());
         }
 
-        // 3. Calculate required margin
-        let leverage = signal.leverage;
-        let notional = signal.entry_price.0 * signal.size.0;
-        let required_margin = notional / Decimal::from(leverage);
-
-        // ✅ CRITICAL: Validate signal size consistency
-        // TRENDING generates signals using: notional = max_usd_per_order * leverage
-        // ORDERING validates: notional <= max_position_notional_usd
-        // These must be consistent to avoid signals being systematically rejected.
-        //
-        // Example mismatch:
-        // - max_usd_per_order = 100, leverage = 20 → notional = 2000
-        // - max_position_notional_usd = 1000 → signal rejected
-        //
-        // This validation ensures the signal's notional matches expectations from TRENDING.
+        // 3. Calculate margin, leverage, notional, and position size
+        // ORDERING's responsibility: Calculate all position parameters from balance and config
+        // TRENDING only provides: symbol, side, entry_price, TP/SL, spread info
+        
+        // Get balance and margin limits
+        let available_balance = {
+            let balance_store = shared_state.balance_store.read().await;
+            if cfg.quote_asset.to_uppercase() == "USDT" {
+                balance_store.usdt
+            } else {
+                balance_store.usdc
+            }
+        };
+        
+        let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
+        let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
+        
+        // Calculate margin: Use available balance (10 <= margin <= 100 USD)
+        let margin_usd = match cfg.margin_strategy.as_str() {
+            "fixed" => {
+                // Fixed: use max_usd_per_order (clamped to [min_margin_usd, max_margin_usd])
+                Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(max_margin)
+                    .max(min_margin)
+                    .min(max_margin)
+                    .min(available_balance) // Never exceed available balance
+            }
+            "balance_based" | "max_balance" | "dynamic" | "trend_based" | _ => {
+                // Balance-based: Use all available balance (up to max_margin_usd)
+                if available_balance >= min_margin {
+                    available_balance.min(max_margin)
+                } else {
+                    // Balance too low
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - balance below minimum margin"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        
+        // Fetch symbol rules to get max leverage
+        let rules = match connection.rules_for(&signal.symbol).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    symbol = %signal.symbol,
+                    "ORDERING: Failed to fetch symbol rules, skipping order"
+                );
+                return Ok(());
+            }
+        };
+        
+        // Use coin's max leverage (if available), otherwise use config leverage
+        // ✅ CRITICAL: Use coin's max leverage as requested
+        let leverage = if let Some(symbol_max_lev) = rules.max_leverage {
+            // Coin has max leverage - use it
+            symbol_max_lev
+        } else {
+            // No symbol max leverage - use config leverage
+            cfg.leverage.unwrap_or(cfg.exec.default_leverage) as u32
+        };
+        
+        debug!(
+            symbol = %signal.symbol,
+            leverage,
+            symbol_max_leverage = ?rules.max_leverage,
+            "ORDERING: Using coin's max leverage"
+        );
+        
+        // Calculate notional: margin × leverage
+        let leverage_decimal = Decimal::from(leverage);
+        let notional = margin_usd
+            .checked_mul(leverage_decimal)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Notional calculation overflow: margin={} × leverage={}",
+                    margin_usd,
+                    leverage
+                )
+            })?;
+        
+        // Check max position notional limit
         let max_position_notional =
             Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
-                .unwrap_or(Decimal::from(10000)); // Default to 10000 USD if conversion fails
-
-        // Calculate expected notional from TRENDING's perspective
-        let max_usd_per_order =
-            Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(Decimal::from(100));
-        let expected_notional = max_usd_per_order * Decimal::from(leverage);
-
-        // Warn if there's a mismatch between TRENDING's expected notional and ORDERING's limit
-        if expected_notional > max_position_notional {
-            warn!(
-                symbol = %signal.symbol,
-                expected_notional = %expected_notional,
-                max_position_notional = %max_position_notional,
-                max_usd_per_order = %max_usd_per_order,
-                leverage,
-                "ORDERING: Config mismatch - TRENDING will generate signals with notional {} but ORDERING limit is {}. Signals may be systematically rejected.",
-                expected_notional,
-                max_position_notional
-            );
-        }
-
-        // 4. Risk control check - max position notional (before lock)
+                .unwrap_or(Decimal::from(10000));
+        
         if notional > max_position_notional {
             warn!(
                 symbol = %signal.symbol,
@@ -520,87 +712,102 @@ impl Ordering {
             return Ok(());
         }
         
-        debug!(
-            symbol = %signal.symbol,
-            side = ?signal.side,
-            notional = %notional,
-            required_margin = %required_margin,
-            leverage,
-            "ORDERING: Processing TradeSignal - validation passed"
-        );
-
-        // ✅ CRITICAL: Check minimum quote balance when opening positions
-        // This ensures we have sufficient balance for both margin AND closing commission.
-        // For small balances (< max_margin_usd), we use a more flexible threshold:
-        // - Large balances: min_quote_balance_usd (e.g., 120 USD) = max_margin_usd + commission buffer
-        // - Small balances: min_margin_usd + commission buffer (e.g., 10 + 5 = 15 USD)
-        // This allows trading with smaller balances while still ensuring we can close positions
-        {
-            let balance_store = shared_state.balance_store.read().await;
-            let available_balance = if cfg.quote_asset.to_uppercase() == "USDT" {
-                balance_store.usdt
-            } else {
-                balance_store.usdc
-            };
-
-            // Calculate dynamic minimum balance threshold
-            // Logic: We can use all available balance (up to max_margin_usd) for margin
-            // But we need to keep a small commission buffer to close positions
-            let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
-            let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
-            
-            // Commission buffer: ~0.1% of notional (entry + exit) + small safety margin
-            // For small balances, use fixed 5 USD commission buffer
-            // For large balances (100x leverage), commission can be higher, but we use 5 USD as minimum
-            let commission_buffer = Decimal::from(5);
-            
-            // Minimum balance = min_margin + commission buffer
-            // This ensures we can open a position AND close it with commission
-            let min_quote_balance = min_margin + commission_buffer;
-
-            if available_balance < min_quote_balance {
-                debug!(
-                    symbol = %signal.symbol,
-                    available_balance = %available_balance,
-                    min_quote_balance = %min_quote_balance,
-                    required_margin = %required_margin,
-                    balance_type = if available_balance < max_margin { "small" } else { "large" },
-                    "ORDERING: Ignoring TradeSignal - available balance below minimum quote balance threshold"
-                );
-                return Ok(());
-            }
-        }
-
-        // ✅ CRITICAL: Spread staleness check (spread range validation already done in TRENDING)
-        // This prevents expensive spread validation from happening while balance is reserved,
-        // which creates a race condition window where another thread can reserve balance
-        // and place an order while this thread is validating spread.
-        //
-        // IMPORTANT: Spread range validation is done in TRENDING module (trending.rs line 605)
-        // ORDERING only needs to check if signal is too stale (time-based check)
-        // This avoids duplicate validation and reduces latency
-        //
-        // Problem: If signal is too old, spread may have changed significantly
-        // Solution: Check signal age - if too old, abort without expensive network call
-        let spread_age = now.duration_since(signal.spread_timestamp);
-        const MAX_SPREAD_AGE_SECS: u64 = 5; // 5 seconds - signal is too stale if older than this
-
-        if spread_age.as_secs() > MAX_SPREAD_AGE_SECS {
-            // Signal is too stale - abort without expensive network call
-            // TRENDING already validated spread range, we only need to check age here
-            warn!(
+        // Check min_notional requirement
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            debug!(
                 symbol = %signal.symbol,
-                spread_age_secs = spread_age.as_secs(),
-                max_age_secs = MAX_SPREAD_AGE_SECS,
-                "ORDERING: Signal is too stale ({} seconds old), aborting. Spread range was already validated in TRENDING.",
-                spread_age.as_secs()
+                notional = %notional,
+                min_notional = %rules.min_notional,
+                "ORDERING: Ignoring TradeSignal - notional below minimum"
             );
             return Ok(());
         }
+        
+        // Calculate position size: notional / entry_price
+        if signal.entry_price.0.is_zero() {
+            warn!(
+                symbol = %signal.symbol,
+                "ORDERING: Entry price is zero - skipping order"
+            );
+            return Ok(());
+        }
+        
+        let size_raw = notional
+            .checked_div(signal.entry_price.0)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Position size calculation error: notional={} / entry_price={}",
+                    notional,
+                    signal.entry_price.0
+                )
+            })?;
+        
+        if size_raw.is_zero() || size_raw.is_sign_negative() {
+            warn!(
+                symbol = %signal.symbol,
+                "ORDERING: Calculated position size is zero or negative - skipping order"
+            );
+            return Ok(());
+        }
+        
+        // Quantize size to step_size
+        let size_quantized = quantize_decimal(size_raw, rules.step_size);
+        
+        if size_quantized.is_zero() {
+            debug!(
+                symbol = %signal.symbol,
+                "ORDERING: Quantized size is zero - skipping order"
+            );
+            return Ok(());
+        }
+        
+        let size = Qty(size_quantized);
+        let required_margin = margin_usd;
+        
+        debug!(
+            symbol = %signal.symbol,
+            side = ?signal.side,
+            margin_usd = %margin_usd,
+            leverage,
+            notional = %notional,
+            size = %size.0,
+            entry_price = %signal.entry_price.0,
+            "ORDERING: Position sizing calculated from balance and config"
+        );
 
-        // Signal is recent (within 5 seconds) - proceed with order placement
-        // Spread range validation was already done in TRENDING, no need to re-validate here
-        // This reduces latency and avoids duplicate validation
+        // 4. Check minimum balance (margin + commission buffer)
+        // Commission buffer: Small buffer for entry + exit commission
+        // Commission is calculated from notional (margin × leverage), not from margin itself
+        // For small balances (20 USD margin, 100x leverage = 2000 USD notional):
+        //   - Commission ≈ 0.1% × 2000 = 2 USD (entry + exit)
+        //   - Buffer: 5 USD (safety margin)
+        let commission_buffer = Decimal::from(5);
+        let min_quote_balance = min_margin + commission_buffer;
+
+        if available_balance < min_quote_balance {
+            debug!(
+                symbol = %signal.symbol,
+                available_balance = %available_balance,
+                min_quote_balance = %min_quote_balance,
+                min_margin = %min_margin,
+                commission_buffer = %commission_buffer,
+                required_margin = %required_margin,
+                "ORDERING: Ignoring TradeSignal - available balance below minimum (min_margin + commission_buffer)"
+            );
+            return Ok(());
+        }
+        
+        // Additional check: Ensure balance is sufficient for required margin
+        if available_balance < required_margin {
+            debug!(
+                symbol = %signal.symbol,
+                available_balance = %available_balance,
+                required_margin = %required_margin,
+                deficit = %(required_margin - available_balance),
+                "ORDERING: Ignoring TradeSignal - available balance below required margin"
+            );
+            return Ok(());
+        }
 
         // Get TIF from config (before lock to minimize lock time)
         let tif = match cfg.exec.tif.as_str() {
@@ -619,29 +826,42 @@ impl Ordering {
             tif,
         };
 
-        // ✅ CRITICAL: Atomic operation - state check + balance reserve + order placement
+        // ✅ CRITICAL: Single Lock Pattern - Atomic state check + balance reservation
         //
-        // IMPORTANT: Spread validation was already done ABOVE (before balance reservation)
-        // This prevents the race condition where expensive validation happens while balance is reserved
+        // PROBLEM: Previous implementation had a race condition:
+        // - Thread A: Lock ordering_state → Check state (OK) → Release lock → Reserve balance → Place order
+        // - Thread B: Lock ordering_state → Check state (OK, Thread A hasn't updated yet) → Release lock → Reserve balance → Place order
+        // - Result: Both threads can reserve balance and place orders (double-spend!)
+        //
+        // ROOT CAUSE: ordering_state lock and balance_store lock are independent
+        // - BalanceReservation::new() acquires balance_store lock internally
+        // - ordering_state lock is released before balance reservation
+        // - Two threads can both pass state check and reserve balance
+        //
+        // SOLUTION: Single Lock Pattern - Everything in ordering_state lock
+        // 1. ✅ Lock ordering_state
+        // 2. ✅ Check state (no open position/order)
+        // 3. ✅ Check available balance (access balance_store inside lock)
+        // 4. ✅ Reserve balance atomically (update both balance_store and ordering_state.reserved_margin)
+        // 5. ✅ Release lock
+        // 6. ✅ Place order (balance already reserved)
+        //
+        // Lock order: ordering_state -> balance_store (always consistent, prevents deadlock)
         //
         // Flow (CORRECT ORDER):
-        // 1. ✅ Spread validation (DONE ABOVE - before any lock, lines 550-675)
-        // 2. ✅ Lock: Check state + reserve balance (lines 712-749)
-        // 3. ✅ Unlock: Place order IMMEDIATELY (minimize delay, lines 765+)
-        // 4. ✅ Lock: Update state atomically (after order placement)
+        // 1. ✅ Quick checks (timestamp, symbol) - done before lock (fast, no I/O)
+        // 2. ✅ Lock ordering_state: Check state + Reserve balance (atomic)
+        // 3. ✅ Release lock: Place order (balance already reserved)
+        // 4. ✅ Update state atomically (after order placement)
         //
-        // This prevents the race condition where:
-        // - Thread A reserves balance, lock released
-        // - Thread B also reserves balance (if enough balance for both)
-        // - Thread A does expensive spread validation (2-3 seconds) ← PREVENTED: validation done BEFORE reservation
-        // - Thread B places order (succeeds)
-        // - Thread A places order (double-spend!) ← PREVENTED: validation already done
-        //
-        // Step 1: Atomic state check + balance reservation (inside lock)
+        // Step 1: Atomic state check + balance reservation (inside single lock)
         let mut balance_reservation = {
-            let state_guard = shared_state.ordering_state.lock().await;
+            let mut state_guard = shared_state.ordering_state.lock().await;
 
-            // 5. Position check - ensure no open position/order
+            // ✅ CRITICAL: ALL checks happen INSIDE the lock to prevent race conditions
+            // This ensures state check + balance reservation is atomic
+
+            // Position check - ensure no open position/order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
                 debug!(
                     symbol = %signal.symbol,
@@ -652,42 +872,74 @@ impl Ordering {
                 return Ok(());
             }
 
-            // 6. Balance reservation (inside lock to prevent race condition)
-            // Balance reserve must happen AFTER state check, INSIDE the same lock
-            match BalanceReservation::new(
+            // Spread staleness check (inside lock to prevent race condition)
+            // Spread range validation was already done in TRENDING module
+            // ORDERING only needs to check if signal is too stale (time-based check)
+            let spread_age = now.duration_since(signal.spread_timestamp);
+            const MAX_SPREAD_AGE_SECS: u64 = 5; // 5 seconds - signal is too stale if older than this
+
+            if spread_age.as_secs() > MAX_SPREAD_AGE_SECS {
+                // Signal is too stale - abort without expensive network call
+                warn!(
+                    symbol = %signal.symbol,
+                    spread_age_secs = spread_age.as_secs(),
+                    max_age_secs = MAX_SPREAD_AGE_SECS,
+                    "ORDERING: Signal is too stale ({} seconds old), aborting. Spread range was already validated in TRENDING.",
+                    spread_age.as_secs()
+                );
+                return Ok(());
+            }
+
+            // ✅ CRITICAL: Check available balance and reserve atomically (inside lock)
+            // Access balance_store inside ordering_state lock (lock order: ordering_state -> balance_store)
+            // Note: Balance was already checked above, but we check again here atomically to prevent race conditions
+            let available_balance_atomic = {
+                let balance_store = shared_state.balance_store.read().await;
+                balance_store.available(&cfg.quote_asset)
+            };
+
+            if available_balance_atomic < required_margin {
+                debug!(
+                    symbol = %signal.symbol,
+                    required_margin = %required_margin,
+                    available_balance = %available_balance_atomic,
+                    quote_asset = %cfg.quote_asset,
+                    "ORDERING: Ignoring TradeSignal - insufficient balance (atomic check)"
+                );
+                return Ok(());
+            }
+
+            // ✅ CRITICAL: Reserve balance atomically (update both balance_store and ordering_state)
+            // This ensures only one thread can reserve balance at a time
+            let reservation = match BalanceReservation::new(
                 shared_state.balance_store.clone(),
                 &cfg.quote_asset,
                 required_margin,
+                cleanup_tx.as_ref().map(|tx| tx.as_ref().clone()),
             )
             .await
             {
                 Some(reservation) => {
-                    // Balance reserved successfully - lock will be released after this block
-                    // Order placement will happen IMMEDIATELY after lock release (minimize delay)
-                    // Balance reservation prevents other threads from reserving same balance
+                    // Track reserved margin in ordering_state for additional safety
+                    state_guard.reserved_margin += required_margin;
                     reservation
                 }
                 None => {
-                    // Insufficient balance or reservation failed
-                    let available_balance = {
-                        let balance_store = shared_state.balance_store.read().await;
-                        if cfg.quote_asset.to_uppercase() == "USDT" {
-                            balance_store.usdt
-                        } else {
-                            balance_store.usdc
-                        }
-                    };
+                    // Reservation failed (another thread reserved it)
                     debug!(
                         symbol = %signal.symbol,
                         required_margin = %required_margin,
                         available_balance = %available_balance,
                         quote_asset = %cfg.quote_asset,
-                        "ORDERING: Ignoring TradeSignal - insufficient balance or reservation failed"
+                        "ORDERING: Ignoring TradeSignal - balance reservation failed (another thread reserved it)"
                     );
                     return Ok(());
                 }
-            }
-        }; // Lock released here - order placement happens IMMEDIATELY next
+            };
+
+            // Lock released here - balance is reserved, state is checked
+            reservation
+        }; // ordering_state lock released here - order placement happens IMMEDIATELY next
 
         // Balance Reservation Release Checklist
         // Balance reserved - will be released automatically when balance_reservation is dropped
@@ -756,6 +1008,11 @@ impl Ordering {
                                 "ORDERING: Permanent error, not retrying"
                             );
                             // Permanent error - release balance and return early
+                            // Also update reserved_margin in ordering_state
+                            {
+                                let mut state_guard = shared_state.ordering_state.lock().await;
+                                state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                            }
                             balance_reservation.release().await;
                             return Err(e);
                         }
@@ -785,6 +1042,11 @@ impl Ordering {
                                 "ORDERING: All retries exhausted"
                             );
                             // All retries exhausted - release balance and return
+                            // Also update reserved_margin in ordering_state
+                            {
+                                let mut state_guard = shared_state.ordering_state.lock().await;
+                                state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                            }
                             balance_reservation.release().await;
                             return Err(e);
                         }
@@ -803,6 +1065,11 @@ impl Ordering {
                 None => {
                     // This should never be reached if all paths above return or break correctly
                     // But Rust requires this for the block to compile
+                    // Also update reserved_margin in ordering_state
+                    {
+                        let mut state_guard = shared_state.ordering_state.lock().await;
+                        state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                    }
                     balance_reservation.release().await;
                     return Err(
                         last_error.unwrap_or_else(|| anyhow!("Unknown error after retries"))
@@ -812,14 +1079,18 @@ impl Ordering {
         };
 
         // Step 3: Update state atomically (re-acquire lock for state update)
-        // Double-check pattern - another thread might have placed an order
+        // ✅ CRITICAL: With Reserve-Before-Check pattern, this double-check is primarily a safety net
+        // The balance reservation prevents other threads from even starting the order placement process
+        // However, we still double-check state here as a safety measure in case of edge cases
         // Balance reservation is still held - prevents other threads from reserving
-        // This completes the atomic operation: state check + balance reserve + order placement + state update
+        // This completes the atomic operation: balance reserve + state check + order placement + state update
         {
             let mut state_guard = shared_state.ordering_state.lock().await;
 
             // Double-check: if another thread placed an order while we were making the network call,
             // we should cancel our order to prevent duplicate orders
+            // With Reserve-Before-Check pattern, this should be rare because balance reservation
+            // prevents other threads from starting the process, but we keep it as a safety net
             if state_guard.open_order.is_none() && state_guard.open_position.is_none() {
                 state_guard.open_order = Some(OpenOrder {
                     symbol: signal.symbol.clone(),
@@ -845,6 +1116,11 @@ impl Ordering {
                 );
 
                 // Release balance AFTER state is updated
+                // Also update reserved_margin in ordering_state
+                {
+                    let mut state_guard = shared_state.ordering_state.lock().await;
+                    state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                }
                 balance_reservation.release().await;
             } else {
                 // Another thread placed an order/position while we were making the network call
@@ -867,6 +1143,11 @@ impl Ordering {
                             "ORDERING: Successfully canceled duplicate order after race condition"
                         );
                         // Cancel succeeded - now safe to release balance
+                        // Also update reserved_margin in ordering_state
+                        {
+                            let mut state_guard = shared_state.ordering_state.lock().await;
+                            state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                        }
                         balance_reservation.release().await;
                     }
                     Err(cancel_err) => {
@@ -1360,22 +1641,43 @@ impl Ordering {
                 let existing_entry_price = existing_pos.entry_price.0;
 
                 // Calculate differences for both qty and entry_price
-                // Use small epsilon to handle floating point precision issues
-                let epsilon_qty = Decimal::new(1, 6); // 0.000001
-                let epsilon_price = Decimal::new(1, 2); // 0.01 (for price, 1 cent is reasonable)
+                // ✅ CRITICAL: Use percentage-based epsilon for price comparison
+                // Problem: Absolute epsilon (0.01 USD) doesn't work for high-priced assets
+                // - BTC price ~$100,000 → 0.01 = 0.0001% (too small, causes false positives)
+                // - OrderUpdate: entry=50033.333333... (exact weighted average)
+                // - PositionUpdate: entry=50033.33 (rounded)
+                // - Difference: 0.003333 < 0.01 → Update SKIPPED ❌ (should update!)
+                //
+                // Solution: Use percentage-based epsilon (0.001% = 1 basis point)
+                // - Works for all price ranges (BTC, ETH, low-cap coins)
+                // - 0.001% of $100,000 = $1.00 (reasonable threshold)
+                // - 0.001% of $1.00 = $0.00001 (still reasonable for low prices)
+                let epsilon_qty = Decimal::new(1, 6); // 0.000001 (absolute for qty is fine)
+                const EPSILON_PRICE_PCT: f64 = 0.001; // 0.001% = 1 basis point
 
                 let qty_diff = (qty_abs_update - qty_abs_existing).abs();
-                let price_diff = (update.entry_price.0 - existing_entry_price).abs();
+                let price_diff_abs = (update.entry_price.0 - existing_entry_price).abs();
+                
+                // Calculate percentage difference for price
+                let price_diff_pct = if existing_entry_price > Decimal::ZERO {
+                    (price_diff_abs / existing_entry_price) * Decimal::from(100)
+                } else {
+                    // If existing price is zero, use absolute difference (shouldn't happen, but safe)
+                    price_diff_abs
+                };
 
                 // Check BOTH qty AND entry_price
                 // Extract values for logging before mutating state_guard
-                let should_skip = qty_diff < epsilon_qty && price_diff < epsilon_price;
+                use rust_decimal::prelude::ToPrimitive;
+                let price_diff_pct_f64 = price_diff_pct.to_f64().unwrap_or(100.0); // Default to 100% if conversion fails
+                let should_skip = qty_diff < epsilon_qty && price_diff_pct_f64 < EPSILON_PRICE_PCT;
                 let existing_qty_for_log = qty_abs_existing;
                 let update_qty_for_log = qty_abs_update;
                 let existing_entry_for_log = existing_entry_price;
                 let update_entry_for_log = update.entry_price.0;
                 let qty_diff_for_log = qty_diff;
-                let price_diff_for_log = price_diff;
+                let price_diff_for_log = price_diff_abs;
+                let price_diff_pct_for_log = price_diff_pct_f64;
 
                 if should_skip {
                     // Both qty and entry_price unchanged - this is likely a redundant update from race condition
@@ -1389,8 +1691,11 @@ impl Ordering {
                         qty_diff = %qty_diff_for_log,
                         existing_entry = %existing_entry_for_log,
                         update_entry = %update_entry_for_log,
-                        price_diff = %price_diff_for_log,
-                        "ORDERING: Position qty and entry_price unchanged, skipping redundant update (race condition prevention)"
+                        price_diff_abs = %price_diff_for_log,
+                        price_diff_pct = price_diff_pct_for_log,
+                        epsilon_price_pct = EPSILON_PRICE_PCT,
+                        "ORDERING: Position qty and entry_price unchanged (within {}% threshold), skipping redundant update (race condition prevention)",
+                        EPSILON_PRICE_PCT
                     );
                     return;
                 }
@@ -1422,8 +1727,9 @@ impl Ordering {
                 info!(
                     symbol = %update.symbol,
                     qty_diff = %qty_diff,
-                    price_diff = %price_diff,
-                    "ORDERING: Position updated from PositionUpdate (qty changed, timestamp verified)"
+                    price_diff_abs = %price_diff_for_log,
+                    price_diff_pct = price_diff_pct_for_log,
+                    "ORDERING: Position updated from PositionUpdate (qty or entry_price changed, timestamp verified)"
                 );
                 return;
             }
