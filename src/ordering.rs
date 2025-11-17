@@ -2594,6 +2594,10 @@ impl Ordering {
     /// Reconcile positions on startup
     /// Fetches all positions from exchange and restores them to state
     /// This prevents orphan positions after crash/restart
+    /// 
+    /// ✅ CRITICAL: This function is called BEFORE WebSocket is fully connected
+    /// WebSocket ACCOUNT_UPDATE events may arrive later, but we need immediate state restoration
+    /// Solution: Fetch all positions via REST API and restore state immediately
     async fn reconcile_positions_on_startup(
         connection: &Arc<Connection>,
         shared_state: &Arc<SharedState>,
@@ -2601,18 +2605,107 @@ impl Ordering {
     ) -> Result<()> {
         info!("ORDERING: Starting position reconciliation on startup");
         
-        // Get all symbols from connection (or use a method to get all positions)
-        // For now, we'll rely on PositionUpdate events from WebSocket
-        // But we can also fetch positions for known symbols if needed
+        // Fetch all positions from exchange via REST API
+        match connection.get_all_positions().await {
+            Ok(exchange_positions) => {
+                if exchange_positions.is_empty() {
+                    info!("ORDERING: No open positions found on exchange");
+                    
+                    // Check if internal state has orphaned positions
+                    let mut state_guard = shared_state.ordering_state.lock().await;
+                    if let Some(internal_pos) = &state_guard.open_position {
+                        warn!(
+                            symbol = %internal_pos.symbol,
+                            "ORDERING: Internal state has position but exchange doesn't - clearing orphaned position"
+                        );
+                        
+                        // Clear orphaned position
+                        state_guard.open_position = None;
+                        
+                        // Publish state update
+                        let state_to_publish = state_guard.clone();
+                        drop(state_guard);
+                        Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                    }
+                } else {
+                    let position_count = exchange_positions.len();
+                    info!(
+                        position_count,
+                        "ORDERING: Found {} open position(s) on exchange, restoring to state",
+                        position_count
+                    );
+                    
+                    // Collect exchange symbols before loop (exchange_positions is moved in loop)
+                    let exchange_symbols: Vec<String> = exchange_positions.iter().map(|(sym, _)| sym.clone()).collect();
+                    
+                    // Restore each position by sending PositionUpdate events
+                    // This ensures handle_position_update is called, which properly restores state
+                    for (symbol, exchange_pos) in exchange_positions {
+                        let position_update = PositionUpdate {
+                            symbol: symbol.clone(),
+                            qty: exchange_pos.qty,
+                            entry_price: exchange_pos.entry,
+                            leverage: exchange_pos.leverage,
+                            unrealized_pnl: None,
+                            is_open: true,
+                            liq_px: exchange_pos.liq_px,
+                            timestamp: Instant::now(),
+                        };
+                        
+                        // Send PositionUpdate event - handle_position_update will process it
+                        if let Err(e) = event_bus.position_update_tx.send(position_update) {
+                            error!(
+                                error = ?e,
+                                symbol = %symbol,
+                                "ORDERING: Failed to send PositionUpdate for startup reconciliation"
+                            );
+                        } else {
+                            info!(
+                                symbol = %symbol,
+                                qty = %exchange_pos.qty.0,
+                                entry_price = %exchange_pos.entry.0,
+                                "ORDERING: Position restored from exchange (startup reconciliation)"
+                            );
+                        }
+                    }
+                    
+                    // Wait a bit for PositionUpdate events to be processed
+                    // This ensures state is fully restored before continuing
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    
+                    // Check for orphaned internal positions (internal has but exchange doesn't)
+                    let mut state_guard = shared_state.ordering_state.lock().await;
+                    if let Some(internal_pos) = &state_guard.open_position {
+                        let exchange_has = exchange_symbols.iter().any(|sym| sym == &internal_pos.symbol);
+                        if !exchange_has {
+                            warn!(
+                                symbol = %internal_pos.symbol,
+                                "ORDERING: Internal state has position but exchange doesn't - clearing orphaned position"
+                            );
+                            
+                            // Clear orphaned position
+                            state_guard.open_position = None;
+                            
+                            // Publish state update
+                            let state_to_publish = state_guard.clone();
+                            drop(state_guard);
+                            Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                        }
+                    }
+                    
+                    info!("ORDERING: Position reconciliation complete - {} position(s) restored", position_count);
+                }
+            }
+            Err(e) => {
+                // If we can't fetch positions, log warning but don't fail startup
+                // WebSocket ACCOUNT_UPDATE events will restore positions later
+                warn!(
+                    error = %e,
+                    "ORDERING: Failed to fetch positions from exchange on startup - positions will be restored via WebSocket events"
+                );
+            }
+        }
         
-        // Note: WebSocket ACCOUNT_UPDATE events will send PositionUpdate events
-        // which will restore positions automatically via handle_position_update
-        // This function is a placeholder for future enhancement (e.g., fetch all positions via REST API)
-        
-        // TODO: Add method to fetch all positions from exchange (if Binance API supports it)
-        // For now, positions will be restored via WebSocket ACCOUNT_UPDATE events
-        
-        info!("ORDERING: Position reconciliation complete (positions will be restored via WebSocket events)");
         Ok(())
     }
 }

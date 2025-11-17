@@ -336,12 +336,14 @@ impl Trending {
 
     /// Calculate Simple Moving Average (SMA) for EMA bootstrap
     /// Returns the average of the last `period` prices
+    /// ✅ CRITICAL: This function should always return Some() when prices.len() >= period
+    /// because we already checked prices.len() >= period before calling this function
     fn calculate_sma(prices: &std::collections::VecDeque<crate::types::PricePoint>, period: usize) -> Option<Decimal> {
         if prices.len() < period {
             return None;
         }
         
-        // Get last `period` prices
+        // Get last `period` prices (most recent first)
         let recent_prices: Vec<Decimal> = prices
             .iter()
             .rev()
@@ -349,7 +351,16 @@ impl Trending {
             .map(|p| p.price)
             .collect();
         
+        // ✅ CRITICAL FIX: This check should never fail if prices.len() >= period
+        // But we keep it as a safety check in case of concurrent modification
         if recent_prices.len() < period {
+            // This should never happen, but log it if it does
+            warn!(
+                prices_len = prices.len(),
+                period,
+                recent_prices_len = recent_prices.len(),
+                "TRENDING: calculate_sma - unexpected: prices.len() >= period but recent_prices.len() < period"
+            );
             return None;
         }
         
@@ -381,15 +392,26 @@ impl Trending {
                 // This ensures EMA starts with a proper average, not just the latest price
                 if prices.len() >= period {
                     // Calculate SMA for initialization (bootstrap)
-                    if let Some(sma) = Self::calculate_sma(prices, period) {
-                        sma // Use SMA as initial EMA value
-                    } else {
-                        // Fallback: use current price if SMA calculation fails
-                        new_price
+                    // ✅ CRITICAL FIX: calculate_sma should always return Some() when prices.len() >= period
+                    // If it returns None, this is a bug and we should log it
+                    match Self::calculate_sma(prices, period) {
+                        Some(sma) => sma, // Use SMA as initial EMA value
+                        None => {
+                            // This should never happen if prices.len() >= period
+                            // Log it as a warning and use new_price as fallback
+                            warn!(
+                                prices_len = prices.len(),
+                                period,
+                                "TRENDING: update_ema - calculate_sma returned None despite prices.len() >= period, using new_price as fallback"
+                            );
+                            new_price
+                        }
                     }
                 } else {
                     // Not enough prices yet - use current price as temporary value
                     // This will be replaced with SMA once we have enough prices
+                    // Note: This branch should never be reached in update_indicators
+                    // because we check prices.len() >= period before calling update_ema
                     new_price
                 }
             }
@@ -428,12 +450,18 @@ impl Trending {
         }
         
         // Track EMA_55 history for slope calculation
+        // ✅ CRITICAL: Only track history when EMA_55 is properly initialized
+        // This ensures slope calculation has valid data
         if let Some(ema_55) = state.ema_55 {
             state.ema_55_history.push_back(ema_55);
             const EMA_HISTORY_SIZE: usize = 10; // Keep last 10 EMA values for slope
             while state.ema_55_history.len() > EMA_HISTORY_SIZE {
                 state.ema_55_history.pop_front();
             }
+        } else {
+            // ✅ CRITICAL FIX: Clear history when EMA_55 is None
+            // This prevents using stale EMA values from previous initialization attempts
+            state.ema_55_history.clear();
         }
         
         // Update RSI incrementally (Wilder's smoothing method)
@@ -602,24 +630,77 @@ impl Trending {
         // ✅ CRITICAL FIX: Check for minimum price points required for all indicators
         // Need enough prices for: volume average (20) AND EMA_55 bootstrap (55)
         if prices.len() < MIN_PRICE_POINTS {
-            debug!(
+            // Only log every 5 price points to reduce log spam
+            if prices.len() % 5 == 0 || prices.len() >= MIN_PRICE_POINTS - 1 {
+                debug!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    required = MIN_PRICE_POINTS,
+                    volume_period = VOLUME_PERIOD,
+                    ema_slow_period = EMA_SLOW_PERIOD,
+                    "TRENDING: Not enough price data for analysis (need {} points for EMA_55 bootstrap)",
+                    MIN_PRICE_POINTS
+                );
+            }
+            return None;
+        }
+        
+        // ✅ DEBUG: Log when we reach 55 price points with detailed state info
+        if prices.len() == MIN_PRICE_POINTS {
+            info!(
                 symbol = %state.symbol,
                 prices_len = prices.len(),
-                required = MIN_PRICE_POINTS,
-                volume_period = VOLUME_PERIOD,
-                ema_slow_period = EMA_SLOW_PERIOD,
-                "TRENDING: Not enough price data for analysis (need {} points for EMA_55 bootstrap)",
-                MIN_PRICE_POINTS
+                rsi_period_count = state.rsi_period_count,
+                ema_9_initialized = state.ema_9.is_some(),
+                ema_21_initialized = state.ema_21.is_some(),
+                ema_55_initialized = state.ema_55.is_some(),
+                volume_count = prices.iter().filter(|p| p.volume.is_some()).count(),
+                "TRENDING: Reached {} price points, starting trend analysis (RSI count: {}, EMA_55: {})",
+                MIN_PRICE_POINTS,
+                state.rsi_period_count,
+                if state.ema_55.is_some() { "OK" } else { "MISSING" }
             );
-            return None;
         }
         
         // ✅ CRITICAL FIX: Check if EMAs are properly initialized
         // EMA_55 requires 55 price points for bootstrap (SMA calculation)
         // If EMA_55 is None, it means we don't have enough data yet
-        let ema_fast = state.ema_9?;
-        let ema_mid = state.ema_21?;
-        let ema_slow = state.ema_55?;
+        let ema_fast = match state.ema_9 {
+            Some(ema) => ema,
+            None => {
+                warn!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    "TRENDING: EMA_9 not initialized despite having {} prices",
+                    prices.len()
+                );
+                return None;
+            }
+        };
+        let ema_mid = match state.ema_21 {
+            Some(ema) => ema,
+            None => {
+                warn!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    "TRENDING: EMA_21 not initialized despite having {} prices",
+                    prices.len()
+                );
+                return None;
+            }
+        };
+        let ema_slow = match state.ema_55 {
+            Some(ema) => ema,
+            None => {
+                warn!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    "TRENDING: EMA_55 not initialized despite having {} prices - this should not happen!",
+                    prices.len()
+                );
+                return None;
+            }
+        };
         
         let current_price = prices.back()?.price;
         
@@ -687,7 +768,21 @@ impl Trending {
         };
         
         // 2. RSI momentum confirmation (weight: 1.0) with adaptive thresholds
-        let rsi = Self::calculate_rsi_from_state(state)?;
+        let rsi = match Self::calculate_rsi_from_state(state) {
+            Some(rsi_val) => rsi_val,
+            None => {
+                warn!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    rsi_period_count = state.rsi_period_count,
+                    rsi_avg_gain = ?state.rsi_avg_gain,
+                    rsi_avg_loss = ?state.rsi_avg_loss,
+                    "TRENDING: RSI calculation failed - rsi_period_count={} < 14, skipping trend analysis",
+                    state.rsi_period_count
+                );
+                return None;
+            }
+        };
         
         // Adaptive RSI thresholds based on volatility
         let atr = Self::calculate_atr(prices, 14);
@@ -740,8 +835,44 @@ impl Trending {
         // Backtest analysis: DOGE (54.5% win rate) had strong volume confirmation
         // ETH (25% win rate) and SOL (33% win rate) had weak volume confirmation
         // Solution: Higher volume threshold and make it mandatory for medium-volatility coins
-        let current_volume = prices.back()?.volume?;
-        let avg_volume = Self::calculate_avg_volume(prices, VOLUME_PERIOD)?;
+        let current_volume = match prices.back() {
+            Some(price_point) => match price_point.volume {
+                Some(vol) => vol,
+                None => {
+                    warn!(
+                        symbol = %state.symbol,
+                        prices_len = prices.len(),
+                        "TRENDING: Current price point has no volume data, skipping trend analysis"
+                    );
+                    return None;
+                }
+            },
+            None => {
+                warn!(
+                    symbol = %state.symbol,
+                    "TRENDING: No price data available, skipping trend analysis"
+                );
+                return None;
+            }
+        };
+        
+        let avg_volume = match Self::calculate_avg_volume(prices, VOLUME_PERIOD) {
+            Some(avg) => avg,
+            None => {
+                // Count how many price points have volume data
+                let volume_count = prices.iter().filter(|p| p.volume.is_some()).count();
+                warn!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    volume_period = VOLUME_PERIOD,
+                    volume_count,
+                    "TRENDING: Average volume calculation failed - only {}/{} price points have volume data, skipping trend analysis",
+                    volume_count,
+                    prices.len()
+                );
+                return None;
+            }
+        };
         
         // ✅ SMART OPTIMIZATION: Keep original volume threshold for trending markets
         // Backtest: DOGE (54.5% win rate) worked well with 1.5x threshold
@@ -750,7 +881,21 @@ impl Trending {
         let volume_surge = current_volume > avg_volume * volume_multiplier;
         
         // Volume trend (recent > longer average)
-        let recent_avg_volume = Self::calculate_avg_volume(prices, 5)?;
+        let recent_avg_volume = match Self::calculate_avg_volume(prices, 5) {
+            Some(avg) => avg,
+            None => {
+                let volume_count = prices.iter().filter(|p| p.volume.is_some()).count();
+                warn!(
+                    symbol = %state.symbol,
+                    prices_len = prices.len(),
+                    volume_count,
+                    "TRENDING: Recent average volume calculation failed - only {}/{} price points have volume data, skipping trend analysis",
+                    volume_count,
+                    prices.len()
+                );
+                return None;
+            }
+        };
         let volume_trend = recent_avg_volume > avg_volume;
         
         let volume_confirms = volume_surge && volume_trend;
@@ -804,20 +949,28 @@ impl Trending {
             min_score * 1.1
         };
         
-        // ✅ DEBUG: Log score analysis for troubleshooting
-        if score_long > 0.0 || score_short > 0.0 {
-            debug!(
-                symbol = %state.symbol,
-                score_long,
-                score_short,
-                final_min_score,
-                is_strong_trend,
-                volume_confirms,
-                trend_strength,
-                rsi,
-                "TRENDING: Score analysis (signal will be generated if score >= threshold)"
-            );
-        }
+        // ✅ DEBUG: Always log score analysis for troubleshooting (even if scores are 0)
+        // This helps identify why signals are not being generated
+        debug!(
+            symbol = %state.symbol,
+            score_long,
+            score_short,
+            final_min_score,
+            is_strong_trend,
+            volume_confirms,
+            trend_strength,
+            rsi,
+            ema_fast = %ema_fast,
+            ema_mid = %ema_mid,
+            ema_slow = %ema_slow,
+            current_price = %current_price,
+            short_term_aligned,
+            mid_term_aligned,
+            slope_strong,
+            rsi_bullish,
+            rsi_bearish,
+            "TRENDING: Score analysis (signal will be generated if score >= threshold)"
+        );
         
         if score_long >= final_min_score {
             Some(TrendSignal::Long)
@@ -866,6 +1019,15 @@ impl Trending {
             if let Some(last_signal) = last_signals_map.get(&tick.symbol) {
                 let elapsed = now.duration_since(last_signal.timestamp);
                 if elapsed < Duration::from_secs(cooldown_seconds) {
+                    debug!(
+                        symbol = %tick.symbol,
+                        elapsed_secs = elapsed.as_secs(),
+                        cooldown_secs = cooldown_seconds,
+                        last_signal_side = ?last_signal.side,
+                        "TRENDING: Cooldown check failed - {} seconds elapsed, need {} seconds",
+                        elapsed.as_secs(),
+                        cooldown_seconds
+                    );
                     return Ok(());
                 }
             }

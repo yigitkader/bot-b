@@ -64,65 +64,6 @@ fn load_historical_ticks_from_csv(
     }
 }
 
-/// Mock historical tick data generator
-/// Generates realistic price movements with trend
-fn generate_historical_ticks(
-    symbol: &str,
-    start_price: Decimal,
-    num_ticks: usize,
-    trend: f64, // Positive = uptrend, negative = downtrend
-) -> Vec<MarketTick> {
-    let mut ticks = Vec::new();
-    let mut current_price = start_price;
-    let mut price_history = VecDeque::new();
-    
-    for i in 0..num_ticks {
-        // Add trend component (gradual price movement)
-        let trend_change_pct = trend / num_ticks as f64;
-        let trend_change = current_price * Decimal::from_str(&format!("{:.8}", trend_change_pct / 100.0))
-            .unwrap_or(Decimal::ZERO);
-        
-        // Add random noise (simulated volatility) - simple PRNG
-        let seed = i as u64;
-        let random = ((seed * 1103515245 + 12345) % 2147483648) as f64 / 2147483648.0;
-        // Higher volatility for more realistic price movements
-        let noise_pct = (random - 0.5) * 0.002; // 0.2% max noise
-        let noise = current_price * Decimal::from_str(&format!("{:.8}", noise_pct))
-            .unwrap_or(Decimal::ZERO);
-        
-        current_price = current_price + trend_change + noise;
-        
-        // Ensure price stays positive
-        if current_price <= Decimal::ZERO {
-            current_price = Decimal::from_str("0.01").unwrap();
-        }
-        
-        // Calculate bid/ask with small spread
-        let spread = current_price * Decimal::from_str("0.0001").unwrap(); // 0.01% spread
-        let bid = current_price - spread / Decimal::from(2);
-        let ask = current_price + spread / Decimal::from(2);
-        
-        // Generate volume (random between 1000-10000) - simple PRNG
-        let seed = i as u64;
-        let volume = Decimal::from((seed * 1103515245 + 12345) % 9000 + 1000);
-        
-        price_history.push_back(current_price);
-        if price_history.len() > 100 {
-            price_history.pop_front();
-        }
-        
-        ticks.push(MarketTick {
-            symbol: symbol.to_string(),
-            bid: Px(bid),
-            ask: Px(ask),
-            mark_price: Some(Px(current_price)),
-            volume: Some(volume),
-            timestamp: Instant::now() + Duration::from_secs(i as u64),
-        });
-    }
-    
-    ticks
-}
 
 /// Simulate a trade from signal to exit
 /// Returns PnL in USD
@@ -164,6 +105,21 @@ struct BacktestResults {
     max_drawdown: f64,
     profit_factor: f64,
     average_trade_duration_ticks: f64,
+}
+
+/// Point-in-time backtest results (1-minute validation)
+/// Tests if signals generated at time T are correct 1 minute later
+#[derive(Debug, Clone)]
+struct PointInTimeBacktestResults {
+    total_signals: u64,
+    correct_signals: u64,
+    incorrect_signals: u64,
+    win_rate: f64,
+    average_price_change_pct: f64,
+    long_signals_correct: u64,
+    long_signals_total: u64,
+    short_signals_correct: u64,
+    short_signals_total: u64,
 }
 
 /// Run backtest on historical data
@@ -415,144 +371,229 @@ async fn run_backtest(
     }
 }
 
-#[tokio::test]
-async fn test_strategy_on_uptrend() {
-    // Try to load from CSV first, fallback to generated data
-    let symbol = "BTCUSDT";
-    let ticks = load_historical_ticks_from_csv(symbol, "data/btcusdt_uptrend.csv")
-        .unwrap_or_else(|| {
-            // Generate uptrend data (need enough ticks for EMA 55 + buffer)
-            let start_price = Decimal::from_str("50000").unwrap();
-            generate_historical_ticks(symbol, start_price, 2000, 5.0) // 5% uptrend, 2000 ticks
-        });
+/// Point-in-time backtest: Test if signals at time T are correct 1 minute later
+/// 
+/// This backtest validates signal quality by:
+/// 1. Taking data up to a specific time (e.g., 15:00)
+/// 2. Generating long/short signals based on that data
+/// 3. Checking price 1 minute later (e.g., 15:01)
+/// 4. Determining if the signal direction was correct
+/// 
+/// This is useful for validating that signals have immediate predictive power.
+async fn run_point_in_time_backtest(
+    symbol: &str,
+    ticks: Vec<MarketTick>,
+    cfg: Arc<AppCfg>,
+    validation_minutes: u64, // How many minutes ahead to check (default: 1)
+) -> PointInTimeBacktestResults {
+    // Initialize trending module
+    let event_bus = Arc::new(app::event_bus::EventBus::new_with_config(&cfg.event_bus));
+    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _trending = Trending::new(cfg.clone(), event_bus.clone(), shutdown_flag.clone());
     
-    // Load config or use minimal test config
-    let cfg = Arc::new(
-        app::config::load_config().unwrap_or_else(|_| {
-            // Minimal test config - relaxed for backtesting
-            let mut cfg = AppCfg::default();
-            cfg.trending.min_spread_bps = 0.1;
-            cfg.trending.max_spread_bps = 100.0;
-            // Use production cooldown settings for realistic backtest results
-            // cfg.trending.signal_cooldown_seconds uses default (5 seconds) from config
-            // Use production volume confirmation settings for realistic backtest results
-            // cfg.trending.require_volume_confirmation uses default from config
-            cfg.trending.hft_mode = true; // Enable HFT mode for more signals
-            cfg
-        })
-    );
+    // Initialize symbol state
+    let symbol_states = Arc::new(tokio::sync::Mutex::new(HashMap::<String, SymbolState>::new()));
     
-    let results = run_backtest(symbol, ticks, cfg).await;
+    // For minute-based klines (e.g., 1m interval), each tick represents 1 minute
+    // For validation, we check the tick N minutes ahead
+    // If using 1m klines: validation_minutes = 1 means check next tick
+    // If using 5m klines: validation_minutes = 1 means check 1/5 of the way to next tick (approximate)
+    let validation_ticks = validation_minutes as usize; // For 1m klines, 1 minute = 1 tick
     
-    println!("\n=== Backtest Results (Uptrend) ===");
-    println!("Winning Trades: {}", results.winning_trades);
-    println!("Losing Trades: {}", results.losing_trades);
-    println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
-    println!("Win Rate: {:.2}%", results.win_rate * 100.0);
-    println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
-    println!("Max Drawdown: ${:.2}", results.max_drawdown);
-    println!("Profit Factor: {:.2}", results.profit_factor);
-    println!("Average Trade Duration: {:.1} ticks", results.average_trade_duration_ticks);
+    let mut total_signals = 0u64;
+    let mut correct_signals = 0u64;
+    let mut incorrect_signals = 0u64;
+    let mut long_signals_total = 0u64;
+    let mut long_signals_correct = 0u64;
+    let mut short_signals_total = 0u64;
+    let mut short_signals_correct = 0u64;
+    let mut price_changes: Vec<f64> = Vec::new();
     
-    // Assertions (relaxed for initial testing)
-    if results.winning_trades + results.losing_trades == 0 {
-        println!("⚠️  WARNING: No trades executed - strategy may need more data or different parameters");
-        // Don't fail test, just warn - strategy might be working but too conservative
-        return;
+    // Process ticks in windows
+    // For each window starting at index i, use data up to i, then check price at i+validation_ticks
+    for i in 0..ticks.len().saturating_sub(validation_ticks) {
+        let signal_tick = &ticks[i];
+        let validation_tick_index = i + validation_ticks;
+        
+        if validation_tick_index >= ticks.len() {
+            break; // Not enough data for validation
+        }
+        
+        let validation_tick = &ticks[validation_tick_index];
+        
+        // Process every tick for minute-based klines
+        // (For 1m klines, each tick is already 1 minute apart)
+        
+        // Build state up to signal_tick (point-in-time: use ONLY data up to i, not including i+1)
+        // Reset state for each window to simulate starting fresh at this time point
+        {
+            let mut states = symbol_states.lock().await;
+            let state = states.entry(symbol.to_string()).or_insert_with(|| SymbolState {
+                symbol: symbol.to_string(),
+                prices: VecDeque::new(),
+                last_signal_time: None,
+                last_position_close_time: None,
+                last_position_direction: None,
+                tick_counter: 0,
+                ema_9: None,
+                ema_21: None,
+                ema_55: None,
+                ema_55_history: VecDeque::new(),
+                rsi_avg_gain: None,
+                rsi_avg_loss: None,
+                rsi_period_count: 0,
+            });
+            
+            // Reset state for point-in-time testing (start fresh at each time point)
+            state.prices.clear();
+            state.ema_9 = None;
+            state.ema_21 = None;
+            state.ema_55 = None;
+            state.ema_55_history.clear();
+            state.rsi_avg_gain = None;
+            state.rsi_avg_loss = None;
+            state.rsi_period_count = 0;
+            
+            // Build state with all ticks up to (but not including) signal_tick
+            // This simulates having only historical data up to this point
+            for tick_idx in 0..i {
+                if tick_idx >= ticks.len() {
+                    break;
+                }
+                let tick = &ticks[tick_idx];
+                let mid_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
+                
+                state.prices.push_back(PricePoint {
+                    timestamp: tick.timestamp,
+                    price: mid_price,
+                    volume: tick.volume,
+                });
+                
+                // Keep last 100 prices
+                while state.prices.len() > 100 {
+                    state.prices.pop_front();
+                }
+                
+                // Update indicators incrementally
+                Trending::update_indicators(state, mid_price);
+            }
+            
+            // Now add the signal_tick itself to generate signal
+            let mid_price = (signal_tick.bid.0 + signal_tick.ask.0) / Decimal::from(2);
+            state.prices.push_back(PricePoint {
+                timestamp: signal_tick.timestamp,
+                price: mid_price,
+                volume: signal_tick.volume,
+            });
+            
+            while state.prices.len() > 100 {
+                state.prices.pop_front();
+            }
+            
+            Trending::update_indicators(state, mid_price);
+        }
+        
+        // Generate signal at this point
+        let state = {
+            let states = symbol_states.lock().await;
+            states.get(symbol).cloned()
+        };
+        
+        if let Some(state) = state {
+            if let Some(signal) = Trending::analyze_trend(&state) {
+                total_signals += 1;
+                
+                let signal_price = (signal_tick.bid.0 + signal_tick.ask.0) / Decimal::from(2);
+                let validation_price = (validation_tick.bid.0 + validation_tick.ask.0) / Decimal::from(2);
+                
+                let price_change_pct = ((validation_price - signal_price) / signal_price * Decimal::from(100))
+                    .to_f64()
+                    .unwrap_or(0.0);
+                
+                price_changes.push(price_change_pct);
+                
+                // Check if signal was correct
+                let is_correct = match signal {
+                    TrendSignal::Long => {
+                        long_signals_total += 1;
+                        // Long is correct if price went up
+                        if price_change_pct > 0.0 {
+                            long_signals_correct += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    TrendSignal::Short => {
+                        short_signals_total += 1;
+                        // Short is correct if price went down
+                        if price_change_pct < 0.0 {
+                            short_signals_correct += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                
+                if is_correct {
+                    correct_signals += 1;
+                } else {
+                    incorrect_signals += 1;
+                }
+                
+                let signal_str = match signal {
+                    TrendSignal::Long => "LONG",
+                    TrendSignal::Short => "SHORT",
+                };
+                let result_str = if is_correct { "✅" } else { "❌" };
+                println!("  {} Signal at tick {}: {} @ ${:.2} → {} min later @ ${:.2} ({:+.2}%)", 
+                    result_str, i, signal_str, 
+                    signal_price.to_f64().unwrap_or(0.0),
+                    validation_minutes,
+                    validation_price.to_f64().unwrap_or(0.0),
+                    price_change_pct);
+            }
+        }
     }
     
-    println!("✅ Strategy executed {} trades", results.winning_trades + results.losing_trades);
-    // Note: Win rate and PnL assertions removed for initial testing
-    // Adjust thresholds based on actual backtest results
+    // Calculate metrics
+    let win_rate = if total_signals > 0 {
+        correct_signals as f64 / total_signals as f64
+    } else {
+        0.0
+    };
+    
+    let average_price_change_pct = if !price_changes.is_empty() {
+        price_changes.iter().sum::<f64>() / price_changes.len() as f64
+    } else {
+        0.0
+    };
+    
+    PointInTimeBacktestResults {
+        total_signals,
+        correct_signals,
+        incorrect_signals,
+        win_rate,
+        average_price_change_pct,
+        long_signals_correct,
+        long_signals_total,
+        short_signals_correct,
+        short_signals_total,
+    }
 }
 
-#[tokio::test]
-async fn test_strategy_on_downtrend() {
-    // Try to load from CSV first, fallback to generated data
-    let symbol = "BTCUSDT";
-    let ticks = load_historical_ticks_from_csv(symbol, "data/btcusdt_downtrend.csv")
-        .unwrap_or_else(|| {
-            // Generate downtrend data with stronger trend for better short signal detection
-            let start_price = Decimal::from_str("50000").unwrap();
-            generate_historical_ticks(symbol, start_price, 2000, -8.0) // 8% downtrend, 2000 ticks (stronger)
-        });
-    
-    // Load config or use minimal test config
-    let cfg = Arc::new(
-        app::config::load_config().unwrap_or_else(|_| {
-            let mut cfg = AppCfg::default();
-            cfg.trending.min_spread_bps = 0.1;
-            cfg.trending.max_spread_bps = 100.0;
-            // Use production cooldown settings for realistic backtest results
-            // cfg.trending.signal_cooldown_seconds uses default (5 seconds) from config
-            cfg
-        })
-    );
-    
-    println!("\n=== Running Downtrend Backtest ===");
-    let results = run_backtest(symbol, ticks, cfg).await;
-    
-    println!("\n=== Backtest Results (Downtrend) ===");
-    println!("Winning Trades: {}", results.winning_trades);
-    println!("Losing Trades: {}", results.losing_trades);
-    println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
-    println!("Win Rate: {:.2}%", results.win_rate * 100.0);
-    println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
-    println!("Max Drawdown: ${:.2}", results.max_drawdown);
-    println!("Profit Factor: {:.2}", results.profit_factor);
-    println!("Average Trade Duration: {:.1} ticks", results.average_trade_duration_ticks);
-    
-    // In downtrend, we expect short signals to be profitable
-    if results.winning_trades + results.losing_trades == 0 {
-        println!("⚠️  WARNING: No trades executed in downtrend - strategy may not be generating short signals");
-        return;
-    }
-    
-    // Check if we're getting short signals
-    if results.losing_trades > results.winning_trades && results.total_pnl < Decimal::ZERO {
-        println!("⚠️  WARNING: Strategy is losing in downtrend - may be generating LONG signals instead of SHORT");
-    }
-}
+// Removed test_strategy_on_uptrend - uses mock data generator
+// Use test_strategy_with_binance_data or test_strategy_with_multiple_binance_symbols instead
+// which use real Binance API data
 
-#[tokio::test]
-async fn test_strategy_on_sideways() {
-    // Try to load from CSV first, fallback to generated data
-    let symbol = "BTCUSDT";
-    let ticks = load_historical_ticks_from_csv(symbol, "data/btcusdt_sideways.csv")
-        .unwrap_or_else(|| {
-            // Generate sideways data (no trend) - fewer ticks for less false signals
-            let start_price = Decimal::from_str("50000").unwrap();
-            generate_historical_ticks(symbol, start_price, 1500, 0.0) // No trend, 1500 ticks (fewer)
-        });
-    
-    // Load config or use minimal test config
-    let cfg = Arc::new(
-        app::config::load_config().unwrap_or_else(|_| {
-            let mut cfg = AppCfg::default();
-            cfg.trending.min_spread_bps = 0.1;
-            cfg.trending.max_spread_bps = 100.0;
-            // Use production cooldown settings for realistic backtest results
-            // cfg.trending.signal_cooldown_seconds uses default (5 seconds) from config
-            cfg
-        })
-    );
-    
-    let results = run_backtest(symbol, ticks, cfg).await;
-    
-    println!("\n=== Backtest Results (Sideways) ===");
-    println!("Winning Trades: {}", results.winning_trades);
-    println!("Losing Trades: {}", results.losing_trades);
-    println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
-    println!("Win Rate: {:.2}%", results.win_rate * 100.0);
-    println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
-    println!("Max Drawdown: ${:.2}", results.max_drawdown);
-    println!("Profit Factor: {:.2}", results.profit_factor);
-    println!("Average Trade Duration: {:.1} ticks", results.average_trade_duration_ticks);
-    
-    // In sideways market, we expect fewer signals (or break-even)
-    // This is expected behavior for trend-following strategy
-    assert!(results.winning_trades + results.losing_trades >= 0, "Invalid trade count");
-}
+// Removed test_strategy_on_downtrend - uses mock data generator
+// Use test_strategy_with_binance_data or test_strategy_with_multiple_binance_symbols instead
+// which use real Binance API data
+
+// Removed test_strategy_on_sideways - uses mock data generator
+// Use test_strategy_with_binance_data or test_strategy_with_multiple_binance_symbols instead
+// which use real Binance API data
 
 /// Binance Kline (Candlestick) data structure
 #[derive(Debug, Deserialize)]
@@ -926,5 +967,142 @@ async fn test_strategy_with_binance_data() {
     println!("\n✅ Backtest completed successfully with real Binance data!");
     println!("   Strategy executed {} trades on {} days of historical data", 
         results.winning_trades + results.losing_trades, days_back);
+}
+
+/// Point-in-time backtest: Test if signals at time T are correct 1 minute later
+/// 
+/// This test implements the user's proposed backtest approach:
+/// 1. Take data at a specific time (e.g., 15:00)
+/// 2. Generate long/short signals based on that data
+/// 3. Check price 1 minute later (e.g., 15:01)
+/// 4. Determine if the signal was correct or wrong
+/// 
+/// This validates signal quality for immediate predictive power (1-minute horizon).
+/// 
+/// # Usage
+/// ```bash
+/// cargo test test_point_in_time_backtest -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore] // Ignore by default - requires internet connection
+async fn test_point_in_time_backtest() {
+    use chrono::TimeZone;
+    
+    // Test parameters
+    let symbol = "BTCUSDT";
+    let interval = "1m"; // 1-minute candles for precise timing
+    let days_back = 3; // Last 3 days (enough data for testing)
+    let validation_minutes = 1; // Check price 1 minute after signal
+    
+    // Calculate start and end times
+    let end_time = Utc::now();
+    let start_time = end_time - chrono::Duration::days(days_back);
+    
+    let start_time_ms = start_time.timestamp_millis();
+    let end_time_ms = end_time.timestamp_millis();
+    
+    println!("\n=== Point-in-Time Backtest (1-Minute Validation) ===");
+    println!("Symbol: {}", symbol);
+    println!("Interval: {}", interval);
+    println!("Start Time: {}", start_time);
+    println!("End Time: {}", end_time);
+    println!("Validation Window: {} minute(s) after signal", validation_minutes);
+    println!("\n📊 This backtest validates signal quality by:");
+    println!("   1. Taking data up to time T (e.g., 15:00)");
+    println!("   2. Generating long/short signals based on that data");
+    println!("   3. Checking price {} minute(s) later (e.g., 15:01)", validation_minutes);
+    println!("   4. Determining if the signal direction was correct");
+    
+    // Fetch historical data from Binance
+    let ticks = match fetch_binance_klines(
+        symbol,
+        interval,
+        Some(start_time_ms),
+        Some(end_time_ms),
+        Some(4320), // 3 days * 24 hours * 60 minutes
+    ).await {
+        Ok(ticks) => {
+            if ticks.is_empty() {
+                println!("⚠️  WARNING: No data fetched from Binance. Skipping test.");
+                return;
+            }
+            ticks
+        }
+        Err(e) => {
+            println!("❌ ERROR: Failed to fetch Binance data: {}. Skipping test.", e);
+            println!("   This test requires internet connection and Binance API access.");
+            return;
+        }
+    };
+    
+    println!("✅ Fetched {} ticks from Binance", ticks.len());
+    
+    if ticks.len() < 100 {
+        println!("⚠️  WARNING: Not enough data for meaningful backtest. Need at least 100 ticks.");
+        return;
+    }
+    
+    // Load config or use minimal test config
+    let cfg = Arc::new(
+        app::config::load_config().unwrap_or_else(|_| {
+            // Minimal test config - relaxed for backtesting
+            let mut cfg = AppCfg::default();
+            cfg.trending.min_spread_bps = 0.1;
+            cfg.trending.max_spread_bps = 100.0;
+            cfg.trending.hft_mode = true; // Enable HFT mode for more signals
+            cfg
+        })
+    );
+    
+    println!("\n=== Running Point-in-Time Backtest ===");
+    let results = run_point_in_time_backtest(symbol, ticks, cfg, validation_minutes).await;
+    
+    println!("\n=== Point-in-Time Backtest Results ===");
+    println!("Symbol: {}", symbol);
+    println!("Validation Window: {} minute(s)", validation_minutes);
+    println!("Total Signals Generated: {}", results.total_signals);
+    println!("Correct Signals: {} ✅", results.correct_signals);
+    println!("Incorrect Signals: {} ❌", results.incorrect_signals);
+    println!("Win Rate: {:.2}%", results.win_rate * 100.0);
+    println!("Average Price Change: {:.4}%", results.average_price_change_pct);
+    println!("\n--- Signal Breakdown ---");
+    println!("Long Signals: {} total, {} correct ({:.2}%)", 
+        results.long_signals_total,
+        results.long_signals_correct,
+        if results.long_signals_total > 0 {
+            results.long_signals_correct as f64 / results.long_signals_total as f64 * 100.0
+        } else {
+            0.0
+        });
+    println!("Short Signals: {} total, {} correct ({:.2}%)", 
+        results.short_signals_total,
+        results.short_signals_correct,
+        if results.short_signals_total > 0 {
+            results.short_signals_correct as f64 / results.short_signals_total as f64 * 100.0
+        } else {
+            0.0
+        });
+    
+    // Interpretation
+    println!("\n=== Interpretation ===");
+    if results.total_signals == 0 {
+        println!("⚠️  WARNING: No signals generated - strategy may need more data or different parameters");
+    } else {
+        if results.win_rate > 0.55 {
+            println!("✅ EXCELLENT: Win rate > 55% - signals show strong predictive power");
+        } else if results.win_rate > 0.50 {
+            println!("✅ GOOD: Win rate > 50% - signals show positive predictive power");
+        } else if results.win_rate > 0.45 {
+            println!("⚠️  MARGINAL: Win rate 45-50% - signals show weak predictive power");
+        } else {
+            println!("❌ POOR: Win rate < 45% - signals may not be predictive");
+        }
+        
+        println!("\n💡 This backtest measures immediate signal quality ({} minute horizon).", validation_minutes);
+        println!("   Compare with full backtest (SL/TP based) to understand signal performance");
+        println!("   across different time horizons.");
+    }
+    
+    println!("\n✅ Point-in-time backtest completed!");
 }
 
