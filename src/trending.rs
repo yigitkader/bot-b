@@ -26,43 +26,7 @@ enum MarketRegime {
     Unknown,    // Not enough data
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
 
-/// Quantize decimal value to step (floor to nearest step multiple)
-///
-/// ✅ KRİTİK: Precision loss önleme
-/// Decimal division ve multiplication yaparken precision loss olabilir.
-/// Sonucu normalize ederek step'in tam katı olduğundan emin oluyoruz.
-fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() || step.is_sign_negative() {
-        return value;
-    }
-
-    let ratio = value / step;
-    let floored = ratio.floor();
-    let result = floored * step;
-    let step_scale = step.scale();
-    let normalized = result.normalize();
-
-    // Round to step's scale first
-    let rounded = normalized.round_dp_with_strategy(
-        step_scale,
-        rust_decimal::RoundingStrategy::ToNegativeInfinity,
-    );
-
-    // Double-check quantization - ensure result is a multiple of step
-    let re_quantized_ratio = rounded / step;
-    let re_quantized_floor = re_quantized_ratio.floor();
-    let final_result = re_quantized_floor * step;
-
-    // Final normalization and rounding
-    final_result.normalize().round_dp_with_strategy(
-        step_scale,
-        rust_decimal::RoundingStrategy::ToNegativeInfinity,
-    )
-}
 
 /// TRENDING module - trend analysis and signal generation
 pub struct Trending {
@@ -1053,8 +1017,7 @@ impl Trending {
         let now = Instant::now();
         
         // 1. Spread check (liquidity validation)
-        let spread_bps = ((tick.ask.0 - tick.bid.0) / tick.bid.0) * Decimal::from(10000);
-        let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
+        let spread_bps_f64 = crate::utils::calculate_spread_bps(tick.bid, tick.ask);
         
         let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
         let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
@@ -1109,7 +1072,7 @@ impl Trending {
         }
         
         // 3. Trend analysis
-        let mid_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
+        let mid_price = crate::utils::calculate_mid_price(tick.bid, tick.ask);
         let spread_timestamp = now;
         
         let trend_signal = {

@@ -13,6 +13,7 @@ mod balance;
 mod logging;
 mod metrics;
 mod ai_analyzer;
+mod utils;
 
 use crate::ai_analyzer::AiAnalyzer;
 use crate::balance::Balance;

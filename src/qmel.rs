@@ -931,8 +931,6 @@ impl ExecutionOptimizer {
 // Online Learning (Bandit)
 // ============================================================================
 
-use std::collections::VecDeque;
-
 /// Parameter arm for bandit algorithm
 #[derive(Clone, Debug)]
 pub struct ParameterArm {

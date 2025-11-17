@@ -367,7 +367,7 @@ impl FollowOrders {
             }
         };
         let current_price = tick.mark_price.unwrap_or_else(|| {
-            Px((tick.bid.0 + tick.ask.0) / Decimal::from(2))
+            Px(crate::utils::calculate_mid_price(tick.bid, tick.ask))
         });
 
         let entry_price = position.entry_price.0;

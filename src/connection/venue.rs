@@ -6,84 +6,8 @@ use crate::types::{
     FutExchangeInfo, FutExchangeSymbol, FutFilter, Position, PriceUpdate, Px, Qty, Side,
     SymbolMeta, SymbolRules, Tif, VenueOrder,
 };
-// Utility functions for decimal operations
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::str::FromStr;
-
-fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() || step.is_sign_negative() {
-        return value;
-    }
-
-    let ratio = value / step;
-    let floored = ratio.floor();
-    let result = floored * step;
-    let step_scale = step.scale();
-    let normalized = result.normalize();
-
-    let rounded = normalized.round_dp_with_strategy(
-        step_scale,
-        rust_decimal::RoundingStrategy::ToNegativeInfinity,
-    );
-
-    let re_quantized_ratio = rounded / step;
-    let re_quantized_floor = re_quantized_ratio.floor();
-    let final_result = re_quantized_floor * step;
-
-    final_result.normalize().round_dp_with_strategy(
-        step_scale,
-        rust_decimal::RoundingStrategy::ToNegativeInfinity,
-    )
-}
-
-fn format_decimal_fixed(value: Decimal, precision: usize) -> String {
-    let precision = precision.min(28);
-    let scale = precision as u32;
-    let normalized = value.normalize();
-    let rounded =
-        normalized.round_dp_with_strategy(scale, RoundingStrategy::ToNegativeInfinity);
-
-    if scale == 0 {
-        let s = rounded.to_string();
-        if let Some(dot_pos) = s.find('.') {
-            s[..dot_pos].to_string()
-        } else {
-            s
-        }
-    } else {
-        let s = rounded.to_string();
-        if let Some(dot_pos) = s.find('.') {
-            let integer_part = &s[..dot_pos];
-            let decimal_part = &s[dot_pos + 1..];
-            let current_decimals = decimal_part.len();
-
-            if current_decimals < scale as usize {
-                format!(
-                    "{}.{}{}",
-                    integer_part,
-                    decimal_part,
-                    "0".repeat(scale as usize - current_decimals)
-                )
-            } else if current_decimals > scale as usize {
-                let truncated_decimal = &decimal_part[..scale as usize];
-                format!("{}.{}", integer_part, truncated_decimal)
-            } else {
-                if decimal_part.len() == scale as usize {
-                    s
-                } else {
-                    format!(
-                        "{}.{}{}",
-                        integer_part,
-                        decimal_part,
-                        "0".repeat(scale as usize - decimal_part.len())
-                    )
-                }
-            }
-        } else {
-            format!("{}.{}", s, "0".repeat(scale as usize))
-        }
-    }
-}
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -1123,8 +1047,8 @@ pub fn refresh_rules_for(&self, sym: &str) {
         } else {
             rules.qty_precision.min(rules.step_size.scale() as usize)
         };
-        let qty_str = format_decimal_fixed(qty.0, effective_qty_precision);
-        let activation_price_str = format_decimal_fixed(activation_price.0, effective_price_precision);
+        let qty_str = crate::utils::format_decimal_fixed(qty.0, effective_qty_precision);
+        let activation_price_str = crate::utils::format_decimal_fixed(activation_price.0, effective_price_precision);
         
         // Binance expects callback rate as percentage (0.1 not 0.001)
         // Example: callback_rate = 0.001 (0.1%) → callback_rate_pct = 0.1
@@ -1418,7 +1342,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
         }
 
         let rules = self.rules_for(sym).await?;
-        let initial_qty_abs = quantize_decimal(initial_qty.abs(), rules.step_size);
+        let initial_qty_abs = crate::utils::quantize_decimal(initial_qty.abs(), rules.step_size);
 
         if initial_qty_abs <= Decimal::ZERO {
             warn!(
@@ -1505,7 +1429,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
             }
 
         // Kalan pozisyon miktarını hesapla (quantize et)
-            let remaining_qty = quantize_decimal(current_qty.abs(), rules.step_size);
+            let remaining_qty = crate::utils::quantize_decimal(current_qty.abs(), rules.step_size);
 
             if remaining_qty <= Decimal::ZERO {
             // Quantize sonrası sıfır oldu, pozisyon zaten kapalı sayılabilir
@@ -1525,7 +1449,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
             } else {
                 rules.qty_precision.min(rules.step_size.scale() as usize)
             };
-            let qty_str = format_decimal_fixed(remaining_qty, effective_qty_precision);
+            let qty_str = crate::utils::format_decimal_fixed(remaining_qty, effective_qty_precision);
 
         // Add positionSide parameter if hedge mode is enabled
             let position_side = if self.hedge_mode {
@@ -1923,7 +1847,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             best_ask.0 - tick_size
                         };
 
-                        let limit_price_quantized = quantize_decimal(limit_price, tick_size);
+                        let limit_price_quantized = crate::utils::quantize_decimal(limit_price, tick_size);
                         // Calculate effective precision from tick_size (source of truth)
                         let effective_price_precision = if rules.tick_size.is_zero() {
                             rules.price_precision
@@ -1931,7 +1855,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             rules.price_precision.min(rules.tick_size.scale() as usize)
                         };
                         let limit_price_str =
-                            format_decimal_fixed(limit_price_quantized, effective_price_precision);
+                            crate::utils::format_decimal_fixed(limit_price_quantized, effective_price_precision);
 
                     // Limit reduce-only emri gönder
                         let mut limit_params = vec![
@@ -2560,8 +2484,8 @@ impl BinanceFutures {
         let effective_qty_precision = rules.qty_precision.min(qty_precision_from_step);
 
     // 1. Quantize: step_size'a göre floor
-        let price_quantized = quantize_decimal(px.0, rules.tick_size);
-        let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
+        let price_quantized = crate::utils::quantize_decimal(px.0, rules.tick_size);
+        let qty_quantized = crate::utils::quantize_decimal(qty.0.abs(), rules.step_size);
 
     // 2. Round: precision'a göre round et
     // Use ToNegativeInfinity (floor) instead of ToZero for safety
@@ -2580,7 +2504,7 @@ impl BinanceFutures {
         // qty_rounded is zero but qty_quantized is not - rounding precision issue
         // Use qty_quantized but ensure it's still quantized to step_size
         // Re-quantize to ensure it's still a multiple of step_size
-        let re_quantized = quantize_decimal(qty_quantized, rules.step_size);
+        let re_quantized = crate::utils::quantize_decimal(qty_quantized, rules.step_size);
         if re_quantized.is_zero() {
             // Even re-quantized is zero - this is a real problem
             return Err(anyhow!(
@@ -2596,8 +2520,8 @@ impl BinanceFutures {
     };
 
     // 3. Format: precision'a göre string'e çevir
-        let price_str = format_decimal_fixed(price, effective_price_precision);
-        let qty_str = format_decimal_fixed(qty_rounded, effective_qty_precision);
+        let price_str = crate::utils::format_decimal_fixed(price, effective_price_precision);
+        let qty_str = crate::utils::format_decimal_fixed(qty_rounded, effective_qty_precision);
 
     // 4. KRİTİK: Son kontrol - fractional_digits kontrolü
         let price_fractional = if let Some(dot_pos) = price_str.find('.') {

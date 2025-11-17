@@ -19,39 +19,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-/// Quantize decimal value to step (floor to nearest step multiple)
-fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
-    if step.is_zero() || step.is_sign_negative() {
-        return value;
-    }
-
-    let ratio = value / step;
-    let floored = ratio.floor();
-    let result = floored * step;
-    let step_scale = step.scale();
-    let normalized = result.normalize();
-
-    // Round to step's scale first
-    let rounded = normalized.round_dp_with_strategy(
-        step_scale,
-        rust_decimal::RoundingStrategy::ToNegativeInfinity,
-    );
-
-    // Double-check quantization - ensure result is a multiple of step
-    let re_quantized_ratio = rounded / step;
-    let re_quantized_floor = re_quantized_ratio.floor();
-    let final_result = re_quantized_floor * step;
-
-    // Final normalization and rounding
-    final_result.normalize().round_dp_with_strategy(
-        step_scale,
-        rust_decimal::RoundingStrategy::ToNegativeInfinity,
-    )
-}
 
 // ============================================================================
 // Balance Reservation Guard (RAII Pattern)
@@ -1375,7 +1342,7 @@ impl Ordering {
         }
         
         // Quantize size to step_size
-        let size_quantized = quantize_decimal(size_raw, rules.step_size);
+        let size_quantized = crate::utils::quantize_decimal(size_raw, rules.step_size);
         
         if size_quantized.is_zero() {
             debug!(
@@ -1802,8 +1769,7 @@ impl Ordering {
             Ok((current_bid, current_ask)) => {
                 // Calculate current spread
                 if !current_bid.0.is_zero() {
-                    let current_spread_bps = ((current_ask.0 - current_bid.0) / current_bid.0) * Decimal::from(10000);
-                    let current_spread_bps_f64 = current_spread_bps.to_f64().unwrap_or(0.0);
+                    let current_spread_bps_f64 = crate::utils::calculate_spread_bps(current_bid, current_ask);
                     
                     // Validate current spread against thresholds
                     let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
