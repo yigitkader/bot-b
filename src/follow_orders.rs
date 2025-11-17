@@ -6,18 +6,31 @@
 use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
-use crate::position_manager::{PositionState, StrategyInfo, should_close_position_smart};
+use crate::position_manager::{PositionState, should_close_position_smart};
 use crate::types::{PositionDirection, PositionInfo, Px, Qty};
+use crate::utils;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
+struct PositionPnL {
+    price_change_pct_f64: f64,
+    price_change_pct: Decimal,
+    gross_pnl_pct_f64: f64,
+    gross_pnl_pct: Decimal,
+    net_pnl_pct_f64: f64,
+    net_pnl_pct: Decimal,
+    net_pnl_usd: f64,
+    entry_commission_pct: Decimal,
+    exit_commission_pct: Decimal,
+    total_commission_pct: Decimal,
+}
 
 /// FOLLOW_ORDERS module - position tracking and TP/SL control
 pub struct FollowOrders {
@@ -66,31 +79,29 @@ impl FollowOrders {
         let positions = self.positions.clone();
         let tp_sl_from_signals = self.tp_sl_from_signals.clone();
         
-        // Spawn task for TradeSignal events (to capture TP/SL info)
         let tp_sl_signals = tp_sl_from_signals.clone();
         let positions_signal = positions.clone();
         let event_bus_signal = event_bus.clone();
         let shutdown_flag_signal = shutdown_flag.clone();
         tokio::spawn(async move {
-            let mut trade_signal_rx = event_bus_signal.subscribe_trade_signal();
-            
-            info!("FOLLOW_ORDERS: Started, listening to TradeSignal events for TP/SL info");
-            
-            loop {
-                match trade_signal_rx.recv().await {
-                    Ok(signal) => {
-                        if shutdown_flag_signal.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                        
+            let trade_signal_rx = event_bus_signal.subscribe_trade_signal();
+            let tp_sl_signals_clone = tp_sl_signals.clone();
+            let positions_signal_clone = positions_signal.clone();
+            crate::event_loop::run_event_loop_async(
+                trade_signal_rx,
+                shutdown_flag_signal,
+                "FOLLOW_ORDERS",
+                "TradeSignal",
+                move |signal| {
+                    let tp_sl_signals = tp_sl_signals_clone.clone();
+                    let positions_signal = positions_signal_clone.clone();
+                    async move {
                         Self::handle_trade_signal(&signal, &tp_sl_signals, &positions_signal).await;
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
         
-        // Spawn task for PositionUpdate events
         let cfg_pos = cfg.clone();
         let positions_pos = positions.clone();
         let tp_sl_pos = tp_sl_from_signals.clone();
@@ -98,47 +109,46 @@ impl FollowOrders {
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
         tokio::spawn(async move {
-            let mut position_update_rx = event_bus_pos.subscribe_position_update();
-            
-            info!("FOLLOW_ORDERS: Started, listening to PositionUpdate events");
-            
-            loop {
-                match position_update_rx.recv().await {
-                    Ok(update) => {
-                        if shutdown_flag_pos.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                        
+            let position_update_rx = event_bus_pos.subscribe_position_update();
+            let cfg_pos_clone = cfg_pos.clone();
+            let positions_pos_clone = positions_pos.clone();
+            let tp_sl_pos_clone = tp_sl_pos.clone();
+            let position_states_pos_clone = position_states_pos.clone();
+            crate::event_loop::run_event_loop_async(
+                position_update_rx,
+                shutdown_flag_pos,
+                "FOLLOW_ORDERS",
+                "PositionUpdate",
+                move |update| {
+                    let cfg_pos = cfg_pos_clone.clone();
+                    let positions_pos = positions_pos_clone.clone();
+                    let tp_sl_pos = tp_sl_pos_clone.clone();
+                    let position_states_pos = position_states_pos_clone.clone();
+                    async move {
                         Self::handle_position_update(&update, &cfg_pos, &positions_pos, &tp_sl_pos, &position_states_pos).await;
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
         
-        // Spawn task for OrderUpdate events (to capture is_maker for commission calculation)
         let positions_order = positions.clone();
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
         tokio::spawn(async move {
-            let mut order_update_rx = event_bus_order.subscribe_order_update();
-            
-            info!("FOLLOW_ORDERS: Started, listening to OrderUpdate events for is_maker info");
-            
-            loop {
-                match order_update_rx.recv().await {
-                    Ok(update) => {
-                        if shutdown_flag_order.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                        
-                        // Update is_maker info in PositionInfo when order is filled
+            let order_update_rx = event_bus_order.subscribe_order_update();
+            let positions_order_clone = positions_order.clone();
+            crate::event_loop::run_event_loop_async(
+                order_update_rx,
+                shutdown_flag_order,
+                "FOLLOW_ORDERS",
+                "OrderUpdate",
+                move |update| {
+                    let positions_order = positions_order_clone.clone();
+                    async move {
                         if matches!(update.status, crate::event_bus::OrderStatus::Filled) {
                             let mut positions_guard = positions_order.write().await;
                             if let Some(position) = positions_guard.get_mut(&update.symbol) {
-                                // Update is_maker info for commission calculation
                                 position.is_maker = update.is_maker;
-                                
                                 debug!(
                                     symbol = %update.symbol,
                                     is_maker = ?update.is_maker,
@@ -147,12 +157,10 @@ impl FollowOrders {
                             }
                         }
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
         
-        // Spawn task for MarketTick events (TP/SL checking)
         let positions_tick = positions.clone();
         let position_states_tick = self.position_states.clone();
         let event_bus_tick = event_bus.clone();
@@ -160,24 +168,28 @@ impl FollowOrders {
         let cfg_tick = cfg.clone();
         let connection_tick = self.connection.clone();
         tokio::spawn(async move {
-            let mut market_tick_rx = event_bus_tick.subscribe_market_tick();
-            
-            info!("FOLLOW_ORDERS: Started, listening to MarketTick events for TP/SL checking");
-            
-            loop {
-                match market_tick_rx.recv().await {
-                    Ok(tick) => {
-                        if shutdown_flag_tick.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                        
-                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &position_states_tick, &event_bus_tick, &cfg_tick, &connection_tick).await {
-                            warn!(error = %e, symbol = %tick.symbol, "FOLLOW_ORDERS: error checking TP/SL");
-                        }
+            let market_tick_rx = event_bus_tick.subscribe_market_tick();
+            let positions_tick_clone = positions_tick.clone();
+            let position_states_tick_clone = position_states_tick.clone();
+            let event_bus_tick_clone = event_bus_tick.clone();
+            let cfg_tick_clone = cfg_tick.clone();
+            let connection_tick_clone = connection_tick.clone();
+            crate::event_loop::run_event_loop(
+                market_tick_rx,
+                shutdown_flag_tick,
+                "FOLLOW_ORDERS",
+                "MarketTick",
+                move |tick| {
+                    let positions_tick = positions_tick_clone.clone();
+                    let position_states_tick = position_states_tick_clone.clone();
+                    let event_bus_tick = event_bus_tick_clone.clone();
+                    let cfg_tick = cfg_tick_clone.clone();
+                    let connection_tick = connection_tick_clone.clone();
+                    async move {
+                        Self::check_tp_sl(&tick, &positions_tick, &position_states_tick, &event_bus_tick, &cfg_tick, &connection_tick).await
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
         
         Ok(())
@@ -309,6 +321,174 @@ impl FollowOrders {
         }
     }
 
+    async fn get_position_and_price(
+        tick: &MarketTick,
+        positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
+    ) -> Result<Option<(PositionInfo, Px)>> {
+        let position = {
+            let positions_read = positions.read().await;
+            match positions_read.get(&tick.symbol) {
+                Some(pos) => {
+                    if pos.close_requested {
+                        return Ok(None);
+                    }
+                    pos.clone()
+                }
+                None => {
+                    return Ok(None);
+                }
+            }
+        };
+        
+        let current_price = tick.mark_price.unwrap_or_else(|| {
+            Px(crate::utils::calculate_mid_price(tick.bid, tick.ask))
+        });
+        
+        Ok(Some((position, current_price)))
+    }
+
+    fn calculate_position_pnl(
+        position: &PositionInfo,
+        current_price: Px,
+        cfg: &Arc<AppCfg>,
+    ) -> Result<PositionPnL> {
+        let entry_price = position.entry_price.0;
+        let current_price_val = current_price.0;
+
+        let price_change_pct_f64 = utils::calculate_pnl_percentage(
+            entry_price,
+            current_price_val,
+            position.direction,
+            position.leverage,
+        );
+        let price_change_pct = utils::f64_to_decimal_pct(price_change_pct_f64) * Decimal::from(100);
+        
+        const MAX_WAIT_FOR_ORDER_UPDATE_MS: u64 = 2000;
+        let position_age_ms = position.opened_at.elapsed().as_millis() as u64;
+        
+        let entry_commission_pct = if let Some(is_maker) = position.is_maker {
+            utils::get_commission_rate(is_maker, cfg.risk.maker_commission_pct, cfg.risk.taker_commission_pct)
+        } else {
+            if position_age_ms > MAX_WAIT_FOR_ORDER_UPDATE_MS {
+                warn!(
+                    symbol = %position.symbol,
+                    position_age_ms,
+                    max_wait_ms = MAX_WAIT_FOR_ORDER_UPDATE_MS,
+                    "FOLLOW_ORDERS: OrderUpdate with is_maker info delayed > {}ms, using conservative taker commission estimate.",
+                    MAX_WAIT_FOR_ORDER_UPDATE_MS
+                );
+            } else {
+                debug!(
+                    symbol = %position.symbol,
+                    position_age_ms,
+                    "FOLLOW_ORDERS: Using conservative taker commission estimate (OrderUpdate pending)"
+                );
+            }
+            utils::get_commission_rate(false, cfg.risk.maker_commission_pct, cfg.risk.taker_commission_pct)
+        };
+
+        let gross_pnl_pct_f64 = price_change_pct_f64;
+        let gross_pnl_pct = price_change_pct;
+        
+        let exit_commission_pct = utils::get_commission_rate(false, cfg.risk.maker_commission_pct, cfg.risk.taker_commission_pct);
+        let total_commission_pct = entry_commission_pct + exit_commission_pct;
+        let net_pnl_pct = gross_pnl_pct - total_commission_pct;
+        let net_pnl_pct_f64 = net_pnl_pct.to_f64().unwrap_or(0.0);
+        
+        let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
+        let entry_price_f64 = position.entry_price.0.to_f64().unwrap_or(0.0);
+        let current_price_f64 = current_price_val.to_f64().unwrap_or(0.0);
+        
+        let price_diff = match position.direction {
+            PositionDirection::Long => current_price_f64 - entry_price_f64,
+            PositionDirection::Short => entry_price_f64 - current_price_f64,
+        };
+        let entry_notional = utils::f64_to_decimal(entry_price_f64, Decimal::ZERO) * position.qty.0;
+        let exit_notional = utils::f64_to_decimal(current_price_f64, Decimal::ZERO) * position.qty.0;
+        let total_commission = utils::calculate_total_commission(
+            entry_notional,
+            exit_notional,
+            position.is_maker,
+            cfg.risk.maker_commission_pct,
+            cfg.risk.taker_commission_pct,
+        );
+        
+        let gross_pnl_usd = price_diff * position_qty_f64;
+        let net_pnl_usd = gross_pnl_usd - total_commission.to_f64().unwrap_or(0.0);
+        
+        Ok(PositionPnL {
+            price_change_pct_f64,
+            price_change_pct,
+            gross_pnl_pct_f64,
+            gross_pnl_pct,
+            net_pnl_pct_f64,
+            net_pnl_pct,
+            net_pnl_usd,
+            entry_commission_pct,
+            exit_commission_pct,
+            total_commission_pct,
+        })
+    }
+
+    async fn send_close_request_and_remove_position(
+        tick: &MarketTick,
+        position: &PositionInfo,
+        reason: CloseReason,
+        positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
+        position_states: &Arc<RwLock<HashMap<String, PositionState>>>,
+        event_bus: &Arc<EventBus>,
+    ) -> Result<bool> {
+        let position_removed = {
+            let mut positions_guard = positions.write().await;
+            if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
+                pos.close_requested = true;
+                positions_guard.remove(&tick.symbol).is_some()
+            } else {
+                false
+            }
+        };
+
+        if !position_removed {
+            return Ok(false);
+        }
+
+        {
+            let mut states_guard = position_states.write().await;
+            states_guard.remove(&tick.symbol);
+        }
+        
+        let reason_for_log = reason.clone();
+        let close_request = CloseRequest {
+            symbol: tick.symbol.clone(),
+            position_id: None,
+            reason,
+            current_bid: Some(tick.bid),
+            current_ask: Some(tick.ask),
+            timestamp: Instant::now(),
+        };
+        match event_bus.close_request_tx.send(close_request) {
+            Ok(receiver_count) => {
+                if receiver_count == 0 {
+                    warn!(
+                        symbol = %tick.symbol,
+                        reason = ?reason_for_log,
+                        "FOLLOW_ORDERS: CloseRequest sent but no subscribers"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    symbol = %tick.symbol,
+                    reason = ?reason_for_log,
+                    "FOLLOW_ORDERS: CloseRequest failed"
+                );
+            }
+        }
+        
+        Ok(true)
+    }
+
     /// Check TP/SL for a market tick
     /// If TP or SL is triggered, send CloseRequest
     /// 
@@ -334,157 +514,27 @@ impl FollowOrders {
         cfg: &Arc<AppCfg>,
         connection: &Arc<Connection>,
     ) -> Result<()> {
-        // ✅ CRITICAL: Fast early check - position must exist to process TP/SL
-        // Performance: If no position, return immediately (no expensive PnL calculations)
-        // Responsibility: FOLLOW_ORDERS only processes when position is tracked
-        // This is a fast read-only check, so do it first
-        //
-        // Race condition prevention (Layer 1 - Early Check):
-        // - Check close_requested flag BEFORE expensive PnL calculations
-        // - If flag is true, another thread is already processing close - skip this tick
-        // - This prevents duplicate PnL calculations and reduces lock contention
-        // - Note: This is a read lock, so multiple threads can check simultaneously
-        // - The flag is set in Layer 2 (atomic remove), so this is a fast pre-filter
-        let position = {
-            let positions_read = positions.read().await;
-            match positions_read.get(&tick.symbol) {
-                Some(pos) => {
-                    // ✅ CRITICAL: Early check for close_requested flag (read lock, fast)
-                    // If another thread already set this flag, skip expensive PnL calculations
-                    // This is the first line of defense against race conditions
-                    // Performance: Avoids expensive calculations when close is already in progress
-                    if pos.close_requested {
-                        return Ok(());
-                    }
-                    pos.clone()
-                }
-                None => {
-                    // No position for this symbol - return immediately
-                    // Performance: Skip all expensive calculations (PnL, commission, etc.)
-                    // This is expected behavior - FOLLOW_ORDERS waits for position to be tracked
-                    return Ok(());
-                }
-            }
-        };
-        let current_price = tick.mark_price.unwrap_or_else(|| {
-            Px(crate::utils::calculate_mid_price(tick.bid, tick.ask))
-        });
-
-        let entry_price = position.entry_price.0;
-        let current_price_val = current_price.0;
-
-        let price_change_pct = match position.direction {
-            PositionDirection::Long => {
-                // Long position: profit when price goes up
-                ((current_price_val - entry_price) / entry_price) * Decimal::from(100)
-            }
-            PositionDirection::Short => {
-                // Short position: profit when price goes down
-                ((entry_price - current_price_val) / entry_price) * Decimal::from(100)
-            }
-        };
-        
-
-        
-        // ✅ CRITICAL: Use conservative commission estimate when is_maker is None
-        // Problem: position.is_maker may be None if OrderUpdate hasn't arrived yet (100-500ms delay)
-        // During this delay, fast price movements can cause SL to be missed
-        // Example: Price drops 1% in 100ms → SL should trigger, but TP/SL check is skipped!
-        //
-        // Solution: Use conservative taker commission (higher) when is_maker is None
-        // This ensures:
-        // - SL triggers EARLIER (safer - prevents larger losses)
-        // - TP triggers LATER (slightly less optimal, but safer)
-        // - No delay in TP/SL checks (critical for fast markets)
-        //
-        // Timeout: If OrderUpdate doesn't arrive within 2 seconds, log warning
-        // This prevents indefinite waiting and helps identify issues
-        const MAX_WAIT_FOR_ORDER_UPDATE_MS: u64 = 2000; // 2 seconds
-        let position_age_ms = position.opened_at.elapsed().as_millis() as u64;
-        
-        let entry_commission_pct = if let Some(is_maker) = position.is_maker {
-            // OrderUpdate arrived - use actual commission
-            if is_maker {
-                // Maker order - use maker commission
-                Decimal::from_str(&cfg.risk.maker_commission_pct.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str("0.02").unwrap_or(Decimal::ZERO))
-            } else {
-                // Taker order - use taker commission
-                Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
-            }
-        } else {
-            // OrderUpdate hasn't arrived yet - use conservative taker commission
-            // This ensures SL triggers earlier (safer) and TP triggers later (acceptable)
-            if position_age_ms > MAX_WAIT_FOR_ORDER_UPDATE_MS {
-                warn!(
-                    symbol = %tick.symbol,
-                    position_age_ms,
-                    max_wait_ms = MAX_WAIT_FOR_ORDER_UPDATE_MS,
-                    "FOLLOW_ORDERS: OrderUpdate with is_maker info delayed > {}ms, using conservative taker commission estimate. This may cause slightly early SL triggers or late TP triggers.",
-                    MAX_WAIT_FOR_ORDER_UPDATE_MS
-                );
-            } else {
-                debug!(
-                    symbol = %tick.symbol,
-                    position_age_ms,
-                    "FOLLOW_ORDERS: Using conservative taker commission estimate (OrderUpdate pending, typically arrives < 500ms)"
-                );
-            }
-            // Use taker commission (higher) - conservative estimate
-            Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-                .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO))
+        let (position, current_price) = match Self::get_position_and_price(tick, positions).await? {
+            Some(p) => p,
+            None => return Ok(()),
         };
 
-        let leverage_decimal = Decimal::from(position.leverage);
-        let gross_pnl_pct = price_change_pct * leverage_decimal;
+        let pnl = Self::calculate_position_pnl(&position, current_price, cfg)?;
         
-        let exit_commission_pct = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-            .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO));
-
-        let total_commission_pct = entry_commission_pct + exit_commission_pct;
-        
-        // Calculate net PnL percentage (gross PnL - commission)
-        // Net PnL% = Gross PnL% - (Commission% * 2)
-        let net_pnl_pct = gross_pnl_pct - total_commission_pct;
-        
-        let net_pnl_pct_f64 = net_pnl_pct.to_f64().unwrap_or(0.0);
-        let gross_pnl_pct_f64 = gross_pnl_pct.to_f64().unwrap_or(0.0);
-        
-        // ✅ NEW: Smart closing logic (11 different closing conditions)
-        // Calculate net PnL in USD for smart closing
-        let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
-        let entry_price_f64 = position.entry_price.0.to_f64().unwrap_or(0.0);
-        let current_price_f64 = current_price_val.to_f64().unwrap_or(0.0);
-        
-        // Calculate net PnL in USD (simplified - using current price)
-        let price_diff = match position.direction {
-            PositionDirection::Long => current_price_f64 - entry_price_f64,
-            PositionDirection::Short => entry_price_f64 - current_price_f64,
-        };
-        let gross_pnl_usd = price_diff * position_qty_f64;
-        let entry_fee_usd = (entry_price_f64 * position_qty_f64) * (entry_commission_pct.to_f64().unwrap_or(0.0) / 100.0);
-        let exit_fee_usd = (current_price_f64 * position_qty_f64) * (exit_commission_pct.to_f64().unwrap_or(0.0) / 100.0);
-        let net_pnl_usd = gross_pnl_usd - entry_fee_usd - exit_fee_usd;
-        
-        // Update position state (for smart closing logic)
         {
             let mut states_guard = position_states.write().await;
             if let Some(state) = states_guard.get_mut(&tick.symbol) {
-                state.update_pnl(Decimal::from_str(&format!("{:.2}", net_pnl_usd))
-                    .unwrap_or(Decimal::ZERO));
+                state.update_pnl(utils::f64_to_decimal(pnl.net_pnl_usd, Decimal::ZERO));
             }
         }
         
-        // Get position state for smart closing check
         let position_state = {
             let states_guard = position_states.read().await;
             states_guard.get(&tick.symbol).cloned()
         };
         
-        // Check smart closing conditions (if position state exists)
         if let Some(ref state) = position_state {
-            let min_profit_usd = cfg.min_profit_usd.unwrap_or(0.50);
+            let min_profit_usd = 0.50;
             let maker_fee_rate = cfg.risk.maker_commission_pct / 100.0;
             let taker_fee_rate = cfg.risk.taker_commission_pct / 100.0;
             
@@ -503,64 +553,34 @@ impl FollowOrders {
                 info!(
                     symbol = %tick.symbol,
                     reason = %reason,
-                    net_pnl_usd,
+                    net_pnl_usd = pnl.net_pnl_usd,
                     "FOLLOW_ORDERS: Smart closing condition triggered"
                 );
                 
-                // Remove position and send CloseRequest
-                let position_removed = {
-                    let mut positions_guard = positions.write().await;
-                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
-                        pos.close_requested = true;
-                        positions_guard.remove(&tick.symbol).is_some()
-                    } else {
-                        false
-                    }
-                };
-                
-                if position_removed {
-                    // Clean up position state
-                    {
-                        let mut states_guard = position_states.write().await;
-                        states_guard.remove(&tick.symbol);
-                    }
-                    
-                    let close_request = CloseRequest {
-                        symbol: tick.symbol.clone(),
-                        position_id: None,
-                        reason: CloseReason::Manual, // Smart closing is manual decision
-                        current_bid: Some(tick.bid),
-                        current_ask: Some(tick.ask),
-                        timestamp: Instant::now(),
-                    };
-                    
-                    if let Err(e) = event_bus.close_request_tx.send(close_request) {
-                        error!(
-                            error = ?e,
-                            symbol = %tick.symbol,
-                            reason = %reason,
-                            "FOLLOW_ORDERS: Failed to send CloseRequest for smart closing"
-                        );
-                    } else {
-                        info!(
-                            symbol = %tick.symbol,
-                            reason = %reason,
-                            net_pnl_usd,
-                            "FOLLOW_ORDERS: Smart closing CloseRequest sent"
-                        );
-                    }
+                if Self::send_close_request_and_remove_position(
+                    tick,
+                    &position,
+                    CloseReason::Manual,
+                    positions,
+                    position_states,
+                    event_bus,
+                ).await? {
+                    info!(
+                        symbol = %tick.symbol,
+                        reason = %reason,
+                        net_pnl_usd = pnl.net_pnl_usd,
+                        "FOLLOW_ORDERS: Smart closing CloseRequest sent"
+                    );
                 }
                 
                 return Ok(());
             }
         }
         
-        // ✅ NEW: Liquidation risk monitoring
         if let Some(liquidation_price) = position.liquidation_price {
+            let current_price_val = current_price.0;
             let liquidation_distance_pct = match position.direction {
                 PositionDirection::Long => {
-                    // Long: liquidation_price < current_price
-                    // Distance = (current_price - liquidation_price) / liquidation_price * 100
                     if liquidation_price.0 > Decimal::ZERO {
                         let distance = ((current_price_val - liquidation_price.0) / liquidation_price.0) * Decimal::from(100);
                         distance.to_f64().unwrap_or(0.0)
@@ -569,8 +589,6 @@ impl FollowOrders {
                     }
                 }
                 PositionDirection::Short => {
-                    // Short: liquidation_price > current_price
-                    // Distance = (liquidation_price - current_price) / current_price * 100
                     if current_price_val > Decimal::ZERO {
                         let distance = ((liquidation_price.0 - current_price_val) / current_price_val) * Decimal::from(100);
                         distance.to_f64().unwrap_or(0.0)
@@ -580,7 +598,6 @@ impl FollowOrders {
                 }
             };
             
-            // Warning at 10% distance
             if liquidation_distance_pct < 10.0 && liquidation_distance_pct >= 5.0 {
                 warn!(
                     symbol = %tick.symbol,
@@ -592,7 +609,6 @@ impl FollowOrders {
                 );
             }
             
-            // Auto-close at 5% distance
             if liquidation_distance_pct < 5.0 {
                 error!(
                     symbol = %tick.symbol,
@@ -603,60 +619,37 @@ impl FollowOrders {
                     liquidation_distance_pct
                 );
                 
-                // Send CloseRequest with Manual reason
-                let position_removed = {
-                    let mut positions_guard = positions.write().await;
-                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
-                        pos.close_requested = true;
-                        positions_guard.remove(&tick.symbol).is_some()
-                    } else {
-                        false
-                    }
-                };
-                
-                if position_removed {
-                    let close_request = CloseRequest {
-                        symbol: tick.symbol.clone(),
-                        position_id: None,
-                        reason: CloseReason::Manual,
-                        current_bid: Some(tick.bid),
-                        current_ask: Some(tick.ask),
-                        timestamp: Instant::now(),
-                    };
-                    
-                    if let Err(e) = event_bus.close_request_tx.send(close_request) {
-                        error!(
-                            error = ?e,
-                            symbol = %tick.symbol,
-                            "FOLLOW_ORDERS: Failed to send CloseRequest for liquidation risk"
-                        );
-                    } else {
-                        info!(
-                            symbol = %tick.symbol,
-                            liquidation_distance_pct,
-                            "FOLLOW_ORDERS: Auto-closed position due to liquidation risk"
-                        );
-                    }
+                if Self::send_close_request_and_remove_position(
+                    tick,
+                    &position,
+                    CloseReason::Manual,
+                    positions,
+                    position_states,
+                    event_bus,
+                ).await? {
+                    info!(
+                        symbol = %tick.symbol,
+                        liquidation_distance_pct,
+                        "FOLLOW_ORDERS: Auto-closed position due to liquidation risk"
+                    );
                 }
                 
-                return Ok(()); // Exit early - position will be closed
+                return Ok(());
             }
         }
         
-        // ✅ NEW: Trailing stop placement when TP threshold is reached
         if let Some(tp_pct) = position.take_profit_pct {
-            if net_pnl_pct_f64 >= tp_pct {
+            if pnl.net_pnl_pct_f64 >= tp_pct {
                 // TP threshold reached - check if trailing stop should be placed
                 if cfg.trending.use_trailing_stop && !position.trailing_stop_placed {
                     // Calculate TP price (activation price for trailing stop)
                     let tp_price = match position.direction {
                         PositionDirection::Long => {
-                            // Long: TP = entry * (1 + tp_pct / 100)
-                            position.entry_price.0 * (Decimal::from(1) + Decimal::from_str(&format!("{}", tp_pct / 100.0)).unwrap_or(Decimal::ZERO))
+                            position.entry_price.0 * (Decimal::ONE + utils::f64_to_decimal_pct(tp_pct))
                         }
                         PositionDirection::Short => {
                             // Short: TP = entry * (1 - tp_pct / 100)
-                            position.entry_price.0 * (Decimal::from(1) - Decimal::from_str(&format!("{}", tp_pct / 100.0)).unwrap_or(Decimal::ZERO))
+                            position.entry_price.0 * (Decimal::ONE - utils::f64_to_decimal_pct(tp_pct))
                         }
                     };
                     
@@ -698,191 +691,70 @@ impl FollowOrders {
                     }
                 }
                 
-                // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
-                // Race condition prevention (Layer 2 - Atomic Remove):
-                // - Multiple threads can reach here if they all pass early check (close_requested flag)
-                // - Atomic operation: acquire write lock → check position exists → set flag → remove
-                // - Only ONE thread can successfully remove the position (HashMap::remove() is atomic)
-                // - Threads that fail to remove (position already removed) skip CloseRequest
-                //
-                // Thread safety guarantee:
-                // - Thread A: get_mut() → pos found, close_requested = true, remove() → true → CloseRequest sent ✓
-                // - Thread B: get_mut() → pos found (if A hasn't removed yet), close_requested = true, remove() → false (A already removed) → skip ✓
-                // - Thread C: get_mut() → None (A already removed) → skip ✓
-                //
-                // Result: Only ONE CloseRequest is sent, even if multiple threads trigger TP/SL simultaneously
-                let position_removed = {
-                    let mut positions_guard = positions.write().await;
-                    // Double-check: position might have been removed by another thread between read and write lock
-                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
-                        // Mark as close_requested to prevent duplicate requests (defensive, already checked in early check)
-                        pos.close_requested = true;
-                        // ✅ CRITICAL: Atomic remove - only ONE thread can successfully remove
-                        // HashMap::remove() returns Some(value) if key existed, None if key didn't exist
-                        // This ensures only the first thread to call remove() gets true
-                        positions_guard.remove(&tick.symbol).is_some()
-                    } else {
-                        // Position already removed by another thread (between read lock and write lock)
-                        false
-                    }
-                };
-
-                // Only send CloseRequest if position was successfully removed
-                // This ensures only ONE thread sends CloseRequest, even if multiple threads trigger TP/SL
-                if !position_removed {
-                    // Position was already removed by another thread - skip
-                    // This is expected behavior in high-frequency scenarios where multiple ticks arrive simultaneously
+                if !Self::send_close_request_and_remove_position(
+                    tick,
+                    &position,
+                    CloseReason::TakeProfit,
+                    positions,
+                    position_states,
+                    event_bus,
+                ).await? {
                     debug!(
                         symbol = %tick.symbol,
-                        net_pnl_pct = net_pnl_pct_f64,
+                        net_pnl_pct = pnl.net_pnl_pct_f64,
                         tp_pct,
-                        "FOLLOW_ORDERS: Take profit triggered but position already removed by another thread (race condition prevented)"
+                        "FOLLOW_ORDERS: Take profit triggered but position already removed by another thread"
                     );
                     return Ok(());
                 }
 
-                let close_request = CloseRequest {
-                    symbol: tick.symbol.clone(),
-                    position_id: None,
-                    reason: CloseReason::TakeProfit,
-                    current_bid: Some(tick.bid),
-                    current_ask: Some(tick.ask),
-                    timestamp: Instant::now(),
-                };
-
-                match event_bus.close_request_tx.send(close_request) {
-                    Ok(receiver_count) => {
-                        if receiver_count == 0 {
-                            warn!(
-                                symbol = %tick.symbol,
-                                net_pnl_pct = net_pnl_pct_f64,
-                                tp_pct,
-                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position already removed from tracking"
-                            );
-                            // Position already removed - can't retry on next tick
-                            return Ok(());
-                        }
-                        
-                        info!(
-                            symbol = %tick.symbol,
-                            net_pnl_pct = net_pnl_pct_f64,
-                            gross_pnl_pct = gross_pnl_pct_f64,
-                            entry_commission_pct = entry_commission_pct.to_f64().unwrap_or(0.0),
-                            exit_commission_pct = exit_commission_pct.to_f64().unwrap_or(0.0),
-                            total_commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
-                            tp_pct,
-                            leverage = position.leverage,
-                            price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
-                            "FOLLOW_ORDERS: Take profit triggered (net PnL), CloseRequest sent, position removed from tracking"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = ?e,
-                            symbol = %tick.symbol,
-                            net_pnl_pct = net_pnl_pct_f64,
-                            tp_pct,
-                            "FOLLOW_ORDERS: CloseRequest failed for take profit, position already removed from tracking"
-                        );
-                        // Position already removed - can't retry on next tick
-                    }
-                }
+                info!(
+                    symbol = %tick.symbol,
+                    net_pnl_pct = pnl.net_pnl_pct_f64,
+                    gross_pnl_pct = pnl.gross_pnl_pct_f64,
+                    entry_commission_pct = pnl.entry_commission_pct.to_f64().unwrap_or(0.0),
+                    exit_commission_pct = pnl.exit_commission_pct.to_f64().unwrap_or(0.0),
+                    total_commission_pct = pnl.total_commission_pct.to_f64().unwrap_or(0.0),
+                    tp_pct,
+                    leverage = position.leverage,
+                    price_change_pct = pnl.price_change_pct.to_f64().unwrap_or(0.0),
+                    "FOLLOW_ORDERS: Take profit triggered (net PnL), CloseRequest sent"
+                );
                 return Ok(());
             }
         }
         
-        // Check stop loss (using net PnL - commission included)
         if let Some(sl_pct) = position.stop_loss_pct {
-            if net_pnl_pct_f64 <= -sl_pct {
-                // ✅ CRITICAL: Remove position FIRST (before sending CloseRequest)
-                // Race condition prevention (Layer 2 - Atomic Remove):
-                // - Multiple threads can reach here if they all pass early check (close_requested flag)
-                // - Atomic operation: acquire write lock → check position exists → set flag → remove
-                // - Only ONE thread can successfully remove the position (HashMap::remove() is atomic)
-                // - Threads that fail to remove (position already removed) skip CloseRequest
-                //
-                // Thread safety guarantee:
-                // - Thread A: get_mut() → pos found, close_requested = true, remove() → true → CloseRequest sent ✓
-                // - Thread B: get_mut() → pos found (if A hasn't removed yet), close_requested = true, remove() → false (A already removed) → skip ✓
-                // - Thread C: get_mut() → None (A already removed) → skip ✓
-                //
-                // Result: Only ONE CloseRequest is sent, even if multiple threads trigger TP/SL simultaneously
-                let position_removed = {
-                    let mut positions_guard = positions.write().await;
-                    // Double-check: position might have been removed by another thread between read and write lock
-                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
-                        // Mark as close_requested to prevent duplicate requests (defensive, already checked in early check)
-                        pos.close_requested = true;
-                        // ✅ CRITICAL: Atomic remove - only ONE thread can successfully remove
-                        // HashMap::remove() returns Some(value) if key existed, None if key didn't exist
-                        // This ensures only the first thread to call remove() gets true
-                        positions_guard.remove(&tick.symbol).is_some()
-                    } else {
-                        // Position already removed by another thread (between read lock and write lock)
-                        false
-                    }
-                };
-
-                // Only send CloseRequest if position was successfully removed
-                // This ensures only ONE thread sends CloseRequest, even if multiple threads trigger TP/SL
-                if !position_removed {
-                    // Position was already removed by another thread - skip
-                    // This is expected behavior in high-frequency scenarios where multiple ticks arrive simultaneously
+            if pnl.net_pnl_pct_f64 <= -sl_pct {
+                if !Self::send_close_request_and_remove_position(
+                    tick,
+                    &position,
+                    CloseReason::StopLoss,
+                    positions,
+                    position_states,
+                    event_bus,
+                ).await? {
                     debug!(
                         symbol = %tick.symbol,
-                        net_pnl_pct = net_pnl_pct_f64,
+                        net_pnl_pct = pnl.net_pnl_pct_f64,
                         sl_pct,
-                        "FOLLOW_ORDERS: Stop loss triggered but position already removed by another thread (race condition prevented)"
+                        "FOLLOW_ORDERS: Stop loss triggered but position already removed by another thread"
                     );
                     return Ok(());
                 }
 
-                let close_request = CloseRequest {
-                    symbol: tick.symbol.clone(),
-                    position_id: None,
-                    reason: CloseReason::StopLoss,
-                    current_bid: Some(tick.bid),
-                    current_ask: Some(tick.ask),
-                    timestamp: Instant::now(),
-                };
-
-                match event_bus.close_request_tx.send(close_request) {
-                    Ok(receiver_count) => {
-                        if receiver_count == 0 {
-                            warn!(
-                                symbol = %tick.symbol,
-                                net_pnl_pct = net_pnl_pct_f64,
-                                sl_pct,
-                                "FOLLOW_ORDERS: CloseRequest sent but no subscribers (ORDERING may have shutdown), position already removed from tracking"
-                            );
-                            // Position already removed - can't retry on next tick
-                            return Ok(());
-                        }
-                        
-                        info!(
-                            symbol = %tick.symbol,
-                            net_pnl_pct = net_pnl_pct_f64,
-                            gross_pnl_pct = gross_pnl_pct_f64,
-                            entry_commission_pct = entry_commission_pct.to_f64().unwrap_or(0.0),
-                            exit_commission_pct = exit_commission_pct.to_f64().unwrap_or(0.0),
-                            total_commission_pct = total_commission_pct.to_f64().unwrap_or(0.0),
-                            sl_pct,
-                            leverage = position.leverage,
-                            price_change_pct = price_change_pct.to_f64().unwrap_or(0.0),
-                            "FOLLOW_ORDERS: Stop loss triggered (net PnL), CloseRequest sent, position removed from tracking"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = ?e,
-                            symbol = %tick.symbol,
-                            net_pnl_pct = net_pnl_pct_f64,
-                            sl_pct,
-                            "FOLLOW_ORDERS: CloseRequest failed for stop loss, position already removed from tracking"
-                        );
-                        // Position already removed - can't retry on next tick
-                    }
-                }
+                info!(
+                    symbol = %tick.symbol,
+                    net_pnl_pct = pnl.net_pnl_pct_f64,
+                    gross_pnl_pct = pnl.gross_pnl_pct_f64,
+                    entry_commission_pct = pnl.entry_commission_pct.to_f64().unwrap_or(0.0),
+                    exit_commission_pct = pnl.exit_commission_pct.to_f64().unwrap_or(0.0),
+                    total_commission_pct = pnl.total_commission_pct.to_f64().unwrap_or(0.0),
+                    sl_pct,
+                    leverage = position.leverage,
+                    price_change_pct = pnl.price_change_pct.to_f64().unwrap_or(0.0),
+                    "FOLLOW_ORDERS: Stop loss triggered (net PnL), CloseRequest sent"
+                );
                 return Ok(());
             }
         }

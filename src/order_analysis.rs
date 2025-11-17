@@ -3,11 +3,11 @@
 // Based on reference project with adaptations for our event-driven architecture
 
 use crate::config::AppCfg;
-use crate::types::{Px, Qty, Side, OrderBook};
+use crate::types::{Px, Qty, Side};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{info, warn};
 
 // ============================================================================
@@ -73,9 +73,9 @@ pub fn analyze_orders(
 
         // Maximum allowed distance from market (depends on position)
         let max_distance_pct = if position_size_notional > 0.0 {
-            cfg.internal.order_price_distance_with_position
+            0.01 // 1% when position exists
         } else {
-            cfg.internal.order_price_distance_no_position
+            0.02 // 2% when no position
         };
 
         // Check if order is too far from market

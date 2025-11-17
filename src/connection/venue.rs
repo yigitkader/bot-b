@@ -209,7 +209,6 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         price_precision: p_prec,
         qty_precision: q_prec,
         min_notional,
-        // TODO: Fetch max_leverage from /fapi/v1/leverageBrackets endpoint
         // For now, set to None (will use config max_leverage instead)
         max_leverage: None,
     }

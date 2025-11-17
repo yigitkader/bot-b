@@ -2,8 +2,7 @@
 // Smart position closing with 11 different closing conditions
 // Based on reference project with adaptations for our event-driven architecture
 
-use crate::config::AppCfg;
-use crate::types::{Px, Qty, PositionInfo, PositionDirection, Side};
+use crate::types::{Px, PositionInfo, PositionDirection, Side};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::time::Instant;
@@ -34,6 +33,12 @@ pub struct PositionState {
     /// Strategy interface for trend/volatility information
     /// This is optional - if not available, some checks will be skipped
     pub strategy_info: Option<StrategyInfo>,
+}
+
+struct NetPnlContext {
+    net_pnl: f64,
+    position_side: Side,
+    position_qty_abs: f64,
 }
 
 /// Strategy information interface (for trend/volatility)
@@ -100,58 +105,13 @@ pub fn should_close_position_smart(
     maker_fee_rate: f64,
     taker_fee_rate: f64,
 ) -> (bool, String) {
-    let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
-    let entry_price_f64 = position.entry_price.0.to_f64().unwrap_or(0.0);
-    let mark_price_f64 = mark_px.0.to_f64().unwrap_or(0.0);
-
-    // Early exit: no position
-    if position_qty_f64.abs() <= 0.0001 || entry_price_f64 <= 0.0 || mark_price_f64 <= 0.0 {
-        return (false, "no_position".to_string());
-    }
-
-    // Determine position side from direction
-    let position_side = match position.direction {
-        PositionDirection::Long => Side::Buy,
-        PositionDirection::Short => Side::Sell,
+    let net_pnl_ctx = match calculate_net_pnl_context(position, mark_px, bid, ask, maker_fee_rate, taker_fee_rate) {
+        Some(ctx) => ctx,
+        None => return (false, "no_position".to_string()),
     };
 
-    let exit_price = match position_side {
-        Side::Buy => bid.0,
-        Side::Sell => ask.0,
-    };
-
-    // Calculate net PnL (with fees)
-    let entry_fee_bps = if position.is_maker.unwrap_or(false) {
-        maker_fee_rate * 10000.0
-    } else {
-        taker_fee_rate * 10000.0
-    };
-    let exit_fee_bps = estimate_close_fee_bps(true, maker_fee_rate * 10000.0, taker_fee_rate * 10000.0);
-    let qty_abs = position.qty.0.abs();
-    let net_pnl = calc_net_pnl_usd(
-        position.entry_price.0,
-        exit_price,
-        qty_abs,
-        &position_side,
-        entry_fee_bps,
-        exit_fee_bps,
-    );
-
-    // Rule 1: Fixed Take Profit ($0.50 or min_profit_usd)
-    if net_pnl >= min_profit_usd {
-        return (true, format!("take_profit_{:.2}_usd", net_pnl));
-    }
-
-    // Rule 2: Stop Loss (-$0.10)
-    // Tight stop loss: close small losses immediately, don't let them grow
-    if net_pnl <= -0.10 {
-        return (true, format!("stop_loss_{:.2}_usd", net_pnl));
-    }
-
-    // Rule 3: Inventory Threshold
-    // If position size is too large, force close (risk management)
-    if position_qty_f64.abs() > 0.5 {
-        return (true, format!("inventory_threshold_exceeded_{:.2}", position_qty_f64));
+    if let Some(result) = check_basic_rules(&net_pnl_ctx, min_profit_usd) {
+        return result;
     }
 
     // Rule 4 & 5: Timeout checks (require entry_time)
@@ -161,17 +121,8 @@ pub fn should_close_position_smart(
     };
 
     let age_secs = entry_time.elapsed().as_secs() as f64;
-
-    // Rule 4: Loss Timeout
-    // If position is in loss for too long, force close
-    if net_pnl < 0.0 && age_secs >= MAX_LOSS_DURATION_SEC {
-        return (true, format!("loss_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
-    }
-
-    // Rule 5: Max Duration Timeout
-    // Market making positions shouldn't stay open too long
-    if age_secs >= MAX_POSITION_DURATION_SEC {
-        return (true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs));
+    if let Some(result) = check_timeout_rules(net_pnl_ctx.net_pnl, age_secs) {
+        return result;
     }
 
     // Rule 6: Time-weighted Profit Thresholds
@@ -187,7 +138,110 @@ pub fn should_close_position_smart(
     };
 
     // Rule 7: Trend Alignment
-    let trend_factor = if let Some(ref strategy_info) = state.strategy_info {
+    let trend_factor = calculate_trend_factor(position, state);
+    let momentum_factor = calculate_momentum_factor(state);
+    let volatility_factor = calculate_volatility_factor(state);
+    let (should_close_trailing, should_close_drawdown, should_close_recovery) =
+        evaluate_trailing_rules(state, net_pnl_ctx.net_pnl, min_profit_usd);
+
+    // Combined threshold (time-weighted + factors)
+    let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
+    let should_close_by_threshold = net_pnl_ctx.net_pnl >= combined_threshold;
+
+    // Return result (priority order)
+    if should_close_by_threshold {
+        (true, format!("smart_threshold_{:.2}_usd", net_pnl_ctx.net_pnl))
+    } else if should_close_trailing {
+        (true, format!("trailing_stop_{:.2}_usd", net_pnl_ctx.net_pnl))
+    } else if should_close_drawdown {
+        (true, format!("drawdown_{:.2}_usd", net_pnl_ctx.net_pnl))
+    } else if should_close_recovery {
+        (true, format!("recovery_{:.2}_usd", net_pnl_ctx.net_pnl))
+    } else {
+        (false, "".to_string())
+    }
+}
+
+fn calculate_net_pnl_context(
+    position: &PositionInfo,
+    mark_px: Px,
+    bid: Px,
+    ask: Px,
+    maker_fee_rate: f64,
+    taker_fee_rate: f64,
+) -> Option<NetPnlContext> {
+    let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
+    let entry_price_f64 = position.entry_price.0.to_f64().unwrap_or(0.0);
+    let mark_price_f64 = mark_px.0.to_f64().unwrap_or(0.0);
+
+    if position_qty_f64.abs() <= 0.0001 || entry_price_f64 <= 0.0 || mark_price_f64 <= 0.0 {
+        return None;
+    }
+
+    let position_side = match position.direction {
+        PositionDirection::Long => Side::Buy,
+        PositionDirection::Short => Side::Sell,
+    };
+
+    let exit_price = match position_side {
+        Side::Buy => bid.0,
+        Side::Sell => ask.0,
+    };
+
+    let qty_abs = position.qty.0.abs();
+    let entry_commission_pct = crate::utils::get_commission_rate(
+        position.is_maker.unwrap_or(false),
+        maker_fee_rate,
+        taker_fee_rate,
+    );
+    let exit_commission_pct = crate::utils::get_commission_rate(false, maker_fee_rate, taker_fee_rate);
+    let net_pnl_decimal = crate::utils::calculate_net_pnl(
+        position.entry_price.0,
+        exit_price,
+        qty_abs,
+        position.direction,
+        position.leverage,
+        entry_commission_pct,
+        exit_commission_pct,
+    );
+
+    Some(NetPnlContext {
+        net_pnl: net_pnl_decimal.to_f64().unwrap_or(0.0),
+        position_side,
+        position_qty_abs: position_qty_f64.abs(),
+    })
+}
+
+fn check_basic_rules(ctx: &NetPnlContext, min_profit_usd: f64) -> Option<(bool, String)> {
+    if ctx.net_pnl >= min_profit_usd {
+        return Some((true, format!("take_profit_{:.2}_usd", ctx.net_pnl)));
+    }
+
+    if ctx.net_pnl <= -0.10 {
+        return Some((true, format!("stop_loss_{:.2}_usd", ctx.net_pnl)));
+    }
+
+    if ctx.position_qty_abs > 0.5 {
+        return Some((true, format!("inventory_threshold_exceeded_{:.2}", ctx.position_qty_abs)));
+    }
+
+    None
+}
+
+fn check_timeout_rules(net_pnl: f64, age_secs: f64) -> Option<(bool, String)> {
+    if net_pnl < 0.0 && age_secs >= MAX_LOSS_DURATION_SEC {
+        return Some((true, format!("loss_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs)));
+    }
+
+    if age_secs >= MAX_POSITION_DURATION_SEC {
+        return Some((true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs)));
+    }
+
+    None
+}
+
+fn calculate_trend_factor(position: &PositionInfo, state: &PositionState) -> f64 {
+    if let Some(ref strategy_info) = state.strategy_info {
         let trend_bps = strategy_info.trend_bps;
         let position_side_f64 = match position.direction {
             PositionDirection::Long => 1.0,
@@ -195,25 +249,26 @@ pub fn should_close_position_smart(
         };
         let trend_aligned = (trend_bps > 0.0 && position_side_f64 > 0.0) || (trend_bps < 0.0 && position_side_f64 < 0.0);
         if trend_aligned {
-            1.3 // Trend aligned: hold longer
+            1.3
         } else {
-            0.8 // Trend against: close earlier
+            0.8
         }
     } else {
-        1.0 // No trend info: neutral
-    };
+        1.0
+    }
+}
 
-    // Rule 8: Momentum Factor
-    let momentum_factor = if state.pnl_history.len() >= 10 {
+fn calculate_momentum_factor(state: &PositionState) -> f64 {
+    if state.pnl_history.len() >= 10 {
         let recent = &state.pnl_history[state.pnl_history.len().saturating_sub(10)..];
         let first = recent[0];
         let last = recent[recent.len() - 1];
         if first > Decimal::ZERO {
             let pnl_trend = ((last - first) / first).to_f64().unwrap_or(0.0);
             if pnl_trend > 0.1 {
-                1.2 // Strong positive momentum: hold longer
+                1.2
             } else if pnl_trend < -0.1 {
-                0.7 // Negative momentum: close earlier
+                0.7
             } else {
                 1.0
             }
@@ -222,99 +277,40 @@ pub fn should_close_position_smart(
         }
     } else {
         1.0
-    };
+    }
+}
 
-    // Rule 9: Volatility Factor
-    let volatility_factor = if let Some(ref strategy_info) = state.strategy_info {
+fn calculate_volatility_factor(state: &PositionState) -> f64 {
+    if let Some(ref strategy_info) = state.strategy_info {
         let volatility = strategy_info.volatility;
         if volatility > 0.05 {
-            0.7 // High volatility: close earlier (risk reduction)
+            0.7
         } else if volatility < 0.01 {
-            1.2 // Low volatility: hold longer
+            1.2
         } else {
             1.0
         }
     } else {
         1.0
-    };
+    }
+}
 
-    // Rule 10: Peak PnL Trailing Stop
+fn evaluate_trailing_rules(state: &PositionState, net_pnl: f64, min_profit_usd: f64) -> (bool, bool, bool) {
     let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
     let drawdown_from_peak = peak_pnl_f64 - net_pnl;
     let trailing_stop_threshold = min_profit_usd * 0.5;
     let should_close_trailing = peak_pnl_f64 > min_profit_usd && drawdown_from_peak > trailing_stop_threshold;
 
-    // Rule 11: Drawdown
     let max_loss_threshold = -min_profit_usd * 2.0;
     let should_close_drawdown = net_pnl < max_loss_threshold;
 
-    // Rule 12: Recovery (from loss to profit)
     let was_in_loss = state.pnl_history.len() >= 2 && {
         let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);
         prev_pnl < 0.0
     };
     let should_close_recovery = was_in_loss && net_pnl > 0.0;
 
-    // Combined threshold (time-weighted + factors)
-    let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
-    let should_close_by_threshold = net_pnl >= combined_threshold;
-
-    // Return result (priority order)
-    if should_close_by_threshold {
-        (true, format!("smart_threshold_{:.2}_usd", net_pnl))
-    } else if should_close_trailing {
-        (true, format!("trailing_stop_{:.2}_usd", net_pnl))
-    } else if should_close_drawdown {
-        (true, format!("drawdown_{:.2}_usd", net_pnl))
-    } else if should_close_recovery {
-        (true, format!("recovery_{:.2}_usd", net_pnl))
-    } else {
-        (false, "".to_string())
-    }
+    (should_close_trailing, should_close_drawdown, should_close_recovery)
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Calculate net PnL in USD (with fees)
-fn calc_net_pnl_usd(
-    entry_price: Decimal,
-    exit_price: Decimal,
-    qty: Decimal,
-    side: &Side,
-    entry_fee_bps: f64,
-    exit_fee_bps: f64,
-) -> f64 {
-    let entry_f = entry_price.to_f64().unwrap_or(0.0);
-    let exit_f = exit_price.to_f64().unwrap_or(0.0);
-    let qty_f = qty.to_f64().unwrap_or(0.0);
-
-    if entry_f <= 0.0 || exit_f <= 0.0 || qty_f <= 0.0 {
-        return 0.0;
-    }
-
-    let notional = entry_f * qty_f;
-    let entry_fee = notional * (entry_fee_bps / 10000.0);
-    let exit_fee = notional * (exit_fee_bps / 10000.0);
-    let total_fees = entry_fee + exit_fee;
-
-    let price_diff = match side {
-        Side::Buy => exit_f - entry_f,  // Long: profit when exit > entry
-        Side::Sell => entry_f - exit_f, // Short: profit when exit < entry
-    };
-
-    let gross_pnl = price_diff * qty_f;
-    gross_pnl - total_fees
-}
-
-/// Estimate close fee in BPS
-/// Returns exit fee in BPS (maker or taker based on is_maker)
-fn estimate_close_fee_bps(is_maker: bool, maker_fee_bps: f64, taker_fee_bps: f64) -> f64 {
-    if is_maker {
-        maker_fee_bps
-    } else {
-        taker_fee_bps
-    }
-}
 

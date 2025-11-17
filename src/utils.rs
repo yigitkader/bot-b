@@ -106,3 +106,85 @@ pub fn f64_to_decimal_percent(value: f64, fallback: Decimal) -> Decimal {
         .unwrap_or_else(|_| fallback)
 }
 
+/// Convert f64 to Decimal with safe fallback
+pub fn f64_to_decimal(value: f64, fallback: Decimal) -> Decimal {
+    Decimal::from_str(&value.to_string())
+        .unwrap_or_else(|_| fallback)
+}
+
+/// Convert f64 to Decimal percentage (divides by 100)
+pub fn f64_to_decimal_pct(value: f64) -> Decimal {
+    Decimal::from_str(&value.to_string())
+        .unwrap_or(Decimal::ZERO) / Decimal::from(100)
+}
+
+/// Get commission rate based on order type
+pub fn get_commission_rate(is_maker: bool, maker_rate: f64, taker_rate: f64) -> Decimal {
+    let rate = if is_maker { maker_rate } else { taker_rate };
+    f64_to_decimal_pct(rate)
+}
+
+/// Calculate commission amount from notional
+pub fn calculate_commission(notional: Decimal, is_maker: bool, maker_rate: f64, taker_rate: f64) -> Decimal {
+    let commission_rate = get_commission_rate(is_maker, maker_rate, taker_rate);
+    notional * commission_rate
+}
+
+/// Calculate total commission for entry and exit
+pub fn calculate_total_commission(
+    entry_notional: Decimal,
+    exit_notional: Decimal,
+    entry_is_maker: Option<bool>,
+    maker_rate: f64,
+    taker_rate: f64,
+) -> Decimal {
+    let entry_commission = if let Some(is_maker) = entry_is_maker {
+        calculate_commission(entry_notional, is_maker, maker_rate, taker_rate)
+    } else {
+        calculate_commission(entry_notional, false, maker_rate, taker_rate)
+    };
+    let exit_commission = calculate_commission(exit_notional, false, maker_rate, taker_rate);
+    entry_commission + exit_commission
+}
+
+/// Calculate PnL percentage for a position
+pub fn calculate_pnl_percentage(
+    entry_price: Decimal,
+    current_price: Decimal,
+    direction: crate::types::PositionDirection,
+    leverage: u32,
+) -> f64 {
+    let leverage_decimal = Decimal::from(leverage);
+    let price_change = if direction == crate::types::PositionDirection::Long {
+        (current_price - entry_price) / entry_price
+    } else {
+        (entry_price - current_price) / entry_price
+    };
+    let pnl_pct = price_change * leverage_decimal * Decimal::from(100);
+    pnl_pct.to_f64().unwrap_or(0.0)
+}
+
+/// Calculate net PnL with commission
+pub fn calculate_net_pnl(
+    entry_price: Decimal,
+    exit_price: Decimal,
+    qty: Decimal,
+    direction: crate::types::PositionDirection,
+    leverage: u32,
+    entry_commission_pct: Decimal,
+    exit_commission_pct: Decimal,
+) -> Decimal {
+    let notional = entry_price * qty;
+    let leverage_decimal = Decimal::from(leverage);
+    
+    let price_change = if direction == crate::types::PositionDirection::Long {
+        (exit_price - entry_price) / entry_price
+    } else {
+        (entry_price - exit_price) / entry_price
+    };
+    
+    let gross_pnl = notional * leverage_decimal * price_change;
+    let total_commission = (notional * entry_commission_pct) + (exit_price * qty * exit_commission_pct);
+    gross_pnl - total_commission
+}
+

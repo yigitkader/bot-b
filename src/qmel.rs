@@ -2,12 +2,11 @@
 // Market microstructure + statistical edge + dynamic risk/margin + execution science
 // Based on reference project with adaptations for our event-driven architecture
 
-use crate::types::{Px, Qty, OrderBook, BookLevel};
+use crate::types::OrderBook;
 use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::warn;
 
 // ============================================================================
 // Feature Extraction (State Vector)

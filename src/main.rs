@@ -13,7 +13,10 @@ mod balance;
 mod logging;
 mod metrics;
 mod ai_analyzer;
+mod risk;
+mod position_manager;
 mod utils;
+mod event_loop;
 
 use crate::ai_analyzer::AiAnalyzer;
 use crate::balance::Balance;

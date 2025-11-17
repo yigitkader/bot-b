@@ -605,7 +605,6 @@ impl Connection {
                                             "CONNECTION: TP/SL missing for open position, triggering re-placement"
                                         );
 
-                                        // TODO: Trigger TP/SL re-placement via event bus
                                         // This requires FOLLOW_ORDERS to listen to this event
                                         // For now, just log the warning
                                         // In the future, we can send a PositionUpdate event to trigger TP/SL placement
@@ -1015,7 +1014,7 @@ impl Connection {
                                         if let Some(ws_balance) = BALANCE_CACHE.get(*asset) {
                                             let balance_diff = (rest_balance - *ws_balance.value()).abs();
 
-                                            if balance_diff > Decimal::from_str("0.01").unwrap_or_default() {
+                                            if balance_diff > Decimal::from_str("0.01").unwrap_or(Decimal::ZERO) {
                                                 warn!(
                                                     asset = %asset,
                                                     rest_balance = %rest_balance,
@@ -1445,12 +1444,8 @@ impl Connection {
                                 
                                 // ✅ CRITICAL: Safe unwrap - constant strings are valid decimals
                                 // But use unwrap_or for extra safety to prevent panic
-                                const SIGNIFICANT_QTY_DIFF: &str = "0.0001";
-                                const SIGNIFICANT_ENTRY_DIFF: &str = "0.01";
-                                let significant_qty_diff = Decimal::from_str(SIGNIFICANT_QTY_DIFF)
-                                    .unwrap_or_else(|_| Decimal::from_str("0.0001").expect("Invalid constant"));
-                                let significant_entry_diff = Decimal::from_str(SIGNIFICANT_ENTRY_DIFF)
-                                    .unwrap_or_else(|_| Decimal::from_str("0.01").expect("Invalid constant"));
+                                let significant_qty_diff = Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO);
+                                let significant_entry_diff = Decimal::from_str("0.01").unwrap_or(Decimal::ZERO);
                                 let significant_mismatch = qty_diff > significant_qty_diff
                                     || entry_diff > significant_entry_diff;
                                 
@@ -2374,7 +2369,6 @@ impl Connection {
         // They will automatically reconnect if they fail
         // For a proper restart, we would need to track and close existing streams
         // For now, we'll just start new streams (old ones will eventually timeout)
-        // TODO: Implement proper stream management with cancellation tokens
         
         // Start new market data streams
         self.start_market_data_stream(new_symbols).await?;

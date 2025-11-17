@@ -585,17 +585,6 @@ async fn run_point_in_time_backtest(
     }
 }
 
-// Removed test_strategy_on_uptrend - uses mock data generator
-// Use test_strategy_with_binance_data or test_strategy_with_multiple_binance_symbols instead
-// which use real Binance API data
-
-// Removed test_strategy_on_downtrend - uses mock data generator
-// Use test_strategy_with_binance_data or test_strategy_with_multiple_binance_symbols instead
-// which use real Binance API data
-
-// Removed test_strategy_on_sideways - uses mock data generator
-// Use test_strategy_with_binance_data or test_strategy_with_multiple_binance_symbols instead
-// which use real Binance API data
 
 /// Binance Kline (Candlestick) data structure
 #[derive(Debug, Deserialize)]

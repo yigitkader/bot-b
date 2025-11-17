@@ -6,9 +6,8 @@ use crate::config::AppCfg;
 use crate::types::{Px, Qty, Position};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 // ============================================================================
 // Core Risk Types and Limits

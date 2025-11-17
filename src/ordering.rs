@@ -7,12 +7,12 @@ use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, EventBus, OrderUpdate, PositionUpdate, TradeSignal};
 use crate::state::{OpenOrder, OpenPosition, OrderingState, SharedState};
-use crate::types::{PositionDirection, Qty, Tif, Px};
-use crate::risk::{self, PositionRiskLevel, PositionRiskState, determine_risk_actions, RiskActions};
+use crate::types::{PositionDirection, Qty, Tif};
+use crate::risk::{self, PositionRiskState};
+use crate::utils;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,6 +59,14 @@ struct BalanceReservation {
     pending_cleanup: Option<Arc<std::sync::Mutex<Vec<BalanceCleanupMessage>>>>,
 }
 
+struct MarginCalculationResult {
+    margin_usd: Decimal,
+    commission_buffer: Decimal,
+    safety_margin: Decimal,
+    total_buffer: Decimal,
+    usable_balance: Decimal,
+}
+
 impl BalanceReservation {
     /// Create a new balance reservation with an already-acquired lock
     /// This allows atomic reservation inside another lock (e.g., ordering_state)
@@ -74,7 +82,7 @@ impl BalanceReservation {
         cleanup_tx: Option<mpsc::UnboundedSender<BalanceCleanupMessage>>,
         pending_cleanup: Option<Arc<std::sync::Mutex<Vec<BalanceCleanupMessage>>>>,
     ) -> Option<Self> {
-        // ✅ CRITICAL: try_reserve() is atomic - it checks available balance and reserves in one operation
+        // try_reserve() is atomic - it checks available balance and reserves in one operation
         // Do not call available() separately - it would create a race condition
         if store.try_reserve(asset, amount) {
             // Clone Arc before moving it into Self (store borrows balance_store)
@@ -132,7 +140,7 @@ impl BalanceReservation {
 
 impl Drop for BalanceReservation {
     fn drop(&mut self) {
-        // CRITICAL: Drop cannot be async, so we cannot release balance here directly
+        // Drop cannot be async, so we cannot release balance here directly
         // Solution: Send cleanup message to background task for async release
         // Fallback: If channel is closed, add to pending_cleanup list (thread-safe)
         // This ensures balance is released even on panic, shutdown, or early return
@@ -454,10 +462,10 @@ impl Ordering {
     /// // Service is now running and will place orders when TradeSignal events are received
     /// ```
     pub async fn start(&self) -> Result<()> {
-        // CRITICAL: State restore is now handled by STORAGE module via event bus
+        // State restore is now handled by STORAGE module via event bus
         // StorageModule will restore OrderingState on startup and update SharedState
         
-        // ✅ CRITICAL: Position reconciliation on startup
+        // Position reconciliation on startup
         // Problem: Crash sonrası orphan position'lar kalabilir
         // Solution: Fetch all positions from exchange and restore to state
         Self::reconcile_positions_on_startup(
@@ -484,37 +492,38 @@ impl Ordering {
         let cleanup_tx_trade = self.balance_cleanup_tx.clone();
         let pending_cleanup_trade = self.pending_cleanup.clone();
         tokio::spawn(async move {
-            let mut trade_signal_rx = event_bus_trade.subscribe_trade_signal();
-
-            info!("ORDERING: Started, listening to TradeSignal events");
-
-            loop {
-                match trade_signal_rx.recv().await {
-                    Ok(signal) => {
-                        if shutdown_flag_trade.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-
-                        if let Err(e) = Self::handle_trade_signal(
+            let trade_signal_rx = event_bus_trade.subscribe_trade_signal();
+            let connection_trade_clone = connection_trade.clone();
+            let state_trade_clone = state_trade.clone();
+            let cfg_trade_clone = cfg_trade.clone();
+            let event_bus_trade_clone = event_bus_trade.clone();
+            let cleanup_tx_trade_clone = cleanup_tx_trade.clone();
+            let pending_cleanup_trade_clone = pending_cleanup_trade.clone();
+            crate::event_loop::run_event_loop(
+                trade_signal_rx,
+                shutdown_flag_trade,
+                "ORDERING",
+                "TradeSignal",
+                move |signal| {
+                    let connection_trade = connection_trade_clone.clone();
+                    let state_trade = state_trade_clone.clone();
+                    let cfg_trade = cfg_trade_clone.clone();
+                    let event_bus_trade = event_bus_trade_clone.clone();
+                    let cleanup_tx_trade = cleanup_tx_trade_clone.clone();
+                    let pending_cleanup_trade = pending_cleanup_trade_clone.clone();
+                    async move {
+                        Self::handle_trade_signal(
                             &signal,
                             &connection_trade,
                             &state_trade,
                             &cfg_trade,
                             &event_bus_trade,
-                            Some(cleanup_tx_trade.clone()),
-                            Some(pending_cleanup_trade.clone()),
-                        )
-                        .await
-                        {
-                            warn!(error = %e, symbol = %signal.symbol, "ORDERING: error handling TradeSignal");
-                        }
+                            Some(cleanup_tx_trade),
+                            Some(pending_cleanup_trade),
+                        ).await
                     }
-                    Err(_) => {
-                        // Channel closed or lagged - break
-                        break;
-                    }
-                }
-            }
+                },
+            ).await;
         });
 
         // Spawn task for CloseRequest events
@@ -524,31 +533,29 @@ impl Ordering {
         let shutdown_flag_close = shutdown_flag.clone();
         let cfg_close = cfg.clone();
         tokio::spawn(async move {
-            let mut close_request_rx = event_bus_close.subscribe_close_request();
-
-            info!("ORDERING: Started, listening to CloseRequest events");
-
-            loop {
-                match close_request_rx.recv().await {
-                    Ok(request) => {
-                        if shutdown_flag_close.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-
-                        if let Err(e) = Self::handle_close_request(
+            let close_request_rx = event_bus_close.subscribe_close_request();
+            let connection_close_clone = connection_close.clone();
+            let state_close_clone = state_close.clone();
+            let cfg_close_clone = cfg_close.clone();
+            crate::event_loop::run_event_loop(
+                close_request_rx,
+                shutdown_flag_close,
+                "ORDERING",
+                "CloseRequest",
+                move |request| {
+                    let connection_close = connection_close_clone.clone();
+                    let state_close = state_close_clone.clone();
+                    let cfg_close = cfg_close_clone.clone();
+                    async move {
+                        Self::handle_close_request(
                             &request,
                             &connection_close,
                             &state_close,
                             &cfg_close,
-                        )
-                        .await
-                        {
-                            warn!(error = %e, symbol = %request.symbol, "ORDERING: error handling CloseRequest");
-                        }
+                        ).await
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
 
         // Spawn task for OrderUpdate events (state sync)
@@ -556,22 +563,22 @@ impl Ordering {
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
         tokio::spawn(async move {
-            let mut order_update_rx = event_bus_order.subscribe_order_update();
-
-            info!("ORDERING: Started, listening to OrderUpdate events");
-
-            loop {
-                match order_update_rx.recv().await {
-                    Ok(update) => {
-                        if shutdown_flag_order.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-
+            let order_update_rx = event_bus_order.subscribe_order_update();
+            let state_order_clone = state_order.clone();
+            let event_bus_order_clone = event_bus_order.clone();
+            crate::event_loop::run_event_loop_async(
+                order_update_rx,
+                shutdown_flag_order,
+                "ORDERING",
+                "OrderUpdate",
+                move |update| {
+                    let state_order = state_order_clone.clone();
+                    let event_bus_order = event_bus_order_clone.clone();
+                    async move {
                         Self::handle_order_update(&update, &state_order, &event_bus_order, None).await;
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
 
         // Spawn task for PositionUpdate events (state sync)
@@ -579,25 +586,25 @@ impl Ordering {
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
         tokio::spawn(async move {
-            let mut position_update_rx = event_bus_pos.subscribe_position_update();
-
-            info!("ORDERING: Started, listening to PositionUpdate events");
-
-            loop {
-                match position_update_rx.recv().await {
-                    Ok(update) => {
-                        if shutdown_flag_pos.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-
+            let position_update_rx = event_bus_pos.subscribe_position_update();
+            let state_pos_clone = state_pos.clone();
+            let event_bus_pos_clone = event_bus_pos.clone();
+            crate::event_loop::run_event_loop_async(
+                position_update_rx,
+                shutdown_flag_pos,
+                "ORDERING",
+                "PositionUpdate",
+                move |update| {
+                    let state_pos = state_pos_clone.clone();
+                    let event_bus_pos = event_bus_pos_clone.clone();
+                    async move {
                         Self::handle_position_update(&update, &state_pos, &event_bus_pos).await;
                     }
-                    Err(_) => break,
-                }
-            }
+                },
+            ).await;
         });
 
-        // ✅ NEW: Start periodic position reconciliation task
+        // Start periodic position reconciliation task
         Self::start_position_reconciliation_task(
             connection.clone(),
             shared_state.clone(),
@@ -863,18 +870,274 @@ impl Ordering {
         });
     }
 
-    /// Handle TradeSignal event
-    /// If no open position/order, place order via CONNECTION
-    async fn handle_trade_signal(
+    fn calculate_position_size(
         signal: &TradeSignal,
-        connection: &Arc<Connection>,
-        shared_state: &Arc<SharedState>,
+        notional: Decimal,
+        rules: &crate::types::SymbolRules,
+    ) -> Result<Option<Qty>> {
+        if signal.entry_price.0.is_zero() {
+            warn!(
+                symbol = %signal.symbol,
+                "ORDERING: Entry price is zero - skipping order"
+            );
+            return Ok(None);
+        }
+
+        if !rules.min_notional.is_zero() && notional < rules.min_notional {
+            debug!(
+                symbol = %signal.symbol,
+                notional = %notional,
+                min_notional = %rules.min_notional,
+                "ORDERING: Ignoring TradeSignal - notional below minimum"
+            );
+            return Ok(None);
+        }
+
+        let size_raw = notional
+            .checked_div(signal.entry_price.0)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Position size calculation error: notional={} / entry_price={}",
+                    notional,
+                    signal.entry_price.0
+                )
+            })?;
+
+        if size_raw.is_zero() || size_raw.is_sign_negative() {
+            warn!(
+                symbol = %signal.symbol,
+                "ORDERING: Calculated position size is zero or negative - skipping order"
+            );
+            return Ok(None);
+        }
+
+        let size_quantized = crate::utils::quantize_decimal(size_raw, rules.step_size);
+
+        if size_quantized.is_zero() {
+            debug!(
+                symbol = %signal.symbol,
+                "ORDERING: Quantized size is zero - skipping order"
+            );
+            return Ok(None);
+        }
+
+        let notional_after_quantize = size_quantized
+            .checked_mul(signal.entry_price.0)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Notional calculation after quantization overflow: size={} × entry_price={}",
+                    size_quantized,
+                    signal.entry_price.0
+                )
+            })?;
+
+        if !rules.min_notional.is_zero() && notional_after_quantize < rules.min_notional {
+            debug!(
+                symbol = %signal.symbol,
+                size_raw = %size_raw,
+                size_quantized = %size_quantized,
+                notional_before_quantize = %notional,
+                notional_after_quantize = %notional_after_quantize,
+                min_notional = %rules.min_notional,
+                "ORDERING: Ignoring TradeSignal - notional after quantization below minimum"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(Qty(size_quantized)))
+    }
+
+    async fn calculate_margin_for_trade(
+        signal: &TradeSignal,
+        available_balance: Decimal,
+        min_margin: Decimal,
+        max_margin: Decimal,
+        leverage: u32,
         cfg: &Arc<AppCfg>,
-        event_bus: &Arc<EventBus>,
-        cleanup_tx: Option<Arc<mpsc::UnboundedSender<BalanceCleanupMessage>>>,
-        pending_cleanup: Option<Arc<std::sync::Mutex<Vec<BalanceCleanupMessage>>>>,
+    ) -> Result<Option<MarginCalculationResult>> {
+        let leverage_decimal = Decimal::from(leverage);
+        
+        let estimated_margin = match cfg.margin_strategy.as_str() {
+            "fixed" => {
+                utils::f64_to_decimal(cfg.max_usd_per_order, max_margin)
+                    .max(min_margin)
+                    .min(max_margin)
+                    .min(available_balance)
+            }
+            "balance_based" | "max_balance" => {
+                if available_balance >= min_margin {
+                    available_balance.min(max_margin)
+                } else {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
+                    );
+                    return Ok(None);
+                }
+            }
+            "dynamic" | "trend_based" => {
+                if available_balance < min_margin {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
+                    );
+                    return Ok(None);
+                }
+                
+                let min_spread_bps = cfg.trending.min_spread_bps;
+                let max_spread_bps = cfg.trending.max_spread_bps;
+                let spread_range = max_spread_bps - min_spread_bps;
+                
+                let spread_quality = if spread_range > 0.0 {
+                    let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
+                    normalized.max(0.0).min(1.0)
+                } else {
+                    cfg.trending.default_spread_quality
+                };
+                
+                let base_margin = available_balance.min(max_margin);
+                let dynamic_margin = base_margin * utils::f64_to_decimal(
+                    spread_quality,
+                    utils::f64_to_decimal(cfg.trending.default_spread_quality, Decimal::from(50) / Decimal::from(100))
+                );
+                
+                dynamic_margin.max(min_margin).min(max_margin).min(available_balance)
+            }
+            _ => {
+                if available_balance >= min_margin {
+                    available_balance.min(max_margin)
+                } else {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+        
+        let estimated_notional = estimated_margin * leverage_decimal;
+        let taker_commission_rate = utils::get_commission_rate(false, cfg.risk.maker_commission_pct, cfg.risk.taker_commission_pct);
+        let total_commission_rate = taker_commission_rate * Decimal::from(2);
+        let calculated_commission_buffer = estimated_notional * total_commission_rate;
+        let min_commission_buffer = utils::f64_to_decimal(cfg.risk.min_commission_buffer_usd, Decimal::from(1) / Decimal::from(2));
+        let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
+        
+        let estimated_margin_for_safety = utils::f64_to_decimal(cfg.max_usd_per_order, max_margin)
+            .max(min_margin)
+            .min(max_margin);
+        let safety_margin = (estimated_margin_for_safety * Decimal::from(5) / Decimal::from(100))
+            .max(Decimal::from(1));
+        let total_buffer = commission_buffer + safety_margin;
+        let usable_balance = available_balance.saturating_sub(total_buffer);
+        
+        let margin_usd = match cfg.margin_strategy.as_str() {
+            "fixed" => {
+                utils::f64_to_decimal(cfg.max_usd_per_order, max_margin)
+                    .max(min_margin)
+                    .min(max_margin)
+                    .min(usable_balance)
+            }
+            "balance_based" | "max_balance" => {
+                if usable_balance >= min_margin {
+                    usable_balance.min(max_margin)
+                } else {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        usable_balance = %usable_balance,
+                        commission_buffer = %commission_buffer,
+                        safety_margin = %safety_margin,
+                        total_buffer = %total_buffer,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
+                    );
+                    return Ok(None);
+                }
+            }
+            "dynamic" | "trend_based" => {
+                if usable_balance < min_margin {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        usable_balance = %usable_balance,
+                        commission_buffer = %commission_buffer,
+                        safety_margin = %safety_margin,
+                        total_buffer = %total_buffer,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
+                    );
+                    return Ok(None);
+                }
+                
+                let min_spread_bps = cfg.trending.min_spread_bps;
+                let max_spread_bps = cfg.trending.max_spread_bps;
+                let spread_range = max_spread_bps - min_spread_bps;
+                
+                let spread_quality = if spread_range > 0.0 {
+                    let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
+                    normalized.max(0.0).min(1.0)
+                } else {
+                    cfg.trending.default_spread_quality
+                };
+                
+                let base_margin = usable_balance.min(max_margin);
+                let dynamic_margin = base_margin * utils::f64_to_decimal(
+                    spread_quality,
+                    utils::f64_to_decimal(cfg.trending.default_spread_quality, Decimal::from(50) / Decimal::from(100))
+                );
+                
+                let final_margin = dynamic_margin.max(min_margin).min(max_margin).min(usable_balance);
+                
+                debug!(
+                    symbol = %signal.symbol,
+                    spread_bps = signal.spread_bps,
+                    spread_quality = spread_quality,
+                    base_margin = %base_margin,
+                    dynamic_margin = %final_margin,
+                    "ORDERING: Dynamic margin calculated based on spread quality"
+                );
+                
+                final_margin
+            }
+            _ => {
+                if usable_balance >= min_margin {
+                    usable_balance.min(max_margin)
+                } else {
+                    debug!(
+                        symbol = %signal.symbol,
+                        available_balance = %available_balance,
+                        usable_balance = %usable_balance,
+                        commission_buffer = %commission_buffer,
+                        safety_margin = %safety_margin,
+                        total_buffer = %total_buffer,
+                        min_margin = %min_margin,
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+        
+        Ok(Some(MarginCalculationResult {
+            margin_usd,
+            commission_buffer,
+            safety_margin,
+            total_buffer,
+            usable_balance,
+        }))
+    }
+
+    async fn validate_trade_signal(
+        signal: &TradeSignal,
+        shared_state: &Arc<SharedState>,
     ) -> Result<()> {
-        // 1. Signal validity check - timestamp age
         let now = Instant::now();
         if let Some(signal_age) = now.checked_duration_since(signal.timestamp) {
             if signal_age > Duration::from_secs(5) {
@@ -886,7 +1149,6 @@ impl Ordering {
                 return Ok(());
             }
         } else {
-            // Signal timestamp is in the future (invalid signal)
             warn!(
                 symbol = %signal.symbol,
                 "ORDERING: Ignoring TradeSignal - timestamp in the future"
@@ -894,13 +1156,11 @@ impl Ordering {
             return Ok(());
         }
 
-        // 2. Signal validity check - symbol and side
         if signal.symbol.is_empty() {
             warn!("ORDERING: Ignoring TradeSignal - empty symbol");
             return Ok(());
         }
 
-        // 2.5. Circuit breaker check - prevent order placement if too many rejections
         {
             let mut state_guard = shared_state.ordering_state.lock().await;
             state_guard.circuit_breaker.reset_if_cooldown_passed();
@@ -915,93 +1175,108 @@ impl Ordering {
             }
         }
 
-        // 3. Calculate margin, leverage, notional, and position size
-        // ORDERING's responsibility: Calculate all position parameters from balance and config
-        // TRENDING only provides: symbol, side, entry_price, TP/SL, spread info
-        
-        // ✅ FIX: Determine quote asset from symbol and select balance intelligently
-        // Problem: Code was only using cfg.quote_asset, ignoring which balance is actually available
-        // Solution: Extract quote asset from symbol, check both USDT and USDC balances,
-        //           use the one with sufficient balance (prefer symbol's quote asset, fallback to other)
-        
-        // Extract quote asset from symbol (e.g., BTCUSDC -> USDC, ETHUSDT -> USDT)
+        Ok(())
+    }
+
+    async fn select_balance_for_trade(
+        signal: &TradeSignal,
+        cfg: &Arc<AppCfg>,
+        shared_state: &Arc<SharedState>,
+    ) -> Result<(Decimal, String)> {
         let symbol_upper = signal.symbol.to_uppercase();
         let symbol_quote_asset = if symbol_upper.ends_with("USDC") {
             "USDC"
         } else if symbol_upper.ends_with("USDT") {
             "USDT"
         } else {
-            // Fallback to config if symbol format is unknown
             &cfg.quote_asset
         };
         
-        let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
-        let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
+        let min_margin = utils::f64_to_decimal(cfg.min_margin_usd, Decimal::from(10));
         
-        // Get both balances and select the best one
-        let (available_balance, selected_quote_asset) = {
-            let balance_store = shared_state.balance_store.read().await;
-            let usdt_balance = balance_store.usdt;
-            let usdc_balance = balance_store.usdc;
-            
-            // Priority: 1) Symbol's quote asset if sufficient, 2) Other quote asset if sufficient, 3) None
-            let (balance, quote) = match symbol_quote_asset {
-                "USDT" => {
-                    if usdt_balance >= min_margin {
-                        (usdt_balance, "USDT")
-                    } else if usdc_balance >= min_margin {
-                        (usdc_balance, "USDC")
-                    } else {
-                        (usdt_balance, "USDT") // Use symbol's quote asset even if insufficient (will fail later with better error)
-                    }
+        let balance_store = shared_state.balance_store.read().await;
+        let usdt_balance = balance_store.usdt;
+        let usdc_balance = balance_store.usdc;
+        
+        let (balance, quote) = match symbol_quote_asset {
+            "USDT" => {
+                if usdt_balance >= min_margin {
+                    (usdt_balance, "USDT")
+                } else if usdc_balance >= min_margin {
+                    (usdc_balance, "USDC")
+                } else {
+                    (usdt_balance, "USDT")
                 }
-                "USDC" => {
-                    if usdc_balance >= min_margin {
-                        (usdc_balance, "USDC")
-                    } else if usdt_balance >= min_margin {
-                        (usdt_balance, "USDT")
-                    } else {
-                        (usdc_balance, "USDC") // Use symbol's quote asset even if insufficient (will fail later with better error)
-                    }
+            }
+            "USDC" => {
+                if usdc_balance >= min_margin {
+                    (usdc_balance, "USDC")
+                } else if usdt_balance >= min_margin {
+                    (usdt_balance, "USDT")
+                } else {
+                    (usdc_balance, "USDC")
                 }
-                _ => {
-                    // Unknown quote asset - try both
-                    if usdt_balance >= min_margin {
-                        (usdt_balance, "USDT")
-                    } else if usdc_balance >= min_margin {
-                        (usdc_balance, "USDC")
+            }
+            _ => {
+                if usdt_balance >= min_margin {
+                    (usdt_balance, "USDT")
+                } else if usdc_balance >= min_margin {
+                    (usdc_balance, "USDC")
+                } else {
+                    let balance = if cfg.quote_asset.to_uppercase() == "USDT" {
+                        usdt_balance
                     } else {
-                        // Fallback to config's quote asset
-                        let balance = if cfg.quote_asset.to_uppercase() == "USDT" {
-                            usdt_balance
-                        } else {
-                            usdc_balance
-                        };
-                        (balance, cfg.quote_asset.as_str())
-                    }
+                        usdc_balance
+                    };
+                    (balance, cfg.quote_asset.as_str())
                 }
-            };
-            
-            // ✅ DEBUG: Log balance check for troubleshooting
-            debug!(
+            }
+        };
+        
+        debug!(
+            symbol = %signal.symbol,
+            symbol_quote_asset = symbol_quote_asset,
+            selected_quote_asset = quote,
+            available_balance = %balance,
+            usdt_balance = %usdt_balance,
+            usdc_balance = %usdc_balance,
+            min_margin = %min_margin,
+            last_updated = ?balance_store.last_updated,
+            "ORDERING: Balance check for trade signal (selected quote asset: {})",
+            quote
+        );
+        
+        if symbol_quote_asset != quote {
+            warn!(
                 symbol = %signal.symbol,
                 symbol_quote_asset = symbol_quote_asset,
                 selected_quote_asset = quote,
-                available_balance = %balance,
-                usdt_balance = %usdt_balance,
-                usdc_balance = %usdc_balance,
-                min_margin = %min_margin,
-                last_updated = ?balance_store.last_updated,
-                "ORDERING: Balance check for trade signal (selected quote asset: {})",
+                "ORDERING: Quote asset mismatch - symbol requires {} but selected {} balance. This may indicate symbol discovery issue.",
+                symbol_quote_asset,
                 quote
             );
-            
-            (balance, quote.to_string())
-        };
+        }
         
-        // ✅ FIX: Check if available balance is sufficient for minimum margin
-        // Problem: "Margin is insufficient" errors when balance is too low
-        // Solution: Early check before calculating position size
+        Ok((balance, quote.to_string()))
+    }
+
+    /// Handle TradeSignal event
+    /// If no open position/order, place order via CONNECTION
+    async fn handle_trade_signal(
+        signal: &TradeSignal,
+        connection: &Arc<Connection>,
+        shared_state: &Arc<SharedState>,
+        cfg: &Arc<AppCfg>,
+        event_bus: &Arc<EventBus>,
+        cleanup_tx: Option<Arc<mpsc::UnboundedSender<BalanceCleanupMessage>>>,
+        pending_cleanup: Option<Arc<std::sync::Mutex<Vec<BalanceCleanupMessage>>>>,
+    ) -> Result<()> {
+        Self::validate_trade_signal(signal, shared_state).await?;
+        
+        let now = Instant::now();
+        let (available_balance, selected_quote_asset) = Self::select_balance_for_trade(signal, cfg, shared_state).await?;
+        
+        let min_margin = utils::f64_to_decimal(cfg.min_margin_usd, Decimal::from(10));
         if available_balance < min_margin {
             debug!(
                 symbol = %signal.symbol,
@@ -1013,23 +1288,8 @@ impl Ordering {
             return Ok(());
         }
         
-        // ✅ CRITICAL: Validate that selected quote asset matches symbol's quote asset
-        // If symbol is BTCUSDC but we selected USDT balance, this is a mismatch
-        // This can happen if symbol discovery found both BTCUSDC and BTCUSDT, but we should use the correct one
-        if symbol_quote_asset != selected_quote_asset.as_str() {
-            warn!(
-                symbol = %signal.symbol,
-                symbol_quote_asset = symbol_quote_asset,
-                selected_quote_asset = %selected_quote_asset,
-                "ORDERING: Quote asset mismatch - symbol requires {} but selected {} balance. This may indicate symbol discovery issue.",
-                symbol_quote_asset,
-                selected_quote_asset
-            );
-            // Continue anyway - the balance reservation will use selected_quote_asset
-            // This allows trading if symbol discovery found both quote asset versions
-        }
+        let max_margin = utils::f64_to_decimal(cfg.max_margin_usd, Decimal::from(100));
         
-        // Fetch symbol rules to get max leverage (needed for commission buffer calculation)
         let rules = match connection.rules_for(&signal.symbol).await {
             Ok(r) => r,
             Err(e) => {
@@ -1043,7 +1303,7 @@ impl Ordering {
         };
         
         // Use coin's max leverage (if available), otherwise use config leverage
-        // ✅ CRITICAL: Use coin's max leverage as requested
+        // Use coin's max leverage as requested
         let leverage = if let Some(symbol_max_lev) = rules.max_leverage {
             // Coin has max leverage - use it
             symbol_max_lev
@@ -1059,233 +1319,25 @@ impl Ordering {
             "ORDERING: Using coin's max leverage"
         );
         
-        // ✅ CRITICAL: Commission buffer calculation based on notional
-        // Problem: Commission is calculated from notional (margin × leverage), not from margin itself
-        // Solution: Two-stage calculation - estimate margin first, then calculate accurate commission buffer
-        //
-        // Stage 1: Estimate margin without commission buffer (for initial commission calculation)
-        let estimated_margin = match cfg.margin_strategy.as_str() {
-            "fixed" => {
-                Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(max_margin)
-                    .max(min_margin)
-                    .min(max_margin)
-                    .min(available_balance) // Use available balance (no commission buffer yet)
-            }
-            "balance_based" | "max_balance" => {
-                if available_balance >= min_margin {
-                    available_balance.min(max_margin)
-                } else {
-                    // Available balance too low
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
-                    );
-                    return Ok(());
-                }
-            }
-            "dynamic" | "trend_based" => {
-                // Dynamic/Trend-based: Estimate margin based on spread quality
-                // Use same logic as final margin calculation but without commission buffer
-                if available_balance < min_margin {
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
-                    );
-                    return Ok(());
-                }
-                
-                // Calculate spread quality (same as final calculation)
-                let min_spread_bps = cfg.trending.min_spread_bps;
-                let max_spread_bps = cfg.trending.max_spread_bps;
-                let spread_range = max_spread_bps - min_spread_bps;
-                
-                let spread_quality = if spread_range > 0.0 {
-                    let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
-                    normalized.max(0.0).min(1.0)
-                } else {
-                    cfg.trending.default_spread_quality // From config
-                };
-                
-                let base_margin = available_balance.min(max_margin);
-                let dynamic_margin = base_margin * Decimal::from_str(&spread_quality.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str(&format!("{}", cfg.trending.default_spread_quality))
-                        .unwrap_or(Decimal::from(50) / Decimal::from(100)));
-                
-                dynamic_margin.max(min_margin).min(max_margin).min(available_balance)
-            }
-            _ => {
-                // Default: Use balance-based strategy (fallback)
-                if available_balance >= min_margin {
-                    available_balance.min(max_margin)
-                } else {
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - available balance below minimum margin"
-                    );
-                    return Ok(());
-                }
-            }
+        let margin_result = match Self::calculate_margin_for_trade(
+            signal,
+            available_balance,
+            min_margin,
+            max_margin,
+            leverage,
+            cfg,
+        ).await? {
+            Some(result) => result,
+            None => return Ok(()),
         };
         
-        // Calculate estimated notional for commission buffer calculation
+        let margin_usd = margin_result.margin_usd;
+        let commission_buffer = margin_result.commission_buffer;
+        let safety_margin = margin_result.safety_margin;
+        let total_buffer = margin_result.total_buffer;
+        let usable_balance = margin_result.usable_balance;
+        
         let leverage_decimal = Decimal::from(leverage);
-        let estimated_notional = estimated_margin * leverage_decimal;
-        
-        // Calculate commission buffer based on notional (entry + exit commission)
-        // Commission rate: taker commission (worst case) for both entry and exit
-        let taker_commission_rate = Decimal::from_str(&cfg.risk.taker_commission_pct.to_string())
-            .unwrap_or_else(|_| Decimal::from_str("0.04").unwrap_or(Decimal::ZERO)) / Decimal::from(100);
-        
-        // Total commission = entry (0.04%) + exit (0.04%) = 0.08% of notional
-        let total_commission_rate = taker_commission_rate * Decimal::from(2);
-        let calculated_commission_buffer = estimated_notional * total_commission_rate;
-        
-        // Minimum commission buffer from config (safety margin for small positions)
-        // Real commission is calculated from notional, so config value is sufficient for most cases
-        let min_commission_buffer = Decimal::from_str(&format!("{}", cfg.risk.min_commission_buffer_usd))
-            .unwrap_or_else(|_| Decimal::from_str("0.5").unwrap_or(Decimal::from(1)));
-        
-        // Use max of calculated commission and min buffer
-        let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
-        
-        // ✅ FIX: Add extra safety margin (5% of margin or 1 USD, whichever is higher)
-        // This prevents "Margin is insufficient" errors due to:
-        // - Price movements between calculation and order placement
-        // - Rounding errors in margin/notional calculations
-        // - Binance's internal margin requirements
-        let estimated_margin_for_safety = Decimal::from_str(&cfg.max_usd_per_order.to_string())
-            .unwrap_or(max_margin)
-            .max(min_margin)
-            .min(max_margin);
-        let safety_margin = (estimated_margin_for_safety * Decimal::from_str("0.05").unwrap())
-            .max(Decimal::from(1)); // At least 1 USD safety margin
-        let total_buffer = commission_buffer + safety_margin;
-        
-        // Stage 2: Calculate usable balance (available balance minus commission buffer and safety margin)
-        // This ensures we always have enough balance to close the position and handle price movements
-        let usable_balance = available_balance.saturating_sub(total_buffer);
-        
-        // Calculate final margin: Use usable balance (10 <= margin <= 100 USD)
-        // ✅ CRITICAL: Commission buffer is already subtracted from usable_balance
-        let margin_usd = match cfg.margin_strategy.as_str() {
-            "fixed" => {
-                // Fixed: use max_usd_per_order (clamped to [min_margin_usd, max_margin_usd])
-                // Also respect usable_balance (after commission buffer)
-                Decimal::from_str(&cfg.max_usd_per_order.to_string()).unwrap_or(max_margin)
-                    .max(min_margin)
-                    .min(max_margin)
-                    .min(usable_balance) // Never exceed usable balance (after commission buffer)
-            }
-            "balance_based" | "max_balance" => {
-                // Balance-based: Use usable balance (up to max_margin_usd)
-                // ✅ CRITICAL: Commission buffer is already subtracted, so we can use all usable_balance
-                if usable_balance >= min_margin {
-                    usable_balance.min(max_margin)
-                } else {
-                    // Usable balance too low (after commission buffer and safety margin)
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        usable_balance = %usable_balance,
-                        commission_buffer = %commission_buffer,
-                        safety_margin = %safety_margin,
-                        total_buffer = %total_buffer,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
-                    );
-                    return Ok(());
-                }
-            }
-            "dynamic" | "trend_based" => {
-                // Dynamic/Trend-based: Adjust margin based on signal quality (spread-based)
-                // Lower spread = higher liquidity = safer = higher margin
-                // Higher spread = lower liquidity = riskier = lower margin
-                //
-                // Spread quality calculation:
-                // - Normalize spread to 0.0-1.0 range (min_spread = 1.0, max_spread = 0.0)
-                // - Use this as margin multiplier
-                // - Minimum margin: min_margin, Maximum margin: max_margin
-                if usable_balance < min_margin {
-                    // Usable balance too low (after commission buffer and safety margin)
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        usable_balance = %usable_balance,
-                        commission_buffer = %commission_buffer,
-                        safety_margin = %safety_margin,
-                        total_buffer = %total_buffer,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
-                    );
-                    return Ok(());
-                }
-                
-                // Calculate spread quality (0.0 = worst, 1.0 = best)
-                // Lower spread = better quality = higher margin
-                let min_spread_bps = cfg.trending.min_spread_bps;
-                let max_spread_bps = cfg.trending.max_spread_bps;
-                let spread_range = max_spread_bps - min_spread_bps;
-                
-                let spread_quality = if spread_range > 0.0 {
-                    // Normalize: spread closer to min = higher quality (closer to 1.0)
-                    // spread closer to max = lower quality (closer to 0.0)
-                    let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
-                    // Clamp to [0.0, 1.0]
-                    normalized.max(0.0).min(1.0)
-                } else {
-                    // No spread range - use default quality from config
-                    cfg.trending.default_spread_quality
-                };
-                
-                // Calculate dynamic margin: base margin * spread quality
-                // Base margin is usable_balance (up to max_margin)
-                let base_margin = usable_balance.min(max_margin);
-                let dynamic_margin = base_margin * Decimal::from_str(&spread_quality.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str(&format!("{}", cfg.trending.default_spread_quality))
-                        .unwrap_or(Decimal::from(50) / Decimal::from(100)));
-                
-                // Ensure margin is within bounds [min_margin, max_margin]
-                let final_margin = dynamic_margin.max(min_margin).min(max_margin).min(usable_balance);
-                
-                debug!(
-                    symbol = %signal.symbol,
-                    spread_bps = signal.spread_bps,
-                    spread_quality = spread_quality,
-                    base_margin = %base_margin,
-                    dynamic_margin = %final_margin,
-                    "ORDERING: Dynamic margin calculated based on spread quality"
-                );
-                
-                final_margin
-            }
-            _ => {
-                // Default: Use balance-based strategy (fallback)
-                if usable_balance >= min_margin {
-                    usable_balance.min(max_margin)
-                } else {
-                    // Usable balance too low (after commission buffer and safety margin)
-                    debug!(
-                        symbol = %signal.symbol,
-                        available_balance = %available_balance,
-                        usable_balance = %usable_balance,
-                        commission_buffer = %commission_buffer,
-                        safety_margin = %safety_margin,
-                        total_buffer = %total_buffer,
-                        min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
-                    );
-                    return Ok(());
-                }
-            }
-        };
-        
-        // Calculate final notional: margin × leverage
         let notional = margin_usd
             .checked_mul(leverage_decimal)
             .ok_or_else(|| {
@@ -1296,95 +1348,12 @@ impl Ordering {
                 )
             })?;
         
-        // ✅ FIX: Removed max position notional limit
-        // User requirement: No limit on notional, regardless of leverage
-        // Only margin is limited to max_margin_usd (100 USD)
-        // This allows using high leverage (e.g., 10x leverage with 100 USD margin = 1000 USD notional)
-        // Previous check removed:
-        // if notional > max_position_notional { ... }
+        let size = match Self::calculate_position_size(signal, notional, &rules)? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
         
-        // Check min_notional requirement
-        if !rules.min_notional.is_zero() && notional < rules.min_notional {
-        debug!(
-            symbol = %signal.symbol,
-            notional = %notional,
-                min_notional = %rules.min_notional,
-                "ORDERING: Ignoring TradeSignal - notional below minimum"
-            );
-            return Ok(());
-        }
-        
-        // Calculate position size: notional / entry_price
-        if signal.entry_price.0.is_zero() {
-            warn!(
-                symbol = %signal.symbol,
-                "ORDERING: Entry price is zero - skipping order"
-            );
-            return Ok(());
-        }
-        
-        let size_raw = notional
-            .checked_div(signal.entry_price.0)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Position size calculation error: notional={} / entry_price={}",
-                    notional,
-                    signal.entry_price.0
-                )
-            })?;
-        
-        if size_raw.is_zero() || size_raw.is_sign_negative() {
-            warn!(
-                symbol = %signal.symbol,
-                "ORDERING: Calculated position size is zero or negative - skipping order"
-            );
-            return Ok(());
-        }
-        
-        // Quantize size to step_size
-        let size_quantized = crate::utils::quantize_decimal(size_raw, rules.step_size);
-        
-        if size_quantized.is_zero() {
-            debug!(
-                symbol = %signal.symbol,
-                "ORDERING: Quantized size is zero - skipping order"
-            );
-            return Ok(());
-        }
-        
-        // ✅ CRITICAL: Re-check min_notional after quantization
-        // Problem: Quantization can reduce size, which may make notional < min_notional
-        // Example: size_raw = 0.00015 BTC, step_size = 0.001 BTC
-        //          → size_quantized = 0.0 BTC (floor to step)
-        //          → Notional becomes 0 (below min_notional)
-        // Solution: Recalculate notional after quantization and check min_notional
-        let notional_after_quantize = size_quantized
-            .checked_mul(signal.entry_price.0)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Notional calculation after quantization overflow: size={} × entry_price={}",
-                    size_quantized,
-                    signal.entry_price.0
-                )
-            })?;
-        
-        if !rules.min_notional.is_zero() && notional_after_quantize < rules.min_notional {
-            debug!(
-                symbol = %signal.symbol,
-                size_raw = %size_raw,
-                size_quantized = %size_quantized,
-                notional_before_quantize = %notional,
-                notional_after_quantize = %notional_after_quantize,
-                min_notional = %rules.min_notional,
-                "ORDERING: Ignoring TradeSignal - notional after quantization below minimum"
-            );
-            return Ok(());
-        }
-        
-        let size = Qty(size_quantized);
         let required_margin = margin_usd;
-        
-        // Store calculated size for later use (needed for state update)
         let calculated_size = size.clone();
         
         debug!(
@@ -1411,7 +1380,7 @@ impl Ordering {
         };
 
         // Prepare order command (before lock to minimize lock time)
-        // ✅ CRITICAL: Use calculated size, NOT signal.size (which is not set by TRENDING)
+        // Use calculated size, NOT signal.size (which is not set by TRENDING)
         // ORDERING calculates size based on balance, margin, leverage, and entry price
         use crate::types::OrderCommand;
         let command = OrderCommand::Open {
@@ -1454,8 +1423,6 @@ impl Ordering {
         let mut balance_reservation = {
             let mut state_guard = shared_state.ordering_state.lock().await;
 
-            // ✅ CRITICAL: ALL checks happen INSIDE the lock to prevent race conditions
-            // This ensures state check + balance reservation is atomic
 
             // Position check - ensure no open position/order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
@@ -1499,7 +1466,7 @@ impl Ordering {
                         position_size_notional,
                         total_active_orders_notional,
                         has_open_orders: state_guard.open_order.is_some(),
-                        is_opportunity_mode: false, // TODO: Get from strategy if available
+                        is_opportunity_mode: false,
                     };
 
                     // Calculate effective leverage (use leverage from config/symbol rules)
@@ -1624,10 +1591,6 @@ impl Ordering {
         // Explicit release() should be called before returning (Drop will warn if forgotten)
         //
         // ALL early return paths MUST call balance_reservation.release().await:
-        // 1. ✅ Order placement permanent error (returns early for performance)
-        // 2. ✅ Order placement retries exhausted (returns early for performance)
-        // 3. ✅ Success path - released after state is updated
-        // 4. ✅ Race condition - released ONLY if cancel succeeds (prevents double-spend)
         //    ⚠️ If cancel fails, balance is kept reserved to prevent double-spend (acceptable leak)
         //
         // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
@@ -1637,14 +1600,12 @@ impl Ordering {
         // This minimizes the window where another thread can interfere
         // Real-time spread validation ensures we don't place orders with bad spreads
         //
-        // CRITICAL: Order placement happens IMMEDIATELY after balance reservation and spread validation
         // This prevents the race condition where another thread can reserve balance and place order
         // while this thread is doing expensive validation
 
         // Attempt order placement with retry logic
         // Permanent errors return early with balance release
         //
-        // ✅ CRITICAL: Each call to send_order() generates a NEW clientOrderId
         // (see connection.rs line 1130: clientOrderId is generated inside send_order)
         // This ensures that each retry attempt uses a unique clientOrderId,
         // preventing duplicate orders if a previous attempt timed out but Binance received it.
@@ -1762,7 +1723,6 @@ impl Ordering {
         };
 
         // Step 3: Post-order spread validation (AFTER order placement)
-        // ✅ CRITICAL: Validate spread immediately after order placement
         // This prevents the gap between validation and placement where spread can change
         // If spread changed significantly, cancel the order to prevent slippage
         match connection.get_current_prices(&signal.symbol).await {
@@ -1849,7 +1809,6 @@ impl Ordering {
         }
 
         // Step 4: Update state atomically (re-acquire lock for state update)
-        // ✅ CRITICAL: With Reserve-Before-Check pattern, this double-check is primarily a safety net
         // The balance reservation prevents other threads from even starting the order placement process
         // However, we still double-check state here as a safety measure in case of edge cases
         // Balance reservation is still held - prevents other threads from reserving
@@ -2034,7 +1993,6 @@ impl Ordering {
         // FUTURE: If hedge mode support is added with multiple positions per symbol, position_id
         // should be used to close specific positions. Until then, position_id is reserved for
         // future use and will be logged if provided.
-        // ✅ CRITICAL: Safe unwrap - is_some() check ensures value exists
         // But use if let for extra safety to prevent panic
         if let Some(position_id) = &request.position_id {
             warn!(
@@ -2179,7 +2137,6 @@ impl Ordering {
 
     /// Handle OrderUpdate event (state sync)
     ///
-    /// CRITICAL: Race condition prevention between OrderUpdate and PositionUpdate
     ///
     /// Problem: Binance may send events out of order:
     /// - PositionUpdate may arrive before OrderUpdate (position already created)
@@ -2281,7 +2238,6 @@ impl Ordering {
                             update.filled_qty
                         };
 
-                        // ✅ CRITICAL: Check if position already exists and if qty AND entry_price are unchanged
                         // Problem: Partial fills can change entry_price (weighted average)
                         // Example: Fill 1: 1.0 BTC @ 50000 → entry = 50000
                         //          Fill 2: 0.5 BTC @ 50100 → entry = 50033.33 (weighted avg)
@@ -2343,7 +2299,6 @@ impl Ordering {
                         };
 
                         if should_update_position {
-                            // ✅ CRITICAL: Reset circuit breaker on successful order fill
                             state_guard.circuit_breaker.reset();
 
                         state_guard.open_position = Some(OpenPosition {
@@ -2371,7 +2326,6 @@ impl Ordering {
                             );
                         } else {
                             // Position unchanged - only update order timestamp
-                            // ✅ CRITICAL: Reset circuit breaker on successful order (even if position unchanged)
                             state_guard.circuit_breaker.reset();
                             
                             state_guard.open_order = None;
@@ -2379,7 +2333,6 @@ impl Ordering {
                         }
                     }
                     crate::event_bus::OrderStatus::Canceled => {
-                        // ✅ NEW: Clear timeout entry when order is canceled
                         state_guard.order_timeouts.remove(&update.order_id);
                         
                         // Order canceled, clear state
@@ -2401,7 +2354,6 @@ impl Ordering {
                     }
                     crate::event_bus::OrderStatus::Expired
                     | crate::event_bus::OrderStatus::ExpiredInMatch => {
-                        // ✅ NEW: Clear timeout entry when order is expired
                         state_guard.order_timeouts.remove(&update.order_id);
                         
                         // Order expired, clear state (similar to canceled)
@@ -2418,7 +2370,6 @@ impl Ordering {
                         );
                     }
                     crate::event_bus::OrderStatus::Rejected => {
-                        // ✅ NEW: Clear timeout entry when order is rejected
                         state_guard.order_timeouts.remove(&update.order_id);
                         
                         // Order rejected, clear state
@@ -2427,7 +2378,6 @@ impl Ordering {
                         // Update timestamp after state change
                         state_guard.last_order_update_timestamp = Some(update.timestamp);
 
-                        // ✅ CRITICAL: Record rejection and check circuit breaker
                         // Extract rejection reason from OrderUpdate
                         let rejection_reason = update.rejection_reason.as_deref();
                         let should_open_circuit = state_guard.circuit_breaker.record_rejection(rejection_reason);
@@ -2464,7 +2414,6 @@ impl Ordering {
 
     /// Handle PositionUpdate event (state sync)
     ///
-    /// CRITICAL: Race condition prevention between OrderUpdate and PositionUpdate
     ///
     /// Problem: Binance may send events out of order:
     /// - PositionUpdate may arrive before OrderUpdate (position created before order fill confirmed)
@@ -2569,7 +2518,7 @@ impl Ordering {
                 // - PositionUpdate arrives immediately after (qty=1.5, entry=100.0, timestamp=T2)
                 // - Both have valid timestamps, but qty AND entry_price are same → skip redundant update
                 //
-                // Scenario 2: Partial fills with entry price changes (CRITICAL!)
+                // Scenario 2: Partial fills with entry price changes
                 // - Order partially filled: 1.0 BTC @ 50000 → OrderUpdate creates position (qty=1.0, entry=50000)
                 // - Order partially filled again: 0.5 BTC @ 50100 → OrderUpdate updates position (qty=1.5, entry=50033.33)
                 // - PositionUpdate arrives: (qty=1.5, entry=50033.33) → qty same but entry changed from original!
@@ -2587,7 +2536,6 @@ impl Ordering {
                 let existing_entry_price = existing_pos.entry_price.0;
 
                 // Calculate differences for both qty and entry_price
-                // ✅ CRITICAL: Use percentage-based epsilon for price comparison
                 // Problem: Absolute epsilon (0.01 USD) doesn't work for high-priced assets
                 // - BTC price ~$100,000 → 0.01 = 0.0001% (too small, causes false positives)
                 // - OrderUpdate: entry=50033.333333... (exact weighted average)
@@ -2721,7 +2669,6 @@ impl Ordering {
     /// Fetches all positions from exchange and restores them to state
     /// This prevents orphan positions after crash/restart
     /// 
-    /// ✅ CRITICAL: This function is called BEFORE WebSocket is fully connected
     /// WebSocket ACCOUNT_UPDATE events may arrive later, but we need immediate state restoration
     /// Solution: Fetch all positions via REST API and restore state immediately
     async fn reconcile_positions_on_startup(
