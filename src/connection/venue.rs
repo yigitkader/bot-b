@@ -1112,8 +1112,19 @@ pub fn refresh_rules_for(&self, sym: &str) {
         qty: Qty,
     ) -> Result<String> {
         let rules = self.rules_for(sym).await?;
-        let qty_str = format_decimal_fixed(qty.0, rules.qty_precision);
-        let activation_price_str = format_decimal_fixed(activation_price.0, rules.price_precision);
+        // Calculate effective precision from tick_size/step_size (source of truth)
+        let effective_price_precision = if rules.tick_size.is_zero() {
+            rules.price_precision
+        } else {
+            rules.price_precision.min(rules.tick_size.scale() as usize)
+        };
+        let effective_qty_precision = if rules.step_size.is_zero() {
+            rules.qty_precision
+        } else {
+            rules.qty_precision.min(rules.step_size.scale() as usize)
+        };
+        let qty_str = format_decimal_fixed(qty.0, effective_qty_precision);
+        let activation_price_str = format_decimal_fixed(activation_price.0, effective_price_precision);
         
         // Binance expects callback rate as percentage (0.1 not 0.001)
         // Example: callback_rate = 0.001 (0.1%) → callback_rate_pct = 0.1
@@ -1420,6 +1431,9 @@ pub fn refresh_rules_for(&self, sym: &str) {
 
 
         let max_attempts = 3;
+        // ✅ Note: limit_fallback_attempted is set in inner scopes but checked at loop start (line 1428)
+        // Compiler may warn about unused assignments, but the variable is actually used
+        #[allow(unused_assignments)]
         let mut limit_fallback_attempted = false;
         let mut growth_event_count = 0u32;
     const MAX_RETRIES_ON_GROWTH: u32 = 8; // Max retries allowed when position grows (increased from 2 to 8 to handle volatile markets with multiple simultaneous fills)
@@ -1505,7 +1519,13 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 Side::Buy // Short → Buy
             };
 
-            let qty_str = format_decimal_fixed(remaining_qty, rules.qty_precision);
+            // Calculate effective precision from step_size (source of truth)
+            let effective_qty_precision = if rules.step_size.is_zero() {
+                rules.qty_precision
+            } else {
+                rules.qty_precision.min(rules.step_size.scale() as usize)
+            };
+            let qty_str = format_decimal_fixed(remaining_qty, effective_qty_precision);
 
         // Add positionSide parameter if hedge mode is enabled
             let position_side = if self.hedge_mode {
@@ -1885,6 +1905,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             return Ok(());
                         }
 
+                        // ✅ Set flag to prevent retry - will be checked at loop start (line 1428)
                         limit_fallback_attempted = true; // LIMIT fallback'i işaretle (tekrar denenmeyecek)
                         warn!(
                             symbol = %sym,
@@ -1903,8 +1924,14 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         };
 
                         let limit_price_quantized = quantize_decimal(limit_price, tick_size);
+                        // Calculate effective precision from tick_size (source of truth)
+                        let effective_price_precision = if rules.tick_size.is_zero() {
+                            rules.price_precision
+                        } else {
+                            rules.price_precision.min(rules.tick_size.scale() as usize)
+                        };
                         let limit_price_str =
-                            format_decimal_fixed(limit_price_quantized, rules.price_precision);
+                            format_decimal_fixed(limit_price_quantized, effective_price_precision);
 
                     // Limit reduce-only emri gönder
                         let mut limit_params = vec![
@@ -2508,30 +2535,38 @@ impl BinanceFutures {
         rules: &SymbolRules,
         sym: &str,
     ) -> Result<(String, String, Decimal, Decimal)> {
-        let price_precision = rules.price_precision;
-        let qty_precision = rules.qty_precision;
+        // ✅ CRITICAL FIX: Calculate precision from tick_size/step_size instead of API precision
+        // Problem: API precision might be incorrect or stale, causing "Precision is over" errors (-1111)
+        // Solution: Always calculate precision from tick_size/step_size, which are the source of truth
+        // Binance requires that formatted values match the precision implied by tick_size/step_size
+        
+        // Calculate price precision from tick_size (source of truth)
+        let price_precision_from_tick = if rules.tick_size.is_zero() {
+            rules.price_precision // Fallback to API precision if tick_size is zero
+        } else {
+            rules.tick_size.scale() as usize
+        };
+        
+        // Calculate quantity precision from step_size (source of truth)
+        let qty_precision_from_step = if rules.step_size.is_zero() {
+            rules.qty_precision // Fallback to API precision if step_size is zero
+        } else {
+            rules.step_size.scale() as usize
+        };
+        
+        // Use the minimum of API precision and calculated precision (safety)
+        // This ensures we never exceed Binance's actual requirements
+        let effective_price_precision = rules.price_precision.min(price_precision_from_tick);
+        let effective_qty_precision = rules.qty_precision.min(qty_precision_from_step);
 
     // 1. Quantize: step_size'a göre floor
         let price_quantized = quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
 
-    // ✅ CRITICAL FIX: Calculate precision from step_size instead of using qty_precision
-    // Problem: qty_precision might be different from step_size precision, causing "Precision is over" errors
-    // Solution: Use step_size's scale as the precision for formatting
-    // Example: step_size = 0.01 → precision = 2, step_size = 0.001 → precision = 3
-        let qty_precision_from_step = if rules.step_size.is_zero() {
-            qty_precision // Fallback to qty_precision if step_size is zero
-        } else {
-            rules.step_size.scale() as usize
-        };
-        
-        // Use the minimum of qty_precision and step_size precision to ensure we don't exceed Binance's limits
-        let effective_qty_precision = qty_precision.min(qty_precision_from_step);
-
     // 2. Round: precision'a göre round et
     // Use ToNegativeInfinity (floor) instead of ToZero for safety
         let price = price_quantized
-            .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToNegativeInfinity);
+            .round_dp_with_strategy(effective_price_precision as u32, RoundingStrategy::ToNegativeInfinity);
         let qty_rounded =
             qty_quantized.round_dp_with_strategy(effective_qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
 
@@ -2549,10 +2584,10 @@ impl BinanceFutures {
         if re_quantized.is_zero() {
             // Even re-quantized is zero - this is a real problem
             return Err(anyhow!(
-                "Quantity becomes zero after quantization: qty_quantized={}, step_size={}, qty_precision={}",
+                "Quantity becomes zero after quantization: qty_quantized={}, step_size={}, effective_qty_precision={}",
                 qty_quantized,
                 rules.step_size,
-                qty_precision
+                effective_qty_precision
             ));
         }
         re_quantized
@@ -2561,7 +2596,7 @@ impl BinanceFutures {
     };
 
     // 3. Format: precision'a göre string'e çevir
-        let price_str = format_decimal_fixed(price, price_precision);
+        let price_str = format_decimal_fixed(price, effective_price_precision);
         let qty_str = format_decimal_fixed(qty_rounded, effective_qty_precision);
 
     // 4. KRİTİK: Son kontrol - fractional_digits kontrolü
@@ -2576,21 +2611,21 @@ impl BinanceFutures {
             0
         };
 
-        if price_fractional > price_precision {
+        if price_fractional > effective_price_precision {
             let error_msg = format!(
-                "CRITICAL: price_str fractional digits ({}) > price_precision ({}) for {}",
-                price_fractional, price_precision, sym
+                "CRITICAL: price_str fractional digits ({}) > effective_price_precision ({}) for {}",
+                price_fractional, effective_price_precision, sym
             );
-            tracing::error!(%sym, price_str, price_precision, price_fractional, %error_msg);
+            tracing::error!(%sym, price_str, effective_price_precision, price_fractional, %error_msg);
             return Err(anyhow!(error_msg));
         }
 
         if qty_fractional > effective_qty_precision {
             let error_msg = format!(
-                "CRITICAL: qty_str fractional digits ({}) > qty_precision ({}) for {}",
-                qty_fractional, qty_precision, sym
+                "CRITICAL: qty_str fractional digits ({}) > effective_qty_precision ({}) for {}",
+                qty_fractional, effective_qty_precision, sym
             );
-            tracing::error!(%sym, qty_str, qty_precision, qty_fractional, %error_msg);
+            tracing::error!(%sym, qty_str, effective_qty_precision, qty_fractional, %error_msg);
             return Err(anyhow!(error_msg));
         }
 

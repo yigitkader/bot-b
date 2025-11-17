@@ -7,7 +7,8 @@ use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, EventBus, OrderUpdate, PositionUpdate, TradeSignal};
 use crate::state::{OpenOrder, OpenPosition, OrderingState, SharedState};
-use crate::types::{PositionDirection, Qty, Tif};
+use crate::types::{PositionDirection, Qty, Tif, Px};
+use crate::risk::{self, PositionRiskLevel, PositionRiskState, determine_risk_actions, RiskActions};
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -1498,6 +1499,67 @@ impl Ordering {
                     "ORDERING: Ignoring TradeSignal - already have open position/order"
                 );
                 return Ok(());
+            }
+
+            // ✅ NEW: Risk control check before order placement
+            // Check position size risk if we have an open position
+            // Note: This is a pre-check, actual risk control happens in follow_orders module
+            // But we can block new orders here if risk level is too high
+            // 
+            // IMPORTANT: We only check existing position, not the new order being placed
+            // because calculated_size hasn't been computed yet at this point
+            if let Some(ref open_pos) = state_guard.open_position {
+                if open_pos.symbol == signal.symbol {
+                    // Calculate position size notional
+                    let position_size_notional = (open_pos.entry_price.0 * open_pos.qty.0.abs())
+                        .to_f64()
+                        .unwrap_or(0.0);
+                    
+                    // Calculate total active orders notional (from open_order if exists)
+                    // Note: We use open_order.qty, not calculated_size (which isn't computed yet)
+                    let total_active_orders_notional = if let Some(ref open_order) = state_guard.open_order {
+                        if open_order.symbol == signal.symbol {
+                            (signal.entry_price.0 * open_order.qty.0).to_f64().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+
+                    // Create risk state
+                    let risk_state = PositionRiskState {
+                        position_size_notional,
+                        total_active_orders_notional,
+                        has_open_orders: state_guard.open_order.is_some(),
+                        is_opportunity_mode: false, // TODO: Get from strategy if available
+                    };
+
+                    // Calculate effective leverage (use leverage from config/symbol rules)
+                    // Note: leverage is calculated earlier in the function
+                    let effective_leverage = leverage as f64;
+
+                    // Check position size risk
+                    let (risk_level, _max_position_size_usd, should_block_new_orders) = 
+                        risk::check_position_size_risk(
+                            &risk_state,
+                            cfg.max_usd_per_order,
+                            effective_leverage,
+                            cfg,
+                        );
+
+                    // Block new orders if risk level is Soft, Medium, or Hard
+                    if should_block_new_orders {
+                        warn!(
+                            symbol = %signal.symbol,
+                            risk_level = ?risk_level,
+                            position_size_notional,
+                            total_active_orders_notional,
+                            "ORDERING: Blocking new order due to risk level"
+                        );
+                        return Ok(());
+                    }
+                }
             }
 
             // Spread staleness check (inside lock to prevent race condition)

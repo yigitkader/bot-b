@@ -15,6 +15,43 @@ pub struct Px(pub Decimal);
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Qty(pub Decimal);
 
+/// Order book level (price and quantity)
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct BookLevel {
+    pub px: Px,
+    pub qty: Qty,
+}
+
+/// Order book snapshot
+/// Used for Q-MEL feature extraction and market microstructure analysis
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OrderBook {
+    pub best_bid: Option<BookLevel>,
+    pub best_ask: Option<BookLevel>,
+    /// Top-K bid levels (if available from depth stream)
+    pub top_bids: Option<Vec<BookLevel>>,
+    /// Top-K ask levels (if available from depth stream)
+    pub top_asks: Option<Vec<BookLevel>>,
+}
+
+impl OrderBook {
+    /// Create order book from bid/ask prices
+    pub fn from_prices(bid: Px, ask: Px) -> Self {
+        Self {
+            best_bid: Some(BookLevel {
+                px: bid,
+                qty: Qty(Decimal::ONE), // Default quantity
+            }),
+            best_ask: Some(BookLevel {
+                px: ask,
+                qty: Qty(Decimal::ONE), // Default quantity
+            }),
+            top_bids: None,
+            top_asks: None,
+        }
+    }
+}
+
 /// Order side - represents the direction of an order (BUY or SELL)
 /// 
 /// **IMPORTANT**: This is for ORDER sides, NOT position directions!

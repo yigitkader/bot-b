@@ -6,6 +6,7 @@
 use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
+use crate::position_manager::{PositionState, StrategyInfo, should_close_position_smart};
 use crate::types::{PositionDirection, PositionInfo, Px, Qty};
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
@@ -26,6 +27,8 @@ pub struct FollowOrders {
     connection: Arc<Connection>,
     positions: Arc<RwLock<HashMap<String, PositionInfo>>>,
     tp_sl_from_signals: Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
+    /// Position states for smart closing logic (11 different closing conditions)
+    position_states: Arc<RwLock<HashMap<String, PositionState>>>,
 }
 
 impl FollowOrders {
@@ -42,6 +45,7 @@ impl FollowOrders {
             connection,
             positions: Arc::new(RwLock::new(HashMap::new())),
             tp_sl_from_signals: Arc::new(RwLock::new(HashMap::new())),
+            position_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -90,6 +94,7 @@ impl FollowOrders {
         let cfg_pos = cfg.clone();
         let positions_pos = positions.clone();
         let tp_sl_pos = tp_sl_from_signals.clone();
+        let position_states_pos = self.position_states.clone();
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -104,7 +109,7 @@ impl FollowOrders {
                             break;
                         }
                         
-                        Self::handle_position_update(&update, &cfg_pos, &positions_pos, &tp_sl_pos).await;
+                        Self::handle_position_update(&update, &cfg_pos, &positions_pos, &tp_sl_pos, &position_states_pos).await;
                     }
                     Err(_) => break,
                 }
@@ -149,6 +154,7 @@ impl FollowOrders {
         
         // Spawn task for MarketTick events (TP/SL checking)
         let positions_tick = positions.clone();
+        let position_states_tick = self.position_states.clone();
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
         let cfg_tick = cfg.clone();
@@ -165,7 +171,7 @@ impl FollowOrders {
                             break;
                         }
                         
-                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &event_bus_tick, &cfg_tick, &connection_tick).await {
+                        if let Err(e) = Self::check_tp_sl(&tick, &positions_tick, &position_states_tick, &event_bus_tick, &cfg_tick, &connection_tick).await {
                             warn!(error = %e, symbol = %tick.symbol, "FOLLOW_ORDERS: error checking TP/SL");
                         }
                     }
@@ -225,6 +231,7 @@ impl FollowOrders {
         cfg: &Arc<AppCfg>,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         tp_sl_from_signals: &Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
+        position_states: &Arc<RwLock<HashMap<String, PositionState>>>,
     ) {
         let mut positions_guard = positions.write().await;
         
@@ -247,6 +254,8 @@ impl FollowOrders {
                 update.qty
             };
             
+            let opened_at = Instant::now();
+            
             positions_guard.insert(update.symbol.clone(), PositionInfo {
                 symbol: update.symbol.clone(),
                 qty: qty_abs,
@@ -255,12 +264,18 @@ impl FollowOrders {
                 leverage: update.leverage,
                 stop_loss_pct,
                 take_profit_pct,
-                opened_at: Instant::now(),
+                opened_at,
                 is_maker: None, // Will be updated from OrderUpdate when order is filled
                 close_requested: false, // Initialize to false - will be set when CloseRequest is sent
                 liquidation_price: update.liq_px, // ✅ NEW: Store liquidation price for risk monitoring
                 trailing_stop_placed: false, // ✅ NEW: Initialize trailing stop flag
             });
+            
+            // Initialize position state for smart closing logic
+            {
+                let mut states_guard = position_states.write().await;
+                states_guard.insert(update.symbol.clone(), PositionState::new(opened_at));
+            }
             
             info!(
                 symbol = %update.symbol,
@@ -269,7 +284,7 @@ impl FollowOrders {
                 direction = ?direction,
                 stop_loss_pct = ?stop_loss_pct,
                 take_profit_pct = ?take_profit_pct,
-                "FOLLOW_ORDERS: Position tracked with TP/SL"
+                "FOLLOW_ORDERS: Position tracked with TP/SL and smart closing state"
             );
         } else {
             // Position closed
@@ -279,6 +294,12 @@ impl FollowOrders {
             {
                 let mut tp_sl_guard = tp_sl_from_signals.write().await;
                 tp_sl_guard.remove(&update.symbol);
+            }
+            
+            // Clean up position state
+            {
+                let mut states_guard = position_states.write().await;
+                states_guard.remove(&update.symbol);
             }
             
             info!(
@@ -291,6 +312,10 @@ impl FollowOrders {
     /// Check TP/SL for a market tick
     /// If TP or SL is triggered, send CloseRequest
     /// 
+    /// ✅ NEW: Smart closing logic with 11 different closing conditions
+    /// - First checks smart closing conditions (from position_manager)
+    /// - Then falls back to traditional TP/SL checks
+    /// 
     /// ✅ CRITICAL: Race condition prevention
     /// - Check close_requested flag BEFORE calculating PnL
     /// - Remove position and set flag BEFORE sending CloseRequest
@@ -299,11 +324,12 @@ impl FollowOrders {
     /// 
     /// Performance & Responsibility:
     /// - If position doesn't exist: Return immediately (no expensive calculations)
-    /// - If position exists: Check TP/SL and send CloseRequest if triggered
+    /// - If position exists: Check smart closing + TP/SL and send CloseRequest if triggered
     /// - This ensures FOLLOW_ORDERS only processes ticks when position is tracked
     async fn check_tp_sl(
         tick: &MarketTick,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
+        position_states: &Arc<RwLock<HashMap<String, PositionState>>>,
         event_bus: &Arc<EventBus>,
         cfg: &Arc<AppCfg>,
         connection: &Arc<Connection>,
@@ -424,6 +450,110 @@ impl FollowOrders {
         
         let net_pnl_pct_f64 = net_pnl_pct.to_f64().unwrap_or(0.0);
         let gross_pnl_pct_f64 = gross_pnl_pct.to_f64().unwrap_or(0.0);
+        
+        // ✅ NEW: Smart closing logic (11 different closing conditions)
+        // Calculate net PnL in USD for smart closing
+        let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
+        let entry_price_f64 = position.entry_price.0.to_f64().unwrap_or(0.0);
+        let current_price_f64 = current_price_val.to_f64().unwrap_or(0.0);
+        
+        // Calculate net PnL in USD (simplified - using current price)
+        let price_diff = match position.direction {
+            PositionDirection::Long => current_price_f64 - entry_price_f64,
+            PositionDirection::Short => entry_price_f64 - current_price_f64,
+        };
+        let gross_pnl_usd = price_diff * position_qty_f64;
+        let entry_fee_usd = (entry_price_f64 * position_qty_f64) * (entry_commission_pct.to_f64().unwrap_or(0.0) / 100.0);
+        let exit_fee_usd = (current_price_f64 * position_qty_f64) * (exit_commission_pct.to_f64().unwrap_or(0.0) / 100.0);
+        let net_pnl_usd = gross_pnl_usd - entry_fee_usd - exit_fee_usd;
+        
+        // Update position state (for smart closing logic)
+        {
+            let mut states_guard = position_states.write().await;
+            if let Some(state) = states_guard.get_mut(&tick.symbol) {
+                state.update_pnl(Decimal::from_str(&format!("{:.2}", net_pnl_usd))
+                    .unwrap_or(Decimal::ZERO));
+            }
+        }
+        
+        // Get position state for smart closing check
+        let position_state = {
+            let states_guard = position_states.read().await;
+            states_guard.get(&tick.symbol).cloned()
+        };
+        
+        // Check smart closing conditions (if position state exists)
+        if let Some(ref state) = position_state {
+            let min_profit_usd = cfg.min_profit_usd.unwrap_or(0.50);
+            let maker_fee_rate = cfg.risk.maker_commission_pct / 100.0;
+            let taker_fee_rate = cfg.risk.taker_commission_pct / 100.0;
+            
+            let (should_close_smart, reason) = should_close_position_smart(
+                &position,
+                current_price,
+                tick.bid,
+                tick.ask,
+                state,
+                min_profit_usd,
+                maker_fee_rate,
+                taker_fee_rate,
+            );
+            
+            if should_close_smart {
+                info!(
+                    symbol = %tick.symbol,
+                    reason = %reason,
+                    net_pnl_usd,
+                    "FOLLOW_ORDERS: Smart closing condition triggered"
+                );
+                
+                // Remove position and send CloseRequest
+                let position_removed = {
+                    let mut positions_guard = positions.write().await;
+                    if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
+                        pos.close_requested = true;
+                        positions_guard.remove(&tick.symbol).is_some()
+                    } else {
+                        false
+                    }
+                };
+                
+                if position_removed {
+                    // Clean up position state
+                    {
+                        let mut states_guard = position_states.write().await;
+                        states_guard.remove(&tick.symbol);
+                    }
+                    
+                    let close_request = CloseRequest {
+                        symbol: tick.symbol.clone(),
+                        position_id: None,
+                        reason: CloseReason::Manual, // Smart closing is manual decision
+                        current_bid: Some(tick.bid),
+                        current_ask: Some(tick.ask),
+                        timestamp: Instant::now(),
+                    };
+                    
+                    if let Err(e) = event_bus.close_request_tx.send(close_request) {
+                        error!(
+                            error = ?e,
+                            symbol = %tick.symbol,
+                            reason = %reason,
+                            "FOLLOW_ORDERS: Failed to send CloseRequest for smart closing"
+                        );
+                    } else {
+                        info!(
+                            symbol = %tick.symbol,
+                            reason = %reason,
+                            net_pnl_usd,
+                            "FOLLOW_ORDERS: Smart closing CloseRequest sent"
+                        );
+                    }
+                }
+                
+                return Ok(());
+            }
+        }
         
         // ✅ NEW: Liquidation risk monitoring
         if let Some(liquidation_price) = position.liquidation_price {

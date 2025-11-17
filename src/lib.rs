@@ -12,4 +12,8 @@ pub mod follow_orders;
 pub mod balance;
 pub mod logging;
 pub mod metrics;
+pub mod risk;
+pub mod position_manager;
+pub mod qmel;
+pub mod order_analysis;
 

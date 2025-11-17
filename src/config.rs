@@ -155,6 +155,34 @@ pub struct WebsocketCfg {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+pub struct InternalCfg {
+    /// Maximum position size buffer multiplier (default: 1.5)
+    #[serde(default = "default_max_position_size_buffer")]
+    pub max_position_size_buffer: f64,
+    /// Opportunity mode position multiplier (default: 1.2)
+    #[serde(default = "default_opportunity_mode_position_multiplier")]
+    pub opportunity_mode_position_multiplier: f64,
+    /// Opportunity mode soft limit ratio (default: 0.8 = 80%)
+    #[serde(default = "default_opportunity_mode_soft_limit_ratio")]
+    pub opportunity_mode_soft_limit_ratio: f64,
+    /// Opportunity mode medium limit ratio (default: 0.9 = 90%)
+    #[serde(default = "default_opportunity_mode_medium_limit_ratio")]
+    pub opportunity_mode_medium_limit_ratio: f64,
+    /// Opportunity mode hard limit ratio (default: 1.0 = 100%)
+    #[serde(default = "default_opportunity_mode_hard_limit_ratio")]
+    pub opportunity_mode_hard_limit_ratio: f64,
+    /// PnL alert interval in seconds (default: 60)
+    #[serde(default = "default_pnl_alert_interval_sec")]
+    pub pnl_alert_interval_sec: u64,
+    /// PnL alert threshold for positive PnL (default: 0.1 = 10%)
+    #[serde(default = "default_pnl_alert_threshold_positive")]
+    pub pnl_alert_threshold_positive: f64,
+    /// PnL alert threshold for negative PnL (default: -0.05 = -5%)
+    #[serde(default = "default_pnl_alert_threshold_negative")]
+    pub pnl_alert_threshold_negative: f64,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct EventBusCfg {
     /// Buffer size for MarketTick events (high frequency, needs larger buffer)
     /// 
@@ -310,6 +338,8 @@ pub struct AppCfg {
     pub event_bus: EventBusCfg,
     #[serde(default)]
     pub dynamic_symbol_selection: DynamicSymbolSelection,
+    #[serde(default)]
+    pub internal: InternalCfg,
 }
 
 impl Default for AppCfg {
@@ -338,6 +368,7 @@ impl Default for AppCfg {
             websocket: WebsocketCfg::default(),
             event_bus: EventBusCfg::default(),
             dynamic_symbol_selection: DynamicSymbolSelection::default(),
+            internal: InternalCfg::default(),
         }
     }
 }
@@ -1035,4 +1066,40 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Internal Config Default Functions
+// ============================================================================
+
+fn default_max_position_size_buffer() -> f64 {
+    1.5
+}
+
+fn default_opportunity_mode_position_multiplier() -> f64 {
+    1.2
+}
+
+fn default_opportunity_mode_soft_limit_ratio() -> f64 {
+    0.8
+}
+
+fn default_opportunity_mode_medium_limit_ratio() -> f64 {
+    0.9
+}
+
+fn default_opportunity_mode_hard_limit_ratio() -> f64 {
+    1.0
+}
+
+fn default_pnl_alert_interval_sec() -> u64 {
+    60
+}
+
+fn default_pnl_alert_threshold_positive() -> f64 {
+    0.1 // 10%
+}
+
+fn default_pnl_alert_threshold_negative() -> f64 {
+    -0.05 // -5%
 }

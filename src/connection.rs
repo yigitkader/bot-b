@@ -1597,8 +1597,8 @@ impl Connection {
         symbol: &str,
         price: Px,
         qty: Qty,
-        side: Side,
-        is_open_order: bool, // true for Open orders, false for Close orders
+        _side: Side,
+        _is_open_order: bool, // true for Open orders, false for Close orders
     ) -> Result<()> {
         // 1. Fetch and validate symbol rules (early check)
         let rules = self.venue.rules_for(symbol).await

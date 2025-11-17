@@ -645,7 +645,7 @@ impl Trending {
         let base_min_score = cfg.base_min_score;
         let base_rsi_lower = cfg.rsi_lower_long;
         let base_rsi_upper = cfg.rsi_upper_long;
-        let base_rsi_lower_short = cfg.rsi_lower_short;
+        let _base_rsi_lower_short = cfg.rsi_lower_short; // Reserved for future use
         let base_rsi_upper_short = cfg.rsi_upper_short;
         
         let prices = &state.prices;
