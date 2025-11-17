@@ -1,13 +1,23 @@
 """
 Main optimization coordinator
+
+This module provides the core optimization engine that coordinates
+parameter space exploration, config management, backtest execution,
+and result analysis.
+
+Architecture:
+- Extensible: Easy to add new optimization strategies
+- Configurable: All parameters driven by config
+- Observable: Progress tracking and result persistence
+- Testable: Modular design for easy testing
 """
 
 import json
 from pathlib import Path
-from typing import Optional
-from .parameter_space import ParameterSpace, OptimizationPreset
+from typing import Optional, Callable, Iterator
+from .parameter_space import ParameterSpace, OptimizationPreset, ParameterSet
 from .config_manager import ConfigManager
-from .backtest_runner import BacktestRunner
+from .backtest_runner import BacktestRunner, BacktestResult
 from .result_analyzer import ResultAnalyzer
 
 
@@ -32,7 +42,8 @@ class Optimizer:
     
     def run(
         self,
-        progress_callback: Optional[callable] = None,
+        progress_callback: Optional[Callable[[int, int, ParameterSet, Optional[BacktestResult]], None]] = None,
+        early_stopping: Optional[Callable[[ResultAnalyzer], bool]] = None,
     ) -> ResultAnalyzer:
         """Run full optimization"""
         print("🔍 Starting systematic strategy optimization...\n")
@@ -65,6 +76,11 @@ class Optimizer:
                     self._print_result(backtest_result)
                 
                 self._save_results()
+                
+                # Early stopping check
+                if early_stopping and early_stopping(self.result_analyzer):
+                    print(f"\n⏹️  Early stopping triggered at combination {self._current_combination}")
+                    break
         
         finally:
             self.config_manager.restore()

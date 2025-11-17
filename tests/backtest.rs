@@ -256,9 +256,8 @@ async fn run_backtest(
             };
             
             if let Some(state) = state {
-                // Analyze trend (use default HFT config for backtesting)
-                let default_cfg = app::config::TrendingCfg::default();
-                if let Some(signal) = Trending::analyze_trend(&state, &default_cfg) {
+                // Analyze trend using actual config from config.yaml
+                if let Some(signal) = Trending::analyze_trend(&state, &cfg.trending) {
                     // Open position
                     let entry_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
                     let signal_str = match signal {
@@ -503,8 +502,7 @@ async fn run_point_in_time_backtest(
         };
         
         if let Some(state) = state {
-            let default_cfg = app::config::TrendingCfg::default();
-            if let Some(signal) = Trending::analyze_trend(&state, &default_cfg) {
+            if let Some(signal) = Trending::analyze_trend(&state, &cfg.trending) {
                 total_signals += 1;
                 
                 let signal_price = (signal_tick.bid.0 + signal_tick.ask.0) / Decimal::from(2);
