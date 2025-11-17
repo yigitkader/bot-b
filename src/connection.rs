@@ -154,51 +154,84 @@ impl Connection {
     }
 
     /// Get clamped leverage for a symbol
-    /// Clamps desired leverage to symbol's max leverage (if available) or safe fallback (50x)
+    /// ✅ CRITICAL: Always uses coin's max leverage from exchangeInfo/leverage brackets
+    /// Clamps desired leverage to symbol's max leverage (fetched from coin info)
     /// This centralizes leverage clamping logic to avoid duplication
     async fn get_clamped_leverage(&self, symbol: &str, desired_leverage: u32) -> u32 {
-        const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+        // Use config default_leverage as safe fallback only if coin info is unavailable
+        let safe_leverage_fallback = self.cfg.exec.default_leverage;
         
         match self.venue.rules_for(symbol).await {
             Ok(rules) => {
+                // ✅ CRITICAL: Always use coin's max leverage if available
                 if let Some(symbol_max_lev) = rules.max_leverage {
-                    // Symbol has max leverage - clamp to it
+                    // Coin has max leverage - clamp to it (this is the coin's actual max)
                     let clamped = desired_leverage.min(symbol_max_lev);
                     if clamped < desired_leverage {
-                        warn!(
+                        debug!(
                             symbol = %symbol,
                             desired_leverage,
-                            symbol_max_leverage = symbol_max_lev,
+                            coin_max_leverage = symbol_max_lev,
                             final_leverage = clamped,
-                            "CONNECTION: Leverage clamped to symbol max leverage"
+                            "CONNECTION: Leverage clamped to coin's max leverage"
                         );
                     }
                     clamped
                 } else {
-                    // No symbol max leverage - use safe fallback instead of config max
-                    // Config max (100x) might be too high for some symbols
-                    let clamped = desired_leverage.min(SAFE_LEVERAGE_FALLBACK);
-                    if clamped < desired_leverage {
+                    // Coin's max leverage not available - try to fetch it directly
+                    // This can happen if leverage brackets API failed during rules_for()
+                    if let Some(coin_max_lev) = self.venue.fetch_max_leverage(symbol).await {
+                        // Successfully fetched coin's max leverage - use it
+                        let clamped = desired_leverage.min(coin_max_lev);
+                        if clamped < desired_leverage {
+                            debug!(
+                                symbol = %symbol,
+                                desired_leverage,
+                                coin_max_leverage = coin_max_lev,
+                                final_leverage = clamped,
+                                "CONNECTION: Leverage clamped to coin's max leverage (fetched directly)"
+                            );
+                        }
+                        clamped
+                    } else {
+                        // Coin's max leverage unavailable - use safe fallback as last resort
+                        let clamped = desired_leverage.min(safe_leverage_fallback);
                         warn!(
                             symbol = %symbol,
                             desired_leverage,
-                            safe_fallback = SAFE_LEVERAGE_FALLBACK,
+                            safe_fallback = safe_leverage_fallback,
                             final_leverage = clamped,
-                            "CONNECTION: Leverage brackets not available, using safe fallback (50x) instead of config max"
+                            "CONNECTION: Coin's max leverage unavailable, using safe fallback ({}x) - this should be rare",
+                            safe_leverage_fallback
                         );
+                        clamped
                     }
-                    clamped
                 }
             }
             Err(e) => {
-                // Failed to fetch rules - use safe fallback instead of config max
-                warn!(
-                    error = %e,
-                    symbol = %symbol,
-                    safe_fallback = SAFE_LEVERAGE_FALLBACK,
-                    "CONNECTION: Failed to fetch symbol rules, using safe fallback (50x) instead of config max"
-                );
-                desired_leverage.min(SAFE_LEVERAGE_FALLBACK)
+                // Failed to fetch rules - try to fetch max leverage directly
+                if let Some(coin_max_lev) = self.venue.fetch_max_leverage(symbol).await {
+                    // Successfully fetched coin's max leverage - use it
+                    let clamped = desired_leverage.min(coin_max_lev);
+                    debug!(
+                        symbol = %symbol,
+                        desired_leverage,
+                        coin_max_leverage = coin_max_lev,
+                        final_leverage = clamped,
+                        "CONNECTION: Leverage clamped to coin's max leverage (fetched after rules_for failed)"
+                    );
+                    clamped
+                } else {
+                    // All attempts failed - use safe fallback as last resort
+                    warn!(
+                        error = %e,
+                        symbol = %symbol,
+                        safe_fallback = safe_leverage_fallback,
+                        "CONNECTION: Failed to fetch coin info, using safe fallback ({}x) as last resort",
+                        safe_leverage_fallback
+                    );
+                    desired_leverage.min(safe_leverage_fallback)
+                }
             }
         }
     }
@@ -2229,19 +2262,19 @@ impl Connection {
                 } else {
                     // Position is CLOSED - safe to set leverage
                     // ✅ CRITICAL: Re-fetch symbol rules to get max leverage (may have changed or not been fetched yet)
-                    // Use same safe fallback as startup
-                    const SAFE_LEVERAGE_FALLBACK: u32 = 50;
+                    // Use config default_leverage as safe fallback instead of hardcoded 50
+                    let safe_leverage_fallback = self.cfg.exec.default_leverage;
                     
                     let final_leverage = match self.venue.rules_for(symbol).await {
                         Ok(rules) => {
                             if let Some(symbol_max_lev) = rules.max_leverage {
                                 leverage.min(symbol_max_lev)
                             } else {
-                                leverage.min(SAFE_LEVERAGE_FALLBACK)
+                                leverage.min(safe_leverage_fallback)
                             }
                         }
                         Err(_) => {
-                            leverage.min(SAFE_LEVERAGE_FALLBACK)
+                            leverage.min(safe_leverage_fallback)
                         }
                     };
                     

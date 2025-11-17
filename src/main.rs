@@ -184,10 +184,10 @@ async fn main() -> Result<()> {
     logging.start().await?;
     
     // Initialize AI_ANALYZER module (intelligent log analysis and error detection)
-    let ai_analyzer = AiAnalyzer::new(
+    let ai_analyzer = Arc::new(AiAnalyzer::new(
         event_bus.clone(),
         shutdown_flag.clone(),
-    );
+    ));
     ai_analyzer.start().await?;
     
     info!("All modules started, waiting for shutdown signal...");
@@ -204,6 +204,7 @@ async fn main() -> Result<()> {
     
     // Start health check task
     let event_bus_health = event_bus.clone();
+    let ai_analyzer_health = ai_analyzer.clone();
     let shutdown_flag_health = shutdown_flag.clone();
     let app_start_time = Instant::now();
     tokio::spawn(async move {
@@ -218,7 +219,7 @@ async fn main() -> Result<()> {
             
             // Perform health check
             let uptime_secs = app_start_time.elapsed().as_secs();
-            perform_health_check(&event_bus_health, uptime_secs);
+            perform_health_check(&event_bus_health, &ai_analyzer_health, uptime_secs).await;
         }
     });
     
@@ -234,7 +235,7 @@ async fn main() -> Result<()> {
 
 /// Perform health check and log status
 /// Checks event bus receiver counts and basic system health
-fn perform_health_check(event_bus: &EventBus, uptime_secs: u64) {
+async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, uptime_secs: u64) {
     let health = event_bus.health_stats();
     
     // Check if any critical channels have no receivers (potential issue)
@@ -284,6 +285,63 @@ fn perform_health_check(event_bus: &EventBus, uptime_secs: u64) {
             memory_mb = mem_mb,
             "HEALTH: Process memory usage"
         );
+    }
+    
+    // ✅ Use AI analyzer public API methods to check system health
+    let trade_stats = ai_analyzer.get_trade_stats().await;
+    let order_stats = ai_analyzer.get_order_stats().await;
+    let recent_anomalies = ai_analyzer.get_recent_anomalies(5).await;
+    
+    // Log AI analyzer statistics
+    if !trade_stats.is_empty() {
+        let total_trades: u64 = trade_stats.values().map(|s| s.total_trades).sum();
+        let total_pnl: f64 = trade_stats.values().map(|s| s.total_pnl).sum();
+        info!(
+            total_trades,
+            total_pnl,
+            "HEALTH: AI_ANALYZER trade statistics"
+        );
+    }
+    
+    if !order_stats.is_empty() {
+        let total_orders: u64 = order_stats.values().map(|s| s.total_orders).sum();
+        let rejected_orders: u64 = order_stats.values().map(|s| s.rejected_orders).sum();
+        let rejection_rate = if total_orders > 0 {
+            (rejected_orders as f64) / (total_orders as f64) * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            total_orders,
+            rejected_orders,
+            rejection_rate = format!("{:.1}%", rejection_rate),
+            "HEALTH: AI_ANALYZER order statistics"
+        );
+    }
+    
+    // Log recent anomalies if any
+    if !recent_anomalies.is_empty() {
+        let high_severity = recent_anomalies.iter()
+            .filter(|a| matches!(a.severity, crate::ai_analyzer::Severity::High))
+            .count();
+        let medium_severity = recent_anomalies.iter()
+            .filter(|a| matches!(a.severity, crate::ai_analyzer::Severity::Medium))
+            .count();
+        
+        if high_severity > 0 {
+            warn!(
+                high_severity,
+                medium_severity,
+                "HEALTH: ⚠️ AI_ANALYZER detected {} high and {} medium severity anomalies",
+                high_severity, medium_severity
+            );
+        } else if medium_severity > 0 {
+            info!(
+                medium_severity,
+                "HEALTH: AI_ANALYZER detected {} medium severity anomalies",
+                medium_severity
+            );
+        }
     }
 }
 

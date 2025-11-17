@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// BALANCE module - balance tracking
 pub struct Balance {
@@ -210,11 +210,19 @@ impl Balance {
         };
         
         // Send event first (non-blocking, but ensures event is queued before store update)
-        if let Err(e) = self.event_bus.balance_update_tx.send(balance_update) {
-            warn!(
-                error = ?e,
-                "BALANCE: Failed to send BalanceUpdate event (no subscribers or channel closed)"
-            );
+        // Check if there are subscribers before sending to avoid unnecessary errors
+        let receiver_count = self.event_bus.balance_update_tx.receiver_count();
+        if receiver_count == 0 {
+            // No subscribers - skip sending (not an error, just no consumers yet)
+            debug!("BALANCE: No BalanceUpdate subscribers, skipping event");
+        } else {
+            if let Err(e) = self.event_bus.balance_update_tx.send(balance_update) {
+                warn!(
+                    error = ?e,
+                    receiver_count,
+                    "BALANCE: Failed to send BalanceUpdate event (channel closed or buffer full)"
+                );
+            }
         }
         
         // ✅ CRITICAL: Update shared state AFTER event is sent, but check timestamp first

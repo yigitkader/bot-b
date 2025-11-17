@@ -27,6 +27,9 @@ pub struct RiskCfg {
     /// Default: 0.04% (Binance futures standard taker fee)
     #[serde(default = "default_taker_commission_pct")]
     pub taker_commission_pct: f64,
+    /// Minimum commission buffer in USD (safety margin for small positions)
+    #[serde(default = "default_min_commission_buffer_usd")]
+    pub min_commission_buffer_usd: f64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -56,6 +59,81 @@ pub struct TrendingCfg {
     /// Example: 0.001 = 0.1% callback rate
     #[serde(default = "default_trailing_stop_callback_rate")]
     pub trailing_stop_callback_rate: f64,
+    /// RSI minimum average loss threshold (prevents division by very small numbers)
+    #[serde(default = "default_rsi_min_avg_loss")]
+    pub rsi_min_avg_loss: f64,
+    /// ATR period for volatility calculation
+    #[serde(default = "default_atr_period")]
+    pub atr_period: usize,
+    /// Low volatility threshold (ATR < this = ranging market)
+    #[serde(default = "default_low_volatility_threshold")]
+    pub low_volatility_threshold: f64,
+    /// High volatility threshold (ATR > this = volatile market)
+    #[serde(default = "default_high_volatility_threshold")]
+    pub high_volatility_threshold: f64,
+    /// Base volatility percentage for normalization (2% = 0.02)
+    #[serde(default = "default_base_volatility")]
+    pub base_volatility: f64,
+    /// Base minimum score threshold for signal generation
+    #[serde(default = "default_base_min_score")]
+    pub base_min_score: f64,
+    /// Regime multiplier for trending markets
+    #[serde(default = "default_regime_multiplier_trending")]
+    pub regime_multiplier_trending: f64,
+    /// Regime multiplier for ranging markets
+    #[serde(default = "default_regime_multiplier_ranging")]
+    pub regime_multiplier_ranging: f64,
+    /// Regime multiplier for volatile markets
+    #[serde(default = "default_regime_multiplier_volatile")]
+    pub regime_multiplier_volatile: f64,
+    /// Regime multiplier for unknown markets
+    #[serde(default = "default_regime_multiplier_unknown")]
+    pub regime_multiplier_unknown: f64,
+    /// Volume multiplier for HFT mode (1.1 = 1.1x average volume)
+    #[serde(default = "default_volume_multiplier_hft")]
+    pub volume_multiplier_hft: f64,
+    /// Volume multiplier for normal mode (1.3 = 1.3x average volume)
+    #[serde(default = "default_volume_multiplier_normal")]
+    pub volume_multiplier_normal: f64,
+    /// Trend strength threshold for HFT mode (0.5 = 50% alignment required)
+    #[serde(default = "default_trend_threshold_hft")]
+    pub trend_threshold_hft: f64,
+    /// Trend strength threshold for normal mode (0.7 = 70% alignment required)
+    #[serde(default = "default_trend_threshold_normal")]
+    pub trend_threshold_normal: f64,
+    /// Score multiplier for weak trends with volume (1.1 = 10% higher threshold)
+    #[serde(default = "default_weak_trend_score_multiplier")]
+    pub weak_trend_score_multiplier: f64,
+    /// RSI lower bound for long signals
+    #[serde(default = "default_rsi_lower_long")]
+    pub rsi_lower_long: f64,
+    /// RSI upper bound for long signals
+    #[serde(default = "default_rsi_upper_long")]
+    pub rsi_upper_long: f64,
+    /// RSI lower bound for short signals
+    #[serde(default = "default_rsi_lower_short")]
+    pub rsi_lower_short: f64,
+    /// RSI upper bound for short signals
+    #[serde(default = "default_rsi_upper_short")]
+    pub rsi_upper_short: f64,
+    /// Score weight for short-term EMA alignment
+    #[serde(default = "default_ema_short_score")]
+    pub ema_short_score: f64,
+    /// Score weight for mid-term EMA alignment
+    #[serde(default = "default_ema_mid_score")]
+    pub ema_mid_score: f64,
+    /// Score weight for slope strength
+    #[serde(default = "default_slope_score")]
+    pub slope_score: f64,
+    /// Score weight for RSI confirmation
+    #[serde(default = "default_rsi_score")]
+    pub rsi_score: f64,
+    /// Minimum analysis interval in milliseconds (throttling)
+    #[serde(default = "default_min_analysis_interval_ms")]
+    pub min_analysis_interval_ms: u64,
+    /// Default spread quality when spread range is zero
+    #[serde(default = "default_default_spread_quality")]
+    pub default_spread_quality: f64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -314,6 +392,110 @@ fn default_use_trailing_stop() -> bool {
 
 fn default_trailing_stop_callback_rate() -> f64 {
     0.001 // Default: 0.1% callback rate (0.001 = 0.1%)
+}
+
+fn default_rsi_min_avg_loss() -> f64 {
+    0.0001 // Default: 0.0001 (prevents division by very small numbers)
+}
+
+fn default_atr_period() -> usize {
+    14 // Default: 14 periods for ATR calculation
+}
+
+fn default_low_volatility_threshold() -> f64 {
+    0.5 // Default: 0.5% ATR = ranging market
+}
+
+fn default_high_volatility_threshold() -> f64 {
+    2.0 // Default: 2.0% ATR = volatile market
+}
+
+fn default_base_volatility() -> f64 {
+    0.02 // Default: 2% base volatility for normalization
+}
+
+fn default_base_min_score() -> f64 {
+    3.5 // Default: Base minimum score threshold
+}
+
+fn default_regime_multiplier_trending() -> f64 {
+    0.95 // Default: Trending markets use 95% of base score
+}
+
+fn default_regime_multiplier_ranging() -> f64 {
+    1.1 // Default: Ranging markets use 110% of base score
+}
+
+fn default_regime_multiplier_volatile() -> f64 {
+    1.15 // Default: Volatile markets use 115% of base score
+}
+
+fn default_regime_multiplier_unknown() -> f64 {
+    1.0 // Default: Unknown markets use 100% of base score
+}
+
+fn default_volume_multiplier_hft() -> f64 {
+    1.1 // Default: HFT mode requires 1.1x average volume
+}
+
+fn default_volume_multiplier_normal() -> f64 {
+    1.3 // Default: Normal mode requires 1.3x average volume
+}
+
+fn default_trend_threshold_hft() -> f64 {
+    0.5 // Default: HFT mode requires 50% trend alignment
+}
+
+fn default_trend_threshold_normal() -> f64 {
+    0.7 // Default: Normal mode requires 70% trend alignment
+}
+
+fn default_weak_trend_score_multiplier() -> f64 {
+    1.1 // Default: Weak trends with volume require 10% higher score
+}
+
+fn default_rsi_lower_long() -> f64 {
+    55.0 // Default: RSI lower bound for long signals
+}
+
+fn default_rsi_upper_long() -> f64 {
+    70.0 // Default: RSI upper bound for long signals
+}
+
+fn default_rsi_lower_short() -> f64 {
+    25.0 // Default: RSI lower bound for short signals
+}
+
+fn default_rsi_upper_short() -> f64 {
+    50.0 // Default: RSI upper bound for short signals
+}
+
+fn default_ema_short_score() -> f64 {
+    2.5 // Default: Score weight for short-term EMA alignment
+}
+
+fn default_ema_mid_score() -> f64 {
+    2.0 // Default: Score weight for mid-term EMA alignment
+}
+
+fn default_slope_score() -> f64 {
+    1.5 // Default: Score weight for slope strength
+}
+
+fn default_rsi_score() -> f64 {
+    1.5 // Default: Score weight for RSI confirmation
+}
+
+fn default_min_analysis_interval_ms() -> u64 {
+    100 // Default: 100ms minimum interval (10 analyses per second max)
+}
+
+fn default_default_spread_quality() -> f64 {
+    0.5 // Default: 0.5 = medium spread quality when range is zero
+}
+
+fn default_min_commission_buffer_usd() -> f64 {
+    0.5 // Default: 0.5 USD minimum commission buffer
 }
 
 fn default_min_margin_usd() -> f64 {

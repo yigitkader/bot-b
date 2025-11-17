@@ -594,11 +594,51 @@ pub fn from_config(
     /// Fetch max leverage for a symbol from Binance leverage brackets API
     /// Returns None if API call fails (will use safe fallback instead of config max_leverage)
     /// ✅ CRITICAL: This endpoint requires authentication (signature + API key)
-    async fn fetch_max_leverage(&self, sym: &str) -> Option<u32> {
+    /// Public so it can be called directly when coin's max leverage is needed
+    pub async fn fetch_max_leverage(&self, sym: &str) -> Option<u32> {
+        // Helper function to deserialize u32 from string or number
+        // Binance API returns bracket and initialLeverage as strings in some cases
+        fn deserialize_u32_flexible<'de, D>(deserializer: D) -> Result<u32, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            use serde::de::{self, Visitor};
+            use std::fmt;
+            
+            struct U32FlexibleVisitor;
+            
+            impl<'de> Visitor<'de> for U32FlexibleVisitor {
+                type Value = u32;
+                
+                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                    formatter.write_str("a u32 or string representation of u32")
+                }
+                
+                fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    Ok(value as u32)
+                }
+                
+                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    value.parse::<u32>().map_err(de::Error::custom)
+                }
+            }
+            
+            deserializer.deserialize_any(U32FlexibleVisitor)
+        }
+        
         #[derive(Deserialize)]
         struct LeverageBracket {
+            // ✅ CRITICAL FIX: bracket and initialLeverage can be string or number
+            // Binance API returns them as strings in some cases
+            #[serde(deserialize_with = "deserialize_u32_flexible")]
             bracket: u32,
-            #[serde(rename = "initialLeverage")]
+            #[serde(rename = "initialLeverage", deserialize_with = "deserialize_u32_flexible")]
             initial_leverage: u32,
             #[serde(rename = "notionalCap")]
             notional_cap: String,
@@ -704,16 +744,32 @@ pub fn from_config(
                                                 for bracket_item in brackets_arr {
                                                     if let Some(bracket_obj) = bracket_item.as_object() {
                                                         // Try to extract initialLeverage (required)
-                                                        if let Some(lev_val) = bracket_obj.get("initialLeverage") {
-                                                            if let Some(lev) = lev_val.as_u64() {
-                                                                brackets.push(LeverageBracket {
-                                                                    bracket: bracket_obj.get("bracket").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                                                                    initial_leverage: lev as u32,
-                                                                    notional_cap: bracket_obj.get("notionalCap").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                                                                    notional_floor: bracket_obj.get("notionalFloor").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                                                                    maint_margin_ratio: bracket_obj.get("maintMarginRatio").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                                                                });
-                                                            }
+                                                        // ✅ CRITICAL FIX: initialLeverage can be string or number
+                                                        // API returns "50" as string, not 50 as number
+                                                        let initial_leverage = bracket_obj.get("initialLeverage")
+                                                            .and_then(|v| {
+                                                                // Try as number first
+                                                                v.as_u64()
+                                                                    // If not number, try as string and parse
+                                                                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                                                            });
+                                                        
+                                                        if let Some(lev) = initial_leverage {
+                                                            // ✅ CRITICAL FIX: bracket can also be string or number
+                                                            let bracket_num = bracket_obj.get("bracket")
+                                                                .and_then(|v| {
+                                                                    v.as_u64()
+                                                                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                                                                })
+                                                                .unwrap_or(0) as u32;
+                                                            
+                                                            brackets.push(LeverageBracket {
+                                                                bracket: bracket_num,
+                                                                initial_leverage: lev as u32,
+                                                                notional_cap: bracket_obj.get("notionalCap").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                                                                notional_floor: bracket_obj.get("notionalFloor").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                                                                maint_margin_ratio: bracket_obj.get("maintMarginRatio").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+                                                            });
                                                         }
                                                     }
                                                 }
@@ -2459,12 +2515,25 @@ impl BinanceFutures {
         let price_quantized = quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = quantize_decimal(qty.0.abs(), rules.step_size);
 
+    // ✅ CRITICAL FIX: Calculate precision from step_size instead of using qty_precision
+    // Problem: qty_precision might be different from step_size precision, causing "Precision is over" errors
+    // Solution: Use step_size's scale as the precision for formatting
+    // Example: step_size = 0.01 → precision = 2, step_size = 0.001 → precision = 3
+        let qty_precision_from_step = if rules.step_size.is_zero() {
+            qty_precision // Fallback to qty_precision if step_size is zero
+        } else {
+            rules.step_size.scale() as usize
+        };
+        
+        // Use the minimum of qty_precision and step_size precision to ensure we don't exceed Binance's limits
+        let effective_qty_precision = qty_precision.min(qty_precision_from_step);
+
     // 2. Round: precision'a göre round et
     // Use ToNegativeInfinity (floor) instead of ToZero for safety
         let price = price_quantized
             .round_dp_with_strategy(price_precision as u32, RoundingStrategy::ToNegativeInfinity);
         let qty_rounded =
-            qty_quantized.round_dp_with_strategy(qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
+            qty_quantized.round_dp_with_strategy(effective_qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
 
     // ✅ CRITICAL: Check if qty_rounded is zero after rounding
     // Problem: If qty_precision is too small, rounding can make quantity zero
@@ -2493,7 +2562,7 @@ impl BinanceFutures {
 
     // 3. Format: precision'a göre string'e çevir
         let price_str = format_decimal_fixed(price, price_precision);
-        let qty_str = format_decimal_fixed(qty_rounded, qty_precision);
+        let qty_str = format_decimal_fixed(qty_rounded, effective_qty_precision);
 
     // 4. KRİTİK: Son kontrol - fractional_digits kontrolü
         let price_fractional = if let Some(dot_pos) = price_str.find('.') {
@@ -2516,7 +2585,7 @@ impl BinanceFutures {
             return Err(anyhow!(error_msg));
         }
 
-        if qty_fractional > qty_precision {
+        if qty_fractional > effective_qty_precision {
             let error_msg = format!(
                 "CRITICAL: qty_str fractional digits ({}) > qty_precision ({}) for {}",
                 qty_fractional, qty_precision, sym

@@ -103,7 +103,7 @@ pub struct AiAnalyzer {
     order_stats: Arc<Mutex<HashMap<String, OrderStats>>>,
     
     // Anomaly history (for pattern detection)
-    anomaly_history: Arc<Mutex<VecDeque<AnomalyReport>>>,
+    pub(crate) anomaly_history: Arc<Mutex<VecDeque<AnomalyReport>>>,
     
     // Performance metrics
     total_signals: Arc<AtomicU64>,
@@ -115,10 +115,10 @@ pub struct AiAnalyzer {
     report_file_path: PathBuf,
     
     // Detailed operation tracking
-    operation_log: Arc<Mutex<VecDeque<OperationLog>>>,
+    pub(crate) operation_log: Arc<Mutex<VecDeque<OperationLog>>>,
     
     // Error tracking
-    error_log: Arc<Mutex<VecDeque<ErrorLog>>>,
+    pub(crate) error_log: Arc<Mutex<VecDeque<ErrorLog>>>,
     
     // Log file tracking (for incremental reading)
     console_log_path: PathBuf,
@@ -147,25 +147,25 @@ struct ErrorLog {
 }
 
 #[derive(Debug, Clone)]
-struct TradeStats {
-    symbol: String,
-    total_trades: u64,
-    winning_trades: u64,
-    losing_trades: u64,
-    total_pnl: f64,
-    recent_pnl: VecDeque<f64>, // Last 10 trades PnL
-    last_trade_time: Option<Instant>,
+pub struct TradeStats {
+    pub symbol: String,
+    pub total_trades: u64,
+    pub winning_trades: u64,
+    pub losing_trades: u64,
+    pub total_pnl: f64,
+    pub recent_pnl: VecDeque<f64>, // Last 10 trades PnL
+    pub last_trade_time: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
-struct OrderStats {
-    symbol: String,
-    total_orders: u64,
-    filled_orders: u64,
-    canceled_orders: u64,
-    rejected_orders: u64,
-    recent_spreads: VecDeque<f64>, // Last 20 spreads
-    last_order_time: Option<Instant>,
+pub struct OrderStats {
+    pub symbol: String,
+    pub total_orders: u64,
+    pub filled_orders: u64,
+    pub canceled_orders: u64,
+    pub rejected_orders: u64,
+    pub recent_spreads: VecDeque<f64>, // Last 20 spreads
+    pub last_order_time: Option<Instant>,
 }
 
 impl AiAnalyzer {
@@ -197,7 +197,7 @@ impl AiAnalyzer {
     }
 
     /// Start the AI analyzer service
-    pub async fn start(&self) -> Result<()> {
+    pub async fn start(self: &Arc<Self>) -> Result<()> {
         info!("AI_ANALYZER: Starting intelligent log analysis service");
         info!("AI_ANALYZER: Analysis reports will be written to: {}", self.report_file_path.display());
         
@@ -945,17 +945,15 @@ impl AiAnalyzer {
     }
     
     /// Periodic analysis task (runs every 5 minutes)
-    async fn periodic_analysis(&self) -> Result<()> {
+    async fn periodic_analysis(self: &Arc<Self>) -> Result<()> {
         let shutdown_flag = self.shutdown_flag.clone();
-        let trade_stats = self.trade_stats.clone();
-        let order_stats = self.order_stats.clone();
+        let ai_analyzer = self.clone();
+        let operation_log = self.operation_log.clone();
+        let error_log = self.error_log.clone();
         let total_signals = self.total_signals.clone();
         let total_trades = self.total_trades.clone();
         let total_wins = self.total_wins.clone();
         let total_losses = self.total_losses.clone();
-        let anomaly_history = self.anomaly_history.clone();
-        let operation_log = self.operation_log.clone();
-        let error_log = self.error_log.clone();
         let report_file_path = self.report_file_path.clone();
         
         tokio::spawn(async move {
@@ -983,31 +981,52 @@ impl AiAnalyzer {
                     signals, trades, win_rate, wins, losses
                 );
                 
-                // Generate comprehensive analysis report
-                {
-                    let trade_stats_guard = trade_stats.lock().await;
-                    let order_stats_guard = order_stats.lock().await;
-                    let anomaly_history_guard = anomaly_history.lock().await;
-                    let operation_log_guard = operation_log.lock().await;
-                    let error_log_guard = error_log.lock().await;
+                // ✅ Use public API methods to get statistics
+                let trade_stats_data = ai_analyzer.get_trade_stats().await;
+                let order_stats_data = ai_analyzer.get_order_stats().await;
+                let recent_anomalies = ai_analyzer.get_recent_anomalies(20).await;
+                
+                // Get internal data for report generation
+                let anomaly_history_guard = ai_analyzer.anomaly_history.lock().await;
+                let operation_log_guard = operation_log.lock().await;
+                let error_log_guard = error_log.lock().await;
+                
+                Self::generate_analysis_report(
+                    &trade_stats_data,
+                    &order_stats_data,
+                    &*anomaly_history_guard,
+                    &*operation_log_guard,
+                    &*error_log_guard,
+                    signals,
+                    trades,
+                    wins,
+                    losses,
+                    &report_file_path,
+                ).await;
+                
+                drop(anomaly_history_guard);
+                drop(operation_log_guard);
+                drop(error_log_guard);
+                
+                // Log recent anomalies if any
+                if !recent_anomalies.is_empty() {
+                    let high_severity_count = recent_anomalies.iter()
+                        .filter(|a| matches!(a.severity, Severity::High))
+                        .count();
+                    let medium_severity_count = recent_anomalies.iter()
+                        .filter(|a| matches!(a.severity, Severity::Medium))
+                        .count();
                     
-                    Self::generate_analysis_report(
-                        &*trade_stats_guard,
-                        &*order_stats_guard,
-                        &*anomaly_history_guard,
-                        &*operation_log_guard,
-                        &*error_log_guard,
-                        signals,
-                        trades,
-                        wins,
-                        losses,
-                        &report_file_path,
-                    ).await;
+                    if high_severity_count > 0 || medium_severity_count > 0 {
+                        warn!(
+                            "⚠️ AI_ANALYZER: {} high and {} medium severity anomalies detected in last 20",
+                            high_severity_count, medium_severity_count
+                        );
+                    }
                 }
                 
-                // Analyze per-symbol statistics
-                let stats = trade_stats.lock().await;
-                for (symbol, stat) in stats.iter() {
+                // Analyze per-symbol statistics using public API
+                for (symbol, stat) in trade_stats_data.iter() {
                     if stat.total_trades > 5 {
                         let symbol_win_rate = if stat.total_trades > 0 {
                             (stat.winning_trades as f64) / (stat.total_trades as f64) * 100.0

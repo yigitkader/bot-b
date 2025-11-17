@@ -244,6 +244,7 @@ impl Trending {
                                     rsi_avg_gain: None,
                                     rsi_avg_loss: None,
                                     rsi_period_count: 0,
+                                    last_analysis_time: None,
                                 }
                             });
                             
@@ -496,7 +497,7 @@ impl Trending {
     }
     
     /// Calculate RSI from incremental state (O(1) performance)
-    fn calculate_rsi_from_state(state: &SymbolState) -> Option<f64> {
+    fn calculate_rsi_from_state(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> Option<f64> {
         const RSI_PERIOD: usize = 14;
         
         // Need at least RSI_PERIOD updates before RSI is reliable
@@ -511,9 +512,36 @@ impl Trending {
             return Some(100.0); // All gains, no losses
         }
         
-        let rs = avg_gain / avg_loss;
+        // ✅ FIX: Minimum threshold to prevent division by very small numbers
+        // This prevents RSI values like 0.0001 when price changes are very small
+        // Get from config instead of hardcoded value
+        let min_avg_loss = Decimal::from_str(&format!("{}", cfg.rsi_min_avg_loss))
+            .unwrap_or_else(|_| Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO));
+        
+        // ✅ FIX: Clamp avg_loss to minimum threshold to prevent division by very small numbers
+        let avg_loss_clamped = avg_loss.max(min_avg_loss);
+        
+        let rs = avg_gain / avg_loss_clamped;
         let rsi = Decimal::from(100) - (Decimal::from(100) / (Decimal::ONE + rs));
-        rsi.to_f64()
+        let rsi_value = rsi.to_f64().unwrap_or(50.0);
+        
+        // ✅ FIX: Clamp RSI to valid range [0.1, 99.9] to prevent extreme values
+        let clamped_rsi = rsi_value.max(0.1).min(99.9);
+        
+        // Log warning if RSI was clamped (indicates potential calculation issue)
+        if clamped_rsi != rsi_value {
+            warn!(
+                symbol = %state.symbol,
+                original_rsi = rsi_value,
+                clamped_rsi = clamped_rsi,
+                avg_gain = %avg_gain,
+                avg_loss = %avg_loss,
+                avg_loss_clamped = %avg_loss_clamped,
+                "TRENDING: RSI clamped to valid range [0.1, 99.9]"
+            );
+        }
+        
+        Some(clamped_rsi)
     }
     
     /// Calculate average volume over period
@@ -564,15 +592,15 @@ impl Trending {
     /// Detect market regime (simplified - ATR-based only)
     /// Note: Removed simplified ADX calculation as it was inaccurate
     /// Using only ATR for volatility-based regime detection
-    fn detect_market_regime(state: &SymbolState) -> MarketRegime {
-        const ATR_PERIOD: usize = 14;
-        const LOW_VOLATILITY_THRESHOLD: f64 = 0.5; // ATR < 0.5% = ranging
-        const HIGH_VOLATILITY_THRESHOLD: f64 = 2.0; // ATR > 2% = volatile
+    fn detect_market_regime(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> MarketRegime {
+        let atr_period = cfg.atr_period;
+        let low_volatility_threshold = cfg.low_volatility_threshold;
+        let high_volatility_threshold = cfg.high_volatility_threshold;
 
         let prices = &state.prices;
         
         // Calculate ATR for volatility
-        let atr = Self::calculate_atr(prices, ATR_PERIOD);
+        let atr = Self::calculate_atr(prices, atr_period);
         let atr_pct = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
             if !current_price.price.is_zero() {
                 (atr_val / current_price.price * Decimal::from(100)).to_f64()
@@ -585,9 +613,9 @@ impl Trending {
 
         // Determine regime based on ATR only (simplified approach)
         if let Some(atr_pct_val) = atr_pct {
-            if atr_pct_val < LOW_VOLATILITY_THRESHOLD {
+            if atr_pct_val < low_volatility_threshold {
                 MarketRegime::Ranging
-            } else if atr_pct_val > HIGH_VOLATILITY_THRESHOLD {
+            } else if atr_pct_val > high_volatility_threshold {
                 MarketRegime::Volatile
             } else {
                 // Medium volatility - assume trending (default for trend-following strategy)
@@ -603,7 +631,7 @@ impl Trending {
     /// Uses weighted scoring system for flexible signal generation
     /// Includes adaptive parameters based on volatility and market regime
     /// Public for backtesting
-    pub fn analyze_trend(state: &SymbolState) -> Option<TrendSignal> {
+    pub fn analyze_trend(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> Option<TrendSignal> {
         const VOLUME_PERIOD: usize = 20; // Volume average period
         const EMA_SLOW_PERIOD: usize = 55; // EMA_55 period (slowest EMA, requires most data)
         // ✅ CRITICAL FIX: Minimum price points = max(VOLUME_PERIOD, EMA_SLOW_PERIOD)
@@ -613,17 +641,12 @@ impl Trending {
         // Note: EMA_SLOW_PERIOD (55) > VOLUME_PERIOD (20), so MIN_PRICE_POINTS = 55
         const MIN_PRICE_POINTS: usize = EMA_SLOW_PERIOD; // 55 price points required (max of VOLUME_PERIOD and EMA_SLOW_PERIOD)
         
-        // ✅ OPTIMIZED: Best parameter from systematic testing (120 combinations tested)
-        // Optimization tested: BASE_MIN_SCORE [4.5-5.1], trend_strength [0.5-0.7], SL [1.5-2.0]x, TP [4.0-5.0]x
-        // Current best: BASE=5.0, trend=0.7 provides good balance (38.46% win rate, +$6.23 PnL in previous tests)
-        // Note: BASE=4.9 tested but resulted in lower win rate (31.11%) - reverting to proven 5.0
-        const BASE_MIN_SCORE: f64 = 5.0; // Base threshold (6.5 max score, 5.0 = 77% - proven to work)
-        // ✅ SMART OPTIMIZATION: Keep original RSI range for trending markets
-        // Backtest: DOGE (54.5% win rate) and BTC (50% win rate) worked well with original values
-        const BASE_RSI_LOWER: f64 = 55.0; // Original value (proven to work)
-        const BASE_RSI_UPPER: f64 = 70.0; // Original value (proven to work)
-        const BASE_RSI_LOWER_SHORT: f64 = 25.0;
-        const BASE_RSI_UPPER_SHORT: f64 = 50.0;
+        // ✅ Get all thresholds from config instead of hardcoded values
+        let base_min_score = cfg.base_min_score;
+        let base_rsi_lower = cfg.rsi_lower_long;
+        let base_rsi_upper = cfg.rsi_upper_long;
+        let base_rsi_lower_short = cfg.rsi_lower_short;
+        let base_rsi_upper_short = cfg.rsi_upper_short;
         
         let prices = &state.prices;
         
@@ -711,25 +734,27 @@ impl Trending {
         let mut score_short = 0.0;
         let mut trend_strength = 0.0; // Track overall trend strength (0.0 - 1.0)
         
-        // Short-term: Price > Fast EMA > Mid EMA (weight: 2.0 - most important)
+        // Short-term: Price > Fast EMA > Mid EMA (weight from config)
         let short_term_aligned = current_price > ema_fast && ema_fast > ema_mid;
         let short_term_aligned_short = current_price < ema_fast && ema_fast < ema_mid;
+        let ema_short_score = cfg.ema_short_score;
         if short_term_aligned {
-            score_long += 2.0;
+            score_long += ema_short_score;
             trend_strength += 0.4; // 40% of trend strength
         } else if short_term_aligned_short {
-            score_short += 2.0;
+            score_short += ema_short_score;
             trend_strength += 0.4;
         }
         
         // Mid-term: Mid EMA > Slow EMA (weight: 1.5)
         let mid_term_aligned = ema_mid > ema_slow;
         let mid_term_aligned_short = ema_mid < ema_slow;
+        let ema_mid_score = cfg.ema_mid_score;
         if mid_term_aligned {
-            score_long += 1.5;
+            score_long += ema_mid_score;
             trend_strength += 0.3; // 30% of trend strength
         } else if mid_term_aligned_short {
-            score_short += 1.5;
+            score_short += ema_mid_score;
             trend_strength += 0.3;
         }
         
@@ -752,12 +777,13 @@ impl Trending {
         
         let slope_strong = if let Some(slope) = ema_slope {
             let min_slope = Decimal::from(5) / Decimal::from(10000); // 0.05% minimum
+            let slope_score = cfg.slope_score;
             if slope > min_slope {
-                score_long += 1.0;
+                score_long += slope_score;
                 trend_strength += 0.3; // 30% of trend strength
                 true
             } else if slope < -min_slope {
-                score_short += 1.0;
+                score_short += slope_score;
                 trend_strength += 0.3;
                 true
             } else {
@@ -768,7 +794,7 @@ impl Trending {
         };
         
         // 2. RSI momentum confirmation (weight: 1.0) with adaptive thresholds
-        let rsi = match Self::calculate_rsi_from_state(state) {
+        let rsi = match Self::calculate_rsi_from_state(state, cfg) {
             Some(rsi_val) => rsi_val,
             None => {
                 warn!(
@@ -784,12 +810,12 @@ impl Trending {
             }
         };
         
-        // Adaptive RSI thresholds based on volatility
-        let atr = Self::calculate_atr(prices, 14);
+        // Adaptive RSI thresholds based on volatility (from config)
+        let atr = Self::calculate_atr(prices, cfg.atr_period);
         let volatility_multiplier = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
             if !current_price.price.is_zero() {
                 let atr_pct = (atr_val / current_price.price).to_f64().unwrap_or(0.01);
-                let base_volatility = 0.02; // 2% base volatility
+                let base_volatility = cfg.base_volatility; // From config
                 (atr_pct / base_volatility).max(0.5).min(2.0) // Clamp between 0.5x and 2x
             } else {
                 1.0
@@ -801,104 +827,91 @@ impl Trending {
         // ✅ SMART OPTIMIZATION: Keep original RSI range for trending markets
         // Backtest: DOGE (54.5% win rate) and BTC (50% win rate) worked well with original range
         // Only narrow RSI range for ranging/volatile markets (done in regime-based filtering)
-        let rsi_lower = BASE_RSI_LOWER - (10.0 * volatility_multiplier); // 45-55 range (original)
-        let rsi_upper = BASE_RSI_UPPER - (5.0 * (1.0 - volatility_multiplier)); // 65-70 range (original)
+        let rsi_lower = base_rsi_lower - (10.0 * volatility_multiplier); // 45-55 range (original)
+        let rsi_upper = base_rsi_upper - (5.0 * (1.0 - volatility_multiplier)); // 65-70 range (original)
         
-        // Short signals: RSI < 40 (bearish momentum, oversold region)
-        // Fixed upper limit at 40 to avoid false signals in downtrends
-        // In downtrends, RSI typically stays below 30, so 25-50 range was too wide
-        let rsi_upper_short = 40.0; // Fixed upper limit for short signals
+        // Short signals: RSI < upper_short (bearish momentum, oversold region)
+        // Use config value instead of hardcoded 40.0
+        let rsi_upper_short = base_rsi_upper_short;
         
         let rsi_bullish = rsi > rsi_lower && rsi < rsi_upper;
-        let rsi_bearish = rsi < rsi_upper_short; // RSI < 40 for short signals
+        let rsi_bearish = rsi < rsi_upper_short; // RSI < upper_short for short signals
         
+        // ✅ Get RSI score from config instead of hardcoded value
+        let rsi_score = cfg.rsi_score;
         if rsi_bullish {
-            score_long += 1.0;
+            score_long += rsi_score;
         } else if rsi_bearish {
-            score_short += 1.0;
+            score_short += rsi_score;
         }
         
         // Market regime detection
-        let regime = Self::detect_market_regime(state);
+        let regime = Self::detect_market_regime(state, cfg);
         
-        // ✅ PRODUCTION: Original thresholds that worked in backtests
-        // Backtest: BTC/DOGE achieved 50%+ win rate with original values
-        // Solution: Return to proven thresholds, optimize only risk/reward ratio for better PnL
+        // ✅ Get regime multipliers from config instead of hardcoded values
         let min_score = match regime {
-            MarketRegime::Trending => BASE_MIN_SCORE * 0.95, // Original - BTC/DOGE work well here
-            MarketRegime::Ranging => BASE_MIN_SCORE * 1.3,  // Original - keep as is
-            MarketRegime::Volatile => BASE_MIN_SCORE * 1.15, // Original - keep as is
-            MarketRegime::Unknown => BASE_MIN_SCORE, // Original - default behavior
+            MarketRegime::Trending => base_min_score * cfg.regime_multiplier_trending,
+            MarketRegime::Ranging => base_min_score * cfg.regime_multiplier_ranging,
+            MarketRegime::Volatile => base_min_score * cfg.regime_multiplier_volatile,
+            MarketRegime::Unknown => base_min_score * cfg.regime_multiplier_unknown,
         };
         
         // ✅ OPTIMIZED: Stricter volume confirmation based on backtest results
         // Backtest analysis: DOGE (54.5% win rate) had strong volume confirmation
         // ETH (25% win rate) and SOL (33% win rate) had weak volume confirmation
         // Solution: Higher volume threshold and make it mandatory for medium-volatility coins
-        let current_volume = match prices.back() {
-            Some(price_point) => match price_point.volume {
-                Some(vol) => vol,
+        // ✅ HFT MODE: In HFT mode, volume is optional if require_volume_confirmation is false
+        let (current_volume, avg_volume) = if cfg.hft_mode && !cfg.require_volume_confirmation {
+            // HFT mode with optional volume - try to get volume but don't fail if missing
+            let current_vol = prices.back()
+                .and_then(|p| p.volume);
+            let avg_vol = Self::calculate_avg_volume(prices, VOLUME_PERIOD);
+            
+            // If volume data is available, use it; otherwise use None (volume confirmation will be skipped)
+            (current_vol, avg_vol)
+        } else {
+            // Normal mode - volume is required
+            let current_volume = match prices.back() {
+                Some(price_point) => match price_point.volume {
+                    Some(vol) => vol,
+                    None => {
+                        warn!(
+                            symbol = %state.symbol,
+                            prices_len = prices.len(),
+                            "TRENDING: Current price point has no volume data, skipping trend analysis"
+                        );
+                        return None;
+                    }
+                },
                 None => {
                     warn!(
                         symbol = %state.symbol,
-                        prices_len = prices.len(),
-                        "TRENDING: Current price point has no volume data, skipping trend analysis"
+                        "TRENDING: No price data available, skipping trend analysis"
                     );
                     return None;
                 }
-            },
-            None => {
-                warn!(
-                    symbol = %state.symbol,
-                    "TRENDING: No price data available, skipping trend analysis"
-                );
-                return None;
-            }
+            };
+            
+            let avg_volume = match Self::calculate_avg_volume(prices, VOLUME_PERIOD) {
+                Some(avg) => avg,
+                None => {
+                    // Count how many price points have volume data
+                    let volume_count = prices.iter().filter(|p| p.volume.is_some()).count();
+                    warn!(
+                        symbol = %state.symbol,
+                        prices_len = prices.len(),
+                        volume_period = VOLUME_PERIOD,
+                        volume_count,
+                        "TRENDING: Average volume calculation failed - only {}/{} price points have volume data, skipping trend analysis",
+                        volume_count,
+                        prices.len()
+                    );
+                    return None;
+                }
+            };
+            
+            (Some(current_volume), Some(avg_volume))
         };
-        
-        let avg_volume = match Self::calculate_avg_volume(prices, VOLUME_PERIOD) {
-            Some(avg) => avg,
-            None => {
-                // Count how many price points have volume data
-                let volume_count = prices.iter().filter(|p| p.volume.is_some()).count();
-                warn!(
-                    symbol = %state.symbol,
-                    prices_len = prices.len(),
-                    volume_period = VOLUME_PERIOD,
-                    volume_count,
-                    "TRENDING: Average volume calculation failed - only {}/{} price points have volume data, skipping trend analysis",
-                    volume_count,
-                    prices.len()
-                );
-                return None;
-            }
-        };
-        
-        // ✅ SMART OPTIMIZATION: Keep original volume threshold for trending markets
-        // Backtest: DOGE (54.5% win rate) worked well with 1.5x threshold
-        // Only increase volume threshold for ranging/volatile markets (done in regime-based filtering)
-        let volume_multiplier = Decimal::from_str("1.5").unwrap_or(Decimal::from(150) / Decimal::from(100)); // Original - proven to work
-        let volume_surge = current_volume > avg_volume * volume_multiplier;
-        
-        // Volume trend (recent > longer average)
-        let recent_avg_volume = match Self::calculate_avg_volume(prices, 5) {
-            Some(avg) => avg,
-            None => {
-                let volume_count = prices.iter().filter(|p| p.volume.is_some()).count();
-                warn!(
-                    symbol = %state.symbol,
-                    prices_len = prices.len(),
-                    volume_count,
-                    "TRENDING: Recent average volume calculation failed - only {}/{} price points have volume data, skipping trend analysis",
-                    volume_count,
-                    prices.len()
-                );
-                return None;
-            }
-        };
-        let volume_trend = recent_avg_volume > avg_volume;
-        
-        let volume_confirms = volume_surge && volume_trend;
         
         // ✅ UNIVERSAL PATTERN: Trend + Volume combination = higher win rate across ALL coins
         // Backtest analysis:
@@ -910,10 +923,56 @@ impl Trending {
         // Calculate trend strength (0.0 - 1.0)
         // Strong trend = at least 2 of 3 EMA conditions met (short + mid = 0.7, or short + slope = 0.7, etc.)
         // This allows signals when trend is clearly established (not just perfect alignment)
-        // ✅ PRODUCTION: Original trend strength requirement
-        // Backtest: 0.7 worked well in production, 0.5 was too low (32.5% win rate)
-        // Solution: Return to proven 0.7 threshold for better signal quality
-        let is_strong_trend = trend_strength >= 0.7; // At least 70% of trend indicators aligned (proven to work)
+        // ✅ Get trend threshold from config instead of hardcoded values
+        let trend_threshold = if cfg.hft_mode {
+            cfg.trend_threshold_hft
+        } else {
+            cfg.trend_threshold_normal
+        };
+        let is_strong_trend = trend_strength >= trend_threshold;
+        
+        // ✅ CRITICAL FIX: No volume data available (volume=None in MarketTick)
+        // Since volume data is not available from WebSocket, we bypass volume confirmation
+        // for strong trends. This allows signals to be generated even without volume data.
+        // Calculate volume_confirms AFTER is_strong_trend is defined
+        let volume_confirms = if let (Some(current_vol), Some(avg_vol)) = (current_volume, avg_volume) {
+            // We have volume data - use it for confirmation (from config)
+            let volume_multiplier = if cfg.hft_mode {
+                Decimal::from_str(&format!("{}", cfg.volume_multiplier_hft))
+                    .unwrap_or_else(|_| Decimal::from_str("1.1").unwrap_or(Decimal::from(110) / Decimal::from(100)))
+            } else {
+                Decimal::from_str(&format!("{}", cfg.volume_multiplier_normal))
+                    .unwrap_or_else(|_| Decimal::from_str("1.3").unwrap_or(Decimal::from(130) / Decimal::from(100)))
+            };
+            let volume_surge = current_vol > avg_vol * volume_multiplier;
+            
+            // Volume trend (recent > longer average)
+            let volume_trend = match Self::calculate_avg_volume(prices, 5) {
+                Some(recent_avg_volume) => recent_avg_volume > avg_vol,
+                None => false,
+            };
+            
+            // In HFT mode, only volume_surge is required; volume_trend is optional
+            if cfg.hft_mode {
+                volume_surge
+            } else {
+                volume_surge && volume_trend
+            }
+        } else {
+            // ✅ CRITICAL FIX: No volume data available (volume=None in MarketTick)
+            // Since volume data is not available from WebSocket, we bypass volume confirmation
+            // for strong trends. This allows signals to be generated even without volume data.
+            if cfg.hft_mode && !cfg.require_volume_confirmation {
+                // HFT mode without volume requirement - treat as confirmed
+                true
+            } else if is_strong_trend {
+                // Strong trend can compensate for missing volume data
+                true
+            } else {
+                // Weak trend without volume - require volume confirmation
+                false
+            }
+        };
         
         // Universal rule: Strong trend OR volume confirmation required
         // Weak trend without volume = reject (prevents ETH/SOL false signals)
@@ -944,9 +1003,9 @@ impl Trending {
         let final_min_score = if is_strong_trend {
             min_score // Strong trend: use normal threshold (works for DOGE/BTC)
         } else {
-            // Weak trend but has volume: require higher score (10% more selective - original value)
+            // Weak trend but has volume: require higher score (from config)
             // This filters out marginal signals that fail in ETH/SOL
-            min_score * 1.1
+            min_score * cfg.weak_trend_score_multiplier
         };
         
         // ✅ DEBUG: Always log score analysis for troubleshooting (even if scores are 0)
@@ -1053,7 +1112,24 @@ impl Trending {
                                     rsi_avg_gain: None,
                                     rsi_avg_loss: None,
                                     rsi_period_count: 0,
+                                    last_analysis_time: None,
             });
+            
+            // ✅ FIX: Throttling to prevent channel lag (from config)
+            // Problem: Too many trend analyses causing channel lag (10,000+ warnings)
+            // Solution: Limit analysis frequency based on config (default: 10 per second = 100ms)
+            let min_analysis_interval_ms = cfg.trending.min_analysis_interval_ms;
+            
+            if let Some(last_analysis) = state.last_analysis_time {
+                let elapsed_ms = now.duration_since(last_analysis).as_millis() as u64;
+                if elapsed_ms < min_analysis_interval_ms {
+                    // Skip - too frequent, prevent channel lag
+                    return Ok(());
+                }
+            }
+            
+            // Update last analysis time
+            state.last_analysis_time = Some(now);
             
             state.prices.push_back(PricePoint {
                 timestamp: now,
@@ -1069,7 +1145,7 @@ impl Trending {
             // Incremental EMA/RSI update (O(1) performance)
             Self::update_indicators(state, mid_price);
             
-            Self::analyze_trend(state)
+            Self::analyze_trend(state, &cfg.trending)
         };
         
         // 4. Generate signal if trend detected

@@ -977,6 +977,19 @@ impl Ordering {
         let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
         let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
         
+        // ✅ FIX: Check if available balance is sufficient for minimum margin
+        // Problem: "Margin is insufficient" errors when balance is too low
+        // Solution: Early check before calculating position size
+        if available_balance < min_margin {
+            debug!(
+                symbol = %signal.symbol,
+                available_balance = %available_balance,
+                min_margin = %min_margin,
+                "ORDERING: Insufficient balance for minimum margin - skipping order"
+            );
+            return Ok(());
+        }
+        
         // Fetch symbol rules to get max leverage (needed for commission buffer calculation)
         let rules = match connection.rules_for(&signal.symbol).await {
             Ok(r) => r,
@@ -1055,12 +1068,13 @@ impl Ordering {
                     let normalized = 1.0 - ((signal.spread_bps - min_spread_bps) / spread_range);
                     normalized.max(0.0).min(1.0)
                 } else {
-                    0.5
+                    cfg.trending.default_spread_quality // From config
                 };
                 
                 let base_margin = available_balance.min(max_margin);
                 let dynamic_margin = base_margin * Decimal::from_str(&spread_quality.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str("0.5").unwrap_or(Decimal::from(50) / Decimal::from(100)));
+                    .unwrap_or_else(|_| Decimal::from_str(&format!("{}", cfg.trending.default_spread_quality))
+                        .unwrap_or(Decimal::from(50) / Decimal::from(100)));
                 
                 dynamic_margin.max(min_margin).min(max_margin).min(available_balance)
             }
@@ -1093,10 +1107,10 @@ impl Ordering {
         let total_commission_rate = taker_commission_rate * Decimal::from(2);
         let calculated_commission_buffer = estimated_notional * total_commission_rate;
         
-        // Minimum commission buffer: 0.5 USD (safety margin for small positions)
-        // Reduced from 2 USD to 0.5 USD to allow smaller balances to trade
-        // Real commission is calculated from notional, so 0.5 USD is sufficient for most cases
-        let min_commission_buffer = Decimal::from_str("0.5").unwrap_or(Decimal::from(1));
+        // Minimum commission buffer from config (safety margin for small positions)
+        // Real commission is calculated from notional, so config value is sufficient for most cases
+        let min_commission_buffer = Decimal::from_str(&format!("{}", cfg.risk.min_commission_buffer_usd))
+            .unwrap_or_else(|_| Decimal::from_str("0.5").unwrap_or(Decimal::from(1)));
         
         // Use max of calculated commission and min buffer
         let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
@@ -1169,15 +1183,16 @@ impl Ordering {
                     // Clamp to [0.0, 1.0]
                     normalized.max(0.0).min(1.0)
                 } else {
-                    // No spread range - use default quality (0.5 = medium)
-                    0.5
+                    // No spread range - use default quality from config
+                    cfg.trending.default_spread_quality
                 };
                 
                 // Calculate dynamic margin: base margin * spread quality
                 // Base margin is usable_balance (up to max_margin)
                 let base_margin = usable_balance.min(max_margin);
                 let dynamic_margin = base_margin * Decimal::from_str(&spread_quality.to_string())
-                    .unwrap_or_else(|_| Decimal::from_str("0.5").unwrap_or(Decimal::from(50) / Decimal::from(100)));
+                    .unwrap_or_else(|_| Decimal::from_str(&format!("{}", cfg.trending.default_spread_quality))
+                        .unwrap_or(Decimal::from(50) / Decimal::from(100)));
                 
                 // Ensure margin is within bounds [min_margin, max_margin]
                 let final_margin = dynamic_margin.max(min_margin).min(max_margin).min(usable_balance);

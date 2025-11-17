@@ -733,6 +733,8 @@ pub struct SymbolState {
     pub rsi_avg_gain: Option<Decimal>,
     pub rsi_avg_loss: Option<Decimal>,
     pub rsi_period_count: usize,
+    /// Timestamp of last trend analysis (for throttling to prevent channel lag)
+    pub last_analysis_time: Option<Instant>,
 }
 
 /// Trend signal direction

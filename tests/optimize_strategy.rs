@@ -186,7 +186,8 @@ mod backtest_common {
                 
                 if let Some(state) = state {
                     // Analyze trend
-                    if let Some(signal) = Trending::analyze_trend(&state) {
+                    let default_cfg = app::config::TrendingCfg::default();
+                    if let Some(signal) = Trending::analyze_trend(&state, &default_cfg) {
                         // Open position
                         let entry_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
                         open_position = Some((signal, entry_price, tick_index));
