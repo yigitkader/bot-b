@@ -65,6 +65,12 @@ pub struct TrendingCfg {
     /// ATR period for volatility calculation
     #[serde(default = "default_atr_period")]
     pub atr_period: usize,
+    /// Dynamic ATR-based stop loss multiplier (default: 3.0x ATR)
+    #[serde(default = "default_atr_sl_multiplier")]
+    pub atr_sl_multiplier: f64,
+    /// Dynamic ATR-based take profit multiplier (default: 6.0x ATR)
+    #[serde(default = "default_atr_tp_multiplier")]
+    pub atr_tp_multiplier: f64,
     /// Low volatility threshold (ATR < this = ranging market)
     #[serde(default = "default_low_volatility_threshold")]
     pub low_volatility_threshold: f64,
@@ -431,6 +437,14 @@ fn default_rsi_min_avg_loss() -> f64 {
 
 fn default_atr_period() -> usize {
     14 // Default: 14 periods for ATR calculation
+}
+
+fn default_atr_sl_multiplier() -> f64 {
+    3.0
+}
+
+fn default_atr_tp_multiplier() -> f64 {
+    6.0
 }
 
 fn default_low_volatility_threshold() -> f64 {

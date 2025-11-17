@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 /// Market regime for adaptive strategy
@@ -949,14 +949,16 @@ impl Trending {
         let states = symbol_states.lock().await;
         if let Some(state) = states.get(&tick.symbol) {
             const ATR_PERIOD: usize = 14;
-            const ATR_SL_MULTIPLIER: f64 = 2.0;
-            const ATR_TP_MULTIPLIER: f64 = 5.0;
-            
             if let Some(atr) = Self::calculate_atr(&state.prices, ATR_PERIOD) {
                 if !mid_price.is_zero() {
                     let atr_pct = (atr / mid_price * Decimal::from(100)).to_f64().unwrap_or(0.0);
-                    let dynamic_sl_pct = (ATR_SL_MULTIPLIER * atr_pct).max(cfg.stop_loss_pct).min(5.0);
-                    let dynamic_tp_pct = (ATR_TP_MULTIPLIER * atr_pct).max(cfg.take_profit_pct).min(10.0);
+                    let sl_multiplier = cfg.trending.atr_sl_multiplier.max(0.5);
+                    let tp_multiplier = cfg
+                        .trending
+                        .atr_tp_multiplier
+                        .max(sl_multiplier * 1.25);
+                    let dynamic_sl_pct = (sl_multiplier * atr_pct).max(cfg.stop_loss_pct).min(12.0);
+                    let dynamic_tp_pct = (tp_multiplier * atr_pct).max(cfg.take_profit_pct).min(25.0);
                     let final_tp = dynamic_tp_pct.max(dynamic_sl_pct * 1.5);
                     return (Some(dynamic_sl_pct), Some(final_tp));
                 }

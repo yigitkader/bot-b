@@ -173,6 +173,7 @@ async fn run_backtest(
                 rsi_avg_gain: None,
                 rsi_avg_loss: None,
                 rsi_period_count: 0,
+                last_analysis_time: None,
             });
             
             let mid_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
@@ -443,6 +444,7 @@ async fn run_point_in_time_backtest(
                 rsi_avg_gain: None,
                 rsi_avg_loss: None,
                 rsi_period_count: 0,
+                last_analysis_time: None,
             });
             
             // Reset state for point-in-time testing (start fresh at each time point)

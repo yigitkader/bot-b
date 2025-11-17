@@ -11,6 +11,13 @@ TREND_STRENGTHS=(0.5 0.6 0.65 0.7)
 SL_MULTIPLIERS=(1.5 2.0)
 TP_MULTIPLIERS=(4.0 4.5 5.0)
 
+ORIGINAL_CONFIG="config.yaml.bak"
+cp config.yaml "$ORIGINAL_CONFIG"
+restore_config() {
+    mv "$ORIGINAL_CONFIG" config.yaml 2>/dev/null || true
+}
+trap restore_config EXIT
+
 RESULTS_FILE="optimization_results.json"
 BEST_WIN_RATE=0.0
 BEST_PNL=0.0
@@ -25,11 +32,30 @@ for base_score in "${BASE_SCORES[@]}"; do
             for tp_mult in "${TP_MULTIPLIERS[@]}"; do
                 echo "Testing: BASE_MIN_SCORE=$base_score, trend_strength=$trend_strength, SL=${sl_mult}x, TP=${tp_mult}x"
                 
-                # Modify trending.rs
-                sed -i.bak "s/const BASE_MIN_SCORE: f64 = [0-9.]*/const BASE_MIN_SCORE: f64 = $base_score/" src/trending.rs
-                sed -i.bak "s/let is_strong_trend = trend_strength >= [0-9.]*/let is_strong_trend = trend_strength >= $trend_strength/" src/trending.rs
-                sed -i.bak "s/const ATR_SL_MULTIPLIER: f64 = [0-9.]*/const ATR_SL_MULTIPLIER: f64 = $sl_mult/" src/trending.rs
-                sed -i.bak "s/const ATR_TP_MULTIPLIER: f64 = [0-9.]*/const ATR_TP_MULTIPLIER: f64 = $tp_mult/" src/trending.rs
+                python3 - "$base_score" "$trend_strength" "$sl_mult" "$tp_mult" <<'PY'
+import sys, pathlib
+path = pathlib.Path("config.yaml")
+lines = path.read_text().splitlines()
+base_score, trend, sl_mult, tp_mult = sys.argv[1:5]
+targets = {
+    "base_min_score": base_score,
+    "trend_threshold_hft": trend,
+    "trend_threshold_normal": trend,
+    "atr_sl_multiplier": sl_mult,
+    "atr_tp_multiplier": tp_mult,
+}
+for key, value in targets.items():
+    key_found = False
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(f"{key}:"):
+            indent = line[:len(line) - len(line.lstrip())]
+            lines[idx] = f"{indent}{key}: {value}"
+            key_found = True
+            break
+    if not key_found:
+        lines.append(f"  {key}: {value}")
+path.write_text("\n".join(lines) + "\n")
+PY
                 
                 # Run backtest
                 OUTPUT=$(cargo test --test backtest test_strategy_with_multiple_binance_symbols -- --ignored --nocapture 2>&1)
@@ -37,6 +63,8 @@ for base_score in "${BASE_SCORES[@]}"; do
                 # Parse results
                 WIN_RATE=$(echo "$OUTPUT" | grep "Aggregate Win Rate" | sed 's/.*: //' | sed 's/%//' | awk '{print $1}')
                 PNL=$(echo "$OUTPUT" | grep "Total PnL (All Symbols)" | sed 's/.*\$//' | awk '{print $1}')
+                WIN_RATE=${WIN_RATE:-0}
+                PNL=${PNL:-0}
                 
                 echo "  Result: Win Rate=${WIN_RATE}%, PnL=\$${PNL}"
                 echo ""
@@ -55,8 +83,8 @@ for base_score in "${BASE_SCORES[@]}"; do
     done
 done
 
-# Restore original file
-mv src/trending.rs.bak src/trending.rs 2>/dev/null || true
+restore_config
+trap - EXIT
 
 echo ""
 echo "🏆 BEST OPTIMIZATION:"

@@ -876,8 +876,8 @@ impl Ordering {
         rules: &crate::types::SymbolRules,
     ) -> Result<Option<Qty>> {
         if signal.entry_price.0.is_zero() {
-            warn!(
-                symbol = %signal.symbol,
+                warn!(
+                    symbol = %signal.symbol,
                 "ORDERING: Entry price is zero - skipping order"
             );
             return Ok(None);
@@ -904,8 +904,8 @@ impl Ordering {
             })?;
 
         if size_raw.is_zero() || size_raw.is_sign_negative() {
-            warn!(
-                symbol = %signal.symbol,
+                warn!(
+                    symbol = %signal.symbol,
                 "ORDERING: Calculated position size is zero or negative - skipping order"
             );
             return Ok(None);
@@ -1126,7 +1126,7 @@ impl Ordering {
         };
         
         Ok(Some(MarginCalculationResult {
-            margin_usd,
+                    margin_usd,
             commission_buffer,
             safety_margin,
             total_buffer,
@@ -1142,12 +1142,12 @@ impl Ordering {
         if let Some(signal_age) = now.checked_duration_since(signal.timestamp) {
             if signal_age > Duration::from_secs(5) {
                 warn!(
-                    symbol = %signal.symbol,
+            symbol = %signal.symbol,
                     age_seconds = signal_age.as_secs(),
                     "ORDERING: Ignoring TradeSignal - signal too old"
-                );
-                return Ok(());
-            }
+            );
+            return Ok(());
+        }
         } else {
             warn!(
                 symbol = %signal.symbol,
@@ -1155,7 +1155,7 @@ impl Ordering {
             );
             return Ok(());
         }
-
+        
         if signal.symbol.is_empty() {
             warn!("ORDERING: Ignoring TradeSignal - empty symbol");
             return Ok(());
@@ -1166,12 +1166,12 @@ impl Ordering {
             state_guard.circuit_breaker.reset_if_cooldown_passed();
             
             if state_guard.circuit_breaker.should_block() {
-                warn!(
-                    symbol = %signal.symbol,
+            warn!(
+                symbol = %signal.symbol,
                     reject_count = state_guard.circuit_breaker.reject_count,
                     "ORDERING: Circuit breaker is OPEN - blocking order placement to prevent Binance ban"
-                );
-                return Ok(());
+            );
+            return Ok(());
             }
         }
 
@@ -1233,8 +1233,8 @@ impl Ordering {
             }
         };
         
-        debug!(
-            symbol = %signal.symbol,
+            debug!(
+                symbol = %signal.symbol,
             symbol_quote_asset = symbol_quote_asset,
             selected_quote_asset = quote,
             available_balance = %balance,
@@ -1332,10 +1332,10 @@ impl Ordering {
         };
         
         let margin_usd = margin_result.margin_usd;
-        let commission_buffer = margin_result.commission_buffer;
-        let safety_margin = margin_result.safety_margin;
-        let total_buffer = margin_result.total_buffer;
-        let usable_balance = margin_result.usable_balance;
+        let _commission_buffer = margin_result.commission_buffer;
+        let _safety_margin = margin_result.safety_margin;
+        let _total_buffer = margin_result.total_buffer;
+        let _usable_balance = margin_result.usable_balance;
         
         let leverage_decimal = Decimal::from(leverage);
         let notional = margin_usd

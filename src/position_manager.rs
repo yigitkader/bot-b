@@ -37,7 +37,6 @@ pub struct PositionState {
 
 struct NetPnlContext {
     net_pnl: f64,
-    position_side: Side,
     position_qty_abs: f64,
 }
 
@@ -207,7 +206,6 @@ fn calculate_net_pnl_context(
 
     Some(NetPnlContext {
         net_pnl: net_pnl_decimal.to_f64().unwrap_or(0.0),
-        position_side,
         position_qty_abs: position_qty_f64.abs(),
     })
 }
@@ -217,7 +215,8 @@ fn check_basic_rules(ctx: &NetPnlContext, min_profit_usd: f64) -> Option<(bool, 
         return Some((true, format!("take_profit_{:.2}_usd", ctx.net_pnl)));
     }
 
-    if ctx.net_pnl <= -0.10 {
+    let stop_loss_threshold = -min_profit_usd * 0.8_f64.max(0.3);
+    if ctx.net_pnl <= stop_loss_threshold {
         return Some((true, format!("stop_loss_{:.2}_usd", ctx.net_pnl)));
     }
 
