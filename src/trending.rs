@@ -1078,14 +1078,30 @@ impl Trending {
             if let Some(last_signal) = last_signals_map.get(&tick.symbol) {
                 let elapsed = now.duration_since(last_signal.timestamp);
                 if elapsed < Duration::from_secs(cooldown_seconds) {
-                    debug!(
+                    // ✅ FIX: Reduce log spam - only log when close to cooldown end (last 20% of cooldown)
+                    // This prevents thousands of log messages while still providing useful debugging info
+                    let remaining_secs = cooldown_seconds - elapsed.as_secs();
+                    let cooldown_threshold = (cooldown_seconds * 4) / 5; // 80% of cooldown
+                    if elapsed.as_secs() >= cooldown_threshold {
+                        // Only log in the last 20% of cooldown period
+                        debug!(
+                            symbol = %tick.symbol,
+                            elapsed_secs = elapsed.as_secs(),
+                            remaining_secs = remaining_secs,
+                            cooldown_secs = cooldown_seconds,
+                            last_signal_side = ?last_signal.side,
+                            "TRENDING: Cooldown check failed - {} seconds elapsed, {} seconds remaining",
+                            elapsed.as_secs(),
+                            remaining_secs
+                        );
+                    }
+                    // Use trace level for all other cooldown checks to reduce log spam
+                    tracing::trace!(
                         symbol = %tick.symbol,
                         elapsed_secs = elapsed.as_secs(),
                         cooldown_secs = cooldown_seconds,
                         last_signal_side = ?last_signal.side,
-                        "TRENDING: Cooldown check failed - {} seconds elapsed, need {} seconds",
-                        elapsed.as_secs(),
-                        cooldown_seconds
+                        "TRENDING: Cooldown check failed (trace)"
                     );
                     return Ok(());
                 }

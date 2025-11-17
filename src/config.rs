@@ -747,17 +747,18 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     }
 
     // Leverage validation
+    // ✅ FIX: Removed max_leverage limit check
+    // User requirement: Each coin can have different max leverage (100x, 125x, etc.)
+    // Coin's max leverage comes from exchange (rules.max_leverage) and is always correct
+    // Config leverage is only used as fallback when coin doesn't have max leverage info
+    // Therefore, we should not limit config leverage - exchange will enforce correct limits
     if let Some(leverage) = cfg.leverage {
         if leverage == 0 {
             return Err(anyhow!("leverage must be greater than 0"));
         }
-        if leverage > cfg.risk.max_leverage {
-            return Err(anyhow!(
-                "leverage ({}) exceeds max_leverage ({})",
-                leverage,
-                cfg.risk.max_leverage
-            ));
-        }
+        // Removed: leverage > cfg.risk.max_leverage check
+        // Reason: Coin's max leverage (from exchange) may exceed config max_leverage
+        // Exchange will enforce correct leverage limits per symbol
     }
     
     // CRITICAL: Cross margin mode validation
@@ -779,16 +780,16 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     }
     
     // Also validate exec.default_leverage
+    // ✅ FIX: Removed max_leverage limit check for default_leverage
+    // User requirement: Each coin can have different max leverage (100x, 125x, etc.)
+    // Default leverage is only used as fallback when coin doesn't have max leverage info
+    // Exchange will enforce correct leverage limits per symbol
     if cfg.exec.default_leverage == 0 {
         return Err(anyhow!("exec.default_leverage must be greater than 0"));
     }
-    if cfg.exec.default_leverage > cfg.risk.max_leverage {
-        return Err(anyhow!(
-            "exec.default_leverage ({}) exceeds risk.max_leverage ({})",
-            cfg.exec.default_leverage,
-            cfg.risk.max_leverage
-        ));
-    }
+    // Removed: default_leverage > cfg.risk.max_leverage check
+    // Reason: Coin's max leverage (from exchange) may exceed config max_leverage
+    // Exchange will enforce correct leverage limits per symbol
 
     // Take profit percentage validation
     if cfg.take_profit_pct <= 0.0 {

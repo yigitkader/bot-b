@@ -951,31 +951,85 @@ impl Ordering {
         // ORDERING's responsibility: Calculate all position parameters from balance and config
         // TRENDING only provides: symbol, side, entry_price, TP/SL, spread info
         
-        // Get balance and margin limits
-        let available_balance = {
+        // ✅ FIX: Determine quote asset from symbol and select balance intelligently
+        // Problem: Code was only using cfg.quote_asset, ignoring which balance is actually available
+        // Solution: Extract quote asset from symbol, check both USDT and USDC balances,
+        //           use the one with sufficient balance (prefer symbol's quote asset, fallback to other)
+        
+        // Extract quote asset from symbol (e.g., BTCUSDC -> USDC, ETHUSDT -> USDT)
+        let symbol_upper = signal.symbol.to_uppercase();
+        let symbol_quote_asset = if symbol_upper.ends_with("USDC") {
+            "USDC"
+        } else if symbol_upper.ends_with("USDT") {
+            "USDT"
+        } else {
+            // Fallback to config if symbol format is unknown
+            &cfg.quote_asset
+        };
+        
+        let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
+        let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
+        
+        // Get both balances and select the best one
+        let (available_balance, selected_quote_asset) = {
             let balance_store = shared_state.balance_store.read().await;
-            let balance = if cfg.quote_asset.to_uppercase() == "USDT" {
-                balance_store.usdt
-            } else {
-                balance_store.usdc
+            let usdt_balance = balance_store.usdt;
+            let usdc_balance = balance_store.usdc;
+            
+            // Priority: 1) Symbol's quote asset if sufficient, 2) Other quote asset if sufficient, 3) None
+            let (balance, quote) = match symbol_quote_asset {
+                "USDT" => {
+                    if usdt_balance >= min_margin {
+                        (usdt_balance, "USDT")
+                    } else if usdc_balance >= min_margin {
+                        (usdc_balance, "USDC")
+                    } else {
+                        (usdt_balance, "USDT") // Use symbol's quote asset even if insufficient (will fail later with better error)
+                    }
+                }
+                "USDC" => {
+                    if usdc_balance >= min_margin {
+                        (usdc_balance, "USDC")
+                    } else if usdt_balance >= min_margin {
+                        (usdt_balance, "USDT")
+                    } else {
+                        (usdc_balance, "USDC") // Use symbol's quote asset even if insufficient (will fail later with better error)
+                    }
+                }
+                _ => {
+                    // Unknown quote asset - try both
+                    if usdt_balance >= min_margin {
+                        (usdt_balance, "USDT")
+                    } else if usdc_balance >= min_margin {
+                        (usdc_balance, "USDC")
+                    } else {
+                        // Fallback to config's quote asset
+                        let balance = if cfg.quote_asset.to_uppercase() == "USDT" {
+                            usdt_balance
+                        } else {
+                            usdc_balance
+                        };
+                        (balance, cfg.quote_asset.as_str())
+                    }
+                }
             };
             
             // ✅ DEBUG: Log balance check for troubleshooting
             debug!(
                 symbol = %signal.symbol,
-                quote_asset = %cfg.quote_asset,
+                symbol_quote_asset = symbol_quote_asset,
+                selected_quote_asset = quote,
                 available_balance = %balance,
-                usdt_balance = %balance_store.usdt,
-                usdc_balance = %balance_store.usdc,
+                usdt_balance = %usdt_balance,
+                usdc_balance = %usdc_balance,
+                min_margin = %min_margin,
                 last_updated = ?balance_store.last_updated,
-                "ORDERING: Balance check for trade signal"
+                "ORDERING: Balance check for trade signal (selected quote asset: {})",
+                quote
             );
             
-            balance
+            (balance, quote.to_string())
         };
-        
-        let min_margin = Decimal::from_str(&cfg.min_margin_usd.to_string()).unwrap_or(Decimal::from(10));
-        let max_margin = Decimal::from_str(&cfg.max_margin_usd.to_string()).unwrap_or(Decimal::from(100));
         
         // ✅ FIX: Check if available balance is sufficient for minimum margin
         // Problem: "Margin is insufficient" errors when balance is too low
@@ -983,11 +1037,28 @@ impl Ordering {
         if available_balance < min_margin {
             debug!(
                 symbol = %signal.symbol,
+                selected_quote_asset = %selected_quote_asset,
                 available_balance = %available_balance,
                 min_margin = %min_margin,
-                "ORDERING: Insufficient balance for minimum margin - skipping order"
+                "ORDERING: Insufficient balance for minimum margin in both USDT and USDC - skipping order"
             );
             return Ok(());
+        }
+        
+        // ✅ CRITICAL: Validate that selected quote asset matches symbol's quote asset
+        // If symbol is BTCUSDC but we selected USDT balance, this is a mismatch
+        // This can happen if symbol discovery found both BTCUSDC and BTCUSDT, but we should use the correct one
+        if symbol_quote_asset != selected_quote_asset.as_str() {
+            warn!(
+                symbol = %signal.symbol,
+                symbol_quote_asset = symbol_quote_asset,
+                selected_quote_asset = %selected_quote_asset,
+                "ORDERING: Quote asset mismatch - symbol requires {} but selected {} balance. This may indicate symbol discovery issue.",
+                symbol_quote_asset,
+                selected_quote_asset
+            );
+            // Continue anyway - the balance reservation will use selected_quote_asset
+            // This allows trading if symbol discovery found both quote asset versions
         }
         
         // Fetch symbol rules to get max leverage (needed for commission buffer calculation)
@@ -1115,9 +1186,22 @@ impl Ordering {
         // Use max of calculated commission and min buffer
         let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
         
-        // Stage 2: Calculate usable balance (available balance minus commission buffer)
-        // This ensures we always have enough balance to close the position
-        let usable_balance = available_balance.saturating_sub(commission_buffer);
+        // ✅ FIX: Add extra safety margin (5% of margin or 1 USD, whichever is higher)
+        // This prevents "Margin is insufficient" errors due to:
+        // - Price movements between calculation and order placement
+        // - Rounding errors in margin/notional calculations
+        // - Binance's internal margin requirements
+        let estimated_margin_for_safety = Decimal::from_str(&cfg.max_usd_per_order.to_string())
+            .unwrap_or(max_margin)
+            .max(min_margin)
+            .min(max_margin);
+        let safety_margin = (estimated_margin_for_safety * Decimal::from_str("0.05").unwrap())
+            .max(Decimal::from(1)); // At least 1 USD safety margin
+        let total_buffer = commission_buffer + safety_margin;
+        
+        // Stage 2: Calculate usable balance (available balance minus commission buffer and safety margin)
+        // This ensures we always have enough balance to close the position and handle price movements
+        let usable_balance = available_balance.saturating_sub(total_buffer);
         
         // Calculate final margin: Use usable balance (10 <= margin <= 100 USD)
         // ✅ CRITICAL: Commission buffer is already subtracted from usable_balance
@@ -1136,14 +1220,16 @@ impl Ordering {
                 if usable_balance >= min_margin {
                     usable_balance.min(max_margin)
                 } else {
-                    // Usable balance too low (after commission buffer)
+                    // Usable balance too low (after commission buffer and safety margin)
                     debug!(
                         symbol = %signal.symbol,
                         available_balance = %available_balance,
                         usable_balance = %usable_balance,
                         commission_buffer = %commission_buffer,
+                        safety_margin = %safety_margin,
+                        total_buffer = %total_buffer,
                         min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
                     );
                     return Ok(());
                 }
@@ -1158,14 +1244,16 @@ impl Ordering {
                 // - Use this as margin multiplier
                 // - Minimum margin: min_margin, Maximum margin: max_margin
                 if usable_balance < min_margin {
-                    // Usable balance too low (after commission buffer)
+                    // Usable balance too low (after commission buffer and safety margin)
                     debug!(
                         symbol = %signal.symbol,
                         available_balance = %available_balance,
                         usable_balance = %usable_balance,
                         commission_buffer = %commission_buffer,
+                        safety_margin = %safety_margin,
+                        total_buffer = %total_buffer,
                         min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
                     );
                     return Ok(());
                 }
@@ -1213,14 +1301,16 @@ impl Ordering {
                 if usable_balance >= min_margin {
                     usable_balance.min(max_margin)
                 } else {
-                    // Usable balance too low (after commission buffer)
+                    // Usable balance too low (after commission buffer and safety margin)
                     debug!(
                         symbol = %signal.symbol,
                         available_balance = %available_balance,
                         usable_balance = %usable_balance,
                         commission_buffer = %commission_buffer,
+                        safety_margin = %safety_margin,
+                        total_buffer = %total_buffer,
                         min_margin = %min_margin,
-                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer) below minimum margin"
+                        "ORDERING: Ignoring TradeSignal - usable balance (after commission buffer and safety margin) below minimum margin"
                     );
                     return Ok(());
                 }
@@ -1238,20 +1328,12 @@ impl Ordering {
                 )
             })?;
         
-        // Check max position notional limit
-        let max_position_notional =
-            Decimal::from_str(&cfg.risk.max_position_notional_usd.to_string())
-                .unwrap_or(Decimal::from(10000));
-        
-        if notional > max_position_notional {
-            warn!(
-                symbol = %signal.symbol,
-                notional = %notional,
-                max_notional = %max_position_notional,
-                "ORDERING: Ignoring TradeSignal - exceeds max position notional"
-            );
-            return Ok(());
-        }
+        // ✅ FIX: Removed max position notional limit
+        // User requirement: No limit on notional, regardless of leverage
+        // Only margin is limited to max_margin_usd (100 USD)
+        // This allows using high leverage (e.g., 10x leverage with 100 USD margin = 1000 USD notional)
+        // Previous check removed:
+        // if notional > max_position_notional { ... }
         
         // Check min_notional requirement
         if !rules.min_notional.is_zero() && notional < rules.min_notional {
@@ -1453,14 +1535,15 @@ impl Ordering {
                 let mut balance_store_guard = shared_state.balance_store.write().await;
                 
                 // Check available balance (atomic with reservation)
-                let available_balance_atomic = balance_store_guard.available(&cfg.quote_asset);
+                // ✅ FIX: Use selected_quote_asset instead of cfg.quote_asset
+                let available_balance_atomic = balance_store_guard.available(&selected_quote_asset);
                 
                 if available_balance_atomic < required_margin {
                 debug!(
                     symbol = %signal.symbol,
                     required_margin = %required_margin,
                         available_balance = %available_balance_atomic,
-                    quote_asset = %cfg.quote_asset,
+                    quote_asset = %selected_quote_asset,
                         "ORDERING: Ignoring TradeSignal - insufficient balance (atomic check)"
                 );
                 // Both locks released here (balance_store_guard and state_guard)
@@ -1473,7 +1556,7 @@ impl Ordering {
             let reservation = match BalanceReservation::new_with_lock(
                     balance_store_clone,
                     &mut balance_store_guard,
-                &cfg.quote_asset,
+                &selected_quote_asset,
                 required_margin,
                 cleanup_tx.as_ref().map(|tx| tx.as_ref().clone()),
                     pending_cleanup.clone(),
@@ -1491,7 +1574,7 @@ impl Ordering {
                         symbol = %signal.symbol,
                         required_margin = %required_margin,
                             available_balance = %available_balance_atomic,
-                        quote_asset = %cfg.quote_asset,
+                        quote_asset = %selected_quote_asset,
                             "ORDERING: Ignoring TradeSignal - balance reservation failed (insufficient balance)"
                     );
                     // Both locks released here (balance_store_guard and state_guard)
