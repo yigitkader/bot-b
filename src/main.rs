@@ -55,6 +55,11 @@ async fn main() -> Result<()> {
         )
         .init();
     let _file_guard = _guard;
+    
+    // Initialize weight-based rate limiter for Binance API
+    crate::utils::init_rate_limiter();
+    info!("Rate limiter initialized (40 req/sec, 2400 weight/min with 70% safety factor)");
+    
     let cfg = Arc::new(load_config()?);
     let (json_logger, _logger_handle) = crate::logging::create_logger("logs/trading_events.json")?;
     let shutdown_flag = Arc::new(AtomicBool::new(false));

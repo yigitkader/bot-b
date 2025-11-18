@@ -25,54 +25,8 @@ pub struct Connection {
     cfg: Arc<AppCfg>,
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
-    rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
     shared_state: Option<Arc<SharedState>>,
     order_fill_history: Arc<DashMap<String, OrderFillHistory>>,
-}
-struct RateLimiter {
-    order_requests: Vec<Instant>,
-    balance_requests: Vec<Instant>,
-}
-impl RateLimiter {
-    fn new() -> Self {
-        Self {
-        order_requests: Vec::new(),
-        balance_requests: Vec::new(),
-        }
-    }
-    async fn check_rate_limit(
-        requests: &mut Vec<Instant>,
-        window: Duration,
-        max_requests: usize,
-    ) {
-        let now = Instant::now();
-        requests.retain(|&t| now.duration_since(t) < window);
-        if requests.len() >= max_requests {
-            if let Some(oldest) = requests.first() {
-                let wait_time = window.saturating_sub(now.duration_since(*oldest));
-                if !wait_time.is_zero() {
-                    tokio::time::sleep(wait_time).await;
-                    let now = Instant::now();
-                    requests.retain(|&t| now.duration_since(t) < window);
-                }
-            }
-        }
-        requests.push(now);
-    }
-    async fn check_order_rate(&mut self) {
-        Self::check_rate_limit(
-            &mut self.order_requests,
-            Duration::from_secs(5 * 60),
-            300,
-        ).await;
-    }
-    async fn check_balance_rate(&mut self) {
-        Self::check_rate_limit(
-            &mut self.balance_requests,
-            Duration::from_secs(60),
-            1200,
-        ).await;
-    }
 }
 impl Connection {
     pub fn from_config(
@@ -89,7 +43,6 @@ impl Connection {
             cfg,
             event_bus,
             shutdown_flag,
-            rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
             shared_state,
             order_fill_history: Arc::new(DashMap::new()),
         })
@@ -106,7 +59,6 @@ impl Connection {
             cfg,
             event_bus,
             shutdown_flag,
-            rate_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new())),
             shared_state: None,
             order_fill_history: Arc::new(DashMap::new()),
         }
@@ -1176,10 +1128,8 @@ impl Connection {
         validated_count
     }
     pub async fn send_order(&self, command: OrderCommand) -> Result<String> {
-        {
-            let mut limiter = self.rate_limiter.lock().await;
-            limiter.check_order_rate().await;
-        }
+        // Weight-based rate limiting: POST /fapi/v1/order = weight 1
+        crate::utils::rate_limit_guard(1).await;
         use std::time::{SystemTime, UNIX_EPOCH};
         let client_order_id = format!(
             "{}",
@@ -1246,10 +1196,8 @@ impl Connection {
         Ok(())
     }
     pub async fn fetch_balance(&self, asset: &str) -> Result<Decimal> {
-        {
-            let mut limiter = self.rate_limiter.lock().await;
-            limiter.check_balance_rate().await;
-        }
+        // Weight-based rate limiting: GET /fapi/v2/balance = weight 5
+        crate::utils::rate_limit_guard(5).await;
         self.venue.available_balance(asset).await
     }
     pub async fn get_current_prices(&self, symbol: &str) -> Result<(Px, Px)> {
@@ -1281,10 +1229,8 @@ impl Connection {
         self.venue.place_trailing_stop_order(symbol, activation_price, callback_rate, quantity).await
     }
     pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> Result<()> {
-        {
-            let mut limiter = self.rate_limiter.lock().await;
-            limiter.check_order_rate().await;
-        }
+        // Weight-based rate limiting: DELETE /fapi/v1/order = weight 1
+        crate::utils::rate_limit_guard(1).await;
         self.venue.cancel(order_id, symbol).await
     }
     async fn start_rules_refresh_task(&self) {

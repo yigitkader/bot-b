@@ -139,7 +139,7 @@ pub enum UserEvent {
         price: Px,
         is_maker: bool,
         order_status: String,
-        commission: Decimal,
+        commission: Decimal,  // For future fee tracking
     },
     OrderCanceled {
         symbol: String,
@@ -584,12 +584,4 @@ pub struct PositionInfo {
     pub close_requested: bool,
     pub liquidation_price: Option<Px>,
     pub trailing_stop_placed: bool,
-}
-#[derive(Clone, Debug)]
-pub struct StorageOrderFillHistory {
-    pub total_filled_qty: Qty,
-    pub weighted_price_sum: Decimal,
-    pub last_update: Instant,
-    pub maker_fill_count: u32,
-    pub total_fill_count: u32,
 }

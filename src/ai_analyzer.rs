@@ -64,6 +64,7 @@ pub struct AnomalyReport {
 }
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum Severity {
+    #[allow(dead_code)]
     Low,
     Medium,
     High,
@@ -120,6 +121,7 @@ pub struct OrderStats {
     pub filled_orders: u64,
     pub canceled_orders: u64,
     pub rejected_orders: u64,
+    #[allow(dead_code)]
     pub recent_spreads: VecDeque<f64>,
     pub last_order_time: Option<Instant>,
 }
@@ -379,7 +381,7 @@ impl AiAnalyzer {
                                 let report = AnomalyReport {
                                     timestamp: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
+                                        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                                         .as_secs(),
                                     anomaly_type: AnomalyType::BalanceInconsistency {
                                         expected: prev_usdt,
@@ -424,7 +426,7 @@ impl AiAnalyzer {
                 let report = AnomalyReport {
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                         .as_secs(),
                     anomaly_type: AnomalyType::HighOrderRejectionRate {
                         symbol: stat.symbol.clone(),
@@ -451,7 +453,7 @@ impl AiAnalyzer {
                 let report = AnomalyReport {
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                         .as_secs(),
                     anomaly_type: AnomalyType::FrequentCancellations {
                         symbol: stat.symbol.clone(),
@@ -483,7 +485,7 @@ impl AiAnalyzer {
                 let report = AnomalyReport {
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                         .as_secs(),
                     anomaly_type: AnomalyType::LowWinRate {
                         symbol: stat.symbol.clone(),
@@ -511,7 +513,7 @@ impl AiAnalyzer {
                     let report = AnomalyReport {
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
+                            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
                             .as_secs(),
                         anomaly_type: AnomalyType::UnusualPnLPattern {
                             symbol: stat.symbol.clone(),

@@ -2,6 +2,7 @@ use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
 use crate::position_manager::{PositionState, should_close_position_smart};
+use crate::risk;
 use crate::types::{PositionDirection, PositionInfo, Px};
 use crate::utils;
 use anyhow::{anyhow, Result};
@@ -24,6 +25,7 @@ struct PositionPnL {
     exit_commission_pct: Decimal,
     total_commission_pct: Decimal,
 }
+#[derive(Clone)]
 pub struct FollowOrders {
     cfg: Arc<AppCfg>,
     event_bus: Arc<EventBus>,
@@ -32,6 +34,16 @@ pub struct FollowOrders {
     positions: Arc<RwLock<HashMap<String, PositionInfo>>>,
     tp_sl_from_signals: Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
     position_states: Arc<RwLock<HashMap<String, PositionState>>>,
+    last_pnl_alert: Arc<RwLock<Option<Instant>>>,
+    // Funding cost tracking per symbol
+    funding_tracking: Arc<RwLock<HashMap<String, FundingState>>>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct FundingState {
+    pub total_funding_cost: Decimal,
+    pub last_applied_funding_time: Option<u64>, // Unix timestamp (ms)
 }
 impl FollowOrders {
     pub fn new(
@@ -48,6 +60,8 @@ impl FollowOrders {
             positions: Arc::new(RwLock::new(HashMap::new())),
             tp_sl_from_signals: Arc::new(RwLock::new(HashMap::new())),
             position_states: Arc::new(RwLock::new(HashMap::new())),
+            last_pnl_alert: Arc::new(RwLock::new(None)),
+            funding_tracking: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     pub async fn start(&self) -> Result<()> {
@@ -149,6 +163,7 @@ impl FollowOrders {
         let shutdown_flag_tick = shutdown_flag.clone();
         let cfg_tick = cfg.clone();
         let connection_tick = self.connection.clone();
+        let last_pnl_alert_tick = self.last_pnl_alert.clone();
         tokio::spawn(async move {
             let market_tick_rx = event_bus_tick.subscribe_market_tick();
             let positions_tick_clone = positions_tick.clone();
@@ -156,6 +171,7 @@ impl FollowOrders {
             let event_bus_tick_clone = event_bus_tick.clone();
             let cfg_tick_clone = cfg_tick.clone();
             let connection_tick_clone = connection_tick.clone();
+            let last_pnl_alert_tick_clone = last_pnl_alert_tick.clone();
             crate::event_loop::run_event_loop(
                 market_tick_rx,
                 shutdown_flag_tick,
@@ -167,8 +183,9 @@ impl FollowOrders {
                     let event_bus_tick = event_bus_tick_clone.clone();
                     let cfg_tick = cfg_tick_clone.clone();
                     let connection_tick = connection_tick_clone.clone();
+                    let last_pnl_alert = last_pnl_alert_tick_clone.clone();
                     async move {
-                        Self::check_tp_sl(&tick, &positions_tick, &position_states_tick, &event_bus_tick, &cfg_tick, &connection_tick).await
+                        Self::check_tp_sl_static(&tick, &positions_tick, &position_states_tick, &event_bus_tick, &cfg_tick, &connection_tick, &last_pnl_alert).await
                     }
                 },
             ).await;
@@ -423,13 +440,14 @@ impl FollowOrders {
         }
         Ok(true)
     }
-    async fn check_tp_sl(
+    async fn check_tp_sl_static(
         tick: &MarketTick,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         position_states: &Arc<RwLock<HashMap<String, PositionState>>>,
         event_bus: &Arc<EventBus>,
         cfg: &Arc<AppCfg>,
         connection: &Arc<Connection>,
+        last_pnl_alert: &Arc<RwLock<Option<Instant>>>,
     ) -> Result<()> {
         let (position, current_price) = match Self::get_position_and_price(tick, positions).await? {
             Some(p) => p,
@@ -442,12 +460,23 @@ impl FollowOrders {
                 state.update_pnl(utils::f64_to_decimal(pnl.net_pnl_usd, Decimal::ZERO));
             }
         }
+        // Risk module: PnL alerts
+        {
+            let position_size_notional = utils::decimal_to_f64(position.entry_price.0 * position.qty.0.abs());
+            let mut last_alert_guard = last_pnl_alert.write().await;
+            risk::check_pnl_alerts(
+                &mut *last_alert_guard,
+                pnl.net_pnl_usd,
+                position_size_notional,
+                cfg,
+            );
+        }
         let position_state = {
             let states_guard = position_states.read().await;
             states_guard.get(&tick.symbol).cloned()
         };
         if let Some(ref state) = position_state {
-            let min_profit_usd = 0.50;
+            let min_profit_usd = cfg.exec.min_profit_usd;
             let maker_fee_rate = cfg.risk.maker_commission_pct / 100.0;
             let taker_fee_rate = cfg.risk.taker_commission_pct / 100.0;
             let (should_close_smart, reason) = should_close_position_smart(
@@ -459,6 +488,15 @@ impl FollowOrders {
                 min_profit_usd,
                 maker_fee_rate,
                 taker_fee_rate,
+                cfg.exec.max_position_duration_sec,
+                cfg.exec.max_loss_duration_sec,
+                cfg.exec.time_weighted_threshold_early,
+                cfg.exec.time_weighted_threshold_normal,
+                cfg.exec.time_weighted_threshold_mid,
+                cfg.exec.time_weighted_threshold_late,
+                cfg.exec.trailing_stop_threshold_ratio,
+                cfg.exec.max_loss_threshold_ratio,
+                cfg.exec.stop_loss_threshold_ratio,
             );
             if should_close_smart {
                 info!(

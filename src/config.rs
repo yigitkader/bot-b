@@ -4,6 +4,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RiskCfg {
     #[serde(default = "default_max_leverage")]
+    #[allow(dead_code)]
     pub max_leverage: u32,
     #[serde(default = "default_use_isolated_margin")]
     pub use_isolated_margin: bool,
@@ -71,6 +72,7 @@ pub struct TrendingCfg {
     #[serde(default = "default_rsi_upper_long")]
     pub rsi_upper_long: f64,
     #[serde(default = "default_rsi_lower_short")]
+    #[allow(dead_code)]
     pub rsi_lower_short: f64,
     #[serde(default = "default_rsi_upper_short")]
     pub rsi_upper_short: f64,
@@ -93,6 +95,26 @@ pub struct ExecCfg {
     pub tif: String,
     #[serde(default = "default_default_leverage")]
     pub default_leverage: u32,
+    #[serde(default = "default_min_profit_usd")]
+    pub min_profit_usd: f64,
+    #[serde(default = "default_max_position_duration_sec")]
+    pub max_position_duration_sec: f64,
+    #[serde(default = "default_max_loss_duration_sec")]
+    pub max_loss_duration_sec: f64,
+    #[serde(default = "default_time_weighted_threshold_early")]
+    pub time_weighted_threshold_early: f64,
+    #[serde(default = "default_time_weighted_threshold_normal")]
+    pub time_weighted_threshold_normal: f64,
+    #[serde(default = "default_time_weighted_threshold_mid")]
+    pub time_weighted_threshold_mid: f64,
+    #[serde(default = "default_time_weighted_threshold_late")]
+    pub time_weighted_threshold_late: f64,
+    #[serde(default = "default_trailing_stop_threshold_ratio")]
+    pub trailing_stop_threshold_ratio: f64,
+    #[serde(default = "default_max_loss_threshold_ratio")]
+    pub max_loss_threshold_ratio: f64,
+    #[serde(default = "default_stop_loss_threshold_ratio")]
+    pub stop_loss_threshold_ratio: f64,
 }
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct WebsocketCfg {
@@ -114,10 +136,13 @@ pub struct InternalCfg {
     #[serde(default = "default_opportunity_mode_hard_limit_ratio")]
     pub opportunity_mode_hard_limit_ratio: f64,
     #[serde(default = "default_pnl_alert_interval_sec")]
+    #[allow(dead_code)]
     pub pnl_alert_interval_sec: u64,
     #[serde(default = "default_pnl_alert_threshold_positive")]
+    #[allow(dead_code)]
     pub pnl_alert_threshold_positive: f64,
     #[serde(default = "default_pnl_alert_threshold_negative")]
+    #[allow(dead_code)]
     pub pnl_alert_threshold_negative: f64,
 }
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -393,6 +418,36 @@ fn default_tif() -> String {
 }
 fn default_default_leverage() -> u32 {
     20
+}
+fn default_min_profit_usd() -> f64 {
+    0.50
+}
+fn default_max_position_duration_sec() -> f64 {
+    300.0
+}
+fn default_max_loss_duration_sec() -> f64 {
+    120.0
+}
+fn default_time_weighted_threshold_early() -> f64 {
+    0.6
+}
+fn default_time_weighted_threshold_normal() -> f64 {
+    1.0
+}
+fn default_time_weighted_threshold_mid() -> f64 {
+    0.4
+}
+fn default_time_weighted_threshold_late() -> f64 {
+    0.2
+}
+fn default_trailing_stop_threshold_ratio() -> f64 {
+    0.5
+}
+fn default_max_loss_threshold_ratio() -> f64 {
+    2.0
+}
+fn default_stop_loss_threshold_ratio() -> f64 {
+    0.8
 }
 fn default_ws_reconnect_delay() -> u64 {
     5_000

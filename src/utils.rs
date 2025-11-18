@@ -2,8 +2,11 @@
 use crate::types::Px;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
+use std::collections::VecDeque;
+use std::sync::OnceLock;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 pub fn quantize_decimal(value: Decimal, step: Decimal) -> Decimal {
     if step.is_zero() || step.is_sign_negative() {
         return value;
@@ -80,6 +83,7 @@ pub fn calculate_spread_bps(bid: Px, ask: Px) -> f64 {
 pub fn calculate_mid_price(bid: Px, ask: Px) -> Decimal {
     (bid.0 + ask.0) / Decimal::from(2)
 }
+#[allow(dead_code)]
 pub fn f64_to_decimal_percent(value: f64, fallback: Decimal) -> Decimal {
     Decimal::from_str(&value.to_string())
         .unwrap_or_else(|_| fallback)
@@ -219,4 +223,243 @@ pub fn calculate_dust_threshold(min_notional: Decimal, current_price: Decimal) -
         let assumed_min_price = Decimal::new(1, 2);
         min_notional / assumed_min_price
     }
+}
+
+// ============================================================================
+// Rate Limiting - Weight-Based Binance API Rate Limiter
+// ============================================================================
+
+/// Weight-based rate limiter for Binance Futures API calls
+/// 
+/// Binance Futures API Limits:
+/// - Futures: 2400 requests/minute (40 req/sec) - weight-based
+/// 
+/// Common endpoint weights:
+/// - GET /fapi/v1/depth (best_prices): Weight 5
+/// - POST /fapi/v1/order (place_limit): Weight 1
+/// - DELETE /fapi/v1/order (cancel): Weight 1
+/// - GET /fapi/v1/openOrders: Weight 1
+/// - GET /fapi/v2/positionRisk: Weight 5
+/// - GET /fapi/v2/balance: Weight 5
+pub struct RateLimiter {
+    /// Per-second request timestamps (for burst protection)
+    requests: Mutex<VecDeque<Instant>>,
+    /// Per-minute weight tracking (for weight-based limits)
+    weights: Mutex<VecDeque<(Instant, u32)>>,
+    /// Atomik counter: Sleep sırasında reserve edilen weight (race condition fix)
+    /// Bu, sleep sırasında başka thread'lerin weight eklemesini önler
+    reserved_weight: std::sync::atomic::AtomicU32,
+    /// Maximum requests per second (with safety margin)
+    max_requests_per_sec: u32,
+    /// Maximum weight per minute (with safety margin)
+    max_weight_per_minute: u32,
+    /// Minimum interval between requests (ms)
+    min_interval_ms: u64,
+    /// Safety factor (0.0-1.0) - how much of the limit to use
+    #[allow(dead_code)]
+    safety_factor: f64,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter with safety margin
+    /// 
+    /// # Arguments
+    /// * `max_requests_per_sec` - Maximum requests per second (Futures: 40)
+    /// * `max_weight_per_minute` - Maximum weight per minute (Futures: 2400)
+    /// * `safety_factor` - Safety margin (0.0-1.0). 0.7 = use only 70% of limit
+    pub fn new(max_requests_per_sec: u32, max_weight_per_minute: u32, safety_factor: f64) -> Self {
+        let safety_factor = safety_factor.clamp(0.5, 0.95); // En az %50, en fazla %95 kullan
+        let safe_req_limit = (max_requests_per_sec as f64 * safety_factor) as u32;
+        let safe_weight_limit = (max_weight_per_minute as f64 * safety_factor) as u32;
+        let min_interval_ms = (1000.0 / safe_req_limit as f64).ceil() as u64;
+        
+        Self {
+            requests: Mutex::new(VecDeque::new()),
+            weights: Mutex::new(VecDeque::new()),
+            reserved_weight: std::sync::atomic::AtomicU32::new(0),
+            max_requests_per_sec: safe_req_limit,
+            max_weight_per_minute: safe_weight_limit,
+            min_interval_ms,
+            safety_factor,
+        }
+    }
+    
+    /// Wait if needed to respect rate limits (weight-based)
+    /// 
+    /// # Arguments
+    /// * `weight` - API endpoint weight (default: 1 for most endpoints)
+    pub async fn wait_if_needed(&self, weight: u32) {
+        loop {
+            let now = Instant::now();
+            let mut requests = self.requests.lock().await;
+            let mut weights = self.weights.lock().await;
+            
+            // ===== PER-SECOND LIMIT (Burst Protection) =====
+            // Son 1 saniyede yapılan request'leri temizle
+            let one_sec_ago = now.checked_sub(Duration::from_secs(1))
+                .unwrap_or(Instant::now());
+            while requests.front().map_or(false, |&t| t < one_sec_ago) {
+                requests.pop_front();
+            }
+            
+            // Eğer per-second limit aşıldıysa bekle
+            if requests.len() >= self.max_requests_per_sec as usize {
+                if let Some(oldest) = requests.front().copied() {
+                    let wait_time = oldest + Duration::from_secs(1);
+                    if wait_time > now {
+                        let sleep_duration = wait_time.duration_since(now);
+                        drop(requests);
+                        drop(weights);
+                        // Kısa bekleme (< 1 saniye): 100ms polling
+                        let poll_interval_ms = 100;
+                        self.sleep_with_polling(sleep_duration, poll_interval_ms).await;
+                        continue;
+                    }
+                }
+            }
+            
+            // Minimum interval kontrolü (her request arasında minimum bekleme)
+            if let Some(last) = requests.back() {
+                let elapsed = now.duration_since(*last);
+                if elapsed.as_millis() < self.min_interval_ms as u128 {
+                    let wait = Duration::from_millis(self.min_interval_ms)
+                        .saturating_sub(elapsed);
+                    if wait.as_millis() > 0 {
+                        drop(requests);
+                        drop(weights);
+                        let poll_interval_ms = 100;
+                        self.sleep_with_polling(wait, poll_interval_ms).await;
+                        continue;
+                    }
+                }
+            }
+            
+            // ===== PER-MINUTE WEIGHT LIMIT =====
+            // Son 1 dakikada kullanılan weight'leri temizle
+            let one_min_ago = now.checked_sub(Duration::from_secs(60))
+                .unwrap_or(Instant::now());
+            while weights.front().map_or(false, |&(t, _)| t < one_min_ago) {
+                weights.pop_front();
+            }
+            
+            // Toplam weight'i hesapla (reserved weight dahil - race condition fix)
+            let total_weight: u32 = weights.iter().map(|(_, w)| *w).sum();
+            let reserved = self.reserved_weight.load(std::sync::atomic::Ordering::Acquire);
+            let total_with_reserved = total_weight + reserved;
+            
+            // Eğer weight limit aşıldıysa bekle
+            if total_with_reserved + weight > self.max_weight_per_minute {
+                if let Some((oldest_time, _)) = weights.front().copied() {
+                    let wait_time = oldest_time + Duration::from_secs(60);
+                    if wait_time > now {
+                        let sleep_duration = wait_time.duration_since(now);
+                        
+                        // KRİTİK RACE CONDITION FIX: Weight'i atomik olarak reserve et
+                        self.reserved_weight.fetch_add(weight, std::sync::atomic::Ordering::AcqRel);
+                        
+                        drop(requests);
+                        drop(weights);
+                        
+                        // Adaptive polling interval
+                        let poll_interval_ms = if sleep_duration.as_secs() >= 1 {
+                            5000 // 5 saniye - Binance 1 dakikalık window için yeterli
+                        } else {
+                            100 // 100ms - kısa bekleme için
+                        };
+                        self.sleep_with_polling(sleep_duration, poll_interval_ms).await;
+                        
+                        // Sleep bitince reserve'i serbest bırak
+                        self.reserved_weight.fetch_sub(weight, std::sync::atomic::Ordering::AcqRel);
+                        continue;
+                    }
+                }
+            }
+            
+            // Request'i kaydet ve çık
+            requests.push_back(now);
+            weights.push_back((now, weight));
+            break;
+        }
+    }
+    
+    /// Sleep with polling: Sleep'i küçük parçalara böl (overhead azaltma için)
+    async fn sleep_with_polling(&self, total_duration: Duration, poll_interval_ms: u64) {
+        let poll_interval = Duration::from_millis(poll_interval_ms);
+        let mut remaining = total_duration;
+        
+        while remaining > Duration::ZERO {
+            let sleep_duration = remaining.min(poll_interval);
+            tokio::time::sleep(sleep_duration).await;
+            remaining = remaining.saturating_sub(sleep_duration);
+        }
+    }
+    
+    /// Get current usage statistics (for monitoring)
+    #[allow(dead_code)]
+    pub async fn get_stats(&self) -> (usize, u32, f64) {
+        let now = Instant::now();
+        let requests = self.requests.lock().await;
+        let weights = self.weights.lock().await;
+        
+        // Son 1 saniyede yapılan request sayısı
+        let one_sec_ago = now.checked_sub(Duration::from_secs(1))
+            .unwrap_or(Instant::now());
+        let req_count = requests.iter().filter(|&&t| t >= one_sec_ago).count();
+        
+        // Son 1 dakikada kullanılan weight
+        let one_min_ago = now.checked_sub(Duration::from_secs(60))
+            .unwrap_or(Instant::now());
+        let total_weight: u32 = weights.iter()
+            .filter(|(t, _)| *t >= one_min_ago)
+            .map(|(_, w)| *w)
+            .sum();
+        
+        let weight_usage_pct = (total_weight as f64 / self.max_weight_per_minute as f64) * 100.0;
+        
+        (req_count, total_weight, weight_usage_pct)
+    }
+}
+
+/// Global rate limiter instance
+/// 
+/// Futures limits:
+/// - Futures: 40 req/sec, 2400 weight/min → 28 req/sec, 1680 weight/min (70% safety)
+static RATE_LIMITER: OnceLock<RateLimiter> = OnceLock::new();
+
+/// Initialize rate limiter for futures
+pub fn init_rate_limiter() {
+    // Futures: 40 req/sec, 2400 weight/min
+    let max_req_per_sec = 40;
+    let max_weight_per_min = 2400;
+    
+    // Safety factor 0.7 (daha agresif, ban riski hala minimal)
+    let safety_factor = 0.7;
+    
+    RATE_LIMITER.set(RateLimiter::new(
+        max_req_per_sec,
+        max_weight_per_min,
+        safety_factor,
+    )).ok();
+}
+
+/// Get or initialize the global rate limiter (default: Futures limits)
+pub fn get_rate_limiter() -> &'static RateLimiter {
+    RATE_LIMITER.get_or_init(|| {
+        // Default: Futures limits with 70% safety factor
+        RateLimiter::new(40, 2400, 0.7)
+    })
+}
+
+/// Guard function for rate limiting (async)
+/// 
+/// # Arguments
+/// * `weight` - API endpoint weight (default: 1)
+pub async fn rate_limit_guard(weight: u32) {
+    get_rate_limiter().wait_if_needed(weight).await;
+}
+
+/// Convenience function for rate limiting with default weight (1)
+#[allow(dead_code)]
+pub async fn rate_limit_guard_default() {
+    rate_limit_guard(1).await;
 }

@@ -1,11 +1,11 @@
 
 pub use crate::types::{
     BalanceUpdate, CloseReason, CloseRequest, FillHistoryAction, FillHistoryData,
-    LogEvent, MarketTick, OpenOrderSnapshot, OpenPositionSnapshot,
+    MarketTick, OpenOrderSnapshot, OpenPositionSnapshot,
     OrderFillHistoryUpdate, OrderingStateUpdate, OrderStatus, OrderUpdate,
     PositionUpdate, TradeSignal,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use std::cmp;
 #[derive(Clone)]
 pub struct EventBus {
@@ -17,7 +17,6 @@ pub struct EventBus {
     pub balance_update_tx: broadcast::Sender<BalanceUpdate>,
     pub ordering_state_update_tx: broadcast::Sender<OrderingStateUpdate>,
     pub order_fill_history_update_tx: broadcast::Sender<OrderFillHistoryUpdate>,
-    pub log_event_tx: mpsc::UnboundedSender<LogEvent>,
 }
 impl EventBus {
     pub fn new_with_config(cfg: &crate::config::EventBusCfg) -> Self {
@@ -35,7 +34,6 @@ impl EventBus {
         let (balance_update_tx, _) = broadcast::channel(balance_update_buffer);
         let (ordering_state_update_tx, _) = broadcast::channel(1000);
         let (order_fill_history_update_tx, _) = broadcast::channel(1000);
-        let (log_event_tx, _) = mpsc::unbounded_channel();
         Self {
             market_tick_tx,
             trade_signal_tx,
@@ -45,7 +43,6 @@ impl EventBus {
             balance_update_tx,
             ordering_state_update_tx,
             order_fill_history_update_tx,
-            log_event_tx,
         }
     }
     pub fn new() -> Self {
@@ -70,12 +67,6 @@ impl EventBus {
     pub fn subscribe_balance_update(&self) -> broadcast::Receiver<BalanceUpdate> {
         self.balance_update_tx.subscribe()
     }
-    pub fn subscribe_ordering_state_update(&self) -> broadcast::Receiver<OrderingStateUpdate> {
-        self.ordering_state_update_tx.subscribe()
-    }
-    pub fn subscribe_order_fill_history_update(&self) -> broadcast::Receiver<OrderFillHistoryUpdate> {
-        self.order_fill_history_update_tx.subscribe()
-    }
     pub fn health_stats(&self) -> EventBusHealth {
         EventBusHealth {
             market_tick_receivers: self.market_tick_tx.receiver_count(),
@@ -84,8 +75,6 @@ impl EventBus {
             order_update_receivers: self.order_update_tx.receiver_count(),
             position_update_receivers: self.position_update_tx.receiver_count(),
             balance_update_receivers: self.balance_update_tx.receiver_count(),
-            ordering_state_update_receivers: self.ordering_state_update_tx.receiver_count(),
-            order_fill_history_update_receivers: self.order_fill_history_update_tx.receiver_count(),
         }
     }
 }
@@ -97,8 +86,6 @@ pub struct EventBusHealth {
     pub order_update_receivers: usize,
     pub position_update_receivers: usize,
     pub balance_update_receivers: usize,
-    pub ordering_state_update_receivers: usize,
-    pub order_fill_history_update_receivers: usize,
 }
 impl Default for EventBus {
     fn default() -> Self {

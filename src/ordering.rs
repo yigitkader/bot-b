@@ -15,7 +15,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 #[derive(Clone)]
 struct BalanceCleanupMessage {
-    balance_store: Arc<tokio::sync::RwLock<crate::state::BalanceStore>>,
     asset: String,
     amount: Decimal,
     order_id: Option<String>,
@@ -92,7 +91,6 @@ impl Drop for BalanceReservation {
         if !self.released {
             let allocation_age = Instant::now().duration_since(self.allocation_timestamp);
                 let cleanup_msg = BalanceCleanupMessage {
-                    balance_store: self.balance_store.clone(),
                     asset: self.asset.clone(),
                     amount: self.amount,
                     order_id: self.order_id.clone(),
@@ -217,11 +215,18 @@ impl Ordering {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     let pending_msgs: Vec<BalanceCleanupMessage> = {
-                        let mut pending = pending_cleanup.lock().unwrap();
-                        if !pending.is_empty() {
-                            std::mem::take(&mut *pending)
-                        } else {
-                            Vec::new()
+                        match pending_cleanup.lock() {
+                            Ok(mut pending) => {
+                                if !pending.is_empty() {
+                                    std::mem::take(&mut *pending)
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "ORDERING: Mutex poisoned in balance cleanup, clearing pending messages");
+                                Vec::new()
+                            }
                         }
                     };
                     if !pending_msgs.is_empty() {
@@ -248,11 +253,18 @@ impl Ordering {
             }
         }
         let pending_msgs: Vec<BalanceCleanupMessage> = {
-            let mut pending = pending_cleanup.lock().unwrap();
-            if !pending.is_empty() {
-                std::mem::take(&mut *pending)
-            } else {
-                Vec::new()
+            match pending_cleanup.lock() {
+                Ok(mut pending) => {
+                    if !pending.is_empty() {
+                        std::mem::take(&mut *pending)
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "ORDERING: Mutex poisoned in balance cleanup final flush, clearing pending messages");
+                    Vec::new()
+                }
             }
         };
         if !pending_msgs.is_empty() {

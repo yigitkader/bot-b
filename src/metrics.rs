@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct TradeResult {
     pub symbol: String,
     pub side: String,
@@ -16,6 +17,7 @@ pub struct TradeResult {
     pub timestamp: std::time::Instant,
 }
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct StrategyMetrics {
     pub total_signals: u64,
     pub total_trades: u64,
@@ -32,6 +34,7 @@ pub struct StrategyMetrics {
     pub sharpe_ratio: f64,
     pub trades: VecDeque<TradeResult>,
 }
+#[allow(dead_code)]
 impl StrategyMetrics {
     pub fn new() -> Self {
         Self {
@@ -131,9 +134,11 @@ impl Default for StrategyMetrics {
         Self::new()
     }
 }
+#[allow(dead_code)]
 pub struct MetricsTracker {
     metrics: Arc<RwLock<StrategyMetrics>>,
 }
+#[allow(dead_code)]
 impl MetricsTracker {
     pub fn new() -> Self {
         Self {

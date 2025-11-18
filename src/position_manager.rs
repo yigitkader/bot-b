@@ -3,8 +3,6 @@ use crate::types::{Px, PositionInfo, PositionDirection, Side};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::time::Instant;
-pub const MAX_POSITION_DURATION_SEC: f64 = 300.0;
-pub const MAX_LOSS_DURATION_SEC: f64 = 120.0;
 #[derive(Debug, Clone)]
 pub struct PositionState {
     pub entry_time: Option<Instant>,
@@ -49,12 +47,21 @@ pub fn should_close_position_smart(
     min_profit_usd: f64,
     maker_fee_rate: f64,
     taker_fee_rate: f64,
+    max_position_duration_sec: f64,
+    max_loss_duration_sec: f64,
+    time_weighted_threshold_early: f64,
+    time_weighted_threshold_normal: f64,
+    time_weighted_threshold_mid: f64,
+    time_weighted_threshold_late: f64,
+    trailing_stop_threshold_ratio: f64,
+    max_loss_threshold_ratio: f64,
+    stop_loss_threshold_ratio: f64,
 ) -> (bool, String) {
     let net_pnl_ctx = match calculate_net_pnl_context(position, mark_px, bid, ask, maker_fee_rate, taker_fee_rate) {
         Some(ctx) => ctx,
         None => return (false, "no_position".to_string()),
     };
-    if let Some(result) = check_basic_rules(&net_pnl_ctx, min_profit_usd) {
+    if let Some(result) = check_basic_rules(&net_pnl_ctx, min_profit_usd, stop_loss_threshold_ratio) {
         return result;
     }
     let entry_time = match state.entry_time {
@@ -62,23 +69,23 @@ pub fn should_close_position_smart(
         None => return (false, "no_entry_time".to_string()),
     };
     let age_secs = entry_time.elapsed().as_secs() as f64;
-    if let Some(result) = check_timeout_rules(net_pnl_ctx.net_pnl, age_secs) {
+    if let Some(result) = check_timeout_rules(net_pnl_ctx.net_pnl, age_secs, max_position_duration_sec, max_loss_duration_sec) {
         return result;
     }
     let time_weighted_threshold = if age_secs <= 10.0 {
-        min_profit_usd * 0.6
+        min_profit_usd * time_weighted_threshold_early
     } else if age_secs <= 20.0 {
-        min_profit_usd
+        min_profit_usd * time_weighted_threshold_normal
     } else if age_secs <= 60.0 {
-        min_profit_usd * 0.4
+        min_profit_usd * time_weighted_threshold_mid
     } else {
-        min_profit_usd * 0.2
+        min_profit_usd * time_weighted_threshold_late
     };
     let trend_factor = calculate_trend_factor(position, state);
     let momentum_factor = calculate_momentum_factor(state);
     let volatility_factor = calculate_volatility_factor(state);
     let (should_close_trailing, should_close_drawdown, should_close_recovery) =
-        evaluate_trailing_rules(state, net_pnl_ctx.net_pnl, min_profit_usd);
+        evaluate_trailing_rules(state, net_pnl_ctx.net_pnl, min_profit_usd, trailing_stop_threshold_ratio, max_loss_threshold_ratio);
     let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
     let should_close_by_threshold = net_pnl_ctx.net_pnl >= combined_threshold;
     if should_close_by_threshold {
@@ -136,11 +143,11 @@ fn calculate_net_pnl_context(
         position_qty_abs: position_qty_f64.abs(),
     })
 }
-fn check_basic_rules(ctx: &NetPnlContext, min_profit_usd: f64) -> Option<(bool, String)> {
+fn check_basic_rules(ctx: &NetPnlContext, min_profit_usd: f64, stop_loss_threshold_ratio: f64) -> Option<(bool, String)> {
     if ctx.net_pnl >= min_profit_usd {
         return Some((true, format!("take_profit_{:.2}_usd", ctx.net_pnl)));
     }
-    let stop_loss_threshold = -min_profit_usd * 0.8_f64.max(0.3);
+    let stop_loss_threshold = -min_profit_usd * stop_loss_threshold_ratio.max(0.3);
     if ctx.net_pnl <= stop_loss_threshold {
         return Some((true, format!("stop_loss_{:.2}_usd", ctx.net_pnl)));
     }
@@ -149,11 +156,11 @@ fn check_basic_rules(ctx: &NetPnlContext, min_profit_usd: f64) -> Option<(bool, 
     }
     None
 }
-fn check_timeout_rules(net_pnl: f64, age_secs: f64) -> Option<(bool, String)> {
-    if net_pnl < 0.0 && age_secs >= MAX_LOSS_DURATION_SEC {
+fn check_timeout_rules(net_pnl: f64, age_secs: f64, max_position_duration_sec: f64, max_loss_duration_sec: f64) -> Option<(bool, String)> {
+    if net_pnl < 0.0 && age_secs >= max_loss_duration_sec {
         return Some((true, format!("loss_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs)));
     }
-    if age_secs >= MAX_POSITION_DURATION_SEC {
+    if age_secs >= max_position_duration_sec {
         return Some((true, format!("max_duration_timeout_{:.2}_usd_{:.0}_sec", net_pnl, age_secs)));
     }
     None
@@ -210,12 +217,12 @@ fn calculate_volatility_factor(state: &PositionState) -> f64 {
         1.0
     }
 }
-fn evaluate_trailing_rules(state: &PositionState, net_pnl: f64, min_profit_usd: f64) -> (bool, bool, bool) {
+fn evaluate_trailing_rules(state: &PositionState, net_pnl: f64, min_profit_usd: f64, trailing_stop_threshold_ratio: f64, max_loss_threshold_ratio: f64) -> (bool, bool, bool) {
     let peak_pnl_f64 = state.peak_pnl.to_f64().unwrap_or(0.0);
     let drawdown_from_peak = peak_pnl_f64 - net_pnl;
-    let trailing_stop_threshold = min_profit_usd * 0.5;
+    let trailing_stop_threshold = min_profit_usd * trailing_stop_threshold_ratio;
     let should_close_trailing = peak_pnl_f64 > min_profit_usd && drawdown_from_peak > trailing_stop_threshold;
-    let max_loss_threshold = -min_profit_usd * 2.0;
+    let max_loss_threshold = -min_profit_usd * max_loss_threshold_ratio;
     let should_close_drawdown = net_pnl < max_loss_threshold;
     let was_in_loss = state.pnl_history.len() >= 2 && {
         let prev_pnl = state.pnl_history[state.pnl_history.len() - 2].to_f64().unwrap_or(0.0);

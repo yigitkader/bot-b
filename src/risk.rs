@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use std::time::Instant;
 use tracing::{info, warn};
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RiskLimits {
     pub inv_cap: Qty,
     pub min_liq_gap_bps: f64,
@@ -13,6 +14,7 @@ pub struct RiskLimits {
     pub max_leverage: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum RiskAction {
     Ok,
     Widen,
@@ -26,6 +28,7 @@ pub enum PositionRiskLevel {
     Medium,
     Hard,
 }
+#[allow(dead_code)]
 pub fn check_risk(
     pos: &Position,
     inv: Qty,
@@ -52,6 +55,7 @@ pub fn check_risk(
 pub struct PositionRiskState {
     pub position_size_notional: f64,
     pub total_active_orders_notional: f64,
+    #[allow(dead_code)]
     pub has_open_orders: bool,
     pub is_opportunity_mode: bool,
 }
@@ -83,6 +87,7 @@ pub fn check_position_size_risk(
     let should_block_new_orders = risk_level != PositionRiskLevel::Ok;
     (risk_level, max_position_size_usd, should_block_new_orders)
 }
+#[allow(dead_code)]
 pub fn calculate_total_active_orders_notional(active_orders: &[(Px, Qty)]) -> f64 {
     active_orders
         .iter()
@@ -126,11 +131,13 @@ pub fn check_pnl_alerts(
         }
     }
 }
+#[allow(dead_code)]
 pub fn update_peak_pnl(peak_pnl: &mut Decimal, current_pnl: Decimal) {
     if current_pnl > *peak_pnl {
         *peak_pnl = current_pnl;
     }
 }
+#[allow(dead_code)]
 pub fn determine_risk_actions(
     risk_level: PositionRiskLevel,
     position_size_notional: f64,
@@ -198,6 +205,7 @@ pub fn determine_risk_actions(
     }
 }
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RiskActions {
     pub should_close_position: bool,
     pub should_cancel_all_orders: bool,

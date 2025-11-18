@@ -400,7 +400,11 @@ impl DirectionModel {
         use std::hash::{Hash, Hasher};
         use std::time::{SystemTime, UNIX_EPOCH};
         let mut hasher = DefaultHasher::new();
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().hash(&mut hasher);
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_nanos()
+            .hash(&mut hasher);
         let seed = hasher.finish();
         let std_dev = 1.0 / (feature_dim as f64).sqrt();
         let mut weights = Vec::with_capacity(feature_dim);
@@ -627,16 +631,13 @@ impl AutoRiskGovernor {
     }
 }
 pub struct ExecutionOptimizer {
-    maker_fee_rate: f64,
-    taker_fee_rate: f64,
-    edge_decay_half_life_ms: f64,
+    // Field'lar şu an kullanılmıyor - future implementation için reserved
+    // maker_fee_rate ve taker_fee_rate config'den alınacak
+    // edge_decay_half_life_ms QMEL parametresi olarak kullanılacak
 }
 impl ExecutionOptimizer {
-    pub fn new(maker_fee_rate: f64, taker_fee_rate: f64, edge_decay_half_life_ms: f64) -> Self {
+    pub fn new(_maker_fee_rate: f64, _taker_fee_rate: f64, _edge_decay_half_life_ms: f64) -> Self {
         Self {
-            maker_fee_rate,
-            taker_fee_rate,
-            edge_decay_half_life_ms,
         }
     }
     pub fn estimate_fill_probability(
@@ -720,10 +721,10 @@ impl ParameterArm {
 }
 pub struct ThompsonSamplingBandit {
     pub arms: Vec<ParameterArm>,
-    exploration_rate: f64,
+    // exploration_rate şu an kullanılmıyor - Thompson Sampling algoritması zaten exploration/exploitation dengesini otomatik sağlıyor
 }
 impl ThompsonSamplingBandit {
-    pub fn new(exploration_rate: f64) -> Self {
+    pub fn new(_exploration_rate: f64) -> Self {
         let mut arms = Vec::new();
         for target_tick in [1.0, 2.0] {
             for stop_tick in [1.0, 1.5] {
@@ -741,7 +742,7 @@ impl ThompsonSamplingBandit {
         }
         Self {
             arms,
-            exploration_rate,
+            // exploration_rate şu an kullanılmıyor - Thompson Sampling algoritması zaten exploration/exploitation dengesini otomatik sağlıyor
         }
     }
     pub fn select_arm(&self) -> usize {
@@ -749,7 +750,11 @@ impl ThompsonSamplingBandit {
         use std::hash::{Hash, Hasher};
         use std::time::{SystemTime, UNIX_EPOCH};
         let mut hasher = DefaultHasher::new();
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos().hash(&mut hasher);
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_nanos()
+            .hash(&mut hasher);
         let seed = hasher.finish();
         let mut best_arm = 0;
         let mut best_sample = f64::NEG_INFINITY;

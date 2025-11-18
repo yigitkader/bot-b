@@ -102,6 +102,17 @@ impl JsonLogger {
             })
             .as_millis() as u64
     }
+    fn instant_to_timestamp_ms(instant: Instant) -> u64 {
+        // Convert Instant to SystemTime by using elapsed time from a reference point
+        // This is approximate but sufficient for logging purposes
+        let now = SystemTime::now();
+        let elapsed = instant.elapsed();
+        now.duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .checked_sub(elapsed)
+            .unwrap_or_else(|| Duration::from_secs(0))
+            .as_millis() as u64
+    }
     fn send_event(&self, event: LogEvent) {
         match self.event_tx.try_send(event) {
             Ok(()) => {}
@@ -121,10 +132,14 @@ impl JsonLogger {
         is_maker: bool,
         new_inventory: Qty,
         fill_rate: f64,
+        event_timestamp: Option<Instant>,
     ) {
         let notional = price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0);
+        let timestamp_ms = event_timestamp
+            .map(|ts| Self::instant_to_timestamp_ms(ts))
+            .unwrap_or_else(|| Self::timestamp_ms());
         let event = LogEvent::OrderFilled {
-            timestamp: Self::timestamp_ms(),
+            timestamp: timestamp_ms,
             symbol: symbol.to_string(),
             order_id: order_id.to_string(),
             side: format!("{:?}", side),
@@ -137,9 +152,12 @@ impl JsonLogger {
         };
         self.send_event(event);
     }
-    pub fn log_order_canceled(&self, symbol: &str, order_id: &str, reason: &str, fill_rate: f64) {
+    pub fn log_order_canceled(&self, symbol: &str, order_id: &str, reason: &str, fill_rate: f64, event_timestamp: Option<Instant>) {
+        let timestamp_ms = event_timestamp
+            .map(|ts| Self::instant_to_timestamp_ms(ts))
+            .unwrap_or_else(|| Self::timestamp_ms());
         let event = LogEvent::OrderCanceled {
-            timestamp: Self::timestamp_ms(),
+            timestamp: timestamp_ms,
             symbol: symbol.to_string(),
             order_id: order_id.to_string(),
             reason: reason.to_string(),
@@ -155,6 +173,7 @@ impl JsonLogger {
         qty: Qty,
         mark_price: Px,
         leverage: u32,
+        event_timestamp: Option<Instant>,
     ) {
         let notional = entry_price.0.to_f64().unwrap_or(0.0) * qty.0.to_f64().unwrap_or(0.0).abs();
         let qty_f = qty.0.to_f64().unwrap_or(0.0);
@@ -166,8 +185,11 @@ impl JsonLogger {
         } else {
             0.0
         };
+        let timestamp_ms = event_timestamp
+            .map(|ts| Self::instant_to_timestamp_ms(ts))
+            .unwrap_or_else(|| Self::timestamp_ms());
         let event = LogEvent::PositionUpdated {
-            timestamp: Self::timestamp_ms(),
+            timestamp: timestamp_ms,
             symbol: symbol.to_string(),
             side: side.to_string(),
             entry_price: entry_f,
@@ -220,10 +242,12 @@ impl Logging {
                         if shutdown_flag_trade.load(AtomicOrdering::Relaxed) {
                             break;
                         }
+                        let signal_age_ms = signal.timestamp.elapsed().as_millis();
                         info!(
                             symbol = %signal.symbol,
                             side = ?signal.side,
                             entry_price = %signal.entry_price.0,
+                            signal_age_ms = signal_age_ms,
                             "LOGGING: TradeSignal received"
                         );
                     }
@@ -264,6 +288,7 @@ impl Logging {
                                     false,
                                     update.remaining_qty,
                                     1.0,
+                                    Some(update.timestamp),
                                 );
                             }
                             crate::event_bus::OrderStatus::Canceled => {
@@ -272,6 +297,7 @@ impl Logging {
                                     &update.order_id,
                                     "Order canceled",
                                     1.0,
+                                    Some(update.timestamp),
                                 );
                             }
                             crate::event_bus::OrderStatus::Expired | crate::event_bus::OrderStatus::ExpiredInMatch => {
@@ -280,6 +306,7 @@ impl Logging {
                                     &update.order_id,
                                     "Order expired",
                                     1.0,
+                                    Some(update.timestamp),
                                 );
                             }
                             crate::event_bus::OrderStatus::Rejected => {
@@ -288,6 +315,7 @@ impl Logging {
                                     &update.order_id,
                                     "Order rejected",
                                     1.0,
+                                    Some(update.timestamp),
                                 );
                             }
                             _ => {
@@ -339,6 +367,7 @@ impl Logging {
                                 update.qty,
                                 update.entry_price,
                                 update.leverage,
+                                Some(update.timestamp),
                             );
                         } else {
                             info!(
@@ -477,10 +506,12 @@ impl Logging {
                             }
                         };
                         if should_log {
+                            let tick_age_ms = tick.timestamp.elapsed().as_millis();
                             info!(
                                 symbol = %tick.symbol,
                                 bid = %tick.bid.0,
                                 ask = %tick.ask.0,
+                                tick_age_ms = tick_age_ms,
                                 "LOGGING: MarketTick (logged every {} ticks per symbol)",
                                 LOG_INTERVAL
                             );

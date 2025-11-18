@@ -198,12 +198,12 @@ struct OrderBookTop {
     asks: Vec<(String, String)>,
 }
 #[derive(Deserialize)]
-pub(crate) struct FutPlacedOrder {
+pub struct FutPlacedOrder {
 #[serde(rename = "orderId")]
-    pub(crate) order_id: u64,
+    pub order_id: u64,
 #[serde(rename = "clientOrderId")]
 #[allow(dead_code)]
-    pub(crate) client_order_id: Option<String>,
+    pub client_order_id: Option<String>,
 }
 #[derive(Deserialize)]
 struct FutOpenOrder {
@@ -230,8 +230,7 @@ struct FutPosition {
     liquidation_price: String,
 #[serde(rename = "positionSide", default)]
     position_side: Option<String>,
-#[serde(rename = "marginType", default)]
-    margin_type: String,
+    // marginType field ignored - not needed for position tracking
 }
 impl BinanceFutures {
 pub fn from_config(
@@ -312,7 +311,11 @@ pub fn from_config(
                             continue;
                         } else {
                             warn!(symbol = %sym, leverage = lev, error = ?last_error, "Failed to set leverage (non-leverage error)");
-                            return Err(last_error.unwrap());
+                            if let Some(err) = last_error {
+                                return Err(err);
+                            } else {
+                                return Err(anyhow!("Failed to set leverage: unknown error"));
+                            }
                         }
                     } else {
                         return Err(anyhow!("Unknown error setting leverage"));
@@ -430,16 +433,9 @@ pub fn from_config(
         }
         #[derive(Deserialize)]
         struct LeverageBracket {
-            #[serde(deserialize_with = "deserialize_u32_flexible")]
-            bracket: u32,
             #[serde(rename = "initialLeverage", deserialize_with = "deserialize_u32_flexible")]
             initial_leverage: u32,
-            #[serde(rename = "notionalCap")]
-            notional_cap: String,
-            #[serde(rename = "notionalFloor")]
-            notional_floor: String,
-            #[serde(rename = "maintMarginRatio")]
-            maint_margin_ratio: String,
+            // Other fields (bracket, notionalCap, notionalFloor, maintMarginRatio) ignored
         }
         #[derive(Deserialize)]
         struct LeverageBracketsResponse {
@@ -519,18 +515,8 @@ pub fn from_config(
                                                                     .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                                                             });
                                                         if let Some(lev) = initial_leverage {
-                                                            let bracket_num = bracket_obj.get("bracket")
-                                                                .and_then(|v| {
-                                                                    v.as_u64()
-                                                                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-                                                                })
-                                                                .unwrap_or(0) as u32;
                                                             brackets.push(LeverageBracket {
-                                                                bracket: bracket_num,
                                                                 initial_leverage: lev as u32,
-                                                                notional_cap: bracket_obj.get("notionalCap").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                                                                notional_floor: bracket_obj.get("notionalFloor").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
-                                                                maint_margin_ratio: bracket_obj.get("maintMarginRatio").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
                                                             });
                                                         }
                                                     }
@@ -604,6 +590,8 @@ pub fn from_config(
         }
     }
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
+        // Weight-based rate limiting: GET /fapi/v1/exchangeInfo = weight 1
+        crate::utils::rate_limit_guard(1).await;
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }
@@ -686,6 +674,8 @@ pub fn refresh_rules_for(&self, sym: &str) {
         if let Some(balance) = BALANCE_CACHE.get(asset) {
             return Ok(*balance);
         }
+        // Weight-based rate limiting: GET /fapi/v2/balance = weight 5
+        crate::utils::rate_limit_guard(5).await;
         tracing::debug!(
             asset = %asset,
             "BALANCE_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
@@ -725,6 +715,8 @@ pub fn refresh_rules_for(&self, sym: &str) {
         if let Some(orders) = OPEN_ORDERS_CACHE.get(sym) {
             return Ok(orders.clone());
         }
+        // Weight-based rate limiting: GET /fapi/v1/openOrders = weight 1
+        crate::utils::rate_limit_guard(1).await;
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
             sym,
@@ -854,6 +846,8 @@ pub fn refresh_rules_for(&self, sym: &str) {
         if let Some(position) = POSITION_CACHE.get(sym) {
             return Ok(position.clone());
         }
+        // Weight-based rate limiting: GET /fapi/v2/positionRisk = weight 5
+        crate::utils::rate_limit_guard(5).await;
         tracing::debug!(
             symbol = %sym,
             "POSITION_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
@@ -1374,6 +1368,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             ));
                         }
                     }
+                    #[allow(unused_assignments)]
                     if crate::utils::is_min_notional_error(&e) && !limit_fallback_attempted
                     {
                         warn!(symbol = %sym, "MIN_NOTIONAL error detected in flatten_position, invalidating rules cache");
@@ -1584,6 +1579,10 @@ impl Venue for BinanceFutures {
         tif: Tif,
         client_order_id: &str,
     ) -> Result<(String, Option<String>)> {
+        // Weight-based rate limiting: POST /fapi/v1/order = weight 1
+        // Note: Connection.rs'de de rate limit guard var, ama burada da ekliyoruz
+        // çünkü venue trait'i doğrudan kullanılabilir
+        crate::utils::rate_limit_guard(1).await;
         let s_side = match side {
             Side::Buy => "BUY",
             Side::Sell => "SELL",
@@ -1832,6 +1831,9 @@ impl Venue for BinanceFutures {
         Ok((order.order_id.to_string(), order.client_order_id))
     }
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()> {
+        // Weight-based rate limiting: DELETE /fapi/v1/order = weight 1
+        // Note: Connection.rs'de de rate limit guard var, ama burada da ekliyoruz
+        crate::utils::rate_limit_guard(1).await;
         let qs = format!(
             "symbol={}&orderId={}&timestamp={}&recvWindow={}",
             sym,
@@ -1854,6 +1856,8 @@ impl Venue for BinanceFutures {
         if let Some(price_update) = PRICE_CACHE.get(sym) {
             return Ok((price_update.bid, price_update.ask));
         }
+        // Weight-based rate limiting: GET /fapi/v1/depth = weight 5
+        crate::utils::rate_limit_guard(5).await;
         warn!(
             symbol = %sym,
             "PRICE_CACHE empty in best_prices, falling back to REST API (should be rare)"
