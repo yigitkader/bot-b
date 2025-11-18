@@ -14,58 +14,47 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AnomalyType {
-    /// High order rejection rate (potential exchange issues or config problems)
     HighOrderRejectionRate {
         symbol: String,
         rejection_rate: f64,
         threshold: f64,
     },
-    /// Unusual PnL pattern (sudden losses or gains)
     UnusualPnLPattern {
         symbol: String,
         pnl_change: f64,
         recent_trades: u64,
     },
-    /// Low win rate (strategy may not be working)
     LowWinRate {
         symbol: String,
         win_rate: f64,
         total_trades: u64,
     },
-    /// High spread detected (liquidity issues)
     HighSpread {
         symbol: String,
         spread_bps: f64,
         threshold: f64,
     },
-    /// Frequent order cancellations (market conditions or timing issues)
     FrequentCancellations {
         symbol: String,
         cancel_rate: f64,
         recent_orders: u64,
     },
-    /// Balance inconsistency (potential accounting error)
     BalanceInconsistency {
         expected: f64,
         actual: f64,
         difference: f64,
     },
-    /// WebSocket disconnections (connectivity issues)
     WebSocketDisconnections {
         count: u64,
         duration: Duration,
     },
-    /// Circuit breaker triggered (too many rejections)
     CircuitBreakerTriggered {
         symbol: String,
         rejection_count: u64,
     },
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub struct AnomalyReport {
     pub timestamp: u64,
@@ -74,43 +63,31 @@ pub struct AnomalyReport {
     pub message: String,
     pub recommendation: String,
 }
-
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum Severity {
     Low,
     Medium,
     High,
 }
-
-
 pub struct AiAnalyzer {
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
-    
     trade_stats: Arc<Mutex<HashMap<String, TradeStats>>>,
-    
     order_stats: Arc<Mutex<HashMap<String, OrderStats>>>,
-    
     pub(crate) anomaly_history: Arc<Mutex<VecDeque<AnomalyReport>>>,
-    
     total_signals: Arc<AtomicU64>,
     total_trades: Arc<AtomicU64>,
     total_wins: Arc<AtomicU64>,
     total_losses: Arc<AtomicU64>,
-    
     report_file_path: PathBuf,
-    
     pub(crate) operation_log: Arc<Mutex<VecDeque<OperationLog>>>,
-    
     pub(crate) error_log: Arc<Mutex<VecDeque<ErrorLog>>>,
-    
     console_log_path: PathBuf,
     last_console_log_position: Arc<Mutex<u64>>,
     trading_events_path: PathBuf,
 }
-
 #[derive(Debug, Clone, Serialize)]
-struct OperationLog {
+pub(crate) struct OperationLog {
     timestamp: u64,
     operation_type: String,
     symbol: Option<String>,
@@ -118,9 +95,8 @@ struct OperationLog {
     success: bool,
     duration_ms: Option<u64>,
 }
-
 #[derive(Debug, Clone, Serialize)]
-struct ErrorLog {
+pub(crate) struct ErrorLog {
     timestamp: u64,
     error_type: String,
     module: String,
@@ -128,7 +104,6 @@ struct ErrorLog {
     message: String,
     context: HashMap<String, String>,
 }
-
 #[derive(Debug, Clone)]
 pub struct TradeStats {
     pub symbol: String,
@@ -139,7 +114,6 @@ pub struct TradeStats {
     pub recent_pnl: VecDeque<f64>,
     pub last_trade_time: Option<Instant>,
 }
-
 #[derive(Debug, Clone)]
 pub struct OrderStats {
     pub symbol: String,
@@ -150,15 +124,12 @@ pub struct OrderStats {
     pub recent_spreads: VecDeque<f64>,
     pub last_order_time: Option<Instant>,
 }
-
 impl AiAnalyzer {
     pub fn new(event_bus: Arc<EventBus>, shutdown_flag: Arc<AtomicBool>) -> Self {
         std::fs::create_dir_all("logs").ok();
-        
         let report_file_path = PathBuf::from("logs/ai_analysis_report.json");
         let console_log_path = PathBuf::from("logs/console.log");
         let trading_events_path = PathBuf::from("logs/trading_events.json");
-        
         Self {
             event_bus,
             shutdown_flag,
@@ -177,57 +148,43 @@ impl AiAnalyzer {
             trading_events_path,
         }
     }
-
-    /// Start the AI analyzer service
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         info!("AI_ANALYZER: Starting intelligent log analysis service");
         info!("AI_ANALYZER: Analysis reports will be written to: {}", self.report_file_path.display());
-        
         self.analyze_trade_signals().await?;
         self.analyze_order_updates().await?;
         self.analyze_position_updates().await?;
         self.analyze_balance_updates().await?;
-        
         self.analyze_log_files().await?;
-        
         self.periodic_analysis().await?;
-        
         Ok(())
     }
-    
     fn timestamp_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_millis() as u64
     }
-    
     fn timestamp_secs() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs()
     }
-
-    /// Analyze trade signals for patterns
     async fn analyze_trade_signals(&self) -> Result<()> {
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let total_signals = self.total_signals.clone();
         let operation_log = self.operation_log.clone();
-        
         tokio::spawn(async move {
             let mut trade_signal_rx = event_bus.subscribe_trade_signal();
-            
             loop {
                 match trade_signal_rx.recv().await {
                     Ok(signal) => {
                         if shutdown_flag.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
                         total_signals.fetch_add(1, AtomicOrdering::Relaxed);
-                        
                         let mut op_log = operation_log.lock().await;
                         op_log.push_back(OperationLog {
                             timestamp: Self::timestamp_ms(),
@@ -240,7 +197,6 @@ impl AiAnalyzer {
                         if op_log.len() > 1000 {
                             op_log.pop_front();
                         }
-                        
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         warn!("AI_ANALYZER: TradeSignal receiver lagged, {} events missed", missed);
@@ -252,11 +208,8 @@ impl AiAnalyzer {
                 }
             }
         });
-        
         Ok(())
     }
-
-    /// Analyze order updates for anomalies
     async fn analyze_order_updates(&self) -> Result<()> {
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
@@ -264,17 +217,14 @@ impl AiAnalyzer {
         let anomaly_history = self.anomaly_history.clone();
         let operation_log = self.operation_log.clone();
         let error_log = self.error_log.clone();
-        
         tokio::spawn(async move {
             let mut order_update_rx = event_bus.subscribe_order_update();
-            
             loop {
                 match order_update_rx.recv().await {
                     Ok(update) => {
                         if shutdown_flag.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
                         let mut stats = order_stats.lock().await;
                         let stat = stats.entry(update.symbol.clone())
                             .or_insert_with(|| OrderStats {
@@ -286,10 +236,8 @@ impl AiAnalyzer {
                                 recent_spreads: VecDeque::new(),
                                 last_order_time: None,
                             });
-                        
                         stat.total_orders += 1;
                         stat.last_order_time = Some(Instant::now());
-                        
                         let mut op_log = operation_log.lock().await;
                         let success = matches!(update.status, crate::event_bus::OrderStatus::Filled);
                         op_log.push_back(OperationLog {
@@ -303,7 +251,6 @@ impl AiAnalyzer {
                         if op_log.len() > 1000 {
                             op_log.pop_front();
                         }
-                        
                         match update.status {
                             crate::event_bus::OrderStatus::Filled => {
                                 stat.filled_orders += 1;
@@ -313,7 +260,6 @@ impl AiAnalyzer {
                             }
                             crate::event_bus::OrderStatus::Rejected => {
                                 stat.rejected_orders += 1;
-                                
                                 let mut err_log = error_log.lock().await;
                                 let mut context = HashMap::new();
                                 context.insert("order_id".to_string(), update.order_id.clone());
@@ -333,7 +279,6 @@ impl AiAnalyzer {
                             }
                             _ => {}
                         }
-                        
                         let mut history = anomaly_history.lock().await;
                         Self::detect_order_anomalies(&stat, &mut *history);
                     }
@@ -347,11 +292,8 @@ impl AiAnalyzer {
                 }
             }
         });
-        
         Ok(())
     }
-
-    /// Analyze position updates for PnL patterns
     async fn analyze_position_updates(&self) -> Result<()> {
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
@@ -360,21 +302,17 @@ impl AiAnalyzer {
         let total_trades = self.total_trades.clone();
         let total_wins = self.total_wins.clone();
         let total_losses = self.total_losses.clone();
-        
         tokio::spawn(async move {
             let mut position_update_rx = event_bus.subscribe_position_update();
-            
             loop {
                 match position_update_rx.recv().await {
                     Ok(update) => {
                         if shutdown_flag.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
                         let pnl = update.unrealized_pnl
                             .map(|pnl| pnl.to_f64().unwrap_or(0.0))
                             .unwrap_or(0.0);
-                        
                         let mut stats = trade_stats.lock().await;
                         let stat = stats.entry(update.symbol.clone())
                             .or_insert_with(|| TradeStats {
@@ -386,11 +324,9 @@ impl AiAnalyzer {
                                 recent_pnl: VecDeque::new(),
                                 last_trade_time: None,
                             });
-                        
                         if !update.is_open && stat.last_trade_time.is_some() {
                             stat.total_trades += 1;
                             total_trades.fetch_add(1, AtomicOrdering::Relaxed);
-                            
                             if pnl > 0.0 {
                                 stat.winning_trades += 1;
                                 total_wins.fetch_add(1, AtomicOrdering::Relaxed);
@@ -398,17 +334,14 @@ impl AiAnalyzer {
                                 stat.losing_trades += 1;
                                 total_losses.fetch_add(1, AtomicOrdering::Relaxed);
                             }
-                            
                             stat.total_pnl += pnl;
                             stat.recent_pnl.push_back(pnl);
                             if stat.recent_pnl.len() > 10 {
                                 stat.recent_pnl.pop_front();
                             }
-                            
                             let mut history = anomaly_history.lock().await;
                             Self::detect_trade_anomalies(&stat, &mut *history);
                         }
-                        
                         stat.last_trade_time = Some(Instant::now());
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -421,36 +354,28 @@ impl AiAnalyzer {
                 }
             }
         });
-        
         Ok(())
     }
-
-    /// Analyze balance updates for inconsistencies
     async fn analyze_balance_updates(&self) -> Result<()> {
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let anomaly_history = self.anomaly_history.clone();
-        
         tokio::spawn(async move {
             let mut balance_update_rx = event_bus.subscribe_balance_update();
             let mut last_balance: Option<(f64, f64)> = None;
-            
             loop {
                 match balance_update_rx.recv().await {
                     Ok(update) => {
                         if shutdown_flag.load(AtomicOrdering::Relaxed) {
                             break;
                         }
-                        
                         let current_balance = (
                             update.usdt.to_f64().unwrap_or(0.0),
                             update.usdc.to_f64().unwrap_or(0.0),
                         );
-                        
                         if let Some((prev_usdt, prev_usdc)) = last_balance {
                             let usdt_change = (current_balance.0 - prev_usdt).abs();
                             let usdc_change = (current_balance.1 - prev_usdc).abs();
-                            
                             if usdt_change > 100.0 || usdt_change > prev_usdt * 0.1 {
                                 let mut history = anomaly_history.lock().await;
                                 let report = AnomalyReport {
@@ -470,7 +395,6 @@ impl AiAnalyzer {
                                     ),
                                     recommendation: "Check recent trades and order fills for accounting errors".to_string(),
                                 };
-                                
                                 error!("🚨 AI_ANALYZER: {}", report.message);
                                 history.push_back(report);
                                 if history.len() > 100 {
@@ -478,7 +402,6 @@ impl AiAnalyzer {
                                 }
                             }
                         }
-                        
                         last_balance = Some(current_balance);
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -491,11 +414,8 @@ impl AiAnalyzer {
                 }
             }
         });
-        
         Ok(())
     }
-
-    /// Detect order-related anomalies
     fn detect_order_anomalies(
         stat: &OrderStats,
         anomaly_history: &mut VecDeque<AnomalyReport>,
@@ -520,7 +440,6 @@ impl AiAnalyzer {
                     ),
                     recommendation: "Check exchange API status, order parameters, and account permissions".to_string(),
                 };
-                
                 error!("🚨 AI_ANALYZER: {}", report.message);
                 anomaly_history.push_back(report);
                 if anomaly_history.len() > 100 {
@@ -528,7 +447,6 @@ impl AiAnalyzer {
                 }
             }
         }
-        
         if stat.total_orders > 10 {
             let cancel_rate = (stat.canceled_orders as f64) / (stat.total_orders as f64) * 100.0;
             if cancel_rate > 30.0 {
@@ -549,7 +467,6 @@ impl AiAnalyzer {
                     ),
                     recommendation: "Review spread validation logic and market conditions".to_string(),
                 };
-                
                 warn!("⚠️ AI_ANALYZER: {}", report.message);
                 anomaly_history.push_back(report);
                 if anomaly_history.len() > 100 {
@@ -558,8 +475,6 @@ impl AiAnalyzer {
             }
         }
     }
-
-    /// Detect trade-related anomalies
     fn detect_trade_anomalies(
         stat: &TradeStats,
         anomaly_history: &mut VecDeque<AnomalyReport>,
@@ -584,7 +499,6 @@ impl AiAnalyzer {
                     ),
                     recommendation: "Review strategy parameters, market conditions, and consider pausing trading for this symbol".to_string(),
                 };
-                
                 warn!("⚠️ AI_ANALYZER: {}", report.message);
                 anomaly_history.push_back(report);
                 if anomaly_history.len() > 100 {
@@ -592,7 +506,6 @@ impl AiAnalyzer {
                 }
             }
         }
-        
         if stat.recent_pnl.len() >= 3 {
             let recent_avg = stat.recent_pnl.iter().sum::<f64>() / stat.recent_pnl.len() as f64;
             if let Some(&last_pnl) = stat.recent_pnl.back() {
@@ -614,7 +527,6 @@ impl AiAnalyzer {
                         ),
                         recommendation: "Review recent trades, check for slippage or execution issues".to_string(),
                     };
-                    
                     error!("🚨 AI_ANALYZER: {}", report.message);
                     anomaly_history.push_back(report);
                     if anomaly_history.len() > 100 {
@@ -624,84 +536,62 @@ impl AiAnalyzer {
             }
         }
     }
-
-    /// Analyze log files for patterns and errors
     async fn analyze_log_files(&self) -> Result<()> {
         let shutdown_flag = self.shutdown_flag.clone();
         let error_log = self.error_log.clone();
         let console_log_path = self.console_log_path.clone();
         let trading_events_path = self.trading_events_path.clone();
         let last_position = self.last_console_log_position.clone();
-        
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                
                 if shutdown_flag.load(AtomicOrdering::Relaxed) {
                     break;
                 }
-                
                 if let Ok(new_content) = Self::read_log_incremental(&console_log_path, &last_position).await {
                     if !new_content.is_empty() {
                         let mut err_log = error_log.lock().await;
                         Self::analyze_console_log(&new_content, &mut *err_log);
                     }
                 }
-                
                 if let Ok(content) = std::fs::read_to_string(&trading_events_path) {
                     Self::analyze_trading_events(&content, &error_log).await;
                 }
             }
         });
-        
         Ok(())
     }
-    
-    /// Read log file incrementally from last position
     async fn read_log_incremental(
         log_path: &PathBuf,
         last_position: &Arc<Mutex<u64>>,
     ) -> Result<String, std::io::Error> {
         use std::io::{Seek, SeekFrom};
-        
         let mut file = std::fs::File::open(log_path)?;
         let current_size = file.metadata()?.len() as u64;
-        
         let mut last_pos = last_position.lock().await;
-        
         if *last_pos > current_size {
             *last_pos = 0;
         }
-        
         file.seek(SeekFrom::Start(*last_pos))?;
-        
         use std::io::Read;
         let mut buffer = String::new();
         file.read_to_string(&mut buffer)?;
-        
         *last_pos = current_size;
-        
         Ok(buffer)
     }
-    
-    /// Analyze console.log for errors, warnings, and patterns
-    /// Log format: "2025-11-16T19:16:27.104027Z  WARN app::trending: TRENDING: ..."
     fn analyze_console_log(content: &str, error_log: &mut VecDeque<ErrorLog>) {
         let lines: Vec<&str> = content.lines().collect();
         let mut error_count = 0;
         let mut warn_count = 0;
         let mut recent_errors = Vec::new();
         let mut recent_warnings = Vec::new();
-        
         for line in lines.iter() {
             if line.contains(" ERROR ") || line.contains("\tERROR\t") {
                 error_count += 1;
                 recent_errors.push(line.to_string());
-                
                 let (module, message) = Self::parse_log_line(line);
                 let mut context = HashMap::new();
                 context.insert("log_line".to_string(), line.to_string());
-                
                 error_log.push_back(ErrorLog {
                     timestamp: Self::timestamp_ms(),
                     error_type: "log_error".to_string(),
@@ -716,14 +606,12 @@ impl AiAnalyzer {
                 recent_warnings.push(line.to_string());
             }
         }
-        
         if error_count > 10 {
             let mut context = HashMap::new();
             context.insert("error_count".to_string(), error_count.to_string());
             context.insert("warn_count".to_string(), warn_count.to_string());
             context.insert("sample_errors".to_string(), 
                 recent_errors.iter().take(3).cloned().collect::<Vec<_>>().join("; "));
-            
             error_log.push_back(ErrorLog {
                 timestamp: Self::timestamp_ms(),
                 error_type: "high_error_rate".to_string(),
@@ -734,13 +622,11 @@ impl AiAnalyzer {
                 context,
             });
         }
-        
         if warn_count > 50 && error_count == 0 {
             let mut context = HashMap::new();
             context.insert("warn_count".to_string(), warn_count.to_string());
             context.insert("sample_warnings".to_string(), 
                 recent_warnings.iter().take(3).cloned().collect::<Vec<_>>().join("; "));
-            
             error_log.push_back(ErrorLog {
                 timestamp: Self::timestamp_ms(),
                 error_type: "high_warning_rate".to_string(),
@@ -750,15 +636,11 @@ impl AiAnalyzer {
                 context,
             });
         }
-        
         if error_log.len() > 500 {
             error_log.drain(..error_log.len() - 500);
         }
     }
-    
-    /// Parse log line to extract module and message
     fn parse_log_line(line: &str) -> (String, String) {
-        
         let parts: Vec<&str> = line.splitn(4, ' ').collect();
         if parts.len() >= 4 {
             let module = parts[2].trim_end_matches(':').to_string();
@@ -768,8 +650,6 @@ impl AiAnalyzer {
             ("UNKNOWN".to_string(), line.to_string())
         }
     }
-    
-    /// Extract symbol from log line if present
     fn extract_symbol_from_log(line: &str) -> Option<String> {
         if let Some(symbol_start) = line.find("symbol=") {
             let after_eq = &line[symbol_start + 7..];
@@ -781,26 +661,21 @@ impl AiAnalyzer {
         }
         None
     }
-    
-    /// Analyze trading events JSON for patterns
     async fn analyze_trading_events(
         content: &str,
         error_log: &Arc<Mutex<VecDeque<ErrorLog>>>,
     ) {
         use serde_json::Value;
-        
         let lines: Vec<&str> = content.lines().collect();
         let mut order_fills = 0;
         let mut order_cancels = 0;
         let mut position_updates = 0;
         let mut recent_pnl_values = Vec::new();
         let mut symbol_trade_counts: HashMap<String, u64> = HashMap::new();
-        
         for line in lines.iter().rev().take(1000) {
             if line.trim().is_empty() {
                 continue;
             }
-            
             match serde_json::from_str::<Value>(line) {
                 Ok(event) => {
                     if let Some(event_type) = event.get("event_type").and_then(|v| v.as_str()) {
@@ -829,17 +704,14 @@ impl AiAnalyzer {
                 }
             }
         }
-        
         let total_events = order_fills + order_cancels + position_updates;
         if total_events > 0 {
             let cancel_rate = (order_cancels as f64) / (order_fills + order_cancels) as f64 * 100.0;
-            
             if cancel_rate > 50.0 && order_cancels > 10 {
                 let mut context = HashMap::new();
                 context.insert("order_fills".to_string(), order_fills.to_string());
                 context.insert("order_cancels".to_string(), order_cancels.to_string());
                 context.insert("cancel_rate".to_string(), format!("{:.1}%", cancel_rate));
-                
                 let mut err_log = error_log.lock().await;
                 err_log.push_back(ErrorLog {
                     timestamp: Self::timestamp_ms(),
@@ -850,22 +722,18 @@ impl AiAnalyzer {
                         cancel_rate, order_cancels, order_fills),
                     context,
                 });
-                
                 if err_log.len() > 500 {
                     err_log.pop_front();
                 }
             }
-            
             if recent_pnl_values.len() > 5 {
                 let avg_pnl = recent_pnl_values.iter().sum::<f64>() / recent_pnl_values.len() as f64;
                 let min_pnl = recent_pnl_values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-                
                 if min_pnl < -100.0 || avg_pnl < -50.0 {
                     let mut context = HashMap::new();
                     context.insert("avg_pnl".to_string(), format!("{:.2}", avg_pnl));
                     context.insert("min_pnl".to_string(), format!("{:.2}", min_pnl));
                     context.insert("position_updates".to_string(), position_updates.to_string());
-                    
                     let mut err_log = error_log.lock().await;
                     err_log.push_back(ErrorLog {
                         timestamp: Self::timestamp_ms(),
@@ -876,7 +744,6 @@ impl AiAnalyzer {
                             avg_pnl, min_pnl),
                         context,
                     });
-                    
                     if err_log.len() > 500 {
                         err_log.pop_front();
                     }
@@ -884,8 +751,6 @@ impl AiAnalyzer {
             }
         }
     }
-    
-    /// Periodic analysis task (runs every 5 minutes)
     async fn periodic_analysis(self: &Arc<Self>) -> Result<()> {
         let shutdown_flag = self.shutdown_flag.clone();
         let ai_analyzer = self.clone();
@@ -896,39 +761,31 @@ impl AiAnalyzer {
         let total_wins = self.total_wins.clone();
         let total_losses = self.total_losses.clone();
         let report_file_path = self.report_file_path.clone();
-        
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
-                
                 if shutdown_flag.load(AtomicOrdering::Relaxed) {
                     break;
                 }
-                
                 let signals = total_signals.load(AtomicOrdering::Relaxed);
                 let trades = total_trades.load(AtomicOrdering::Relaxed);
                 let wins = total_wins.load(AtomicOrdering::Relaxed);
                 let losses = total_losses.load(AtomicOrdering::Relaxed);
-                
                 let win_rate = if trades > 0 {
                     (wins as f64) / (trades as f64) * 100.0
                 } else {
                     0.0
                 };
-                
                 info!(
                     "📊 AI_ANALYZER: Summary - Signals: {}, Trades: {}, Win Rate: {:.1}% ({}W/{}L)",
                     signals, trades, win_rate, wins, losses
                 );
-                
                 let trade_stats_data = ai_analyzer.get_trade_stats().await;
                 let order_stats_data = ai_analyzer.get_order_stats().await;
                 let recent_anomalies = ai_analyzer.get_recent_anomalies(20).await;
-                
                 let anomaly_history_guard = ai_analyzer.anomaly_history.lock().await;
                 let operation_log_guard = operation_log.lock().await;
                 let error_log_guard = error_log.lock().await;
-                
                 Self::generate_analysis_report(
                     &trade_stats_data,
                     &order_stats_data,
@@ -941,11 +798,9 @@ impl AiAnalyzer {
                     losses,
                     &report_file_path,
                 ).await;
-                
                 drop(anomaly_history_guard);
                 drop(operation_log_guard);
                 drop(error_log_guard);
-                
                 if !recent_anomalies.is_empty() {
                     let high_severity_count = recent_anomalies.iter()
                         .filter(|a| matches!(a.severity, Severity::High))
@@ -953,7 +808,6 @@ impl AiAnalyzer {
                     let medium_severity_count = recent_anomalies.iter()
                         .filter(|a| matches!(a.severity, Severity::Medium))
                         .count();
-                    
                     if high_severity_count > 0 || medium_severity_count > 0 {
                         warn!(
                             "⚠️ AI_ANALYZER: {} high and {} medium severity anomalies detected in last 20",
@@ -961,7 +815,6 @@ impl AiAnalyzer {
                         );
                     }
                 }
-                
                 for (symbol, stat) in trade_stats_data.iter() {
                     if stat.total_trades > 5 {
                         let symbol_win_rate = if stat.total_trades > 0 {
@@ -969,7 +822,6 @@ impl AiAnalyzer {
                         } else {
                             0.0
                         };
-                        
                         info!(
                             "📊 AI_ANALYZER: {} - Trades: {}, Win Rate: {:.1}%, PnL: ${:.2}",
                             symbol, stat.total_trades, symbol_win_rate, stat.total_pnl
@@ -978,11 +830,8 @@ impl AiAnalyzer {
                 }
             }
         });
-        
         Ok(())
     }
-    
-    /// Generate comprehensive analysis report and write to file
     async fn generate_analysis_report(
         trade_stats: &HashMap<String, TradeStats>,
         order_stats: &HashMap<String, OrderStats>,
@@ -1005,7 +854,6 @@ impl AiAnalyzer {
             operation_analysis: OperationAnalysis,
             recommendations: Vec<String>,
         }
-        
         #[derive(Serialize)]
         struct SummaryStats {
             total_signals: u64,
@@ -1017,7 +865,6 @@ impl AiAnalyzer {
             total_anomalies: usize,
             total_errors: usize,
         }
-        
         #[derive(Serialize)]
         struct SymbolStats {
             symbol: String,
@@ -1030,7 +877,6 @@ impl AiAnalyzer {
             order_rejection_rate: f64,
             order_cancel_rate: f64,
         }
-        
         #[derive(Serialize)]
         struct OperationAnalysis {
             total_operations: usize,
@@ -1038,14 +884,12 @@ impl AiAnalyzer {
             operation_types: HashMap<String, u64>,
             error_rate: f64,
         }
-        
         let total_orders: u64 = order_stats.values().map(|s| s.total_orders).sum();
         let win_rate = if total_trades > 0 {
             (total_wins as f64) / (total_trades as f64) * 100.0
         } else {
             0.0
         };
-        
         let summary = SummaryStats {
             total_signals,
             total_trades,
@@ -1056,7 +900,6 @@ impl AiAnalyzer {
             total_anomalies: anomalies.len(),
             total_errors: errors.len(),
         };
-        
         let mut per_symbol_stats = Vec::new();
         for (symbol, trade_stat) in trade_stats.iter() {
             let order_stat = order_stats.get(symbol).cloned().unwrap_or_else(|| OrderStats {
@@ -1068,25 +911,21 @@ impl AiAnalyzer {
                 recent_spreads: VecDeque::new(),
                 last_order_time: None,
             });
-            
             let symbol_win_rate = if trade_stat.total_trades > 0 {
                 (trade_stat.winning_trades as f64) / (trade_stat.total_trades as f64) * 100.0
             } else {
                 0.0
             };
-            
             let rejection_rate = if order_stat.total_orders > 0 {
                 (order_stat.rejected_orders as f64) / (order_stat.total_orders as f64) * 100.0
             } else {
                 0.0
             };
-            
             let cancel_rate = if order_stat.total_orders > 0 {
                 (order_stat.canceled_orders as f64) / (order_stat.total_orders as f64) * 100.0
             } else {
                 0.0
             };
-            
             per_symbol_stats.push(SymbolStats {
                 symbol: symbol.clone(),
                 trades: trade_stat.total_trades,
@@ -1099,7 +938,6 @@ impl AiAnalyzer {
                 order_cancel_rate: cancel_rate,
             });
         }
-        
         let total_ops = operations.len();
         let successful_ops = operations.iter().filter(|op| op.success).count();
         let success_rate = if total_ops > 0 {
@@ -1107,34 +945,28 @@ impl AiAnalyzer {
         } else {
             0.0
         };
-        
         let mut op_types = HashMap::new();
         for op in operations.iter() {
             *op_types.entry(op.operation_type.clone()).or_insert(0) += 1;
         }
-        
         let error_rate = if total_ops > 0 {
             (errors.len() as f64) / (total_ops as f64) * 100.0
         } else {
             0.0
         };
-        
         let operation_analysis = OperationAnalysis {
             total_operations: total_ops,
             success_rate,
             operation_types: op_types,
             error_rate,
         };
-        
         let mut recommendations = Vec::new();
-        
         if win_rate < 40.0 && total_trades > 10 {
             recommendations.push(format!(
                 "⚠️ Low win rate ({:.1}%) detected. Consider reviewing strategy parameters or market conditions.",
                 win_rate
             ));
         }
-        
         for stat in per_symbol_stats.iter() {
             if stat.win_rate < 30.0 && stat.trades > 5 {
                 recommendations.push(format!(
@@ -1142,14 +974,12 @@ impl AiAnalyzer {
                     stat.symbol, stat.win_rate
                 ));
             }
-            
             if stat.order_rejection_rate > 20.0 {
                 recommendations.push(format!(
                     "🚨 {} has high order rejection rate ({:.1}%). Check exchange API status and order parameters.",
                     stat.symbol, stat.order_rejection_rate
                 ));
             }
-            
             if stat.order_cancel_rate > 30.0 {
                 recommendations.push(format!(
                     "⚠️ {} has high cancellation rate ({:.1}%). Review spread validation and market conditions.",
@@ -1157,18 +987,14 @@ impl AiAnalyzer {
                 ));
             }
         }
-        
         if errors.len() > 50 {
             recommendations.push(format!(
                 "🚨 High error count ({}) detected. Review error logs for patterns.",
                 errors.len()
             ));
         }
-        
         let recent_errors: Vec<ErrorLog> = errors.iter().rev().take(20).cloned().collect();
-        
         let recent_anomalies: Vec<AnomalyReport> = anomalies.iter().rev().take(20).cloned().collect();
-        
         let report = AnalysisReport {
             timestamp: Self::timestamp_secs(),
             summary,
@@ -1178,7 +1004,6 @@ impl AiAnalyzer {
             operation_analysis,
             recommendations,
         };
-        
         if let Ok(json) = serde_json::to_string_pretty(&report) {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)
@@ -1194,21 +1019,14 @@ impl AiAnalyzer {
             }
         }
     }
-
-    /// Get recent anomalies
     pub async fn get_recent_anomalies(&self, limit: usize) -> Vec<AnomalyReport> {
         let history = self.anomaly_history.lock().await;
         history.iter().rev().take(limit).cloned().collect()
     }
-
-    /// Get trade statistics
     pub async fn get_trade_stats(&self) -> HashMap<String, TradeStats> {
         self.trade_stats.lock().await.clone()
     }
-
-    /// Get order statistics
     pub async fn get_order_stats(&self) -> HashMap<String, OrderStats> {
         self.order_stats.lock().await.clone()
     }
 }
-

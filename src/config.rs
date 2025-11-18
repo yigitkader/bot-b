@@ -1,32 +1,21 @@
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RiskCfg {
-    /// Maximum allowed leverage (validation only, not used as default)
-    /// Used to validate that leverage and exec.default_leverage don't exceed this limit
     #[serde(default = "default_max_leverage")]
     pub max_leverage: u32,
     #[serde(default = "default_use_isolated_margin")]
     pub use_isolated_margin: bool,
     #[serde(default = "default_max_position_notional_usd")]
     pub max_position_notional_usd: f64,
-    /// Maker commission rate (percentage, e.g., 0.02 for 0.02%)
-    /// Maker orders add liquidity to the order book (post-only orders)
     #[serde(default = "default_maker_commission_pct")]
     pub maker_commission_pct: f64,
-    /// Taker commission rate (percentage, e.g., 0.04 for 0.04%)
-    /// Taker orders remove liquidity from the order book (market orders, IOC orders)
-    /// Default: 0.04% (Binance futures standard taker fee)
     #[serde(default = "default_taker_commission_pct")]
     pub taker_commission_pct: f64,
-    /// Minimum commission buffer in USD (safety margin for small positions)
     #[serde(default = "default_min_commission_buffer_usd")]
     pub min_commission_buffer_usd: f64,
 }
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct TrendingCfg {
     #[serde(default = "default_min_spread_bps")]
@@ -35,118 +24,76 @@ pub struct TrendingCfg {
     pub max_spread_bps: f64,
     #[serde(default = "default_signal_cooldown_seconds")]
     pub signal_cooldown_seconds: u64,
-    /// High-frequency trading mode: allows signals without volume confirmation
-    /// When true, trend signals are generated even if volume doesn't confirm (more aggressive)
     #[serde(default = "default_hft_mode")]
     pub hft_mode: bool,
-    /// Require volume confirmation for trend signals
-    /// When true, signals are blocked if volume doesn't confirm the trend
-    /// When false (and hft_mode=true), volume confirmation is optional
     #[serde(default = "default_require_volume_confirmation")]
     pub require_volume_confirmation: bool,
-    /// Enable trailing stop loss (places trailing stop when TP threshold is reached)
-    /// When true, trailing stop order is placed when take profit threshold is reached
-    /// Trailing stop follows price movement to lock in profits
     #[serde(default = "default_use_trailing_stop")]
     pub use_trailing_stop: bool,
-    /// Trailing stop callback rate (0.001 = 0.1%)
-    /// Binance expects percentage (0.1 not 0.001)
-    /// Example: 0.001 = 0.1% callback rate
     #[serde(default = "default_trailing_stop_callback_rate")]
     pub trailing_stop_callback_rate: f64,
-    /// RSI minimum average loss threshold (prevents division by very small numbers)
     #[serde(default = "default_rsi_min_avg_loss")]
     pub rsi_min_avg_loss: f64,
-    /// ATR period for volatility calculation
     #[serde(default = "default_atr_period")]
     pub atr_period: usize,
-    /// Dynamic ATR-based stop loss multiplier (default: 3.0x ATR)
     #[serde(default = "default_atr_sl_multiplier")]
     pub atr_sl_multiplier: f64,
-    /// Dynamic ATR-based take profit multiplier (default: 6.0x ATR)
     #[serde(default = "default_atr_tp_multiplier")]
     pub atr_tp_multiplier: f64,
-    /// Low volatility threshold (ATR < this = ranging market)
     #[serde(default = "default_low_volatility_threshold")]
     pub low_volatility_threshold: f64,
-    /// High volatility threshold (ATR > this = volatile market)
     #[serde(default = "default_high_volatility_threshold")]
     pub high_volatility_threshold: f64,
-    /// Base volatility percentage for normalization (2% = 0.02)
     #[serde(default = "default_base_volatility")]
     pub base_volatility: f64,
-    /// Base minimum score threshold for signal generation
     #[serde(default = "default_base_min_score")]
     pub base_min_score: f64,
-    /// Regime multiplier for trending markets
     #[serde(default = "default_regime_multiplier_trending")]
     pub regime_multiplier_trending: f64,
-    /// Regime multiplier for ranging markets
     #[serde(default = "default_regime_multiplier_ranging")]
     pub regime_multiplier_ranging: f64,
-    /// Regime multiplier for volatile markets
     #[serde(default = "default_regime_multiplier_volatile")]
     pub regime_multiplier_volatile: f64,
-    /// Regime multiplier for unknown markets
     #[serde(default = "default_regime_multiplier_unknown")]
     pub regime_multiplier_unknown: f64,
-    /// Volume multiplier for HFT mode (1.1 = 1.1x average volume)
     #[serde(default = "default_volume_multiplier_hft")]
     pub volume_multiplier_hft: f64,
-    /// Volume multiplier for normal mode (1.3 = 1.3x average volume)
     #[serde(default = "default_volume_multiplier_normal")]
     pub volume_multiplier_normal: f64,
-    /// Trend strength threshold for HFT mode (0.5 = 50% alignment required)
     #[serde(default = "default_trend_threshold_hft")]
     pub trend_threshold_hft: f64,
-    /// Trend strength threshold for normal mode (0.7 = 70% alignment required)
     #[serde(default = "default_trend_threshold_normal")]
     pub trend_threshold_normal: f64,
-    /// Score multiplier for weak trends with volume (1.1 = 10% higher threshold)
     #[serde(default = "default_weak_trend_score_multiplier")]
     pub weak_trend_score_multiplier: f64,
-    /// RSI lower bound for long signals
     #[serde(default = "default_rsi_lower_long")]
     pub rsi_lower_long: f64,
-    /// RSI upper bound for long signals
     #[serde(default = "default_rsi_upper_long")]
     pub rsi_upper_long: f64,
-    /// RSI lower bound for short signals
     #[serde(default = "default_rsi_lower_short")]
     pub rsi_lower_short: f64,
-    /// RSI upper bound for short signals
     #[serde(default = "default_rsi_upper_short")]
     pub rsi_upper_short: f64,
-    /// Score weight for short-term EMA alignment
     #[serde(default = "default_ema_short_score")]
     pub ema_short_score: f64,
-    /// Score weight for mid-term EMA alignment
     #[serde(default = "default_ema_mid_score")]
     pub ema_mid_score: f64,
-    /// Score weight for slope strength
     #[serde(default = "default_slope_score")]
     pub slope_score: f64,
-    /// Score weight for RSI confirmation
     #[serde(default = "default_rsi_score")]
     pub rsi_score: f64,
-    /// Minimum analysis interval in milliseconds (throttling)
     #[serde(default = "default_min_analysis_interval_ms")]
     pub min_analysis_interval_ms: u64,
-    /// Default spread quality when spread range is zero
     #[serde(default = "default_default_spread_quality")]
     pub default_spread_quality: f64,
 }
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ExecCfg {
     #[serde(default = "default_tif")]
     pub tif: String,
-    /// Default leverage to use when leverage (top-level) is not set
-    /// Used as fallback: cfg.leverage.unwrap_or(cfg.exec.default_leverage)
     #[serde(default = "default_default_leverage")]
     pub default_leverage: u32,
 }
-
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct WebsocketCfg {
     #[serde(default = "default_ws_reconnect_delay")]
@@ -154,106 +101,63 @@ pub struct WebsocketCfg {
     #[serde(default = "default_ws_ping_interval")]
     pub ping_interval_ms: u64,
 }
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct InternalCfg {
-    /// Maximum position size buffer multiplier (default: 1.5)
     #[serde(default = "default_max_position_size_buffer")]
     pub max_position_size_buffer: f64,
-    /// Opportunity mode position multiplier (default: 1.2)
     #[serde(default = "default_opportunity_mode_position_multiplier")]
     pub opportunity_mode_position_multiplier: f64,
-    /// Opportunity mode soft limit ratio (default: 0.8 = 80%)
     #[serde(default = "default_opportunity_mode_soft_limit_ratio")]
     pub opportunity_mode_soft_limit_ratio: f64,
-    /// Opportunity mode medium limit ratio (default: 0.9 = 90%)
     #[serde(default = "default_opportunity_mode_medium_limit_ratio")]
     pub opportunity_mode_medium_limit_ratio: f64,
-    /// Opportunity mode hard limit ratio (default: 1.0 = 100%)
     #[serde(default = "default_opportunity_mode_hard_limit_ratio")]
     pub opportunity_mode_hard_limit_ratio: f64,
-    /// PnL alert interval in seconds (default: 60)
     #[serde(default = "default_pnl_alert_interval_sec")]
     pub pnl_alert_interval_sec: u64,
-    /// PnL alert threshold for positive PnL (default: 0.1 = 10%)
     #[serde(default = "default_pnl_alert_threshold_positive")]
     pub pnl_alert_threshold_positive: f64,
-    /// PnL alert threshold for negative PnL (default: -0.05 = -5%)
     #[serde(default = "default_pnl_alert_threshold_negative")]
     pub pnl_alert_threshold_negative: f64,
 }
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct EventBusCfg {
-    /// Buffer size for MarketTick events (high frequency, needs larger buffer)
-    /// 
-    /// **CRITICAL**: MarketTick events are high-frequency and can cause buffer overflow if subscribers are slow.
-    /// 
-    /// Buffer size calculation:
-    /// - 100 symbols × 1 tick/sec = 100 events/sec
-    /// - 1000 buffer = ~10 seconds (may be insufficient if subscribers lag)
-    /// - 10000 buffer = ~100 seconds (recommended for high-frequency trading)
-    /// 
-    /// **Warning**: When buffer is full, new events are dropped (RecvError::Lagged).
-    /// Subscribers should handle lag gracefully and process events quickly.
-    /// 
-    /// **Recommendation**: 
-    /// - Normal operation: 5000-10000
-    /// - High-frequency trading: 10000-20000
-    /// - Very slow subscribers: Consider increasing further or optimizing subscriber performance
     #[serde(default = "default_market_tick_buffer")]
     pub market_tick_buffer: usize,
-    /// Buffer size for TradeSignal events
     #[serde(default = "default_trade_signal_buffer")]
     pub trade_signal_buffer: usize,
-    /// Buffer size for CloseRequest events
     #[serde(default = "default_default_event_buffer")]
     pub close_request_buffer: usize,
-    /// Buffer size for OrderUpdate events
     #[serde(default = "default_default_event_buffer")]
     pub order_update_buffer: usize,
-    /// Buffer size for PositionUpdate events
     #[serde(default = "default_default_event_buffer")]
     pub position_update_buffer: usize,
-    /// Buffer size for BalanceUpdate events
     #[serde(default = "default_default_event_buffer")]
     pub balance_update_buffer: usize,
 }
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct DynamicSymbolSelection {
-    /// Enable dynamic symbol selection (automatic ranking and rotation)
     #[serde(default = "default_dynamic_symbol_selection_enabled")]
     pub enabled: bool,
-    /// Maximum number of symbols to track simultaneously (CPU limit)
     #[serde(default = "default_max_symbols")]
     pub max_symbols: usize,
-    /// Rotation interval in minutes (how often to re-rank and update symbols)
     #[serde(default = "default_rotation_interval_minutes")]
     pub rotation_interval_minutes: u64,
-    /// Minimum volatility percentage (24h price change) to consider a symbol
     #[serde(default = "default_min_volatility_pct")]
     pub min_volatility_pct: f64,
-    /// Minimum quote volume (USD) to consider a symbol (likidity filter)
     #[serde(default = "default_min_quote_volume")]
     pub min_quote_volume: f64,
-    /// Minimum number of trades in 24h to consider a symbol
     #[serde(default = "default_min_trades_24h")]
     pub min_trades_24h: u64,
-    /// Weight for volatility in opportunity score calculation
     #[serde(default = "default_volatility_weight")]
     pub volatility_weight: f64,
-    /// Weight for volume in opportunity score calculation
     #[serde(default = "default_volume_weight")]
     pub volume_weight: f64,
-    /// Weight for trades count in opportunity score calculation
     #[serde(default = "default_trades_weight")]
     pub trades_weight: f64,
-    /// Weight for spread in opportunity score calculation
     #[serde(default = "default_spread_weight")]
     pub spread_weight: f64,
 }
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct BinanceCfg {
     pub api_key: String,
@@ -264,7 +168,6 @@ pub struct BinanceCfg {
     #[serde(default = "default_hedge_mode")]
     pub hedge_mode: bool,
 }
-
 impl Default for BinanceCfg {
     fn default() -> Self {
         Self {
@@ -276,7 +179,6 @@ impl Default for BinanceCfg {
         }
     }
 }
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppCfg {
     #[serde(default)]
@@ -289,33 +191,18 @@ pub struct AppCfg {
     pub quote_asset: String,
     #[serde(default = "default_allow_usdt_quote")]
     pub allow_usdt_quote: bool,
-    /// Maximum margin per trade (USD) - legacy, use min_margin_usd/max_margin_usd instead
-    /// Kept for backward compatibility, but will be clamped to [min_margin_usd, max_margin_usd]
     #[serde(default = "default_max_usd_per_order")]
     pub max_usd_per_order: f64,
-    /// Minimum margin per trade (USD) - legacy, use min_margin_usd instead
     #[serde(default = "default_min_usd_per_order")]
     pub min_usd_per_order: f64,
-    /// Minimum margin per trade (USD) - dynamic margin range lower bound
-    /// Used for dynamic margin calculation: margin will be clamped to [min_margin_usd, max_margin_usd]
     #[serde(default = "default_min_margin_usd")]
     pub min_margin_usd: f64,
-    /// Maximum margin per trade (USD) - dynamic margin range upper bound
-    /// Used for dynamic margin calculation: margin will be clamped to [min_margin_usd, max_margin_usd]
     #[serde(default = "default_max_margin_usd")]
     pub max_margin_usd: f64,
-    /// Margin calculation strategy: "fixed" | "dynamic" | "trend_based" | "balance_based" | "max_balance"
-    /// - "fixed": Always use max_usd_per_order (or clamped to [min_margin_usd, max_margin_usd])
-    /// - "dynamic" | "trend_based": Scale margin based on trend strength, using available balance as base
-    /// - "balance_based" | "max_balance": Use all available balance (up to max_margin_usd)
-    ///   Since we only have one position at a time, we can use all available funds (up to max_margin_usd limit)
     #[serde(default = "default_margin_strategy")]
     pub margin_strategy: String,
     #[serde(default = "default_min_quote_balance_usd")]
     pub min_quote_balance_usd: f64,
-    /// Explicit leverage setting (optional)
-    /// If set, this value is used. Otherwise, exec.default_leverage is used.
-    /// Must not exceed risk.max_leverage (validated in validate_config)
     #[serde(default)]
     pub leverage: Option<u32>,
     #[serde(default = "default_price_tick")]
@@ -342,7 +229,6 @@ pub struct AppCfg {
     #[serde(default)]
     pub internal: InternalCfg,
 }
-
 impl Default for AppCfg {
     fn default() -> Self {
         Self {
@@ -373,338 +259,222 @@ impl Default for AppCfg {
         }
     }
 }
-
-
 fn default_max_leverage() -> u32 {
     50
 }
-
 fn default_use_isolated_margin() -> bool {
     true
 }
-
 fn default_max_position_notional_usd() -> f64 {
     1000.0
 }
-
 fn default_maker_commission_pct() -> f64 {
     0.02
 }
-
 fn default_taker_commission_pct() -> f64 {
     0.04
 }
-
 fn default_min_spread_bps() -> f64 {
     5.0
 }
-
 fn default_max_spread_bps() -> f64 {
     200.0
 }
-
 fn default_signal_cooldown_seconds() -> u64 {
     5
 }
-
 fn default_hft_mode() -> bool {
     true
 }
-
 fn default_require_volume_confirmation() -> bool {
     false
 }
-
 fn default_use_trailing_stop() -> bool {
     false
 }
-
 fn default_trailing_stop_callback_rate() -> f64 {
     0.001
 }
-
 fn default_rsi_min_avg_loss() -> f64 {
     0.0001
 }
-
 fn default_atr_period() -> usize {
     14
 }
-
 fn default_atr_sl_multiplier() -> f64 {
     3.0
 }
-
 fn default_atr_tp_multiplier() -> f64 {
     6.0
 }
-
 fn default_low_volatility_threshold() -> f64 {
     0.5
 }
-
 fn default_high_volatility_threshold() -> f64 {
     2.0
 }
-
 fn default_base_volatility() -> f64 {
     0.02
 }
-
 fn default_base_min_score() -> f64 {
     3.5
 }
-
 fn default_regime_multiplier_trending() -> f64 {
     0.95
 }
-
 fn default_regime_multiplier_ranging() -> f64 {
     1.1
 }
-
 fn default_regime_multiplier_volatile() -> f64 {
     1.15
 }
-
 fn default_regime_multiplier_unknown() -> f64 {
     1.0
 }
-
 fn default_volume_multiplier_hft() -> f64 {
     1.1
 }
-
 fn default_volume_multiplier_normal() -> f64 {
     1.3
 }
-
 fn default_trend_threshold_hft() -> f64 {
     0.5
 }
-
 fn default_trend_threshold_normal() -> f64 {
     0.7
 }
-
 fn default_weak_trend_score_multiplier() -> f64 {
     1.1
 }
-
 fn default_rsi_lower_long() -> f64 {
     55.0
 }
-
 fn default_rsi_upper_long() -> f64 {
     70.0
 }
-
 fn default_rsi_lower_short() -> f64 {
     25.0
 }
-
 fn default_rsi_upper_short() -> f64 {
     50.0
 }
-
 fn default_ema_short_score() -> f64 {
     2.5
 }
-
 fn default_ema_mid_score() -> f64 {
     2.0
 }
-
 fn default_slope_score() -> f64 {
     1.5
 }
-
 fn default_rsi_score() -> f64 {
     1.5
 }
-
 fn default_min_analysis_interval_ms() -> u64 {
     100
 }
-
 fn default_default_spread_quality() -> f64 {
     0.5
 }
-
 fn default_min_commission_buffer_usd() -> f64 {
     0.5
 }
-
 fn default_min_margin_usd() -> f64 {
     10.0
 }
-
 fn default_max_margin_usd() -> f64 {
     100.0
 }
-
 fn default_margin_strategy() -> String {
     "fixed".to_string()
 }
-
 fn default_tif() -> String {
     "post_only".to_string()
 }
-
 fn default_default_leverage() -> u32 {
     20
 }
-
 fn default_ws_reconnect_delay() -> u64 {
     5_000
 }
-
 fn default_ws_ping_interval() -> u64 {
     30_000
 }
-
 fn default_recv_window() -> u64 {
     5_000
 }
-
 fn default_hedge_mode() -> bool {
     false
 }
-
 fn default_auto_discover_quote() -> bool {
     true
 }
-
 fn default_quote_asset() -> String {
     "USDC".to_string()
 }
-
 fn default_allow_usdt_quote() -> bool {
     true
 }
-
 fn default_max_usd_per_order() -> f64 {
     100.0
 }
-
 fn default_min_usd_per_order() -> f64 {
     10.0
 }
-
 fn default_min_quote_balance_usd() -> f64 {
     1.0
 }
-
 fn default_price_tick() -> f64 {
     0.001
 }
-
 fn default_qty_step() -> f64 {
     0.001
 }
-
 fn default_take_profit_pct() -> f64 {
     5.0
 }
-
 fn default_stop_loss_pct() -> f64 {
     2.0
 }
-
 fn default_market_tick_buffer() -> usize {
     10000
 }
-
 fn default_trade_signal_buffer() -> usize {
     1000
 }
-
 fn default_default_event_buffer() -> usize {
     1000
 }
-
 fn default_dynamic_symbol_selection_enabled() -> bool {
     false
 }
-
 fn default_max_symbols() -> usize {
     30
 }
-
 fn default_rotation_interval_minutes() -> u64 {
     15
 }
-
 fn default_min_volatility_pct() -> f64 {
     1.5
 }
-
 fn default_min_quote_volume() -> f64 {
     1_000_000.0
 }
-
 fn default_min_trades_24h() -> u64 {
     1000
 }
-
 fn default_volatility_weight() -> f64 {
     2.0
 }
-
 fn default_volume_weight() -> f64 {
     1.0
 }
-
 fn default_trades_weight() -> f64 {
     0.5
 }
-
 fn default_spread_weight() -> f64 {
     1.0
 }
-
-
-/// Load application configuration from file or command line arguments.
-///
-/// This function loads the configuration from a YAML file. The file path can be specified
-/// via command line argument `--config <path>`, or it defaults to `./config.yaml`.
-///
-/// # Returns
-///
-/// Returns `Ok(AppCfg)` if the configuration file is found and valid, or `Err` if:
-/// - The file cannot be read
-/// - The YAML is invalid or cannot be deserialized
-/// - Configuration validation fails (see `validate_config`)
-///
-/// # Configuration File Format
-///
-/// The configuration file should be in YAML format and include:
-/// - `binance`: API keys and exchange settings
-/// - `symbols` or `symbol`: Trading symbols
-/// - `risk`: Risk management parameters (leverage, margin type)
-/// - `trending`: Trend analysis parameters
-/// - `exec`: Execution parameters (TIF, leverage)
-/// - `event_bus`: Event bus buffer sizes
-///
-/// # Example
-///
-/// ```no_run
-/// use crate::config::load_config;
-///
-/// // Load from default path (./config.yaml)
-/// let cfg = load_config()?;
-///
-/// // Or specify path via command line:
-/// // cargo run -- --config /path/to/config.yaml
-/// ```
-///
-/// # Errors
-///
-/// Common errors include:
-/// - Missing or invalid API keys
-/// - Invalid leverage settings
-/// - Missing required fields
-/// - File I/O errors
 pub fn load_config() -> Result<AppCfg> {
     let args: Vec<String> = std::env::args().collect();
     let path = args
@@ -717,15 +487,11 @@ pub fn load_config() -> Result<AppCfg> {
             }
         })
         .unwrap_or_else(|| "./config.yaml".to_string());
-
     let content = std::fs::read_to_string(&path)?;
     let cfg: AppCfg = serde_yaml::from_str(&content)?;
-
     validate_config(&cfg)?;
     Ok(cfg)
 }
-
-/// Validate configuration values
 fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.price_tick <= 0.0 {
         return Err(anyhow!("price_tick must be positive"));
@@ -736,7 +502,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.max_usd_per_order <= 0.0 {
         return Err(anyhow!("max_usd_per_order must be positive"));
     }
-
     let quote_upper = cfg.quote_asset.to_uppercase();
     if quote_upper != "USDC" && quote_upper != "USDT" {
         return Err(anyhow!(
@@ -744,7 +509,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.quote_asset
         ));
     }
-
     if cfg.binance.api_key.trim().is_empty() {
         return Err(anyhow!(
             "binance.api_key is required but is empty. Please set your API key in config.yaml"
@@ -755,7 +519,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             "binance.secret_key is required but is empty. Please set your secret key in config.yaml"
         ));
     }
-
     if cfg.binance.api_key.len() < 20 {
         return Err(anyhow!(
             "binance.api_key appears to be invalid (too short). Binance API keys are typically 64 characters long"
@@ -766,13 +529,11 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             "binance.secret_key appears to be invalid (too short). Binance secret keys are typically 64 characters long"
         ));
     }
-
     if let Some(leverage) = cfg.leverage {
         if leverage == 0 {
             return Err(anyhow!("leverage must be greater than 0"));
         }
     }
-    
     if !cfg.risk.use_isolated_margin {
         return Err(anyhow!(
             "CRITICAL: Cross margin mode is NOT supported for TP/SL. \
@@ -781,18 +542,15 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
              Please set risk.use_isolated_margin: true in config.yaml"
         ));
     }
-    
     if cfg.exec.default_leverage == 0 {
         return Err(anyhow!("exec.default_leverage must be greater than 0"));
     }
-
     if cfg.take_profit_pct <= 0.0 {
         return Err(anyhow!("take_profit_pct must be greater than 0"));
     }
     if cfg.take_profit_pct >= 100.0 {
         return Err(anyhow!("take_profit_pct must be less than 100"));
     }
-
     if cfg.stop_loss_pct <= 0.0 {
         return Err(anyhow!("stop_loss_pct must be greater than 0"));
     }
@@ -803,7 +561,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.take_profit_pct
         ));
     }
-
     if cfg.max_usd_per_order <= cfg.min_usd_per_order {
         return Err(anyhow!(
             "max_usd_per_order ({}) must be greater than min_usd_per_order ({})",
@@ -814,7 +571,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     if cfg.min_usd_per_order <= 0.0 {
         return Err(anyhow!("min_usd_per_order must be greater than 0"));
     }
-
     if cfg.min_margin_usd <= 0.0 {
         return Err(anyhow!("min_margin_usd must be greater than 0"));
     }
@@ -840,25 +596,16 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.margin_strategy
         ));
     }
-
     if cfg.min_quote_balance_usd <= 0.0 {
         return Err(anyhow!("min_quote_balance_usd must be greater than 0"));
     }
-
-
     let total_commission_pct = 2.0 * cfg.risk.taker_commission_pct;
-    
     let avg_spread_bps = (cfg.trending.min_spread_bps + cfg.trending.max_spread_bps) / 2.0;
     let spread_pct = avg_spread_bps / 10000.0;
-    
     const SLIPPAGE_PCT: f64 = 0.01;
-    
     const ESTIMATED_FUNDING_RATE_PCT: f64 = 0.01;
-    
     let total_cost_pct = total_commission_pct + spread_pct + SLIPPAGE_PCT + ESTIMATED_FUNDING_RATE_PCT;
-    
     let min_required_tp = cfg.stop_loss_pct + total_cost_pct;
-    
     if cfg.take_profit_pct <= min_required_tp {
         return Err(anyhow!(
             "take_profit_pct ({}) must be greater than stop_loss_pct ({}) + total costs ({}). \
@@ -877,7 +624,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             min_required_tp
         ));
     }
-    
     const MIN_HFT_TP_PCT: f64 = 0.1;
     if cfg.take_profit_pct < MIN_HFT_TP_PCT {
         eprintln!(
@@ -888,7 +634,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             MIN_HFT_TP_PCT
         );
     }
-
     if cfg.trending.min_spread_bps < 0.0 {
         return Err(anyhow!("trending.min_spread_bps must be non-negative"));
     }
@@ -902,7 +647,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.trending.max_spread_bps
         ));
     }
-
     if cfg.binance.hedge_mode {
         return Err(anyhow!(
             "CRITICAL: Hedge mode (hedge_mode=true) is NOT supported. \
@@ -923,7 +667,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
              - Separate position tracking in ORDERING state"
         ));
     }
-
     if !cfg.risk.use_isolated_margin {
         eprintln!("⚠️  WARNING: Cross margin mode (use_isolated_margin=false) is enabled.");
         eprintln!("   - TP/SL PnL calculation assumes isolated margin");
@@ -932,7 +675,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         eprintln!("   - This can lead to financial losses");
         eprintln!("   RECOMMENDATION: Use use_isolated_margin=true for correct TP/SL behavior.");
     }
-
     let leverage = cfg.leverage.unwrap_or(cfg.exec.default_leverage);
     let expected_notional = cfg.max_usd_per_order * leverage as f64;
     if expected_notional > cfg.risk.max_position_notional_usd {
@@ -944,39 +686,29 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.risk.max_position_notional_usd
         ));
     }
-
     Ok(())
 }
-
-
 fn default_max_position_size_buffer() -> f64 {
     1.5
 }
-
 fn default_opportunity_mode_position_multiplier() -> f64 {
     1.2
 }
-
 fn default_opportunity_mode_soft_limit_ratio() -> f64 {
     0.8
 }
-
 fn default_opportunity_mode_medium_limit_ratio() -> f64 {
     0.9
 }
-
 fn default_opportunity_mode_hard_limit_ratio() -> f64 {
     1.0
 }
-
 fn default_pnl_alert_interval_sec() -> u64 {
     60
 }
-
 fn default_pnl_alert_threshold_positive() -> f64 {
     0.1
 }
-
 fn default_pnl_alert_threshold_negative() -> f64 {
     -0.05
 }

@@ -6,9 +6,6 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{info, warn};
-
-
-/// Order information for analysis
 #[derive(Clone, Debug)]
 pub struct OrderInfo {
     pub order_id: String,
@@ -17,9 +14,6 @@ pub struct OrderInfo {
     pub qty: Qty,
     pub created_at: Instant,
 }
-
-/// Analyze existing orders and determine which ones should be canceled
-/// Returns list of order IDs that should be canceled
 pub fn analyze_orders(
     active_orders: &HashMap<String, OrderInfo>,
     bid: Px,
@@ -29,7 +23,6 @@ pub fn analyze_orders(
     max_order_age_ms: u64,
 ) -> Vec<String> {
     let mut orders_to_cancel = Vec::new();
-
     for (order_id, order) in active_orders {
         let order_price_f64 = match order.price.0.to_f64() {
             Some(price) => price,
@@ -42,9 +35,7 @@ pub fn analyze_orders(
                 continue;
             }
         };
-
         let order_age_ms = order.created_at.elapsed().as_millis() as u64;
-
         let market_distance_pct = match order.side {
             Side::Buy => {
                 let ask_f64 = ask.0.to_f64().unwrap_or(0.0);
@@ -63,22 +54,18 @@ pub fn analyze_orders(
                 }
             }
         };
-
         let max_distance_pct = if position_size_notional > 0.0 {
             0.01
         } else {
             0.02
         };
-
         let should_cancel_far = market_distance_pct.abs() > max_distance_pct;
-
         let max_age_for_stale = if position_size_notional > 0.0 {
             (max_order_age_ms * 2) / 3
         } else {
             max_order_age_ms
         };
         let should_cancel_stale = order_age_ms > max_age_for_stale;
-
         if should_cancel_far || should_cancel_stale {
             orders_to_cancel.push(order_id.clone());
             info!(
@@ -92,26 +79,16 @@ pub fn analyze_orders(
             );
         }
     }
-
     orders_to_cancel
 }
-
-
-/// Fill rate state for tracking order fill performance
 #[derive(Debug, Clone)]
 pub struct FillRateState {
-    /// Current fill rate (EWMA, 0.0 to 1.0)
     pub fill_rate: f64,
-    /// Consecutive orders with no fills
     pub consecutive_no_fills: u32,
-    /// Last fill time
     pub last_fill_time: Option<Instant>,
-    /// Last decay check time (for periodic decay)
     pub last_decay_check: Option<Instant>,
-    /// Last decay period (for optimization)
     pub last_decay_period: Option<u64>,
 }
-
 impl FillRateState {
     pub fn new() -> Self {
         Self {
@@ -123,8 +100,6 @@ impl FillRateState {
         }
     }
 }
-
-/// Update fill rate when order is filled
 pub fn update_fill_rate_on_fill(
     state: &mut FillRateState,
     increase_factor: f64,
@@ -134,8 +109,6 @@ pub fn update_fill_rate_on_fill(
     state.consecutive_no_fills = 0;
     state.last_fill_time = Some(Instant::now());
 }
-
-/// Update fill rate when order is canceled (no fill)
 pub fn update_fill_rate_on_cancel(
     state: &mut FillRateState,
     decrease_factor: f64,
@@ -143,23 +116,18 @@ pub fn update_fill_rate_on_cancel(
     state.fill_rate = (state.fill_rate * decrease_factor).max(0.0);
     state.consecutive_no_fills += 1;
 }
-
-/// Apply periodic fill rate decay (time-based decay)
 pub fn apply_fill_rate_decay(
     state: &mut FillRateState,
     decay_factor: f64,
     decay_interval_sec: u64,
 ) {
     let now = Instant::now();
-    
     let should_decay = state.last_decay_check
         .map(|last| now.duration_since(last).as_secs() >= decay_interval_sec)
         .unwrap_or(true);
-
     if should_decay {
         state.fill_rate = (state.fill_rate * decay_factor).max(0.0);
         state.last_decay_check = Some(now);
-        
         if let Some(last_period) = state.last_decay_period {
             if last_period != decay_interval_sec {
                 state.last_decay_period = Some(decay_interval_sec);
@@ -169,8 +137,6 @@ pub fn apply_fill_rate_decay(
         }
     }
 }
-
-/// Check if order sync is needed
 pub fn should_sync_orders(
     last_sync: Option<Instant>,
     sync_interval_sec: u64,
@@ -179,9 +145,6 @@ pub fn should_sync_orders(
         .map(|last| last.elapsed().as_secs() >= sync_interval_sec)
         .unwrap_or(true)
 }
-
-/// Calculate fill rate based on recent order history
-/// This is a simplified version - full implementation would track more detailed statistics
 pub fn calculate_fill_rate_from_history(
     filled_orders: usize,
     total_orders: usize,
@@ -190,24 +153,15 @@ pub fn calculate_fill_rate_from_history(
     if total_orders == 0 {
         return 0.5;
     }
-    
     let fill_rate = filled_orders as f64 / total_orders as f64;
-    
     fill_rate.max(0.0).min(1.0)
 }
-
-
-/// Compare local orders with API orders and return differences
 #[derive(Debug, Clone)]
 pub struct OrderSyncResult {
-    /// Orders in API but not in local state (new orders)
     pub new_orders: Vec<String>,
-    /// Orders in local state but not in API (removed orders - likely filled/canceled)
     pub removed_orders: Vec<String>,
-    /// Orders that exist in both (no change)
     pub unchanged_orders: Vec<String>,
 }
-
 impl OrderSyncResult {
     pub fn new() -> Self {
         Self {
@@ -217,14 +171,11 @@ impl OrderSyncResult {
         }
     }
 }
-
-/// Compare local orders with API orders
 pub fn compare_orders(
     local_order_ids: &std::collections::HashSet<String>,
     api_order_ids: &std::collections::HashSet<String>,
 ) -> OrderSyncResult {
     let mut result = OrderSyncResult::new();
-
     for order_id in api_order_ids {
         if !local_order_ids.contains(order_id) {
             result.new_orders.push(order_id.clone());
@@ -232,18 +183,13 @@ pub fn compare_orders(
             result.unchanged_orders.push(order_id.clone());
         }
     }
-
     for order_id in local_order_ids {
         if !api_order_ids.contains(order_id) {
             result.removed_orders.push(order_id.clone());
         }
     }
-
     result
 }
-
-
-/// Validate order parameters before placement
 pub fn validate_order(
     price: Px,
     qty: Qty,
@@ -255,20 +201,16 @@ pub fn validate_order(
     if price.0 <= Decimal::ZERO {
         return Err("Order price must be positive".to_string());
     }
-
     if qty.0 <= Decimal::ZERO {
         return Err("Order quantity must be positive".to_string());
     }
-
     let market_price = match side {
         Side::Buy => ask.0,
         Side::Sell => bid.0,
     };
-
     if market_price <= Decimal::ZERO {
         return Err("Market price is invalid".to_string());
     }
-
     if let Some(min_not) = min_notional {
         let notional = price.0 * qty.0;
         if notional < min_not {
@@ -278,7 +220,5 @@ pub fn validate_order(
             ));
         }
     }
-
     Ok(())
 }
-

@@ -12,17 +12,12 @@ use tokio::time::{timeout, Duration};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream};
 use tracing::{debug, error, info, warn};
-
 pub type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
 #[derive(Deserialize)]
 struct ListenKeyResp {
     #[serde(rename = "listenKey")]
     listen_key: String,
 }
-
-
-
 pub struct UserDataStream {
     client: Client,
     base: String,
@@ -33,14 +28,10 @@ pub struct UserDataStream {
     last_keep_alive: Instant,
     on_reconnect: Option<Box<dyn Fn() + Send + Sync>>,
 }
-
 pub struct MarketDataStream {
     ws: WsStream,
 }
-
 impl MarketDataStream {
-/// Create market data stream for multiple symbols
-/// Binance @bookTicker stream: wss://fstream.binance.com/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker
     pub async fn connect(symbols: &[String]) -> Result<Self> {
         let streams: Vec<String> = symbols
             .iter()
@@ -48,17 +39,13 @@ impl MarketDataStream {
             .collect();
         let stream_param = streams.join("/");
         let url = format!("wss://fstream.binance.com/stream?streams={}", stream_param);
-
         info!(url = %url, symbol_count = symbols.len(), "connecting to market data websocket");
         let (ws, _) = connect_async(&url).await?;
         info!("connected to market data websocket");
-
         Ok(Self {
             ws,
         })
     }
-
-/// Get next price update
     pub async fn next_price_update(&mut self) -> Result<PriceUpdate> {
         loop {
             match timeout(Duration::from_secs(300), self.ws.next()).await {
@@ -69,7 +56,6 @@ impl MarketDataStream {
                         }
                         other => anyhow!(other),
                     })?;
-
                     match msg {
                         Message::Ping(payload) => {
                             self.ws.send(Message::Pong(payload)).await?;
@@ -80,21 +66,17 @@ impl MarketDataStream {
                             if txt.is_empty() {
                                 continue;
                             }
-
                             let value: Value = serde_json::from_str(&txt)?;
                             let stream_name = value.get("stream")
                                 .and_then(|s| s.as_str())
                                 .ok_or_else(|| anyhow!("missing stream field"))?;
-
                             let symbol = stream_name
                                 .split('@')
                                 .next()
                                 .ok_or_else(|| anyhow!("invalid stream name"))?
                                 .to_uppercase();
-
                             let data = value.get("data")
                                 .ok_or_else(|| anyhow!("missing data field"))?;
-
                             let bid_str = data.get("b")
                                 .and_then(|v| v.as_str())
                                 .ok_or_else(|| anyhow!("missing bid price"))?;
@@ -107,12 +89,10 @@ impl MarketDataStream {
                             let ask_qty_str = data.get("A")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("0");
-
                             let bid = Decimal::from_str(bid_str)?;
                             let ask = Decimal::from_str(ask_str)?;
                             let bid_qty = Decimal::from_str(bid_qty_str).unwrap_or(Decimal::ZERO);
                             let ask_qty = Decimal::from_str(ask_qty_str).unwrap_or(Decimal::ZERO);
-
                             return Ok(PriceUpdate {
                                 symbol,
                                 bid: Px(bid),
@@ -135,13 +115,11 @@ impl MarketDataStream {
         }
     }
 }
-
 impl UserDataStream {
 #[inline]
 fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
         format!("wss://fstream.binance.com/ws/{}", listen_key)
     }
-
     async fn create_listen_key(
         client: &Client,
         base: &str,
@@ -150,7 +128,6 @@ fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
     ) -> Result<String> {
         let base = base.trim_end_matches('/');
         let endpoint = format!("{}/fapi/v1/listenKey", base);
-
         let resp = client
             .post(&endpoint)
             .header("X-MBX-APIKEY", api_key)
@@ -162,47 +139,39 @@ fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
             error!(status=?status, body=%body, "listenKey create failed");
             return Err(anyhow!("listenKey create failed: {} {}", status, body));
         }
-
         let lk: ListenKeyResp = resp.json().await?;
         info!(listen_key=%lk.listen_key, "listenKey created");
         Ok(lk.listen_key)
     }
-
     async fn keepalive_listen_key(&self, listen_key: &str) -> Result<()> {
         let base = self.base.trim_end_matches('/');
         let endpoint = format!("{}/fapi/v1/listenKey?listenKey={}", base, listen_key);
-
         let resp = self
             .client
             .put(&endpoint)
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
             .await?;
-
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(status=?status, body=%body, "listenKey keepalive failed");
             return Err(anyhow!("listenKey keepalive failed: {} {}", status, body));
         }
-
         debug!("refreshed user data listen key");
         Ok(())
     }
-
     async fn reconnect_ws_without_new_key(&mut self) -> Result<()> {
         let url = Self::ws_url_for(self.kind, &self.listen_key);
         let (ws, _) = connect_async(&url).await?;
         self.ws = ws;
         self.last_keep_alive = Instant::now();
-
         if let Some(ref callback) = self.on_reconnect {
             callback();
         }
         info!(%url, "reconnected user data websocket (same listen key)");
         Ok(())
     }
-
     async fn reconnect_ws(&mut self) -> Result<()> {
         match self.reconnect_ws_without_new_key().await {
             Ok(()) => {
@@ -212,32 +181,26 @@ fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
                 warn!(error = %e, "reconnect with existing listen key failed, creating new listen key");
             }
         }
-
         let new_key =
             Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
         self.listen_key = new_key;
-
         let url = Self::ws_url_for(self.kind, &self.listen_key);
         let (ws, _) = connect_async(&url).await?;
         self.ws = ws;
         self.last_keep_alive = Instant::now();
-
         if let Some(ref callback) = self.on_reconnect {
             callback();
             info!(%url, "reconnected user data websocket (new listen key), callback triggered");
         }
-
         info!(%url, "reconnected user data websocket (new listen key)");
         Ok(())
     }
-
 pub fn set_on_reconnect<F>(&mut self, callback: F)
     where
         F: Fn() + Send + Sync + 'static,
     {
         self.on_reconnect = Some(Box::new(callback));
     }
-
     pub async fn connect(
         client: Client,
         base: &str,
@@ -245,13 +208,10 @@ pub fn set_on_reconnect<F>(&mut self, callback: F)
         kind: UserStreamKind,
     ) -> Result<Self> {
         let base = base.trim_end_matches('/').to_string();
-
         let listen_key = Self::create_listen_key(&client, &base, api_key, kind).await?;
-
         let ws_url = Self::ws_url_for(kind, &listen_key);
         let (ws, _) = connect_async(&ws_url).await?;
         info!(%ws_url, "connected user data websocket");
-
         Ok(Self {
             client,
             base,
@@ -263,12 +223,10 @@ pub fn set_on_reconnect<F>(&mut self, callback: F)
             on_reconnect: None,
         })
     }
-
     async fn keep_alive(&mut self) -> Result<()> {
         if self.last_keep_alive.elapsed() < Duration::from_secs(60 * 25) {
             return Ok(());
         }
-
         match self.keepalive_listen_key(&self.listen_key).await {
             Ok(()) => {
                 self.last_keep_alive = Instant::now();
@@ -278,15 +236,12 @@ pub fn set_on_reconnect<F>(&mut self, callback: F)
                 warn!(err=?e, "keepalive failed; will recreate listenKey and reconnect ws");
             }
         }
-
         let new_key =
             Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
         self.listen_key = new_key;
-
         self.reconnect_ws().await?;
         Ok(())
     }
-
 fn parse_side(side: &str) -> Side {
         if side.eq_ignore_ascii_case("buy") {
             Side::Buy
@@ -294,7 +249,6 @@ fn parse_side(side: &str) -> Side {
             Side::Sell
         }
     }
-
 fn parse_decimal(value: &Value, key: &str) -> Decimal {
         value
             .get(key)
@@ -302,7 +256,6 @@ fn parse_decimal(value: &Value, key: &str) -> Decimal {
             .and_then(|s| Decimal::from_str(s).ok())
             .unwrap_or(Decimal::ZERO)
     }
-
     pub async fn next_event(&mut self) -> Result<UserEvent> {
         loop {
             self.keep_alive().await?;
@@ -314,7 +267,6 @@ fn parse_decimal(value: &Value, key: &str) -> Decimal {
                         }
                         other => anyhow!(other),
                     })?;
-
                     match msg {
                         Message::Ping(payload) => {
                             self.ws.send(Message::Pong(payload)).await?;
@@ -344,7 +296,6 @@ fn parse_decimal(value: &Value, key: &str) -> Decimal {
             }
         }
     }
-
 fn map_event(value: &Value) -> Result<Option<UserEvent>> {
         let event_type = value.get("e").and_then(Value::as_str).unwrap_or_default();
         match event_type {
@@ -396,7 +347,6 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                     commission,
                 }));
             }
-
             "ORDER_TRADE_UPDATE" => {
                 let data = value
                     .get("o")
@@ -445,11 +395,9 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                     commission,
                 }));
             }
-
             "ACCOUNT_UPDATE" => {
                 let mut positions = Vec::new();
                 let mut balances = Vec::new();
-
                 if let Some(positions_data) = value.get("a").and_then(|v| v.get("P")) {
                     if let Some(positions_array) = positions_data.as_array() {
                         for pos_data in positions_array {
@@ -469,7 +417,6 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                                     .get("up")
                                     .and_then(Value::as_str)
                                     .and_then(|s| Decimal::from_str(s).ok());
-
                                 positions.push(AccountPosition {
                                     symbol: symbol.to_string(),
                                     position_amt,
@@ -481,7 +428,6 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                         }
                     }
                 }
-
                 if let Some(balances_data) = value.get("a").and_then(|v| v.get("B")) {
                     if let Some(balances_array) = balances_data.as_array() {
                         for bal_data in balances_array {
@@ -490,7 +436,6 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                                 bal_data.get("wb").and_then(Value::as_str),
                             ) {
                                 let available_balance = Decimal::from_str(available).unwrap_or(Decimal::ZERO);
-
                                 if asset == "USDT" || asset == "USDC" {
                                     balances.push(AccountBalance {
                                         asset: asset.to_string(),
@@ -501,12 +446,10 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                         }
                     }
                 }
-
                 if !positions.is_empty() || !balances.is_empty() {
                     return Ok(Some(UserEvent::AccountUpdate { positions, balances }));
                 }
             }
-
             _ => {}
         }
         Ok(Some(UserEvent::Heartbeat))

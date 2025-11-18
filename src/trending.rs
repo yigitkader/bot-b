@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-
-/// Market regime for adaptive strategy
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MarketRegime {
     Trending,
@@ -20,26 +18,18 @@ enum MarketRegime {
     Volatile,
     Unknown,
 }
-
 struct TrendScores {
     score_long: f64,
     score_short: f64,
     trend_strength: f64,
 }
-
-/// TRENDING module - trend analysis and signal generation
 pub struct Trending {
     cfg: Arc<AppCfg>,
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
-    /// Track last signal per symbol (side and timestamp) for cooldown and direction checking
-    /// Prevents generating same-direction signals repeatedly
     last_signals: Arc<Mutex<HashMap<String, LastSignal>>>,
-    /// Track symbol state for trend analysis (symbol -> SymbolState)
-    /// Contains price history, volume, and signal timing
     symbol_states: Arc<Mutex<HashMap<String, SymbolState>>>,
 }
-
 impl Trending {
     fn new_symbol_state(symbol: String) -> SymbolState {
         SymbolState {
@@ -59,33 +49,6 @@ impl Trending {
             last_analysis_time: None,
         }
     }
-
-    /// Create a new Trending module instance.
-    ///
-    /// The Trending module analyzes market data and generates trade signals. It does not place
-    /// orders directly - it only publishes TradeSignal events that are consumed by the ORDERING module.
-    ///
-    /// # Arguments
-    ///
-    /// * `cfg` - Application configuration containing trending parameters (spread thresholds, cooldown)
-    /// * `event_bus` - Event bus for subscribing to MarketTick events and publishing TradeSignal events
-    /// * `shutdown_flag` - Shared flag to signal graceful shutdown
-    ///
-    /// # Returns
-    ///
-    /// Returns a new `Trending` instance. Call `start()` to begin processing market data.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use std::sync::Arc;
-    /// # use std::sync::atomic::AtomicBool;
-    /// # let cfg = Arc::new(crate::config::load_config()?);
-    /// # let event_bus = Arc::new(crate::event_bus::EventBus::new());
-    /// # let shutdown_flag = Arc::new(AtomicBool::new(false));
-    /// let trending = Trending::new(cfg, event_bus, shutdown_flag);
-    /// trending.start().await?;
-    /// ```
     pub fn new(
         cfg: Arc<AppCfg>,
         event_bus: Arc<EventBus>,
@@ -99,40 +62,12 @@ impl Trending {
             symbol_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-
-    /// Start the trending service and begin analyzing market data.
-    ///
-    /// This method spawns a background task that:
-    /// - Subscribes to MarketTick events from the event bus
-    /// - Analyzes market data (spread, trends, etc.)
-    /// - Generates TradeSignal events when trading conditions are met
-    /// - Respects cooldown periods to prevent signal spam
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(())` immediately after spawning the background task. The task will continue
-    /// running until `shutdown_flag` is set to true.
-    ///
-    /// # Behavior
-    ///
-    /// - Signals are generated based on spread thresholds configured in `cfg.trending`
-    /// - Each symbol has a cooldown period to prevent duplicate signals
-    /// - TradeSignal events are published to the event bus for ORDERING module to consume
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # let trending = crate::trending::Trending::new(todo!(), todo!(), todo!());
-    /// trending.start().await?;
-    /// // Service is now running in background
-    /// ```
     pub async fn start(&self) -> Result<()> {
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let cfg = self.cfg.clone();
         let last_signals = self.last_signals.clone();
         let symbol_states = self.symbol_states.clone();
-        
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
         let cfg_tick = cfg.clone();
@@ -166,7 +101,6 @@ impl Trending {
                 },
             ).await;
         });
-        
         let symbol_states_pos = symbol_states.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
         let event_bus_pos = event_bus.clone();
@@ -187,15 +121,12 @@ impl Trending {
                             } else {
                                 None
                             };
-                            
                             let mut states = symbol_states_pos.lock().await;
                             let state = states.entry(update.symbol.clone()).or_insert_with(|| {
                                 Self::new_symbol_state(update.symbol.clone())
                             });
-                            
                             state.last_position_close_time = Some(Instant::now());
                             state.last_position_direction = direction;
-                            
                             debug!(
                                 symbol = %update.symbol,
                                 direction = ?direction,
@@ -206,31 +137,25 @@ impl Trending {
                 },
             ).await;
         });
-        
         let symbol_states_cleanup = symbol_states.clone();
         let shutdown_flag_cleanup = shutdown_flag.clone();
         tokio::spawn(async move {
             const CLEANUP_INTERVAL_SECS: u64 = 3600;
             const MAX_AGE_SECS: u64 = 3600;
-            
             loop {
                 tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
-                
                 if shutdown_flag_cleanup.load(AtomicOrdering::Relaxed) {
                     break;
                 }
-                
                 let now = Instant::now();
                 let mut states = symbol_states_cleanup.lock().await;
                 let initial_count = states.len();
-                
                 states.retain(|symbol, state| {
                     let last_activity = state.prices
                         .back()
                         .map(|p| p.timestamp)
                         .or_else(|| state.last_signal_time)
                         .or_else(|| state.last_position_close_time);
-                    
                     if let Some(last_ts) = last_activity {
                         let age = now.duration_since(last_ts);
                         if age.as_secs() > MAX_AGE_SECS {
@@ -253,10 +178,8 @@ impl Trending {
                         false
                     }
                 });
-                
                 let final_count = states.len();
                 let removed_count = initial_count.saturating_sub(final_count);
-                
                 if removed_count > 0 {
                     info!(
                         initial_count,
@@ -268,22 +191,18 @@ impl Trending {
                 }
             }
         });
-        
         Ok(())
     }
-
     fn calculate_sma(prices: &std::collections::VecDeque<crate::types::PricePoint>, period: usize) -> Option<Decimal> {
         if prices.len() < period {
             return None;
         }
-        
         let recent_prices: Vec<Decimal> = prices
             .iter()
             .rev()
             .take(period)
             .map(|p| p.price)
             .collect();
-        
         if recent_prices.len() < period {
             warn!(
                 prices_len = prices.len(),
@@ -293,14 +212,11 @@ impl Trending {
             );
             return None;
         }
-        
         let sum: Decimal = recent_prices.iter().sum();
         Some(sum / Decimal::from(period))
     }
-    
     fn update_ema(prev_ema: Option<Decimal>, new_price: Decimal, period: usize, prices: &std::collections::VecDeque<crate::types::PricePoint>) -> Decimal {
         let k = Decimal::from(2) / Decimal::from(period + 1);
-        
         match prev_ema {
             Some(ema) => new_price * k + ema * (Decimal::ONE - k),
             None => {
@@ -322,26 +238,22 @@ impl Trending {
             }
         }
     }
-    
     pub fn update_indicators(state: &mut SymbolState, new_price: Decimal) {
         if state.prices.len() >= 9 {
             state.ema_9 = Some(Self::update_ema(state.ema_9, new_price, 9, &state.prices));
         } else {
             state.ema_9 = None;
         }
-        
         if state.prices.len() >= 21 {
             state.ema_21 = Some(Self::update_ema(state.ema_21, new_price, 21, &state.prices));
         } else {
             state.ema_21 = None;
         }
-        
         if state.prices.len() >= 55 {
             state.ema_55 = Some(Self::update_ema(state.ema_55, new_price, 55, &state.prices));
         } else {
             state.ema_55 = None;
         }
-        
         if let Some(ema_55) = state.ema_55 {
             state.ema_55_history.push_back(ema_55);
             const EMA_HISTORY_SIZE: usize = 10;
@@ -351,7 +263,6 @@ impl Trending {
         } else {
             state.ema_55_history.clear();
         }
-        
         if state.prices.len() >= 2 {
             if let Some(prev_price_point) = state.prices.get(state.prices.len() - 2) {
                 let prev_price = prev_price_point.price;
@@ -361,48 +272,36 @@ impl Trending {
                 } else {
                     (Decimal::ZERO, -change)
                 };
-                
                 const RSI_PERIOD: usize = 14;
                 let alpha = Decimal::ONE / Decimal::from(RSI_PERIOD);
-                
                 state.rsi_avg_gain = Some(match state.rsi_avg_gain {
                     Some(ag) => ag * (Decimal::ONE - alpha) + gain * alpha,
                     None => gain,
                 });
-                
                 state.rsi_avg_loss = Some(match state.rsi_avg_loss {
                     Some(al) => al * (Decimal::ONE - alpha) + loss * alpha,
                     None => loss,
                 });
-                
                 state.rsi_period_count += 1;
             }
         }
     }
-    
-    /// Calculate RSI from incremental state (O(1) performance)
     fn calculate_rsi_from_state(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> Option<f64> {
         const RSI_PERIOD: usize = 14;
-        
         if state.rsi_period_count < RSI_PERIOD {
             return None;
         }
-        
         let avg_gain = state.rsi_avg_gain?;
         let avg_loss = state.rsi_avg_loss?;
-        
         if avg_loss.is_zero() {
             return Some(100.0);
         }
-        
         let min_avg_loss = utils::f64_to_decimal(cfg.rsi_min_avg_loss, Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO));
         let avg_loss_clamped = avg_loss.max(min_avg_loss);
-        
         let rs = avg_gain / avg_loss_clamped;
         let rsi = Decimal::from(100) - (Decimal::from(100) / (Decimal::ONE + rs));
         let rsi_value = rsi.to_f64().unwrap_or(50.0);
         let clamped_rsi = rsi_value.max(0.1).min(99.9);
-        
         if clamped_rsi != rsi_value {
             warn!(
                 symbol = %state.symbol,
@@ -414,62 +313,47 @@ impl Trending {
                 "TRENDING: RSI clamped to valid range [0.1, 99.9]"
             );
         }
-        
         Some(clamped_rsi)
     }
-    
-    /// Calculate average volume over period
     fn calculate_avg_volume(prices: &VecDeque<PricePoint>, period: usize) -> Option<Decimal> {
         if prices.len() < period {
             return None;
         }
-        
         let volumes: Vec<Decimal> = prices
             .iter()
             .rev()
             .take(period)
             .filter_map(|p| p.volume)
             .collect();
-        
         if volumes.is_empty() {
             return None;
         }
-        
         let sum: Decimal = volumes.iter().sum();
         Some(sum / Decimal::from(volumes.len()))
     }
-    
-    /// Calculate Average True Range (ATR) for volatility measurement
     fn calculate_atr(prices: &VecDeque<PricePoint>, period: usize) -> Option<Decimal> {
         if prices.len() < period + 1 {
             return None;
         }
-
         let mut true_ranges = Vec::new();
         let price_points: Vec<Decimal> = prices.iter().rev().take(period + 1).map(|p| p.price).collect();
-
         for i in 1..price_points.len() {
             let high = price_points[i - 1];
             let low = price_points[i];
             let tr = (high - low).abs();
             true_ranges.push(tr);
         }
-
         if true_ranges.is_empty() {
             return None;
         }
-
         let sum: Decimal = true_ranges.iter().sum();
         Some(sum / Decimal::from(true_ranges.len()))
     }
-
     fn detect_market_regime(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> MarketRegime {
         let atr_period = cfg.atr_period;
         let low_volatility_threshold = cfg.low_volatility_threshold;
         let high_volatility_threshold = cfg.high_volatility_threshold;
-
         let prices = &state.prices;
-        
         let atr = Self::calculate_atr(prices, atr_period);
         let atr_pct = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
             if !current_price.price.is_zero() {
@@ -480,7 +364,6 @@ impl Trending {
         } else {
             None
         };
-
         if let Some(atr_pct_val) = atr_pct {
             if atr_pct_val < low_volatility_threshold {
                 MarketRegime::Ranging
@@ -493,7 +376,6 @@ impl Trending {
             MarketRegime::Unknown
         }
     }
-
     fn calculate_ema_scores(
         state: &SymbolState,
         current_price: Decimal,
@@ -502,11 +384,9 @@ impl Trending {
         let ema_fast = state.ema_9?;
         let ema_mid = state.ema_21?;
         let ema_slow = state.ema_55?;
-        
         let mut score_long = 0.0;
         let mut score_short = 0.0;
         let mut trend_strength = 0.0;
-        
         let short_term_aligned = current_price > ema_fast && ema_fast > ema_mid;
         let short_term_aligned_short = current_price < ema_fast && ema_fast < ema_mid;
         let ema_short_score = cfg.ema_short_score;
@@ -517,7 +397,6 @@ impl Trending {
             score_short += ema_short_score;
             trend_strength += 0.4;
         }
-        
         let mid_term_aligned = ema_mid > ema_slow;
         let mid_term_aligned_short = ema_mid < ema_slow;
         let ema_mid_score = cfg.ema_mid_score;
@@ -528,7 +407,6 @@ impl Trending {
             score_short += ema_mid_score;
             trend_strength += 0.3;
         }
-        
         let ema_slope = if state.ema_55_history.len() >= 2 {
             if let (Some(current_ema), Some(old_ema)) = (state.ema_55_history.back(), state.ema_55_history.front()) {
                 if !old_ema.is_zero() {
@@ -542,7 +420,6 @@ impl Trending {
         } else {
             None
         };
-        
         let slope_strong = if let Some(slope) = ema_slope {
             let min_slope = Decimal::from(5) / Decimal::from(10000);
             let slope_score = cfg.slope_score;
@@ -560,7 +437,6 @@ impl Trending {
         } else {
             false
         };
-        
         Some((
             TrendScores {
                 score_long,
@@ -575,8 +451,6 @@ impl Trending {
             ema_slow,
         ))
     }
-
-    /// Public for backtesting
     pub fn analyze_trend(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> Option<TrendSignal> {
         const VOLUME_PERIOD: usize = 20;
         const EMA_SLOW_PERIOD: usize = 55;
@@ -585,9 +459,7 @@ impl Trending {
         let base_rsi_lower = cfg.rsi_lower_long;
         let base_rsi_upper = cfg.rsi_upper_long;
         let base_rsi_upper_short = cfg.rsi_upper_short;
-        
         let prices = &state.prices;
-        
         if prices.len() < MIN_PRICE_POINTS {
             if prices.len() % 5 == 0 || prices.len() >= MIN_PRICE_POINTS - 1 {
                 debug!(
@@ -600,7 +472,6 @@ impl Trending {
             }
             return None;
         }
-        
         if prices.len() == MIN_PRICE_POINTS {
             info!(
                 symbol = %state.symbol,
@@ -614,18 +485,14 @@ impl Trending {
                 MIN_PRICE_POINTS
             );
         }
-        
         let current_price = prices.back()?.price;
-        
         let (scores, short_term_aligned, mid_term_aligned, slope_strong, ema_fast, ema_mid, ema_slow) = match Self::calculate_ema_scores(state, current_price, cfg) {
             Some(s) => s,
             None => return None,
         };
-        
         let mut score_long = scores.score_long;
         let mut score_short = scores.score_short;
         let trend_strength = scores.trend_strength;
-        
         let rsi = match Self::calculate_rsi_from_state(state, cfg) {
             Some(rsi_val) => rsi_val,
             None => {
@@ -641,7 +508,6 @@ impl Trending {
                 return None;
             }
         };
-        
         let atr = Self::calculate_atr(prices, cfg.atr_period);
         let volatility_multiplier = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
             if !current_price.price.is_zero() {
@@ -654,12 +520,9 @@ impl Trending {
         } else {
             1.0
         };
-        
         let rsi_lower = base_rsi_lower - (10.0 * volatility_multiplier);
         let rsi_upper = base_rsi_upper - (5.0 * (1.0 - volatility_multiplier));
-        
         let rsi_upper_short = base_rsi_upper_short;
-        
         let rsi_bullish = rsi > rsi_lower && rsi < rsi_upper;
         let rsi_bearish = rsi < rsi_upper_short;
         let rsi_score = cfg.rsi_score;
@@ -668,7 +531,6 @@ impl Trending {
         } else if rsi_bearish {
             score_short += rsi_score;
         }
-        
         let regime = Self::detect_market_regime(state, cfg);
         let min_score = match regime {
             MarketRegime::Trending => base_min_score * cfg.regime_multiplier_trending,
@@ -676,12 +538,10 @@ impl Trending {
             MarketRegime::Volatile => base_min_score * cfg.regime_multiplier_volatile,
             MarketRegime::Unknown => base_min_score * cfg.regime_multiplier_unknown,
         };
-        
         let (current_volume, avg_volume) = if cfg.hft_mode && !cfg.require_volume_confirmation {
             let current_vol = prices.back()
                 .and_then(|p| p.volume);
             let avg_vol = Self::calculate_avg_volume(prices, VOLUME_PERIOD);
-            
             (current_vol, avg_vol)
         } else {
             let current_volume = match prices.back() {
@@ -704,7 +564,6 @@ impl Trending {
                     return None;
                 }
             };
-            
             let avg_volume = match Self::calculate_avg_volume(prices, VOLUME_PERIOD) {
                 Some(avg) => avg,
                 None => {
@@ -721,17 +580,14 @@ impl Trending {
                     return None;
                 }
             };
-            
             (Some(current_volume), Some(avg_volume))
         };
-        
         let trend_threshold = if cfg.hft_mode {
             cfg.trend_threshold_hft
         } else {
             cfg.trend_threshold_normal
         };
         let is_strong_trend = trend_strength >= trend_threshold;
-        
         let volume_confirms = if let (Some(current_vol), Some(avg_vol)) = (current_volume, avg_volume) {
             let volume_multiplier = if cfg.hft_mode {
                 utils::f64_to_decimal(cfg.volume_multiplier_hft, Decimal::from_str("1.1").unwrap_or(Decimal::from(110) / Decimal::from(100)))
@@ -739,12 +595,10 @@ impl Trending {
                 utils::f64_to_decimal(cfg.volume_multiplier_normal, Decimal::from_str("1.3").unwrap_or(Decimal::from(130) / Decimal::from(100)))
             };
             let volume_surge = current_vol > avg_vol * volume_multiplier;
-            
             let volume_trend = match Self::calculate_avg_volume(prices, 5) {
                 Some(recent_avg_volume) => recent_avg_volume > avg_vol,
                 None => false,
             };
-            
             if cfg.hft_mode {
                 volume_surge
             } else {
@@ -759,7 +613,6 @@ impl Trending {
                 false
             }
         };
-        
         if !is_strong_trend && !volume_confirms {
             debug!(
                 symbol = %state.symbol,
@@ -770,18 +623,15 @@ impl Trending {
             );
             return None;
         }
-        
         if volume_confirms {
             score_long += 1.0;
             score_short += 1.0;
         }
-        
         let final_min_score = if is_strong_trend {
             min_score
         } else {
             min_score * cfg.weak_trend_score_multiplier
         };
-        
         debug!(
             symbol = %state.symbol,
             score_long,
@@ -802,7 +652,6 @@ impl Trending {
             rsi_bearish,
             "TRENDING: Score analysis (signal will be generated if score >= threshold)"
         );
-        
         if score_long >= final_min_score {
             Some(TrendSignal::Long)
         } else if score_short >= final_min_score {
@@ -811,14 +660,10 @@ impl Trending {
             None
         }
     }
-    
-
-    /// Process a market tick and generate trade signal if conditions are met
     fn check_spread(tick: &MarketTick, cfg: &Arc<AppCfg>) -> Result<Option<f64>> {
         let spread_bps_f64 = crate::utils::calculate_spread_bps(tick.bid, tick.ask);
         let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
         let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
-        
         if spread_bps_f64 < min_acceptable_spread_bps || spread_bps_f64 > max_acceptable_spread_bps {
             debug!(
                 symbol = %tick.symbol,
@@ -829,10 +674,8 @@ impl Trending {
             );
             return Ok(None);
         }
-        
         Ok(Some(spread_bps_f64))
     }
-
     async fn check_cooldown(
         tick: &MarketTick,
         now: Instant,
@@ -870,7 +713,6 @@ impl Trending {
         }
         Ok(true)
     }
-
     async fn calculate_dynamic_tp_sl(
         tick: &MarketTick,
         mid_price: Decimal,
@@ -897,7 +739,6 @@ impl Trending {
         }
         (Some(cfg.stop_loss_pct), Some(cfg.take_profit_pct))
     }
-
     async fn process_market_tick(
         tick: &MarketTick,
         cfg: &Arc<AppCfg>,
@@ -906,67 +747,52 @@ impl Trending {
         symbol_states: &Arc<Mutex<HashMap<String, SymbolState>>>,
     ) -> Result<()> {
         let now = Instant::now();
-        
         let spread_bps_f64 = match Self::check_spread(tick, cfg)? {
             Some(s) => s,
             None => return Ok(()),
         };
-
         if !Self::check_cooldown(tick, now, cfg, last_signals).await? {
             return Ok(());
         }
-        
         let mid_price = crate::utils::calculate_mid_price(tick.bid, tick.ask);
         let spread_timestamp = now;
-        
         let trend_signal = {
             let mut states = symbol_states.lock().await;
             let state = states.entry(tick.symbol.clone()).or_insert_with(|| {
                 Self::new_symbol_state(tick.symbol.clone())
             });
-            
             let min_analysis_interval_ms = cfg.trending.min_analysis_interval_ms;
-            
             if let Some(last_analysis) = state.last_analysis_time {
                 let elapsed_ms = now.duration_since(last_analysis).as_millis() as u64;
                 if elapsed_ms < min_analysis_interval_ms {
                     return Ok(());
                 }
             }
-            
             state.last_analysis_time = Some(now);
-            
             state.prices.push_back(PricePoint {
                 timestamp: now,
                 price: mid_price,
                 volume: tick.volume,
             });
-            
             const MAX_HISTORY: usize = 100;
             while state.prices.len() > MAX_HISTORY {
                 state.prices.pop_front();
             }
-            
             Self::update_indicators(state, mid_price);
-            
             Self::analyze_trend(state, &cfg.trending)
         };
-        
         let side = match trend_signal {
             Some(TrendSignal::Long) => Side::Buy,
             Some(TrendSignal::Short) => Side::Sell,
             None => return Ok(()),
         };
-        
         let entry_price = Px(mid_price);
-        
         let (stop_loss_pct, take_profit_pct) = Self::calculate_dynamic_tp_sl(
             tick,
             mid_price,
             cfg,
             symbol_states,
         ).await;
-        
         let signal = TradeSignal {
             symbol: tick.symbol.clone(),
             side,
@@ -977,7 +803,6 @@ impl Trending {
             spread_timestamp,
             timestamp: now,
         };
-        
         if let Err(e) = event_bus.trade_signal_tx.send(signal.clone()) {
             error!(error = ?e, symbol = %tick.symbol, "TRENDING: Failed to send TradeSignal");
         } else {
@@ -988,7 +813,6 @@ impl Trending {
                     timestamp: now,
                 });
             }
-            
             info!(
                 symbol = %tick.symbol,
                 side = ?side,
@@ -997,7 +821,6 @@ impl Trending {
                 "TRENDING: TradeSignal generated"
             );
         }
-        
         Ok(())
     }
 }

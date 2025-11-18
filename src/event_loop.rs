@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
-
 pub async fn run_event_loop<T, F, Fut>(
     mut receiver: broadcast::Receiver<T>,
     shutdown_flag: Arc<AtomicBool>,
@@ -15,18 +14,15 @@ pub async fn run_event_loop<T, F, Fut>(
     Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
     info!("{}: Started, listening to {} events", module_name, event_name);
-
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
-
         match receiver.recv().await {
             Ok(event) => {
                 if shutdown_flag.load(Ordering::Relaxed) {
                     break;
                 }
-
                 if let Err(e) = handler(event).await {
                     warn!(error = %e, "{}: error handling {}", module_name, event_name);
                 }
@@ -45,10 +41,8 @@ pub async fn run_event_loop<T, F, Fut>(
             }
         }
     }
-
     info!("{}: Stopped", module_name);
 }
-
 pub async fn run_event_loop_async<T, F, Fut>(
     mut receiver: broadcast::Receiver<T>,
     shutdown_flag: Arc<AtomicBool>,
@@ -61,12 +55,10 @@ pub async fn run_event_loop_async<T, F, Fut>(
     Fut: std::future::Future<Output = ()>,
 {
     info!("{}: Started, listening to {} events", module_name, event_name);
-
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
-
         match receiver.recv().await {
             Ok(event) => {
                 if shutdown_flag.load(Ordering::Relaxed) {
@@ -88,7 +80,5 @@ pub async fn run_event_loop_async<T, F, Fut>(
             }
         }
     }
-
     info!("{}: Stopped", module_name);
 }
-

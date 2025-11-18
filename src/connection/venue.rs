@@ -5,7 +5,6 @@ use crate::types::{
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::str::FromStr;
-
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -21,10 +20,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 use tracing::{error, info, warn};
 use urlencoding::encode;
-
-
-/// Exchange interface trait
-/// Implemented by BinanceFutures
 #[async_trait]
 pub trait Venue: Send + Sync {
     async fn place_limit_with_client_id(
@@ -36,18 +31,11 @@ pub trait Venue: Send + Sync {
         tif: Tif,
         client_order_id: &str,
     ) -> Result<(String, Option<String>)>;
-
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()>;
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)>;
     async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>>;
     async fn get_position(&self, sym: &str) -> Result<Position>;
-    /// Get all open positions from exchange
-    /// Returns Vec<(symbol, position)> for all positions with non-zero qty
     async fn get_all_positions(&self) -> Result<Vec<(String, Position)>>;
-    /// Place trailing stop market order
-    /// activation_price: Price at which trailing stop activates
-    /// callback_rate: Trailing stop callback rate (0.001 = 0.1%, Binance expects percentage 0.1)
-    /// quantity: Position quantity to close
     async fn place_trailing_stop_order(
         &self,
         symbol: &str,
@@ -57,36 +45,11 @@ pub trait Venue: Send + Sync {
     ) -> Result<String>;
     async fn available_balance(&self, asset: &str) -> Result<Decimal>;
 }
-
-
 pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
-
-/// Price cache from WebSocket market data stream
-/// Thread-safe price storage - updated by WebSocket, read by main loop
-///
-/// CONCURRENT WRITE BEHAVIOR:
-/// - DashMap.insert() is atomic and thread-safe
-/// - If multiple streams subscribe to the same symbol (duplicate subscription),
-///   concurrent writes are safe: last write wins (correct for price data - we want latest)
-/// - No data corruption or race conditions, but may have unnecessary writes
-/// - Each symbol should ideally be in only one stream chunk to avoid duplicate updates
 pub static PRICE_CACHE: Lazy<DashMap<String, PriceUpdate>> = Lazy::new(|| DashMap::new());
-
-/// Position cache from WebSocket user data stream (ACCOUNT_UPDATE events)
-/// Thread-safe position storage - updated by WebSocket, read by main loop
-/// Binance recommendation: Use WebSocket instead of REST API for real-time data
 pub static POSITION_CACHE: Lazy<DashMap<String, Position>> = Lazy::new(|| DashMap::new());
-
-/// Balance cache from WebSocket user data stream (ACCOUNT_UPDATE events)
-/// Thread-safe balance storage - updated by WebSocket, read by main loop
-/// Binance recommendation: Use WebSocket instead of REST API for real-time data
 pub static BALANCE_CACHE: Lazy<DashMap<String, Decimal>> = Lazy::new(|| DashMap::new());
-
-/// Open orders cache from WebSocket user data stream (ORDER_TRADE_UPDATE events)
-/// Thread-safe open orders storage - updated by WebSocket, read by main loop
-/// Binance recommendation: Use WebSocket instead of REST API for real-time data
 pub static OPEN_ORDERS_CACHE: Lazy<DashMap<String, Vec<VenueOrder>>> = Lazy::new(|| DashMap::new());
-
 fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
     let value = s.as_ref();
     Decimal::from_str(value).unwrap_or_else(|err| {
@@ -94,7 +57,6 @@ fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
         Decimal::ZERO
     })
 }
-
 fn scale_from_step(step: Decimal) -> usize {
     if step.is_zero() {
         return 8;
@@ -102,16 +64,13 @@ fn scale_from_step(step: Decimal) -> usize {
     if step >= Decimal::ONE {
         return 0;
     }
-
     let scale = step.scale() as usize;
     scale
 }
-
 fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
     let mut tick = Decimal::ZERO;
     let mut step = Decimal::ZERO;
     let mut min_notional = Decimal::ZERO;
-
     for f in sym.filters {
         match f {
             FutFilter::PriceFilter { tickSize } => {
@@ -144,7 +103,6 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
             FutFilter::Other => {}
         }
     }
-
     let p_prec = sym.price_precision.unwrap_or_else(|| {
         let calc = scale_from_step(tick);
         tracing::warn!(
@@ -155,7 +113,6 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         );
         calc
     });
-
     let q_prec = sym.qty_precision.unwrap_or_else(|| {
         let calc = scale_from_step(step);
         tracing::warn!(
@@ -166,21 +123,18 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         );
         calc
     });
-
     let final_tick = if tick.is_zero() {
         tracing::warn!(symbol = %sym.symbol, "tickSize is zero, using fallback 0.01");
         Decimal::new(1, 2)
     } else {
         tick
     };
-
     let final_step = if step.is_zero() {
         tracing::warn!(symbol = %sym.symbol, "stepSize is zero, using fallback 0.001");
         Decimal::new(1, 3)
     } else {
         step
     };
-
     tracing::debug!(
         symbol = %sym.symbol,
         tick_size = %final_tick,
@@ -190,7 +144,6 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         min_notional = %min_notional,
         "symbol rules parsed from exchangeInfo"
     );
-
     SymbolRules {
         tick_size: final_tick,
         step_size: final_step,
@@ -200,13 +153,6 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         max_leverage: None,
     }
 }
-
-
-/// Binance API common configuration
-///
-/// Thread-safety and performance optimization
-/// - `client: Arc<Client>`: reqwest::Client is thread-safe, wrapping in Arc avoids unnecessary overhead
-/// - `sign()` function is thread-safe (uses immutable data, read-only)
 #[derive(Clone)]
 pub struct BinanceCommon {
     pub client: Arc<Client>,
@@ -214,7 +160,6 @@ pub struct BinanceCommon {
     pub secret_key: String,
     pub recv_window_ms: u64,
 }
-
 impl BinanceCommon {
 fn ts() -> u64 {
         SystemTime::now()
@@ -225,7 +170,6 @@ fn ts() -> u64 {
             })
             .as_millis() as u64
     }
-
 fn sign(&self, qs: &str) -> String {
         let mut mac = match Hmac::<Sha256>::new_from_slice(self.secret_key.as_bytes()) {
             Ok(mac) => mac,
@@ -242,21 +186,17 @@ fn sign(&self, qs: &str) -> String {
         hex::encode(mac.finalize().into_bytes())
     }
 }
-
-
 #[derive(Clone)]
 pub struct BinanceFutures {
     pub base: String,
     pub common: BinanceCommon,
     pub hedge_mode: bool,
 }
-
 #[derive(Deserialize)]
 struct OrderBookTop {
     bids: Vec<(String, String)>,
     asks: Vec<(String, String)>,
 }
-
 #[derive(Deserialize)]
 struct FutPlacedOrder {
 #[serde(rename = "orderId")]
@@ -265,7 +205,6 @@ struct FutPlacedOrder {
 #[allow(dead_code)]
     client_order_id: Option<String>,
 }
-
 #[derive(Deserialize)]
 struct FutOpenOrder {
 #[serde(rename = "orderId")]
@@ -277,7 +216,6 @@ struct FutOpenOrder {
 #[serde(rename = "side")]
     side: String,
 }
-
 #[derive(Deserialize)]
 struct FutPosition {
 #[serde(rename = "symbol")]
@@ -295,10 +233,7 @@ struct FutPosition {
 #[serde(rename = "marginType", default)]
     margin_type: String,
 }
-
-
 impl BinanceFutures {
-/// Create BinanceFutures from config
 pub fn from_config(
         binance_cfg: &crate::config::BinanceCfg,
     ) -> Result<Self> {
@@ -307,26 +242,18 @@ pub fn from_config(
         } else {
             binance_cfg.futures_base.clone()
         };
-
         let common = BinanceCommon {
             client: Arc::new(Client::new()),
             api_key: binance_cfg.api_key.clone(),
             secret_key: binance_cfg.secret_key.clone(),
             recv_window_ms: binance_cfg.recv_window_ms,
         };
-
         Ok(BinanceFutures {
             base,
             common,
             hedge_mode: binance_cfg.hedge_mode,
         })
     }
-
-/// Set leverage (per symbol) with automatic step-down on error
-/// If leverage is rejected, tries lower values (100 -> 75 -> 50 -> 25 -> 20 -> 10 -> 5 -> 1)
-/// Returns the actual leverage value that was successfully set
-/// Must be set explicitly for each symbol at startup
-/// Uses /fapi/v1/leverage endpoint for per-symbol leverage
     pub async fn set_leverage(&self, sym: &str, leverage: u32) -> Result<u32> {
         let leverage_candidates = if leverage > 100 {
             vec![100, 75, 50, 25, 20, 10, 5, 1]
@@ -339,9 +266,7 @@ pub fn from_config(
         } else {
             vec![leverage, 5, 1]
         };
-        
         let mut last_error = None;
-        
         for &lev in &leverage_candidates {
             let params = vec![
                 format!("symbol={}", sym),
@@ -352,7 +277,6 @@ pub fn from_config(
             let qs = params.join("&");
             let sig = self.common.sign(&qs);
             let url = format!("{}/fapi/v1/leverage?{}&signature={}", self.base, qs, sig);
-
             match send_void(
                 self.common
                     .client
@@ -396,13 +320,8 @@ pub fn from_config(
                 }
             }
         }
-        
         Err(last_error.unwrap_or_else(|| anyhow!("All leverage values failed for symbol {}", sym)))
     }
-
-/// Set position side mode (enable/disable hedge mode)
-/// Must be set explicitly at startup
-/// Uses /fapi/v1/positionSide/dual endpoint to enable/disable hedge mode
     pub async fn set_position_side_dual(&self, dual: bool) -> Result<()> {
         let params = vec![
             format!("dualSidePosition={}", if dual { "true" } else { "false" }),
@@ -415,7 +334,6 @@ pub fn from_config(
             "{}/fapi/v1/positionSide/dual?{}&signature={}",
             self.base, qs, sig
         );
-
         match send_void(
             self.common
                 .client
@@ -443,7 +361,6 @@ pub fn from_config(
             }
         }
     }
-
     pub async fn set_margin_type(&self, sym: &str, isolated: bool) -> Result<()> {
         let margin_type = if isolated { "ISOLATED" } else { "CROSSED" };
         let params = vec![
@@ -455,7 +372,6 @@ pub fn from_config(
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/marginType?{}&signature={}", self.base, qs, sig);
-
         match send_void(
             self.common
                 .client
@@ -484,11 +400,6 @@ pub fn from_config(
             }
         }
     }
-
-    /// Fetch max leverage for a symbol from Binance leverage brackets API
-    /// Returns None if API call fails (will use safe fallback instead of config max_leverage)
-    /// ✅ CRITICAL: This endpoint requires authentication (signature + API key)
-    /// Public so it can be called directly when coin's max leverage is needed
     pub async fn fetch_max_leverage(&self, sym: &str) -> Option<u32> {
         fn deserialize_u32_flexible<'de, D>(deserializer: D) -> Result<u32, D::Error>
         where
@@ -496,23 +407,18 @@ pub fn from_config(
         {
             use serde::de::{self, Visitor};
             use std::fmt;
-            
             struct U32FlexibleVisitor;
-            
             impl<'de> Visitor<'de> for U32FlexibleVisitor {
                 type Value = u32;
-                
                 fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                     formatter.write_str("a u32 or string representation of u32")
                 }
-                
                 fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
                 where
                     E: de::Error,
                 {
                     Ok(value as u32)
                 }
-                
                 fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -520,10 +426,8 @@ pub fn from_config(
                     value.parse::<u32>().map_err(de::Error::custom)
                 }
             }
-            
             deserializer.deserialize_any(U32FlexibleVisitor)
         }
-        
         #[derive(Deserialize)]
         struct LeverageBracket {
             #[serde(deserialize_with = "deserialize_u32_flexible")]
@@ -537,13 +441,11 @@ pub fn from_config(
             #[serde(rename = "maintMarginRatio")]
             maint_margin_ratio: String,
         }
-        
         #[derive(Deserialize)]
         struct LeverageBracketsResponse {
             symbol: String,
             brackets: Vec<LeverageBracket>,
         }
-        
         let qs = format!(
             "timestamp={}&recvWindow={}",
             BinanceCommon::ts(),
@@ -551,7 +453,6 @@ pub fn from_config(
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/leverageBrackets?{}&signature={}", self.base, qs, sig);
-        
         let resp = match self.common
             .client
             .get(&url)
@@ -569,7 +470,6 @@ pub fn from_config(
                 return None;
             }
         };
-
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -581,7 +481,6 @@ pub fn from_config(
             );
             return None;
         }
-
         match resp.json::<serde_json::Value>().await {
             Ok(json) => {
                 let json_str = serde_json::to_string(&json).unwrap_or_default();
@@ -595,8 +494,6 @@ pub fn from_config(
                     response_preview = %preview,
                     "Leverage brackets API response received"
                 );
-                
-                
                 let brackets_result: Result<Vec<LeverageBracketsResponse>, _> = if json.is_array() {
                     serde_json::from_value::<Vec<LeverageBracketsResponse>>(json.clone())
                         .or_else(|_| {
@@ -621,7 +518,6 @@ pub fn from_config(
                                                                 v.as_u64()
                                                                     .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                                                             });
-                                                        
                                                         if let Some(lev) = initial_leverage {
                                                             let bracket_num = bracket_obj.get("bracket")
                                                                 .and_then(|v| {
@@ -629,7 +525,6 @@ pub fn from_config(
                                                                         .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                                                                 })
                                                                 .unwrap_or(0) as u32;
-                                                            
                                                             brackets.push(LeverageBracket {
                                                                 bracket: bracket_num,
                                                                 initial_leverage: lev as u32,
@@ -663,7 +558,6 @@ pub fn from_config(
                     serde_json::from_value::<LeverageBracketsResponse>(json)
                         .map(|r| vec![r])
                 };
-
                 match brackets_result {
                     Ok(brackets_vec) => {
                         let symbol_brackets = match brackets_vec.iter()
@@ -676,13 +570,11 @@ pub fn from_config(
                                 return None;
                             }
                         };
-
                         let max_lev = symbol_brackets.brackets
                             .iter()
                             .map(|b| b.initial_leverage)
                             .max()
                             .unwrap_or(1);
-                        
                         tracing::debug!(
                             symbol = %sym,
                             max_leverage = max_lev,
@@ -711,19 +603,13 @@ pub fn from_config(
             }
         }
     }
-
-/// Get per-symbol metadata (tick_size, step_size, max_leverage)
-/// Does not use global fallback - real rules required for each symbol
-/// Using fallback can cause LOT_SIZE and PRICE_FILTER errors
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }
-
     const MAX_RETRIES: u32 = 2;
     const INITIAL_BACKOFF_MS: u64 = 100;
         let mut last_error = None;
-
         for attempt in 0..=MAX_RETRIES {
             let url = format!("{}/fapi/v1/exchangeInfo?symbol={}", self.base, encode(sym));
             match send_json::<FutExchangeInfo>(self.common.client.get(url)).await {
@@ -733,16 +619,12 @@ pub fn from_config(
                         .into_iter()
                         .next()
                         .ok_or_else(|| anyhow!("symbol info missing"))?;
-
                     if let Some(existing) = FUT_RULES.get(sym) {
                         return Ok(existing.clone());
                     }
-
                     let max_leverage = self.fetch_max_leverage(sym).await;
-                    
                     let mut rules = rules_from_fut_symbol(sym_rec);
                     rules.max_leverage = max_leverage;
-                    
                     let rules = Arc::new(rules);
                     FUT_RULES.insert(sym.to_string(), rules.clone());
                     return Ok(rules);
@@ -766,7 +648,6 @@ pub fn from_config(
                 }
             }
         }
-
         error!(
             error = ?last_error,
             %sym,
@@ -782,16 +663,10 @@ pub fn from_config(
                 .unwrap_or_else(|| "unknown error".to_string())
         ))
     }
-
-/// Force refresh rules for a specific symbol by removing it from cache
-/// Next call to rules_for() will fetch fresh rules from exchange
 pub fn refresh_rules_for(&self, sym: &str) {
         FUT_RULES.remove(sym);
         info!(symbol = %sym, "CONNECTION: Rules cache invalidated for symbol");
     }
-
-/// Refresh rules for all cached symbols
-/// Removes all entries from cache, forcing fresh fetch on next access
     pub async fn symbol_metadata(&self) -> Result<Vec<SymbolMeta>> {
         let url = format!("{}/fapi/v1/exchangeInfo", self.base);
         let info: FutExchangeInfo = send_json(self.common.client.get(url)).await?;
@@ -807,12 +682,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
             })
             .collect())
     }
-
     pub async fn available_balance(&self, asset: &str) -> Result<Decimal> {
         if let Some(balance) = BALANCE_CACHE.get(asset) {
             return Ok(*balance);
         }
-
         tracing::debug!(
             asset = %asset,
             "BALANCE_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
@@ -823,7 +696,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
         #[serde(rename = "availableBalance")]
             available_balance: String,
         }
-
         let qs = format!(
             "timestamp={}&recvWindow={}",
             BinanceCommon::ts(),
@@ -838,7 +710,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
             .await?;
-
         let bal = balances.into_iter().find(|b| b.asset == asset);
         let amt = match bal {
             Some(b) => {
@@ -850,12 +721,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
         };
         Ok(amt)
     }
-
     pub async fn fetch_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
         if let Some(orders) = OPEN_ORDERS_CACHE.get(sym) {
             return Ok(orders.clone());
         }
-
         let qs = format!(
             "symbol={}&timestamp={}&recvWindow={}",
             sym,
@@ -887,17 +756,11 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 qty: Qty(qty),
             });
         }
-
         if !res.is_empty() {
             OPEN_ORDERS_CACHE.insert(sym.to_string(), res.clone());
         }
-
         Ok(res)
     }
-
-    /// Fetch all open positions from exchange
-    /// Returns Vec<(symbol, position)> for all positions with non-zero qty
-    /// Used for order monitoring fallback and position reconciliation
     pub async fn fetch_all_positions(&self) -> Result<Vec<(String, Position)>> {
         let qs = format!(
             "timestamp={}&recvWindow={}",
@@ -909,7 +772,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             "{}/fapi/v2/positionRisk?{}&signature={}",
             self.base, qs, sig
         );
-        
         let positions: Vec<FutPosition> = send_json(
             self.common
                 .client
@@ -917,12 +779,9 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
         .await?;
-
         let mut result = Vec::new();
-        
         for pos in positions {
             let qty = Decimal::from_str(&pos.position_amt).unwrap_or(Decimal::ZERO);
-            
             if !qty.is_zero() {
                 let symbol = pos.symbol.clone();
                 let entry = Decimal::from_str(&pos.entry_price)?;
@@ -933,7 +792,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 } else {
                     None
                 };
-                
                 let position = Position {
                     symbol: symbol.clone(),
                     qty: Qty(qty),
@@ -941,18 +799,11 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     leverage,
                     liq_px,
                 };
-                
                 result.push((symbol, position));
             }
         }
-        
         Ok(result)
     }
-
-    /// Place trailing stop market order
-    /// activation_price: Price at which trailing stop activates
-    /// callback_rate: Trailing stop callback rate (0.001 = 0.1%, Binance expects percentage 0.1)
-    /// quantity: Position quantity to close
     pub async fn place_trailing_stop_order(
         &self,
         sym: &str,
@@ -973,9 +824,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
         };
         let qty_str = crate::utils::format_decimal_fixed(qty.0, effective_qty_precision);
         let activation_price_str = crate::utils::format_decimal_fixed(activation_price.0, effective_price_precision);
-        
         let callback_rate_pct = callback_rate * 100.0;
-        
         let mut params = vec![
             format!("symbol={}", sym),
             "type=TRAILING_STOP_MARKET".to_string(),
@@ -986,7 +835,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             format!("timestamp={}", BinanceCommon::ts()),
             format!("recvWindow={}", self.common.recv_window_ms),
         ];
-        
         if self.hedge_mode {
             let position_side = if qty.0.is_sign_positive() {
                 "LONG"
@@ -995,24 +843,17 @@ pub fn refresh_rules_for(&self, sym: &str) {
             };
             params.push(format!("positionSide={}", position_side));
         }
-        
         let qs = params.join("&");
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-        
         let resp = ensure_success(self.common.client.post(&url).send().await?).await?;
         let order: FutPlacedOrder = resp.json().await?;
-        
         Ok(order.order_id.to_string())
     }
-
-/// Get current margin type for a symbol
-/// Returns true if isolated, false if crossed
     pub async fn fetch_position(&self, sym: &str) -> Result<Position> {
         if let Some(position) = POSITION_CACHE.get(sym) {
             return Ok(position.clone());
         }
-
         tracing::debug!(
             symbol = %sym,
             "POSITION_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
@@ -1035,16 +876,13 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 .header("X-MBX-APIKEY", &self.common.api_key),
         )
             .await?;
-
         let matching_positions: Vec<&FutPosition> = positions
             .iter()
             .filter(|p| p.symbol.eq_ignore_ascii_case(sym))
             .collect();
-
         if matching_positions.is_empty() {
             return Err(anyhow!("position not found for symbol"));
         }
-
         if !self.hedge_mode {
             for pos in &matching_positions {
                 if let Some(ref ps) = pos.position_side {
@@ -1059,12 +897,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     }
                 }
             }
-
             let net_qty: Decimal = matching_positions
                 .iter()
                 .map(|p| Decimal::from_str(&p.position_amt).unwrap_or(Decimal::ZERO))
                 .sum();
-
             let pos = matching_positions[0];
             let qty = Decimal::from_str(&pos.position_amt)?;
             let entry = Decimal::from_str(&pos.entry_price)?;
@@ -1075,7 +911,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             } else {
                 None
             };
-
             if matching_positions.len() > 1 {
                 warn!(
                     symbol = %sym,
@@ -1109,7 +944,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 symbol = %sym,
                 "CRITICAL: Hedge mode detected but NOT supported! Config validation should have prevented this. This indicates a configuration error or runtime config change."
             );
-
             let mut long_qty = Decimal::ZERO;
             let mut short_qty = Decimal::ZERO;
             let mut long_entry = Decimal::ZERO;
@@ -1118,13 +952,11 @@ pub fn refresh_rules_for(&self, sym: &str) {
             let mut short_leverage = 1u32;
             let mut long_liq_px = None;
             let mut short_liq_px = None;
-
             for pos in matching_positions {
                 let qty = Decimal::from_str(&pos.position_amt).unwrap_or(Decimal::ZERO);
                 let entry = Decimal::from_str(&pos.entry_price).unwrap_or(Decimal::ZERO);
                 let lev = pos.leverage.parse::<u32>().unwrap_or(1);
                 let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
-
                 match pos.position_side.as_deref() {
                     Some("LONG") => {
                         long_qty = qty;
@@ -1170,7 +1002,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     }
                 }
             }
-
             if long_qty > Decimal::ZERO && short_qty > Decimal::ZERO {
                 return Err(anyhow!(
                     "CRITICAL: Both LONG and SHORT positions exist for symbol {} in hedge mode. \
@@ -1190,7 +1021,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     short_entry
                 ));
             }
-
             let (final_qty, final_entry, final_leverage, final_liq_px) = if long_qty > Decimal::ZERO {
                 (long_qty, long_entry, long_leverage, long_liq_px)
             } else if short_qty > Decimal::ZERO {
@@ -1198,7 +1028,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             } else {
                 (Decimal::ZERO, Decimal::ZERO, 1u32, None)
             };
-
             let position = Position {
                 symbol: sym.to_string(),
                 qty: Qty(final_qty),
@@ -1210,7 +1039,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             Ok(position)
         }
     }
-
     pub async fn flatten_position(&self, sym: &str, use_market_only: bool) -> Result<()> {
         let initial_pos = match self.fetch_position(sym).await {
             Ok(pos) => pos,
@@ -1223,15 +1051,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
             }
         };
         let initial_qty = initial_pos.qty.0;
-
         if initial_qty.is_zero() {
             info!(symbol = %sym, "position already closed (zero quantity), skipping close");
             return Ok(());
         }
-
         let rules = self.rules_for(sym).await?;
         let initial_qty_abs = crate::utils::quantize_decimal(initial_qty.abs(), rules.step_size);
-
         if initial_qty_abs <= Decimal::ZERO {
             warn!(
                 symbol = %sym,
@@ -1240,21 +1065,17 @@ pub fn refresh_rules_for(&self, sym: &str) {
             );
             return Ok(());
         }
-
-
         let max_attempts = 3;
         #[allow(unused_assignments)]
         let mut limit_fallback_attempted = false;
         let mut growth_event_count = 0u32;
     const MAX_RETRIES_ON_GROWTH: u32 = 8;
-
         for attempt in 0..max_attempts {
             if limit_fallback_attempted {
                 return Err(anyhow::anyhow!(
                     "LIMIT fallback already attempted and failed, cannot proceed with retry. Position may need manual intervention."
                 ));
             }
-
             let current_pos = match self.fetch_position(sym).await {
                 Ok(pos) => pos,
                 Err(e) => {
@@ -1266,14 +1087,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 }
             };
             let current_qty = current_pos.qty.0;
-
             const MAX_POSITION_MULTIPLIER: f64 = 1.5;
             let early_position_multiplier = if initial_qty.abs() > Decimal::ZERO {
                 current_qty.abs() / initial_qty.abs()
             } else {
                 Decimal::ZERO
             };
-            
             let early_multiplier_f64 = early_position_multiplier.to_f64().unwrap_or(0.0);
             if early_multiplier_f64 > MAX_POSITION_MULTIPLIER {
                 tracing::error!(
@@ -1294,7 +1113,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     MAX_POSITION_MULTIPLIER
                 ));
             }
-
             if current_qty.is_zero() {
                 if attempt > 0 {
                     info!(
@@ -1306,26 +1124,21 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 }
                 return Ok(());
             }
-
             let remaining_qty = crate::utils::quantize_decimal(current_qty.abs(), rules.step_size);
-
             if remaining_qty <= Decimal::ZERO {
                 return Ok(());
             }
-
             let side = if current_qty.is_sign_positive() {
                 Side::Sell
             } else {
                 Side::Buy
             };
-
             let effective_qty_precision = if rules.step_size.is_zero() {
                 rules.qty_precision
             } else {
                 rules.qty_precision.min(rules.step_size.scale() as usize)
             };
             let qty_str = crate::utils::format_decimal_fixed(remaining_qty, effective_qty_precision);
-
             let position_side = if self.hedge_mode {
                 if current_qty.is_sign_positive() {
                     Some("LONG")
@@ -1335,7 +1148,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             } else {
                 None
             };
-
             let mut params = vec![
                 format!("symbol={}", sym),
                 format!(
@@ -1352,15 +1164,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 format!("timestamp={}", BinanceCommon::ts()),
                 format!("recvWindow={}", self.common.recv_window_ms),
             ];
-
             if let Some(pos_side) = position_side {
                 params.push(format!("positionSide={}", pos_side));
             }
-
             let qs = params.join("&");
             let sig = self.common.sign(&qs);
             let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-
             match send_void(
                 self.common
                     .client
@@ -1381,7 +1190,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         self.fetch_position(sym).await?
                     };
                     let verify_qty = verify_pos.qty.0;
-
                     if verify_qty.is_zero() {
                         info!(
                             symbol = %sym,
@@ -1393,14 +1201,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     } else {
                         let position_grew_from_attempt = verify_qty.abs() > current_qty.abs();
                         let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
-
                         const MAX_POSITION_MULTIPLIER: f64 = 1.5;
                         let position_multiplier = if initial_qty.abs() > Decimal::ZERO {
                             verify_qty.abs() / initial_qty.abs()
                         } else {
                             Decimal::ZERO
                         };
-                        
                         let multiplier_f64 = position_multiplier.to_f64().unwrap_or(0.0);
                         if multiplier_f64 > MAX_POSITION_MULTIPLIER {
                             tracing::error!(
@@ -1422,7 +1228,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 MAX_POSITION_MULTIPLIER
                             ));
                         }
-
                         if position_grew_from_attempt || position_grew_from_initial {
                             let growth_from_initial = if initial_qty.abs() > Decimal::ZERO {
                                 crate::utils::decimal_to_f64(
@@ -1431,12 +1236,9 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             } else {
                                 0.0
                             };
-
                         const MAX_ACCEPTABLE_GROWTH_PCT: f64 = 10.0;
-
                             if growth_from_initial > MAX_ACCEPTABLE_GROWTH_PCT {
                                 growth_event_count += 1;
-
                                 const CRITICAL_GROWTH_THRESHOLD: u32 = 3;
                                 if growth_event_count > CRITICAL_GROWTH_THRESHOLD && growth_event_count <= MAX_RETRIES_ON_GROWTH {
                                     tracing::error!(
@@ -1451,7 +1253,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                         CRITICAL_GROWTH_THRESHOLD
                                     );
                                 }
-
                                 if growth_event_count > MAX_RETRIES_ON_GROWTH {
                                     tracing::error!(
                                         symbol = %sym,
@@ -1474,7 +1275,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                         growth_event_count
                                     ));
                                 }
-
                                 tracing::warn!(
                                     symbol = %sym,
                                     attempt = attempt + 1,
@@ -1508,14 +1308,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 );
                             }
                         }
-
                         let closed_amount = current_qty.abs() - verify_qty.abs();
                         let close_ratio = if current_qty.abs() > Decimal::ZERO {
                             closed_amount / current_qty.abs()
                         } else {
                             Decimal::ZERO
                         };
-
                         let remaining_pct = if initial_qty.abs() > Decimal::ZERO {
                             crate::utils::decimal_to_f64(
                                 crate::utils::calculate_percentage(verify_qty.abs(), initial_qty.abs())
@@ -1523,7 +1321,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         } else {
                             0.0
                         };
-
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -1535,7 +1332,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             remaining_pct = remaining_pct,
                             "partial close detected, retrying..."
                         );
-
                         if attempt < max_attempts - 1 {
                             continue;
                         } else {
@@ -1559,7 +1355,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         );
                         return Ok(());
                     }
-
                     if use_market_only {
                         warn!(
                             symbol = %sym,
@@ -1579,12 +1374,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             ));
                         }
                     }
-
                     if crate::utils::is_min_notional_error(&e) && !limit_fallback_attempted
                     {
                         warn!(symbol = %sym, "MIN_NOTIONAL error detected in flatten_position, invalidating rules cache");
                         self.refresh_rules_for(sym);
-                        
                         let rules = match self.rules_for(sym).await {
                             Ok(fresh_rules) => fresh_rules,
                             Err(e2) => {
@@ -1592,7 +1385,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 rules.clone()
                             }
                         };
-                        
                         let (best_bid, best_ask) = {
                             if let Some(price_update) = PRICE_CACHE.get(sym) {
                                 (price_update.bid, price_update.ask)
@@ -1603,7 +1395,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                         warn!(symbol = %sym, error = %e2, "failed to fetch best prices for dust check (WebSocket cache empty and REST API failed)");
                                         let assumed_min_price = Decimal::new(1, 2);
                                         let dust_threshold = rules.min_notional / assumed_min_price;
-
                                         warn!(
                                             symbol = %sym,
                                             min_notional = %rules.min_notional,
@@ -1611,7 +1402,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                             conservative_threshold = %dust_threshold,
                                             "Price fetch failed, using very conservative dust threshold (assumes price=0.01)"
                                         );
-
                                         if remaining_qty < dust_threshold {
                                             info!(
                                                 symbol = %sym,
@@ -1630,7 +1420,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 }
                             }
                         };
-
                         let current_price = if matches!(side, Side::Buy) {
                             best_ask.0
                         } else {
@@ -1645,7 +1434,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 "Price is zero, using very conservative dust threshold (assumes price=0.01)"
                             );
                         }
-
                         if remaining_qty < dust_threshold {
                             info!(
                                 symbol = %sym,
@@ -1656,7 +1444,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             );
                             return Ok(());
                         }
-
                         limit_fallback_attempted = true;
                         warn!(
                             symbol = %sym,
@@ -1666,14 +1453,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             min_notional = %rules.min_notional,
                             "MIN_NOTIONAL error in reduce-only market close, trying limit reduce-only fallback (one-time)"
                         );
-
                         let tick_size = rules.tick_size;
                         let limit_price = if matches!(side, Side::Buy) {
                             best_bid.0 + tick_size
                         } else {
                             best_ask.0 - tick_size
                         };
-
                         let limit_price_quantized = crate::utils::quantize_decimal(limit_price, tick_size);
                         let effective_price_precision = if rules.tick_size.is_zero() {
                             rules.price_precision
@@ -1682,7 +1467,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         };
                         let limit_price_str =
                             crate::utils::format_decimal_fixed(limit_price_quantized, effective_price_precision);
-
                         let mut limit_params = vec![
                             format!("symbol={}", sym),
                             format!(
@@ -1701,18 +1485,15 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             format!("timestamp={}", BinanceCommon::ts()),
                             format!("recvWindow={}", self.common.recv_window_ms),
                         ];
-
                         if let Some(pos_side) = position_side {
                             limit_params.push(format!("positionSide={}", pos_side));
                         }
-
                         let limit_qs = limit_params.join("&");
                         let limit_sig = self.common.sign(&limit_qs);
                         let limit_url = format!(
                             "{}/fapi/v1/order?{}&signature={}",
                             self.base, limit_qs, limit_sig
                         );
-
                         match send_void(
                             self.common
                                 .client
@@ -1736,7 +1517,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     error = %e2,
                                     "MIN_NOTIONAL fallback: limit reduce-only order also failed"
                                 );
-
                                 let current_price = if matches!(side, Side::Buy) {
                                     best_ask.0
                                 } else {
@@ -1751,7 +1531,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                         "Price is zero, using very conservative dust threshold (assumes price=0.01)"
                                     );
                                 }
-
                                 if remaining_qty < dust_threshold {
                                     info!(
                                         symbol = %sym,
@@ -1762,7 +1541,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     );
                                     return Ok(());
                                 }
-
                                 limit_fallback_attempted = true;
                                 warn!(
                                     symbol = %sym,
@@ -1792,11 +1570,9 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 }
             }
         }
-
         Err(anyhow::anyhow!("Unexpected error in flatten_position"))
     }
 }
-
 #[async_trait]
 impl Venue for BinanceFutures {
     async fn place_limit_with_client_id(
@@ -1817,11 +1593,9 @@ impl Venue for BinanceFutures {
             Tif::Gtc => "GTC",
             Tif::Ioc => "IOC",
         };
-
         let rules = self.rules_for(sym).await?;
         let (price_str, qty_str, price_quantized, qty_quantized) =
             Self::validate_and_format_order_params(px, qty, &rules, sym)?;
-
         info!(
             %sym,
             side = ?side,
@@ -1836,22 +1610,17 @@ impl Venue for BinanceFutures {
             endpoint = "/fapi/v1/order",
             "order validation guard passed, submitting order"
         );
-
         let mut current_price_str = price_str;
         let mut current_qty_str = qty_str;
-
     const MAX_RETRIES: u32 = 3;
     const INITIAL_BACKOFF_MS: u64 = 100;
-
         let mut last_error = None;
         let mut order_result: Option<FutPlacedOrder> = None;
-
         let base_client_order_id = if !client_order_id.is_empty() {
             client_order_id.to_string()
         } else {
             format!("{}", BinanceCommon::ts())
         };
-
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
                 match self.query_order_by_client_id(sym, &base_client_order_id).await {
@@ -1884,7 +1653,6 @@ impl Venue for BinanceFutures {
                     }
                 }
             }
-
             let unique_client_order_id = if attempt == 0 {
                 base_client_order_id.clone()
             } else {
@@ -1892,7 +1660,6 @@ impl Venue for BinanceFutures {
                 let random_suffix = retry_timestamp % 1000000;
                 format!("{}-{}-{}", base_client_order_id, retry_timestamp, random_suffix)
             };
-
             let mut attempt_params = vec![
                 format!("symbol={}", sym),
                 format!("side={}", s_side),
@@ -1904,7 +1671,6 @@ impl Venue for BinanceFutures {
                 format!("recvWindow={}", self.common.recv_window_ms),
                 "newOrderRespType=RESULT".to_string(),
             ];
-
             if self.hedge_mode {
                 let position_side = match side {
                     Side::Buy => "LONG",
@@ -1912,7 +1678,6 @@ impl Venue for BinanceFutures {
                 };
                 attempt_params.push(format!("positionSide={}", position_side));
             }
-
             if !unique_client_order_id.is_empty() {
                 if unique_client_order_id.len() <= 36
                     && unique_client_order_id
@@ -1929,14 +1694,12 @@ impl Venue for BinanceFutures {
                     );
                 }
             }
-
             let retry_qs = attempt_params.join("&");
             let retry_sig = self.common.sign(&retry_qs);
             let retry_url = format!(
                 "{}/fapi/v1/order?{}&signature={}",
                 self.base, retry_qs, retry_sig
             );
-
             match self
                 .common
                 .client
@@ -1971,20 +1734,16 @@ impl Venue for BinanceFutures {
                         let should_refresh_rules = body_lower.contains("precision is over")
                             || body_lower.contains("-1111")
                             || crate::utils::contains_min_notional(&body_lower);
-
                         if should_refresh_rules {
                             let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
                                 "precision error (-1111)"
                             } else {
                                 "MIN_NOTIONAL error (-1013)"
                             };
-                            
                             warn!(%sym, error_type, "rules-related error detected, invalidating cache immediately");
                             self.refresh_rules_for(sym);
-
                             if attempt < MAX_RETRIES {
                                 warn!(%sym, attempt = attempt + 1, error_type, "refreshing rules and retrying");
-
                                 match self.rules_for(sym).await {
                                     Ok(new_rules) => {
                                         match Self::validate_and_format_order_params(
@@ -1993,10 +1752,8 @@ impl Venue for BinanceFutures {
                                             Ok((new_price_str, new_qty_str, _, _)) => {
                                                 let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
                                                 tokio::time::sleep(backoff).await;
-
                                                 current_price_str = new_price_str;
                                                 current_qty_str = new_qty_str;
-
                                                 last_error = Some(anyhow!("{} error, retrying with refreshed rules", error_type));
                                                 continue;
                                             }
@@ -2025,7 +1782,6 @@ impl Venue for BinanceFutures {
                                 ));
                             }
                         }
-
                         if is_permanent_error(status.as_u16(), &body) {
                             tracing::error!(%status, %body, attempt, "permanent error, no retry");
                             return Err(anyhow!(
@@ -2034,7 +1790,6 @@ impl Venue for BinanceFutures {
                                 body
                             ));
                         }
-
                         if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
                             let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
                             tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms = backoff.as_millis(), "transient error, retrying with exponential backoff (unique clientOrderId)");
@@ -2061,10 +1816,8 @@ impl Venue for BinanceFutures {
                 }
             }
         }
-
         let order = order_result
             .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("unknown error after retries")))?;
-
         info!(
             %sym,
             ?side,
@@ -2078,7 +1831,6 @@ impl Venue for BinanceFutures {
         );
         Ok((order.order_id.to_string(), order.client_order_id))
     }
-
     async fn cancel(&self, order_id: &str, sym: &str) -> Result<()> {
         let qs = format!(
             "symbol={}&orderId={}&timestamp={}&recvWindow={}",
@@ -2089,7 +1841,6 @@ impl Venue for BinanceFutures {
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-
         send_void(
             self.common
                 .client
@@ -2099,7 +1850,6 @@ impl Venue for BinanceFutures {
             .await?;
         Ok(())
     }
-
     async fn best_prices(&self, sym: &str) -> Result<(Px, Px)> {
         if let Some(price_update) = PRICE_CACHE.get(sym) {
             return Ok((price_update.bid, price_update.ask));
@@ -2118,19 +1868,15 @@ impl Venue for BinanceFutures {
             Px(Decimal::from_str(&best_ask)?),
         ))
     }
-
     async fn get_open_orders(&self, sym: &str) -> Result<Vec<VenueOrder>> {
         self.fetch_open_orders(sym).await
     }
-
     async fn get_position(&self, sym: &str) -> Result<Position> {
         self.fetch_position(sym).await
     }
-
     async fn get_all_positions(&self) -> Result<Vec<(String, Position)>> {
         BinanceFutures::fetch_all_positions(self).await
     }
-
     async fn place_trailing_stop_order(
         &self,
         symbol: &str,
@@ -2140,16 +1886,11 @@ impl Venue for BinanceFutures {
     ) -> Result<String> {
         BinanceFutures::place_trailing_stop_order(self, symbol, activation_price, callback_rate, quantity).await
     }
-
     async fn available_balance(&self, asset: &str) -> Result<Decimal> {
         BinanceFutures::available_balance(self, asset).await
     }
 }
-
 impl BinanceFutures {
-    /// Query order by clientOrderId (origClientOrderId)
-    /// Returns Some(order) if order exists, None if not found, Err on API error
-    /// Used to check if previous order exists before retrying to prevent duplicates
     pub async fn query_order_by_client_id(
         &self,
         sym: &str,
@@ -2164,7 +1905,6 @@ impl BinanceFutures {
         );
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
-
         match self
             .common
             .client
@@ -2191,7 +1931,6 @@ impl BinanceFutures {
                 } else {
                     let body = resp.text().await.unwrap_or_default();
                     let body_lower = body.to_lowercase();
-                    
                     if body_lower.contains("-2013") || body_lower.contains("order does not exist") {
                         Ok(None)
                     } else {
@@ -2204,37 +1943,30 @@ impl BinanceFutures {
             }
         }
     }
-
     pub fn validate_and_format_order_params(
         px: Px,
         qty: Qty,
         rules: &SymbolRules,
         sym: &str,
     ) -> Result<(String, String, Decimal, Decimal)> {
-        
         let price_precision_from_tick = if rules.tick_size.is_zero() {
             rules.price_precision
         } else {
             rules.tick_size.scale() as usize
         };
-        
         let qty_precision_from_step = if rules.step_size.is_zero() {
             rules.qty_precision
         } else {
             rules.step_size.scale() as usize
         };
-        
         let effective_price_precision = rules.price_precision.min(price_precision_from_tick);
         let effective_qty_precision = rules.qty_precision.min(qty_precision_from_step);
-
         let price_quantized = crate::utils::quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = crate::utils::quantize_decimal(qty.0.abs(), rules.step_size);
-
         let price = price_quantized
             .round_dp_with_strategy(effective_price_precision as u32, RoundingStrategy::ToNegativeInfinity);
         let qty_rounded =
             qty_quantized.round_dp_with_strategy(effective_qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
-
     let qty_rounded = if qty_rounded.is_zero() && !qty_quantized.is_zero() {
         let re_quantized = crate::utils::quantize_decimal(qty_quantized, rules.step_size);
         if re_quantized.is_zero() {
@@ -2249,10 +1981,8 @@ impl BinanceFutures {
     } else {
         qty_rounded
     };
-
         let price_str = crate::utils::format_decimal_fixed(price, effective_price_precision);
         let qty_str = crate::utils::format_decimal_fixed(qty_rounded, effective_qty_precision);
-
         let price_fractional = if let Some(dot_pos) = price_str.find('.') {
             price_str[dot_pos + 1..].len()
         } else {
@@ -2263,7 +1993,6 @@ impl BinanceFutures {
         } else {
             0
         };
-
         if price_fractional > effective_price_precision {
             let error_msg = format!(
                 "CRITICAL: price_str fractional digits ({}) > effective_price_precision ({}) for {}",
@@ -2272,7 +2001,6 @@ impl BinanceFutures {
             tracing::error!(%sym, price_str, effective_price_precision, price_fractional, %error_msg);
             return Err(anyhow!(error_msg));
         }
-
         if qty_fractional > effective_qty_precision {
             let error_msg = format!(
                 "CRITICAL: qty_str fractional digits ({}) > effective_qty_precision ({}) for {}",
@@ -2281,7 +2009,6 @@ impl BinanceFutures {
             tracing::error!(%sym, qty_str, effective_qty_precision, qty_fractional, %error_msg);
             return Err(anyhow!(error_msg));
         }
-
         let notional = price * qty_rounded;
         if !rules.min_notional.is_zero() && notional < rules.min_notional {
             return Err(anyhow!(
@@ -2290,14 +2017,9 @@ impl BinanceFutures {
                 rules.min_notional
             ));
         }
-
         Ok((price_str, qty_str, price, qty_rounded))
     }
 }
-
-
-
-
 async fn ensure_success(resp: Response) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
@@ -2308,7 +2030,6 @@ async fn ensure_success(resp: Response) -> Result<Response> {
                 .get("retry-after")
                 .and_then(|h| h.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            
             if let Some(seconds) = retry_after {
                 tracing::warn!(
                     status = %status,
@@ -2325,15 +2046,11 @@ async fn ensure_success(resp: Response) -> Result<Response> {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        
         let body = resp.text().await.unwrap_or_default();
-        
         let is_benign_error = body.contains("-4046") || body.contains("-4059")
             || body.contains("No need to change margin type")
             || body.contains("No need to change position side");
-        
         let is_leverage_error = body.contains("-4028") || body.contains("Leverage") && body.contains("not valid");
-        
         if is_benign_error {
             tracing::debug!(%status, %body, "binance api response (benign - already set correctly)");
         } else if is_leverage_error {
@@ -2342,11 +2059,9 @@ async fn ensure_success(resp: Response) -> Result<Response> {
         } else {
             tracing::error!(%status, %body, "binance api error");
         }
-        
         Err(anyhow!("binance api error: {} - {}", status, body))
     }
 }
-
 fn is_transient_error(status: u16, _body: &str) -> bool {
     match status {
         408 => true,
@@ -2358,9 +2073,6 @@ fn is_transient_error(status: u16, _body: &str) -> bool {
         _ => false,
     }
 }
-
-/// Check if error is permanent (should symbol be disabled?)
-/// Errors like "invalid", "margin", "precision" are permanent
 fn is_permanent_error(status: u16, body: &str) -> bool {
     if status == 400 {
         let body_lower = body.to_lowercase();
@@ -2377,7 +2089,6 @@ fn is_permanent_error(status: u16, body: &str) -> bool {
         false
     }
 }
-
 async fn send_json<T>(builder: RequestBuilder) -> Result<T>
 where
     T: DeserializeOwned,
@@ -2386,12 +2097,8 @@ where
     let resp = ensure_success(resp).await?;
     Ok(resp.json().await?)
 }
-
 async fn send_void(builder: RequestBuilder) -> Result<()> {
     let resp = builder.send().await?;
     ensure_success(resp).await?;
     Ok(())
 }
-
-
-

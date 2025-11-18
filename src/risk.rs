@@ -5,8 +5,6 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::time::Instant;
 use tracing::{info, warn};
-
-
 #[derive(Debug, Clone)]
 pub struct RiskLimits {
     pub inv_cap: Qty,
@@ -14,7 +12,6 @@ pub struct RiskLimits {
     pub dd_limit_bps: i64,
     pub max_leverage: u32,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskAction {
     Ok,
@@ -22,8 +19,6 @@ pub enum RiskAction {
     Reduce,
     Halt,
 }
-
-/// Risk level for position size
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PositionRiskLevel {
     Ok,
@@ -31,9 +26,6 @@ pub enum PositionRiskLevel {
     Medium,
     Hard,
 }
-
-
-/// Check risk based on position, inventory, liquidation gap, and drawdown
 pub fn check_risk(
     pos: &Position,
     inv: Qty,
@@ -56,10 +48,6 @@ pub fn check_risk(
     }
     RiskAction::Ok
 }
-
-
-/// State structure for position risk checking
-/// This is a simplified version adapted for our event-driven architecture
 #[derive(Debug, Clone)]
 pub struct PositionRiskState {
     pub position_size_notional: f64,
@@ -67,8 +55,6 @@ pub struct PositionRiskState {
     pub has_open_orders: bool,
     pub is_opportunity_mode: bool,
 }
-
-/// Check position size risk and return risk level
 pub fn check_position_size_risk(
     state: &PositionRiskState,
     max_usd_per_order: f64,
@@ -80,14 +66,11 @@ pub fn check_position_size_risk(
     } else {
         1.0
     };
-
     let max_position_size_usd = max_usd_per_order * effective_leverage * cfg.internal.max_position_size_buffer * max_position_multiplier;
     let total_exposure_notional = state.position_size_notional + state.total_active_orders_notional;
-
     let soft_limit = max_position_size_usd * cfg.internal.opportunity_mode_soft_limit_ratio;
     let medium_limit = max_position_size_usd * cfg.internal.opportunity_mode_medium_limit_ratio;
     let hard_limit = max_position_size_usd * cfg.internal.opportunity_mode_hard_limit_ratio;
-
     let risk_level = if total_exposure_notional >= hard_limit {
         PositionRiskLevel::Hard
     } else if total_exposure_notional >= medium_limit {
@@ -97,21 +80,15 @@ pub fn check_position_size_risk(
     } else {
         PositionRiskLevel::Ok
     };
-
     let should_block_new_orders = risk_level != PositionRiskLevel::Ok;
-
     (risk_level, max_position_size_usd, should_block_new_orders)
 }
-
-/// Calculate total active orders notional from active orders
 pub fn calculate_total_active_orders_notional(active_orders: &[(Px, Qty)]) -> f64 {
     active_orders
         .iter()
         .map(|(price, qty)| (price.0 * qty.0).to_f64().unwrap_or(0.0))
         .sum()
 }
-
-/// Check PnL alerts
 pub fn check_pnl_alerts(
     last_pnl_alert: &mut Option<Instant>,
     pnl_f64: f64,
@@ -121,11 +98,9 @@ pub fn check_pnl_alerts(
     let should_alert = last_pnl_alert
         .map(|last| last.elapsed().as_secs() >= cfg.internal.pnl_alert_interval_sec)
         .unwrap_or(true);
-
     if !should_alert {
         return;
     }
-
     if pnl_f64 > 0.0 && position_size_notional > 0.0 {
         let pnl_pct = pnl_f64 / position_size_notional;
         if pnl_pct >= cfg.internal.pnl_alert_threshold_positive {
@@ -138,7 +113,6 @@ pub fn check_pnl_alerts(
             *last_pnl_alert = Some(Instant::now());
         }
     }
-
     if pnl_f64 < 0.0 && position_size_notional > 0.0 {
         let pnl_pct = pnl_f64 / position_size_notional;
         if pnl_pct <= cfg.internal.pnl_alert_threshold_negative {
@@ -152,21 +126,11 @@ pub fn check_pnl_alerts(
         }
     }
 }
-
-/// Update peak PnL
 pub fn update_peak_pnl(peak_pnl: &mut Decimal, current_pnl: Decimal) {
     if current_pnl > *peak_pnl {
         *peak_pnl = current_pnl;
     }
 }
-
-
-/// Handle risk level actions (Hard, Medium, Soft, Ok)
-/// Returns true if trading should continue, false if position was closed
-/// 
-/// NOTE: This is a simplified version that doesn't directly call venue methods.
-/// The caller should handle order cancellation and position closing.
-/// This function only determines the risk level and returns what actions should be taken.
 pub fn determine_risk_actions(
     risk_level: PositionRiskLevel,
     position_size_notional: f64,
@@ -195,17 +159,14 @@ pub fn determine_risk_actions(
                 total_exposure,
                 "MEDIUM LIMIT: reducing active orders"
             );
-            
             let mut sorted_orders: Vec<_> = active_orders.iter().collect();
             sorted_orders.sort_by_key(|(_, t)| *t);
-            
             let to_cancel_count = (sorted_orders.len() / 2).max(1);
             let orders_to_cancel: Vec<String> = sorted_orders
                 .iter()
                 .take(to_cancel_count)
                 .map(|(id, _)| id.clone())
                 .collect();
-            
             RiskActions {
                 should_close_position: false,
                 should_cancel_all_orders: false,
@@ -236,8 +197,6 @@ pub fn determine_risk_actions(
         }
     }
 }
-
-/// Actions to take based on risk level
 #[derive(Debug, Clone)]
 pub struct RiskActions {
     pub should_close_position: bool,
@@ -245,4 +204,3 @@ pub struct RiskActions {
     pub orders_to_cancel: Vec<String>,
     pub should_block_new_orders: bool,
 }
-
