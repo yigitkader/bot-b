@@ -1,13 +1,8 @@
-// Domain types for the trading bot
-// All types and enums are centralized here for single source of truth
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-// ============================================================================
-// Core Domain Types
-// ============================================================================
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Px(pub Decimal);
@@ -40,11 +35,11 @@ impl OrderBook {
         Self {
             best_bid: Some(BookLevel {
                 px: bid,
-                qty: Qty(Decimal::ONE), // Default quantity
+                qty: Qty(Decimal::ONE),
             }),
             best_ask: Some(BookLevel {
                 px: ask,
-                qty: Qty(Decimal::ONE), // Default quantity
+                qty: Qty(Decimal::ONE),
             }),
             top_bids: None,
             top_asks: None,
@@ -98,6 +93,18 @@ impl PositionDirection {
             PositionDirection::Short
         }
     }
+
+    /// Extract direction and absolute quantity from a signed quantity
+    /// Returns (direction, absolute_qty)
+    pub fn direction_and_abs_qty(qty: Qty) -> (Self, Qty) {
+        let direction = Self::from_qty_sign(qty.0);
+        let qty_abs = if qty.0.is_sign_negative() {
+            Qty(-qty.0)
+        } else {
+            qty
+        };
+        (direction, qty_abs)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -107,9 +114,6 @@ pub enum Tif {
     PostOnly,
 }
 
-// ============================================================================
-// Connection Module Types
-// ============================================================================
 
 /// Order command for ORDERING module
 #[derive(Debug, Clone)]
@@ -185,23 +189,21 @@ pub enum UserEvent {
         symbol: String,
         order_id: String,
         side: Side,
-        qty: Qty,                   // Last executed qty (incremental, this fill only)
-        cumulative_filled_qty: Qty, // Cumulative filled qty (total filled so far)
-        order_qty: Option<Qty>,    // Original order quantity (from "q" field, may be missing)
+        qty: Qty,
+        cumulative_filled_qty: Qty,
+        order_qty: Option<Qty>,
         price: Px,
-        is_maker: bool,       // true = maker, false = taker
-        order_status: String, // Order status: NEW, PARTIALLY_FILLED, FILLED, CANCELED, etc.
-        commission: Decimal,  // Real commission from executionReport "n" field
+        is_maker: bool,
+        order_status: String,
+        commission: Decimal,
     },
     OrderCanceled {
         symbol: String,
         order_id: String,
-        client_order_id: Option<String>, // For idempotency
+        client_order_id: Option<String>,
     },
     AccountUpdate {
-        // Position updates
         positions: Vec<AccountPosition>,
-        // Balance updates
         balances: Vec<AccountBalance>,
     },
     Heartbeat,
@@ -234,9 +236,6 @@ pub struct PriceUpdate {
     pub ask_qty: Qty,
 }
 
-// ============================================================================
-// Event Bus Types
-// ============================================================================
 
 /// Market tick event - published by CONNECTION
 #[derive(Clone, Debug, Serialize)]
@@ -247,7 +246,7 @@ pub struct MarketTick {
     pub mark_price: Option<Px>,
     pub volume: Option<Decimal>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 /// Trade signal event - published by TRENDING
@@ -264,17 +263,9 @@ pub struct TradeSignal {
     pub spread_bps: f64,
     /// Timestamp when spread was measured (for staleness check)
     #[serde(skip)]
-    pub spread_timestamp: Instant, // Not serialized, only for runtime use
+    pub spread_timestamp: Instant,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
-    // NOTE: leverage and size are NOT part of TradeSignal
-    // These are calculated by ORDERING module based on:
-    // - Available balance
-    // - Margin strategy (fixed/balance_based/dynamic)
-    // - Symbol's max leverage
-    // - Risk limits (min/max margin, max position notional)
-    // TRENDING's responsibility: Only generate signals (long/short) with entry price
-    // ORDERING's responsibility: Calculate leverage, margin, notional, and position size
+    pub timestamp: Instant,
 }
 
 /// Close request event - published by FOLLOW_ORDERS
@@ -288,14 +279,14 @@ pub struct CloseRequest {
     pub current_bid: Option<Px>,
     pub current_ask: Option<Px>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CloseReason {
     TakeProfit,
     StopLoss,
-    Manual, // Manual close request
+    Manual,
 }
 
 /// Order update event - published by CONNECTION
@@ -321,7 +312,7 @@ pub struct OrderUpdate {
     /// True if all fills were maker orders, None if unknown
     pub is_maker: Option<bool>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,13 +333,13 @@ pub struct PositionUpdate {
     pub qty: Qty,
     pub entry_price: Px,
     pub leverage: u32,
-    pub unrealized_pnl: Option<Decimal>, // Optional unrealized PnL
-    pub is_open: bool, // true if position is open, false if closed
+    pub unrealized_pnl: Option<Decimal>,
+    pub is_open: bool,
     /// Liquidation price for this position (from exchange)
     /// None if not available (e.g., ACCOUNT_UPDATE doesn't include it, or position not yet opened)
     pub liq_px: Option<Px>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 /// Balance update event - published by BALANCE
@@ -357,7 +348,7 @@ pub struct BalanceUpdate {
     pub usdt: Decimal,
     pub usdc: Decimal,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 /// Ordering state update event - published by ORDERING
@@ -366,16 +357,16 @@ pub struct OrderingStateUpdate {
     pub open_position: Option<OpenPositionSnapshot>,
     pub open_order: Option<OpenOrderSnapshot>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 /// Snapshot of open position for persistence
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenPositionSnapshot {
     pub symbol: String,
-    pub direction: String, // "Long" or "Short"
-    pub qty: String, // Decimal as string
-    pub entry_price: String, // Decimal as string
+    pub direction: String,
+    pub qty: String,
+    pub entry_price: String,
 }
 
 /// Snapshot of open order for persistence
@@ -383,8 +374,8 @@ pub struct OpenPositionSnapshot {
 pub struct OpenOrderSnapshot {
     pub symbol: String,
     pub order_id: String,
-    pub side: String, // "Buy" or "Sell"
-    pub qty: String, // Decimal as string
+    pub side: String,
+    pub qty: String,
 }
 
 /// Order fill history update event - published by CONNECTION
@@ -393,22 +384,22 @@ pub struct OrderFillHistoryUpdate {
     pub order_id: String,
     pub symbol: String,
     pub action: FillHistoryAction,
-    pub data: Option<FillHistoryData>, // None for Remove action
+    pub data: Option<FillHistoryData>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub enum FillHistoryAction {
-    Save,   // Save or update fill history
-    Remove, // Remove fill history (order closed)
+    Save,
+    Remove,
 }
 
 /// Fill history data for persistence
 #[derive(Clone, Debug, Serialize)]
 pub struct FillHistoryData {
-    pub total_filled_qty: String, // Decimal as string
-    pub weighted_price_sum: String, // Decimal as string
+    pub total_filled_qty: String,
+    pub weighted_price_sum: String,
     pub maker_fill_count: u32,
     pub total_fill_count: u32,
 }
@@ -421,7 +412,7 @@ pub struct LogEvent {
     pub message: String,
     pub payload: Option<serde_json::Value>,
     #[serde(skip)]
-    pub timestamp: Instant, // Not serialized, only for runtime use
+    pub timestamp: Instant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -432,9 +423,6 @@ pub enum LogLevel {
     Error,
 }
 
-// ============================================================================
-// State Types
-// ============================================================================
 
 /// Global state for ORDERING module
 #[derive(Clone, Debug)]
@@ -508,15 +496,14 @@ impl CircuitBreakerState {
             return false;
         }
         
-        // Check if cooldown period has passed (1 minute - HFT optimized)
         if let Some(last_trigger) = self.last_trigger_time {
             let elapsed = Instant::now().duration_since(last_trigger);
-            if elapsed > Duration::from_secs(60) { // 1 minute cooldown (HFT optimized, was 5 minutes)
-                return false; // Cooldown passed, allow orders again
+            if elapsed > Duration::from_secs(60) {
+                return false;
             }
         }
         
-        true // Circuit breaker is open and cooldown not passed
+        true
     }
     
     /// Record an order rejection and check if circuit breaker should open
@@ -525,12 +512,11 @@ impl CircuitBreakerState {
     pub fn record_rejection(&mut self, reason: Option<&str>) -> bool {
         self.reject_count += 1;
         
-        // Track rejection reason
         if let Some(reason_str) = reason {
             *self.rejection_reasons.entry(reason_str.to_string()).or_insert(0) += 1;
         }
         
-        const REJECT_THRESHOLD: u32 = 5; // Open circuit after 5 consecutive rejections
+        const REJECT_THRESHOLD: u32 = 5;
         
         if self.reject_count >= REJECT_THRESHOLD {
             self.is_open = true;
@@ -552,7 +538,7 @@ impl CircuitBreakerState {
     pub fn reset_if_cooldown_passed(&mut self) {
         if let Some(last_trigger) = self.last_trigger_time {
             let elapsed = Instant::now().duration_since(last_trigger);
-            if elapsed > Duration::from_secs(60) { // 1 minute cooldown (HFT optimized, was 5 minutes)
+            if elapsed > Duration::from_secs(60) {
                 self.reset();
             }
         }
@@ -656,9 +642,6 @@ impl Default for BalanceStore {
     }
 }
 
-// ============================================================================
-// Connection Module Types
-// ============================================================================
 
 /// Binance futures filter type
 #[derive(Deserialize)]
@@ -702,17 +685,14 @@ pub struct FutExchangeSymbol {
 #[derive(Clone, Debug)]
 pub struct OrderFillHistory {
     pub total_filled_qty: Qty,
-    pub weighted_price_sum: Decimal, // Sum of (price * qty) for all fills
-    pub last_update: Instant,        // Timestamp of last update (for cleanup)
+    pub weighted_price_sum: Decimal,
+    pub last_update: Instant,
     /// Number of fills that were maker orders (for commission calculation)
     pub maker_fill_count: u32,
     /// Total number of fills for this order
     pub total_fill_count: u32,
 }
 
-// ============================================================================
-// Dynamic Symbol Selection Types
-// ============================================================================
 
 /// 24-hour statistics for a symbol (from Binance API)
 #[derive(Clone, Debug)]
@@ -736,9 +716,6 @@ pub struct ScoredSymbol {
     pub trades: u64,
 }
 
-// ============================================================================
-// Trending Module Types
-// ============================================================================
 
 /// Price point for trend analysis
 #[derive(Clone, Debug)]
@@ -777,8 +754,8 @@ pub struct SymbolState {
 /// Trend signal direction
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrendSignal {
-    Long,   // Uptrend - buy signal
-    Short,  // Downtrend - sell signal
+    Long,
+    Short,
 }
 
 /// Last signal information for cooldown and direction checking
@@ -788,9 +765,6 @@ pub struct LastSignal {
     pub timestamp: Instant,
 }
 
-// ============================================================================
-// Follow Orders Module Types
-// ============================================================================
 
 /// Position information for TP/SL tracking
 #[derive(Clone, Debug)]
@@ -817,9 +791,6 @@ pub struct PositionInfo {
     pub trailing_stop_placed: bool,
 }
 
-// ============================================================================
-// Storage Module Types
-// ============================================================================
 
 /// OrderFillHistory structure for storage (matches connection.rs)
 #[derive(Clone, Debug)]

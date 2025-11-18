@@ -1,5 +1,3 @@
-// Library crate for integration tests
-// Re-exports all modules for testing
 
 pub mod config;
 pub mod types;

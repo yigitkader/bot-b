@@ -1,6 +1,3 @@
-// AI_ANALYZER: Intelligent log analysis and error detection module
-// Analyzes logs in real-time to detect patterns, anomalies, and potential issues
-// Uses pattern matching and heuristics to identify problems before they cause failures
 
 use crate::event_bus::EventBus;
 use crate::types::*;
@@ -18,9 +15,6 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-// ============================================================================
-// Error Patterns and Anomaly Detection
-// ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AnomalyType {
@@ -83,44 +77,33 @@ pub struct AnomalyReport {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub enum Severity {
-    Low,      // Informational - monitor
-    Medium,   // Warning - investigate
-    High,     // Critical - immediate action needed
+    Low,
+    Medium,
+    High,
 }
 
-// ============================================================================
-// AI Analyzer - Pattern Detection and Analysis
-// ============================================================================
 
 pub struct AiAnalyzer {
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
     
-    // Trade statistics per symbol
     trade_stats: Arc<Mutex<HashMap<String, TradeStats>>>,
     
-    // Order statistics per symbol
     order_stats: Arc<Mutex<HashMap<String, OrderStats>>>,
     
-    // Anomaly history (for pattern detection)
     pub(crate) anomaly_history: Arc<Mutex<VecDeque<AnomalyReport>>>,
     
-    // Performance metrics
     total_signals: Arc<AtomicU64>,
     total_trades: Arc<AtomicU64>,
     total_wins: Arc<AtomicU64>,
     total_losses: Arc<AtomicU64>,
     
-    // Analysis report file
     report_file_path: PathBuf,
     
-    // Detailed operation tracking
     pub(crate) operation_log: Arc<Mutex<VecDeque<OperationLog>>>,
     
-    // Error tracking
     pub(crate) error_log: Arc<Mutex<VecDeque<ErrorLog>>>,
     
-    // Log file tracking (for incremental reading)
     console_log_path: PathBuf,
     last_console_log_position: Arc<Mutex<u64>>,
     trading_events_path: PathBuf,
@@ -129,7 +112,7 @@ pub struct AiAnalyzer {
 #[derive(Debug, Clone, Serialize)]
 struct OperationLog {
     timestamp: u64,
-    operation_type: String, // "signal", "order", "trade", "position", "balance"
+    operation_type: String,
     symbol: Option<String>,
     details: String,
     success: bool,
@@ -153,7 +136,7 @@ pub struct TradeStats {
     pub winning_trades: u64,
     pub losing_trades: u64,
     pub total_pnl: f64,
-    pub recent_pnl: VecDeque<f64>, // Last 10 trades PnL
+    pub recent_pnl: VecDeque<f64>,
     pub last_trade_time: Option<Instant>,
 }
 
@@ -164,13 +147,12 @@ pub struct OrderStats {
     pub filled_orders: u64,
     pub canceled_orders: u64,
     pub rejected_orders: u64,
-    pub recent_spreads: VecDeque<f64>, // Last 20 spreads
+    pub recent_spreads: VecDeque<f64>,
     pub last_order_time: Option<Instant>,
 }
 
 impl AiAnalyzer {
     pub fn new(event_bus: Arc<EventBus>, shutdown_flag: Arc<AtomicBool>) -> Self {
-        // Create logs directory if it doesn't exist
         std::fs::create_dir_all("logs").ok();
         
         let report_file_path = PathBuf::from("logs/ai_analysis_report.json");
@@ -201,16 +183,13 @@ impl AiAnalyzer {
         info!("AI_ANALYZER: Starting intelligent log analysis service");
         info!("AI_ANALYZER: Analysis reports will be written to: {}", self.report_file_path.display());
         
-        // Subscribe to all relevant events
         self.analyze_trade_signals().await?;
         self.analyze_order_updates().await?;
         self.analyze_position_updates().await?;
         self.analyze_balance_updates().await?;
         
-        // Analyze log files periodically
         self.analyze_log_files().await?;
         
-        // Periodic analysis and report generation
         self.periodic_analysis().await?;
         
         Ok(())
@@ -249,7 +228,6 @@ impl AiAnalyzer {
                         
                         total_signals.fetch_add(1, AtomicOrdering::Relaxed);
                         
-                        // Log operation
                         let mut op_log = operation_log.lock().await;
                         op_log.push_back(OperationLog {
                             timestamp: Self::timestamp_ms(),
@@ -263,8 +241,6 @@ impl AiAnalyzer {
                             op_log.pop_front();
                         }
                         
-                        // Analyze signal patterns
-                        // Track signal frequency, symbol distribution, etc.
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         warn!("AI_ANALYZER: TradeSignal receiver lagged, {} events missed", missed);
@@ -314,7 +290,6 @@ impl AiAnalyzer {
                         stat.total_orders += 1;
                         stat.last_order_time = Some(Instant::now());
                         
-                        // Log operation
                         let mut op_log = operation_log.lock().await;
                         let success = matches!(update.status, crate::event_bus::OrderStatus::Filled);
                         op_log.push_back(OperationLog {
@@ -339,7 +314,6 @@ impl AiAnalyzer {
                             crate::event_bus::OrderStatus::Rejected => {
                                 stat.rejected_orders += 1;
                                 
-                                // Log error
                                 let mut err_log = error_log.lock().await;
                                 let mut context = HashMap::new();
                                 context.insert("order_id".to_string(), update.order_id.clone());
@@ -360,7 +334,6 @@ impl AiAnalyzer {
                             _ => {}
                         }
                         
-                        // Detect anomalies
                         let mut history = anomaly_history.lock().await;
                         Self::detect_order_anomalies(&stat, &mut *history);
                     }
@@ -398,7 +371,6 @@ impl AiAnalyzer {
                             break;
                         }
                         
-                        // Track PnL changes
                         let pnl = update.unrealized_pnl
                             .map(|pnl| pnl.to_f64().unwrap_or(0.0))
                             .unwrap_or(0.0);
@@ -415,7 +387,6 @@ impl AiAnalyzer {
                                 last_trade_time: None,
                             });
                         
-                        // Detect position closed (PnL realized)
                         if !update.is_open && stat.last_trade_time.is_some() {
                             stat.total_trades += 1;
                             total_trades.fetch_add(1, AtomicOrdering::Relaxed);
@@ -434,7 +405,6 @@ impl AiAnalyzer {
                                 stat.recent_pnl.pop_front();
                             }
                             
-                            // Detect anomalies
                             let mut history = anomaly_history.lock().await;
                             Self::detect_trade_anomalies(&stat, &mut *history);
                         }
@@ -463,7 +433,7 @@ impl AiAnalyzer {
         
         tokio::spawn(async move {
             let mut balance_update_rx = event_bus.subscribe_balance_update();
-            let mut last_balance: Option<(f64, f64)> = None; // (usdt, usdc)
+            let mut last_balance: Option<(f64, f64)> = None;
             
             loop {
                 match balance_update_rx.recv().await {
@@ -477,12 +447,10 @@ impl AiAnalyzer {
                             update.usdc.to_f64().unwrap_or(0.0),
                         );
                         
-                        // Detect sudden balance changes (potential accounting error)
                         if let Some((prev_usdt, prev_usdc)) = last_balance {
                             let usdt_change = (current_balance.0 - prev_usdt).abs();
                             let usdc_change = (current_balance.1 - prev_usdc).abs();
                             
-                            // Large unexpected balance change (threshold: 10% or $100)
                             if usdt_change > 100.0 || usdt_change > prev_usdt * 0.1 {
                                 let mut history = anomaly_history.lock().await;
                                 let report = AnomalyReport {
@@ -532,7 +500,6 @@ impl AiAnalyzer {
         stat: &OrderStats,
         anomaly_history: &mut VecDeque<AnomalyReport>,
     ) {
-        // High rejection rate (> 20%)
         if stat.total_orders > 10 {
             let rejection_rate = (stat.rejected_orders as f64) / (stat.total_orders as f64) * 100.0;
             if rejection_rate > 20.0 {
@@ -562,7 +529,6 @@ impl AiAnalyzer {
             }
         }
         
-        // High cancellation rate (> 30%)
         if stat.total_orders > 10 {
             let cancel_rate = (stat.canceled_orders as f64) / (stat.total_orders as f64) * 100.0;
             if cancel_rate > 30.0 {
@@ -598,7 +564,6 @@ impl AiAnalyzer {
         stat: &TradeStats,
         anomaly_history: &mut VecDeque<AnomalyReport>,
     ) {
-        // Low win rate (< 40% with > 10 trades)
         if stat.total_trades > 10 {
             let win_rate = (stat.winning_trades as f64) / (stat.total_trades as f64) * 100.0;
             if win_rate < 40.0 {
@@ -628,11 +593,9 @@ impl AiAnalyzer {
             }
         }
         
-        // Unusual PnL pattern (sudden large loss)
         if stat.recent_pnl.len() >= 3 {
             let recent_avg = stat.recent_pnl.iter().sum::<f64>() / stat.recent_pnl.len() as f64;
             if let Some(&last_pnl) = stat.recent_pnl.back() {
-                // Sudden large loss (> 2x average loss)
                 if last_pnl < -50.0 && recent_avg < -20.0 {
                     let report = AnomalyReport {
                         timestamp: std::time::SystemTime::now()
@@ -672,13 +635,12 @@ impl AiAnalyzer {
         
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await; // Check every minute
+                tokio::time::sleep(Duration::from_secs(60)).await;
                 
                 if shutdown_flag.load(AtomicOrdering::Relaxed) {
                     break;
                 }
                 
-                // Analyze console.log for errors and warnings (incremental reading)
                 if let Ok(new_content) = Self::read_log_incremental(&console_log_path, &last_position).await {
                     if !new_content.is_empty() {
                         let mut err_log = error_log.lock().await;
@@ -686,7 +648,6 @@ impl AiAnalyzer {
                     }
                 }
                 
-                // Analyze trading_events.json for patterns
                 if let Ok(content) = std::fs::read_to_string(&trading_events_path) {
                     Self::analyze_trading_events(&content, &error_log).await;
                 }
@@ -708,20 +669,16 @@ impl AiAnalyzer {
         
         let mut last_pos = last_position.lock().await;
         
-        // If file was truncated or doesn't exist, reset position
         if *last_pos > current_size {
             *last_pos = 0;
         }
         
-        // Seek to last position
         file.seek(SeekFrom::Start(*last_pos))?;
         
-        // Read new content
         use std::io::Read;
         let mut buffer = String::new();
         file.read_to_string(&mut buffer)?;
         
-        // Update position
         *last_pos = current_size;
         
         Ok(buffer)
@@ -737,13 +694,10 @@ impl AiAnalyzer {
         let mut recent_warnings = Vec::new();
         
         for line in lines.iter() {
-            // Parse structured log format: timestamp LEVEL module: message
-            // Check for ERROR level (case-sensitive, as per tracing format)
             if line.contains(" ERROR ") || line.contains("\tERROR\t") {
                 error_count += 1;
                 recent_errors.push(line.to_string());
                 
-                // Extract module and message for better error tracking
                 let (module, message) = Self::parse_log_line(line);
                 let mut context = HashMap::new();
                 context.insert("log_line".to_string(), line.to_string());
@@ -757,14 +711,12 @@ impl AiAnalyzer {
                     context,
                 });
             } 
-            // Check for WARN level
             else if line.contains(" WARN ") || line.contains("\tWARN\t") {
                 warn_count += 1;
                 recent_warnings.push(line.to_string());
             }
         }
         
-        // Detect high error/warning rates
         if error_count > 10 {
             let mut context = HashMap::new();
             context.insert("error_count".to_string(), error_count.to_string());
@@ -783,7 +735,6 @@ impl AiAnalyzer {
             });
         }
         
-        // Detect high warning rate (potential issues)
         if warn_count > 50 && error_count == 0 {
             let mut context = HashMap::new();
             context.insert("warn_count".to_string(), warn_count.to_string());
@@ -807,12 +758,9 @@ impl AiAnalyzer {
     
     /// Parse log line to extract module and message
     fn parse_log_line(line: &str) -> (String, String) {
-        // Format: "timestamp LEVEL module::submodule: message"
-        // Example: "2025-11-16T19:16:27.104027Z  WARN app::trending: TRENDING: MarketTick channel lagged"
         
         let parts: Vec<&str> = line.splitn(4, ' ').collect();
         if parts.len() >= 4 {
-            // parts[0] = timestamp, parts[1] = level, parts[2] = module, parts[3] = message
             let module = parts[2].trim_end_matches(':').to_string();
             let message = parts[3..].join(" ");
             (module, message)
@@ -823,7 +771,6 @@ impl AiAnalyzer {
     
     /// Extract symbol from log line if present
     fn extract_symbol_from_log(line: &str) -> Option<String> {
-        // Look for patterns like "symbol=BTCUSDC" or "symbol: BTCUSDC"
         if let Some(symbol_start) = line.find("symbol=") {
             let after_eq = &line[symbol_start + 7..];
             if let Some(end) = after_eq.find(|c: char| c == ' ' || c == '\t' || c == '\n') {
@@ -849,15 +796,13 @@ impl AiAnalyzer {
         let mut recent_pnl_values = Vec::new();
         let mut symbol_trade_counts: HashMap<String, u64> = HashMap::new();
         
-        // Parse JSON lines (one event per line)
-        for line in lines.iter().rev().take(1000) { // Last 1000 events
+        for line in lines.iter().rev().take(1000) {
             if line.trim().is_empty() {
                 continue;
             }
             
             match serde_json::from_str::<Value>(line) {
                 Ok(event) => {
-                    // Check event type
                     if let Some(event_type) = event.get("event_type").and_then(|v| v.as_str()) {
                         match event_type {
                             "order_filled" => {
@@ -880,18 +825,15 @@ impl AiAnalyzer {
                     }
                 }
                 Err(_) => {
-                    // Skip invalid JSON lines
                     continue;
                 }
             }
         }
         
-        // Detect patterns
         let total_events = order_fills + order_cancels + position_updates;
         if total_events > 0 {
             let cancel_rate = (order_cancels as f64) / (order_fills + order_cancels) as f64 * 100.0;
             
-            // High cancellation rate
             if cancel_rate > 50.0 && order_cancels > 10 {
                 let mut context = HashMap::new();
                 context.insert("order_fills".to_string(), order_fills.to_string());
@@ -914,7 +856,6 @@ impl AiAnalyzer {
                 }
             }
             
-            // Large unrealized losses
             if recent_pnl_values.len() > 5 {
                 let avg_pnl = recent_pnl_values.iter().sum::<f64>() / recent_pnl_values.len() as f64;
                 let min_pnl = recent_pnl_values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
@@ -958,13 +899,12 @@ impl AiAnalyzer {
         
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(300)).await; // 5 minutes
+                tokio::time::sleep(Duration::from_secs(300)).await;
                 
                 if shutdown_flag.load(AtomicOrdering::Relaxed) {
                     break;
                 }
                 
-                // Generate summary report
                 let signals = total_signals.load(AtomicOrdering::Relaxed);
                 let trades = total_trades.load(AtomicOrdering::Relaxed);
                 let wins = total_wins.load(AtomicOrdering::Relaxed);
@@ -981,12 +921,10 @@ impl AiAnalyzer {
                     signals, trades, win_rate, wins, losses
                 );
                 
-                // ✅ Use public API methods to get statistics
                 let trade_stats_data = ai_analyzer.get_trade_stats().await;
                 let order_stats_data = ai_analyzer.get_order_stats().await;
                 let recent_anomalies = ai_analyzer.get_recent_anomalies(20).await;
                 
-                // Get internal data for report generation
                 let anomaly_history_guard = ai_analyzer.anomaly_history.lock().await;
                 let operation_log_guard = operation_log.lock().await;
                 let error_log_guard = error_log.lock().await;
@@ -1008,7 +946,6 @@ impl AiAnalyzer {
                 drop(operation_log_guard);
                 drop(error_log_guard);
                 
-                // Log recent anomalies if any
                 if !recent_anomalies.is_empty() {
                     let high_severity_count = recent_anomalies.iter()
                         .filter(|a| matches!(a.severity, Severity::High))
@@ -1025,7 +962,6 @@ impl AiAnalyzer {
                     }
                 }
                 
-                // Analyze per-symbol statistics using public API
                 for (symbol, stat) in trade_stats_data.iter() {
                     if stat.total_trades > 5 {
                         let symbol_win_rate = if stat.total_trades > 0 {
@@ -1103,7 +1039,6 @@ impl AiAnalyzer {
             error_rate: f64,
         }
         
-        // Calculate summary
         let total_orders: u64 = order_stats.values().map(|s| s.total_orders).sum();
         let win_rate = if total_trades > 0 {
             (total_wins as f64) / (total_trades as f64) * 100.0
@@ -1122,7 +1057,6 @@ impl AiAnalyzer {
             total_errors: errors.len(),
         };
         
-        // Per-symbol stats
         let mut per_symbol_stats = Vec::new();
         for (symbol, trade_stat) in trade_stats.iter() {
             let order_stat = order_stats.get(symbol).cloned().unwrap_or_else(|| OrderStats {
@@ -1166,7 +1100,6 @@ impl AiAnalyzer {
             });
         }
         
-        // Operation analysis
         let total_ops = operations.len();
         let successful_ops = operations.iter().filter(|op| op.success).count();
         let success_rate = if total_ops > 0 {
@@ -1193,7 +1126,6 @@ impl AiAnalyzer {
             error_rate,
         };
         
-        // Generate recommendations
         let mut recommendations = Vec::new();
         
         if win_rate < 40.0 && total_trades > 10 {
@@ -1233,10 +1165,8 @@ impl AiAnalyzer {
             ));
         }
         
-        // Recent errors (last 20)
         let recent_errors: Vec<ErrorLog> = errors.iter().rev().take(20).cloned().collect();
         
-        // Recent anomalies (last 20)
         let recent_anomalies: Vec<AnomalyReport> = anomalies.iter().rev().take(20).cloned().collect();
         
         let report = AnalysisReport {
@@ -1249,7 +1179,6 @@ impl AiAnalyzer {
             recommendations,
         };
         
-        // Write report to file
         if let Ok(json) = serde_json::to_string_pretty(&report) {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)

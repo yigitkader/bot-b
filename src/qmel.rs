@@ -1,6 +1,3 @@
-// Q-MEL: Micro-Edge Trading Algorithm
-// Market microstructure + statistical edge + dynamic risk/margin + execution science
-// Based on reference project with adaptations for our event-driven architecture
 
 use crate::types::OrderBook;
 use rust_decimal::prelude::ToPrimitive;
@@ -8,22 +5,19 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-// ============================================================================
-// Feature Extraction (State Vector)
-// ============================================================================
 
 /// Market state vector (9 dimensions for Q-MEL)
 #[derive(Clone, Debug)]
 pub struct MarketState {
-    pub ofi: f64,                    // Order Flow Imbalance
-    pub microprice: f64,             // Microprice
-    pub spread_velocity: f64,        // Spread velocity (d(spread)/dt)
-    pub liquidity_pressure: f64,     // LP = D_ask / D_bid (weighted by levels)
-    pub volatility_1s: f64,          // Short-term volatility (1s EWMA)
-    pub volatility_5s: f64,           // Medium-term volatility (5s EWMA)
-    pub cancel_trade_ratio: f64,     // Cancel/Trade ratio (spoof detection)
-    pub oi_delta_30s: f64,           // Open Interest delta (30s window)
-    pub funding_rate: Option<f64>,    // Current funding rate
+    pub ofi: f64,
+    pub microprice: f64,
+    pub spread_velocity: f64,
+    pub liquidity_pressure: f64,
+    pub volatility_1s: f64,
+    pub volatility_5s: f64,
+    pub cancel_trade_ratio: f64,
+    pub oi_delta_30s: f64,
+    pub funding_rate: Option<f64>,
     pub timestamp: Instant,
 }
 
@@ -46,26 +40,21 @@ impl Default for MarketState {
 
 /// Feature extractor for Q-MEL algorithm
 pub struct FeatureExtractor {
-    // Volatility tracking (EWMA)
     vol_1s_ewma: f64,
     vol_5s_ewma: f64,
     last_price: Option<f64>,
     last_spread: Option<f64>,
     last_spread_time: Option<Instant>,
     
-    // Price history for volatility
     price_history_1s: VecDeque<(f64, Instant)>,
     price_history_5s: VecDeque<(f64, Instant)>,
     
-    // Cancel/Trade tracking
     cancel_count: u64,
     trade_count: u64,
     last_reset_time: Instant,
     
-    // OI tracking (if available)
     oi_history: VecDeque<(f64, Instant)>,
     
-    // Previous order book for OFI calculation
     prev_orderbook: Option<OrderBook>,
 }
 
@@ -96,7 +85,6 @@ impl FeatureExtractor {
     ) -> f64 {
         let epsilon = 1e-8;
         
-        // Get current bid/ask volumes
         let (v_bid, v_ask) = self.get_weighted_volumes(ob);
         
         if let Some(prev) = prev_ob {
@@ -110,7 +98,6 @@ impl FeatureExtractor {
             }
             (delta_v_bid - delta_v_ask) / denominator
         } else {
-            // First observation - use current imbalance
             let total = v_bid + v_ask + epsilon;
             if total.abs() < epsilon {
                 return 0.0;
@@ -121,7 +108,6 @@ impl FeatureExtractor {
 
     /// Get weighted volumes from order book (top-K levels)
     fn get_weighted_volumes(&self, ob: &OrderBook) -> (f64, f64) {
-        // Use top-K levels if available, otherwise use best bid/ask
         if let (Some(ref top_bids), Some(ref top_asks)) = (&ob.top_bids, &ob.top_asks) {
             let v_bid: f64 = top_bids.iter()
                 .map(|level| level.qty.0.to_f64().unwrap_or(0.0))
@@ -131,7 +117,6 @@ impl FeatureExtractor {
                 .sum();
             (v_bid, v_ask)
         } else {
-            // Fallback to best bid/ask
             let v_bid = ob.best_bid
                 .as_ref()
                 .map(|level| level.qty.0.to_f64().unwrap_or(0.0))
@@ -171,7 +156,6 @@ impl FeatureExtractor {
         if let (Some(prev_spread), Some(prev_time)) = (self.last_spread, self.last_spread_time) {
             let dt = now.duration_since(prev_time).as_secs_f64();
             if dt > 0.0 && dt < 10.0 {
-                // Avoid division by zero and stale data
                 let velocity = (current_spread - prev_spread) / dt;
                 self.last_spread = Some(current_spread);
                 self.last_spread_time = Some(now);
@@ -202,7 +186,7 @@ impl FeatureExtractor {
     pub fn calculate_liquidity_pressure(&self, ob: &OrderBook) -> f64 {
         let (v_bid, v_ask) = self.get_weighted_volumes(ob);
         if v_bid < 1e-8 {
-            return 10.0; // High pressure if no bid depth
+            return 10.0;
         }
         v_ask / v_bid
     }
@@ -211,11 +195,9 @@ impl FeatureExtractor {
     pub fn update_volatility(&mut self, price: f64) {
         let now = Instant::now();
         
-        // Add to history
         self.price_history_1s.push_back((price, now));
         self.price_history_5s.push_back((price, now));
         
-        // Remove old entries
         while let Some(&(_, t)) = self.price_history_1s.front() {
             if now.duration_since(t) > Duration::from_secs(1) {
                 self.price_history_1s.pop_front();
@@ -232,12 +214,10 @@ impl FeatureExtractor {
             }
         }
         
-        // Calculate returns and volatility
         if let Some(prev_price) = self.last_price {
             if prev_price > 0.0 {
                 let ret = (price / prev_price).ln();
                 
-                // EWMA update (alpha = 0.1 for 1s, 0.05 for 5s)
                 let alpha_1s = 0.1;
                 let alpha_5s = 0.05;
                 
@@ -271,7 +251,6 @@ impl FeatureExtractor {
     pub fn get_cancel_trade_ratio(&mut self) -> f64 {
         let now = Instant::now();
         if now.duration_since(self.last_reset_time) > Duration::from_secs(10) {
-            // Reset counters
             self.cancel_count = 0;
             self.trade_count = 0;
             self.last_reset_time = now;
@@ -290,7 +269,6 @@ impl FeatureExtractor {
         let now = Instant::now();
         self.oi_history.push_back((oi, now));
         
-        // Keep only last 30 seconds
         while let Some(&(_, t)) = self.oi_history.front() {
             if now.duration_since(t) > Duration::from_secs(30) {
                 self.oi_history.pop_front();
@@ -325,12 +303,10 @@ impl FeatureExtractor {
         let cancel_trade_ratio = self.get_cancel_trade_ratio();
         let oi_delta = self.get_oi_delta_30s();
         
-        // Update volatility if we have a price
         if let Some(mp) = self.calculate_microprice(ob) {
             self.update_volatility(mp);
         }
         
-        // Store current orderbook for next OFI calculation
         self.prev_orderbook = Some(ob.clone());
         
         MarketState {
@@ -348,17 +324,14 @@ impl FeatureExtractor {
     }
 }
 
-// ============================================================================
-// Edge Estimation (Alpha Gate) - Simplified Version
-// ============================================================================
 
 /// Expected Value (EV) calculator
 pub struct ExpectedValueCalculator {
     maker_fee_rate: f64,
     taker_fee_rate: f64,
-    ev_threshold: f64, // Minimum EV to trade (e.g., $0.10)
-    base_ev_threshold: f64, // Base threshold (adaptif olarak değişir)
-    recent_ev_performance: VecDeque<f64>, // Son EV tahminlerinin performansı
+    ev_threshold: f64,
+    base_ev_threshold: f64,
+    recent_ev_performance: VecDeque<f64>,
 }
 
 impl ExpectedValueCalculator {
@@ -422,7 +395,7 @@ impl ExpectedValueCalculator {
     ) -> f64 {
         let p_down = 1.0 - p_up;
         let fee_rate = if is_maker { self.maker_fee_rate } else { self.taker_fee_rate };
-        let fees = position_size_usd * fee_rate * 2.0; // Entry + exit
+        let fees = position_size_usd * fee_rate * 2.0;
         
         p_up * target_profit_usd - p_down * stop_loss_usd - fees - estimated_slippage_usd
     }
@@ -439,7 +412,7 @@ impl ExpectedValueCalculator {
     ) -> f64 {
         let p_up = 1.0 - p_down;
         let fee_rate = if is_maker { self.maker_fee_rate } else { self.taker_fee_rate };
-        let fees = position_size_usd * fee_rate * 2.0; // Entry + exit
+        let fees = position_size_usd * fee_rate * 2.0;
         
         p_down * target_profit_usd - p_up * stop_loss_usd - fees - estimated_slippage_usd
     }
@@ -450,17 +423,14 @@ impl ExpectedValueCalculator {
     }
 }
 
-// ============================================================================
-// Adam Optimizer
-// ============================================================================
 
 /// Adam Optimizer: Adaptive Moment Estimation
 /// Her parameter için adaptive learning rate sağlar
 #[derive(Clone, Debug)]
 struct AdamOptimizer {
-    m: Vec<f64>,  // Momentum (first moment estimate)
-    v: Vec<f64>,  // Variance (second moment estimate)
-    t: u64,       // Timestep (bias correction için)
+    m: Vec<f64>,
+    v: Vec<f64>,
+    t: u64,
 }
 
 impl AdamOptimizer {
@@ -474,42 +444,33 @@ impl AdamOptimizer {
     
     /// Adam update: Adaptive learning rate per parameter
     fn update(&mut self, gradients: &[f64], weights: &mut [f64], bias: &mut f64, bias_gradient: f64) {
-        let alpha: f64 = 0.001; // Base learning rate
-        let beta1: f64 = 0.9;   // Momentum decay
-        let beta2: f64 = 0.999; // Variance decay
-        let epsilon: f64 = 1e-8; // Numerical stability
+        let alpha: f64 = 0.001;
+        let beta1: f64 = 0.9;
+        let beta2: f64 = 0.999;
+        let epsilon: f64 = 1e-8;
         
         self.t += 1;
         
-        // Bias correction coefficients
         let beta1_t: f64 = beta1.powi(self.t as i32);
         let beta2_t: f64 = beta2.powi(self.t as i32);
         let m_bias_correction = 1.0 - beta1_t;
         let v_bias_correction = 1.0 - beta2_t;
         
-        // Update weights with Adam
         for i in 0..gradients.len() {
-            // Update momentum and variance
             self.m[i] = beta1 * self.m[i] + (1.0 - beta1) * gradients[i];
             self.v[i] = beta2 * self.v[i] + (1.0 - beta2) * gradients[i].powi(2);
             
-            // Bias-corrected estimates
             let m_hat = self.m[i] / m_bias_correction;
             let v_hat = self.v[i] / v_bias_correction;
             
-            // Update weight: w = w - alpha * m_hat / (sqrt(v_hat) + epsilon)
             weights[i] -= alpha * m_hat / (v_hat.sqrt() + epsilon);
         }
         
-        // Update bias
         let bias_alpha = alpha * 0.1;
         *bias -= bias_alpha * bias_gradient;
     }
 }
 
-// ============================================================================
-// Direction Model (Full ML Implementation)
-// ============================================================================
 
 /// Direction probability model with Adam optimizer
 pub struct DirectionModel {
@@ -535,7 +496,6 @@ impl DirectionModel {
             "funding_rate".to_string(),
         ];
         
-        // Xavier/Glorot initialization
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -609,10 +569,8 @@ impl DirectionModel {
             .map(|(w, x)| w * x)
             .sum::<f64>() + self.bias;
         
-        // Sigmoid
         let p = 1.0 / (1.0 + (-score).exp());
         
-        // Adjust for target tick
         let tick_adjustment = 1.0 / (1.0 + target_tick * 10.0);
         let final_p = (p * tick_adjustment).max(0.0).min(1.0);
         
@@ -646,7 +604,6 @@ impl DirectionModel {
         
         let feature_vec = self.state_to_features(state);
         
-        // Feature normalization (L2 norm)
         let feature_norm: f64 = feature_vec.iter().map(|x| x * x).sum::<f64>().sqrt();
         let normalized_features: Vec<f64> = if feature_norm > 1e-8 {
             feature_vec.iter().map(|x| x / feature_norm).collect()
@@ -664,10 +621,8 @@ impl DirectionModel {
         let error = actual_direction - prediction;
         let clipped_error = error.max(-1.0).min(1.0);
         
-        // L2 regularization
         let l2_reg = 0.0001;
         
-        // Calculate gradients
         let mut gradients: Vec<f64> = Vec::with_capacity(normalized_features.len());
         let mut gradient_magnitudes: Vec<(usize, f64)> = Vec::new();
         
@@ -682,10 +637,8 @@ impl DirectionModel {
         
         let bias_gradient = clipped_error;
         
-        // Adam optimizer ile weight update
         self.adam.update(&gradients, &mut self.weights, &mut self.bias, bias_gradient);
         
-        // Weight validation
         for (idx, w) in self.weights.iter_mut().enumerate() {
             if !w.is_finite() {
                 warn!("Invalid weight after Adam update for feature {}, resetting", idx);
@@ -698,23 +651,19 @@ impl DirectionModel {
             self.bias = 0.0;
         }
         
-        // Feature importance tracking
         for (idx, gradient_magnitude) in gradient_magnitudes {
             self.update_feature_importance(idx, gradient_magnitude);
         }
     }
 }
 
-// ============================================================================
-// Dynamic Margin Allocation (DMA)
-// ============================================================================
 
 /// Dynamic margin allocation with min 10, max 100 USDC rule
 pub struct DynamicMarginAllocator {
     min_margin_usdc: f64,
     max_margin_usdc: f64,
-    f_min: f64,  // Minimum risk fraction (e.g., 0.02 = 2%)
-    f_max: f64,  // Maximum risk fraction (e.g., 0.15 = 15%)
+    f_min: f64,
+    f_max: f64,
 }
 
 impl DynamicMarginAllocator {
@@ -790,14 +739,11 @@ impl DynamicMarginAllocator {
     }
 }
 
-// ============================================================================
-// Auto-Risk Governor (ARG)
-// ============================================================================
 
 /// Auto-Risk Governor for leverage selection
 pub struct AutoRiskGovernor {
-    alpha: f64,  // Safety coefficient [0.3, 0.6]
-    beta: f64,   // Volatility coefficient [0.5, 1.5]
+    alpha: f64,
+    beta: f64,
     max_leverage: f64,
 }
 
@@ -821,21 +767,18 @@ impl AutoRiskGovernor {
         volatility_1s: f64,
         daily_drawdown_pct: f64,
     ) -> f64 {
-        // Liquidation safety constraint
         let leverage_by_stop = if mmr > 0.0 {
             (self.alpha * stop_distance_pct) / mmr
         } else {
             self.max_leverage.min(20.0)
         };
         
-        // Volatility constraint
         let leverage_by_vol = if volatility_1s > 1e-8 {
             (self.beta * target_tick_usd) / volatility_1s
         } else {
             self.max_leverage.min(20.0)
         };
         
-        // Drawdown factor
         let drawdown_factor = if daily_drawdown_pct > 0.0 {
             (1.0 - daily_drawdown_pct * 0.3).max(0.3)
         } else {
@@ -849,9 +792,6 @@ impl AutoRiskGovernor {
     }
 }
 
-// ============================================================================
-// Execution Optimizer (EXO)
-// ============================================================================
 
 /// Execution optimizer for maker/taker decision and slippage estimation
 pub struct ExecutionOptimizer {
@@ -926,9 +866,6 @@ impl ExecutionOptimizer {
     }
 }
 
-// ============================================================================
-// Online Learning (Bandit)
-// ============================================================================
 
 /// Parameter arm for bandit algorithm
 #[derive(Clone, Debug)]
@@ -977,7 +914,6 @@ impl ThompsonSamplingBandit {
     pub fn new(exploration_rate: f64) -> Self {
         let mut arms = Vec::new();
         
-        // Create parameter grid
         for target_tick in [1.0, 2.0] {
             for stop_tick in [1.0, 1.5] {
                 for timeout_secs in [5.0, 8.0, 10.0] {
@@ -1052,15 +988,12 @@ impl ThompsonSamplingBandit {
     }
 }
 
-// ============================================================================
-// Regime Filter
-// ============================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MarketRegime {
-    Normal,  // Spread stable, depth sufficient
-    Frenzy,  // Spread volatile, depth shallow
-    Drift,   // Low volatility
+    Normal,
+    Frenzy,
+    Drift,
 }
 
 pub struct RegimeClassifier {
@@ -1076,24 +1009,21 @@ impl RegimeClassifier {
             volatility_threshold_high: 0.05,
             volatility_threshold_low: 0.01,
             cancel_trade_threshold: 5.0,
-            spread_threshold_wide: 0.001, // 10 bps
+            spread_threshold_wide: 0.001,
         }
     }
 
     pub fn classify(&self, state: &MarketState, spread_bps: f64) -> MarketRegime {
-        // Frenzy: high volatility + high cancel/trade ratio
         if state.volatility_1s > self.volatility_threshold_high 
             && state.cancel_trade_ratio > self.cancel_trade_threshold {
             return MarketRegime::Frenzy;
         }
         
-        // Frenzy: wide spread + shallow depth
         if spread_bps > self.spread_threshold_wide * 10000.0 
             && state.liquidity_pressure > 5.0 {
             return MarketRegime::Frenzy;
         }
         
-        // Drift: low volatility
         if state.volatility_1s < self.volatility_threshold_low 
             && state.volatility_5s < self.volatility_threshold_low {
             return MarketRegime::Drift;
@@ -1104,7 +1034,6 @@ impl RegimeClassifier {
 
     /// Check if trading should be paused
     pub fn should_pause(&self, state: &MarketState) -> bool {
-        // Anomaly detection: extreme cancel/trade ratio or volatility spike
         state.cancel_trade_ratio > self.cancel_trade_threshold * 2.0
             || (state.volatility_1s > state.volatility_5s * 3.0 && state.volatility_1s > 0.1)
     }

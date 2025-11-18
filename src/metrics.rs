@@ -1,5 +1,3 @@
-// METRICS: Strategy performance tracking
-// Tracks win rate, Sharpe ratio, drawdown, and other key metrics
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -76,14 +74,12 @@ impl StrategyMetrics {
         
         self.total_pnl += trade.pnl;
         
-        // Keep last 100 trades for calculations
         self.trades.push_back(trade);
         const MAX_TRADES: usize = 100;
         while self.trades.len() > MAX_TRADES {
             self.trades.pop_front();
         }
         
-        // Recalculate metrics
         self.recalculate();
     }
 
@@ -93,10 +89,8 @@ impl StrategyMetrics {
             return;
         }
 
-        // Win rate
         self.win_rate = self.winning_trades as f64 / self.total_trades as f64;
 
-        // Average win/loss
         let wins: Vec<&TradeResult> = self.trades.iter().filter(|t| t.pnl > Decimal::ZERO).collect();
         let losses: Vec<&TradeResult> = self.trades.iter().filter(|t| t.pnl <= Decimal::ZERO).collect();
 
@@ -110,12 +104,10 @@ impl StrategyMetrics {
             self.avg_loss = total_losses / Decimal::from(losses.len());
         }
 
-        // Profit factor
         if !self.avg_loss.is_zero() {
             self.profit_factor = self.avg_win.to_f64().unwrap_or(0.0) / self.avg_loss.to_f64().unwrap_or(1.0);
         }
 
-        // Max drawdown
         let mut peak = Decimal::ZERO;
         let mut max_dd = Decimal::ZERO;
         let mut cumulative = Decimal::ZERO;
@@ -136,7 +128,6 @@ impl StrategyMetrics {
             self.max_drawdown_pct = (max_dd / peak).to_f64().unwrap_or(0.0) * 100.0;
         }
 
-        // Sharpe ratio (simplified: mean return / std dev)
         if self.trades.len() >= 2 {
             let returns: Vec<f64> = self.trades.iter().map(|t| t.pnl_pct).collect();
             let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
@@ -144,7 +135,6 @@ impl StrategyMetrics {
             let std_dev = variance.sqrt();
             
             if std_dev > 0.0 {
-                // Annualized Sharpe (assuming daily returns, 252 trading days)
                 self.sharpe_ratio = (mean / std_dev) * (252.0_f64).sqrt();
             }
         }

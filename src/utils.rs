@@ -1,10 +1,9 @@
-// Utility functions shared across modules
-// Centralized math and formatting helpers to avoid duplication
 
 use crate::types::Px;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Quantize decimal value to step (floor to nearest step multiple)
 /// Ensures precision is maintained and result is a multiple of step
@@ -147,7 +146,39 @@ pub fn calculate_total_commission(
     entry_commission + exit_commission
 }
 
-/// Calculate PnL percentage for a position
+/// Calculate exponential backoff delay for retry attempts
+/// Formula: base_ms * (multiplier ^ attempt)
+/// 
+/// # Arguments
+/// * `attempt` - Current retry attempt (0-indexed)
+/// * `base_ms` - Base delay in milliseconds
+/// * `multiplier` - Exponential multiplier (typically 2 or 3)
+/// 
+/// # Example
+/// ```
+/// use std::time::Duration;
+/// let delay = crate::utils::exponential_backoff(2, 100, 2);
+/// // Returns: Duration::from_millis(100 * 2^2) = 400ms
+/// ```
+pub fn exponential_backoff(attempt: u32, base_ms: u64, multiplier: u64) -> Duration {
+    Duration::from_millis(base_ms * multiplier.pow(attempt))
+}
+
+pub fn calculate_price_change(
+    entry_price: Decimal,
+    current_price: Decimal,
+    direction: crate::types::PositionDirection,
+) -> Decimal {
+    if entry_price.is_zero() {
+        return Decimal::ZERO;
+    }
+    if direction == crate::types::PositionDirection::Long {
+        (current_price - entry_price) / entry_price
+    } else {
+        (entry_price - current_price) / entry_price
+    }
+}
+
 pub fn calculate_pnl_percentage(
     entry_price: Decimal,
     current_price: Decimal,
@@ -155,16 +186,11 @@ pub fn calculate_pnl_percentage(
     leverage: u32,
 ) -> f64 {
     let leverage_decimal = Decimal::from(leverage);
-    let price_change = if direction == crate::types::PositionDirection::Long {
-        (current_price - entry_price) / entry_price
-    } else {
-        (entry_price - current_price) / entry_price
-    };
+    let price_change = calculate_price_change(entry_price, current_price, direction);
     let pnl_pct = price_change * leverage_decimal * Decimal::from(100);
     pnl_pct.to_f64().unwrap_or(0.0)
 }
 
-/// Calculate net PnL with commission
 pub fn calculate_net_pnl(
     entry_price: Decimal,
     exit_price: Decimal,
@@ -176,15 +202,80 @@ pub fn calculate_net_pnl(
 ) -> Decimal {
     let notional = entry_price * qty;
     let leverage_decimal = Decimal::from(leverage);
-    
-    let price_change = if direction == crate::types::PositionDirection::Long {
-        (exit_price - entry_price) / entry_price
-    } else {
-        (entry_price - exit_price) / entry_price
-    };
-    
+    let price_change = calculate_price_change(entry_price, exit_price, direction);
     let gross_pnl = notional * leverage_decimal * price_change;
     let total_commission = (notional * entry_commission_pct) + (exit_price * qty * exit_commission_pct);
     gross_pnl - total_commission
+}
+
+fn error_to_lowercase(error: &anyhow::Error) -> String {
+    error.to_string().to_lowercase()
+}
+
+pub fn is_position_not_found_error(error: &anyhow::Error) -> bool {
+    let error_lower = error_to_lowercase(error);
+    error_lower.contains("position not found")
+        || error_lower.contains("no position")
+        || error_lower.contains("-2011")
+}
+
+pub fn is_min_notional_error(error: &anyhow::Error) -> bool {
+    let error_lower = error_to_lowercase(error);
+    contains_min_notional(&error_lower)
+}
+
+pub fn contains_min_notional(text: &str) -> bool {
+    let text_lower = text.to_lowercase();
+    text_lower.contains("-1013")
+        || text_lower.contains("min notional")
+        || text_lower.contains("min_notional")
+        || text_lower.contains("below min notional")
+}
+
+pub fn is_position_already_closed_error(error: &anyhow::Error) -> bool {
+    let error_lower = error_to_lowercase(error);
+    error_lower.contains("position not found")
+        || error_lower.contains("no position")
+        || error_lower.contains("position already closed")
+        || error_lower.contains("reduceonly")
+        || error_lower.contains("reduce only")
+        || error_lower.contains("-2011")
+        || error_lower.contains("-2019")
+        || error_lower.contains("-2021")
+}
+
+pub fn is_permanent_error(error: &anyhow::Error) -> bool {
+    let error_lower = error_to_lowercase(error);
+
+    error_lower.contains("invalid")
+        || error_lower.contains("margin")
+        || error_lower.contains("insufficient balance")
+        || error_lower.contains("min notional")
+        || error_lower.contains("below min notional")
+        || error_lower.contains("invalid symbol")
+        || error_lower.contains("symbol not found")
+        || is_position_not_found_error(error)
+        || is_position_already_closed_error(error)
+}
+
+pub fn decimal_to_f64(value: Decimal) -> f64 {
+    value.to_f64().unwrap_or(0.0)
+}
+
+pub fn calculate_percentage(numerator: Decimal, denominator: Decimal) -> Decimal {
+    if denominator.is_zero() {
+        Decimal::ZERO
+    } else {
+        (numerator / denominator) * Decimal::from(100)
+    }
+}
+
+pub fn calculate_dust_threshold(min_notional: Decimal, current_price: Decimal) -> Decimal {
+    if !current_price.is_zero() {
+        min_notional / current_price
+    } else {
+        let assumed_min_price = Decimal::new(1, 2);
+        min_notional / assumed_min_price
+    }
 }
 

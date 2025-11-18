@@ -1,6 +1,3 @@
-// LOGGING: Event logging module
-// Listens to all events from event bus and logs them
-// Includes JsonLogger for structured JSON logging
 
 use crate::event_bus::EventBus;
 use crate::types::*;
@@ -17,9 +14,6 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-// ============================================================================
-// JsonLogger Implementation (from logger.rs)
-// ============================================================================
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event_type")]
@@ -111,14 +105,9 @@ impl JsonLogger {
     }
 
     fn timestamp_ms() -> u64 {
-        // ✅ CRITICAL: Graceful error handling for system time
-        // System clock can be adjusted (NTP sync, manual changes, etc.)
-        // Use fallback value instead of panicking
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| {
-                // System time is before UNIX epoch (should never happen, but handle gracefully)
-                // Use current timestamp as fallback (0 would cause issues)
                 warn!("System time is before UNIX epoch, using fallback timestamp");
                 Duration::from_secs(0)
             })
@@ -221,9 +210,6 @@ pub fn create_logger(
     Ok((Arc::new(logger), task_handle))
 }
 
-// ============================================================================
-// LOGGING Module - Event Bus Listener
-// ============================================================================
 
 /// LOGGING module - logs all events from event bus
 pub struct Logging {
@@ -303,7 +289,6 @@ impl Logging {
         let json_logger = self.json_logger.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         
-        // Spawn task for TradeSignal events
         let event_bus_trade = event_bus.clone();
         let shutdown_flag_trade = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -322,8 +307,6 @@ impl Logging {
                             symbol = %signal.symbol,
                             side = ?signal.side,
                             entry_price = %signal.entry_price.0,
-                            // NOTE: size and leverage are calculated by ORDERING, not provided by TRENDING
-                            // These fields were removed from TradeSignal to maintain clear separation of concerns
                             "LOGGING: TradeSignal received"
                         );
                     }
@@ -333,7 +316,6 @@ impl Logging {
                             "LOGGING: TradeSignal receiver lagged, {} events missed",
                             missed
                         );
-                        // Continue processing - don't break on lag
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("LOGGING: TradeSignal channel closed");
@@ -343,7 +325,6 @@ impl Logging {
             }
         });
         
-        // Spawn task for OrderUpdate events
         let json_logger_order = json_logger.clone();
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
@@ -361,18 +342,14 @@ impl Logging {
                         
                         match update.status {
                             crate::event_bus::OrderStatus::Filled => {
-                                // log_order_filled parameters:
-                                // - qty: filled quantity (cumulative filled qty)
-                                // - new_inventory: remaining quantity (remaining_qty)
-                                // - price: average fill price (weighted average of all fills)
                                 json_logger_order.log_order_filled(
                                     &update.symbol,
                                     &update.order_id,
                                     update.side,
-                                    update.average_fill_price, // Average fill price (weighted average)
-                                    update.filled_qty, // Cumulative filled qty
+                                    update.average_fill_price,
+                                    update.filled_qty,
                                     false,
-                                    update.remaining_qty, // Remaining qty (not order_qty)
+                                    update.remaining_qty,
                                     1.0,
                                 );
                             }
@@ -416,7 +393,6 @@ impl Logging {
                             "LOGGING: OrderUpdate receiver lagged, {} events missed (log gap possible)",
                             missed
                         );
-                        // Continue processing - don't break on lag
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("LOGGING: OrderUpdate channel closed");
@@ -426,7 +402,6 @@ impl Logging {
             }
         });
         
-        // Spawn task for PositionUpdate events
         let json_logger_pos = json_logger.clone();
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
@@ -470,7 +445,6 @@ impl Logging {
                             "LOGGING: PositionUpdate receiver lagged, {} events missed (log gap possible)",
                             missed
                         );
-                        // Continue processing - don't break on lag
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("LOGGING: PositionUpdate channel closed");
@@ -480,7 +454,6 @@ impl Logging {
             }
         });
         
-        // Spawn task for CloseRequest events
         let event_bus_close = event_bus.clone();
         let shutdown_flag_close = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -507,7 +480,6 @@ impl Logging {
                             "LOGGING: CloseRequest receiver lagged, {} events missed",
                             missed
                         );
-                        // Continue processing - don't break on lag
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("LOGGING: CloseRequest channel closed");
@@ -517,7 +489,6 @@ impl Logging {
             }
         });
         
-        // Spawn task for BalanceUpdate events
         let event_bus_balance = event_bus.clone();
         let shutdown_flag_balance = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -544,7 +515,6 @@ impl Logging {
                             "LOGGING: BalanceUpdate receiver lagged, {} events missed",
                             missed
                         );
-                        // Continue processing - don't break on lag
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("LOGGING: BalanceUpdate channel closed");
@@ -554,9 +524,6 @@ impl Logging {
             }
         });
         
-        // Spawn task for MarketTick events
-        // NOTE: MarketTick events are very frequent (hundreds per second per symbol)
-        // We use per-symbol counters and higher threshold to reduce log pollution
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
         tokio::spawn(async move {
@@ -565,10 +532,9 @@ impl Logging {
             use tokio::sync::RwLock;
             let tick_counts: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
             let last_seen: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
-            const LOG_INTERVAL: u64 = 1000; // Log every 1000 ticks per symbol (much less frequent)
-            const CLEANUP_INTERVAL_SECS: u64 = 3600; // Cleanup symbols not seen in last hour
+            const LOG_INTERVAL: u64 = 1000;
+            const CLEANUP_INTERVAL_SECS: u64 = 3600;
             
-            // Spawn periodic cleanup task to prevent memory leak
             let tick_counts_cleanup = tick_counts.clone();
             let last_seen_cleanup = last_seen.clone();
             let shutdown_flag_cleanup = shutdown_flag_tick.clone();
@@ -584,14 +550,12 @@ impl Logging {
                     let mut counts = tick_counts_cleanup.write().await;
                     let mut last_seen_guard = last_seen_cleanup.write().await;
                     
-                    // Remove symbols that haven't been seen in the last hour
                     counts.retain(|symbol, _| {
                         last_seen_guard.get(symbol)
                             .map(|ts| now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS)
                             .unwrap_or(false)
                     });
                     
-                    // Also clean up last_seen map
                     last_seen_guard.retain(|_, ts| {
                         now.duration_since(*ts).as_secs() < CLEANUP_INTERVAL_SECS
                     });
@@ -605,19 +569,17 @@ impl Logging {
                             break;
                         }
                         
-                        // Update last seen timestamp
                         {
                             let mut last_seen_guard = last_seen.write().await;
                             last_seen_guard.insert(tick.symbol.clone(), Instant::now());
                         }
                         
-                        // Per-symbol counter to avoid log spam with multiple symbols
                         let should_log = {
                             let mut counts = tick_counts.write().await;
                             let count = counts.entry(tick.symbol.clone()).or_insert(0);
                             *count += 1;
                             if *count >= LOG_INTERVAL {
-                                *count = 0; // Reset counter
+                                *count = 0;
                                 true
                             } else {
                                 false
@@ -640,8 +602,6 @@ impl Logging {
                             "LOGGING: MarketTick receiver lagged, {} events missed (log gap possible)",
                             missed
                         );
-                        // Continue processing - don't break on lag
-                        // MarketTick events are very frequent, so lagging is more common
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         warn!("LOGGING: MarketTick channel closed");

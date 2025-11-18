@@ -1,5 +1,3 @@
-// WebSocket streams for market data and user data
-// Handles Binance Futures WebSocket connections (market data and user data streams)
 
 use crate::types::{AccountBalance, AccountPosition, PriceUpdate, Px, Qty, Side, UserEvent, UserStreamKind};
 use anyhow::{anyhow, Result};
@@ -44,7 +42,6 @@ impl MarketDataStream {
 /// Create market data stream for multiple symbols
 /// Binance @bookTicker stream: wss://fstream.binance.com/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker
     pub async fn connect(symbols: &[String]) -> Result<Self> {
-    // Build stream URL: wss://fstream.binance.com/stream?streams=symbol1@bookTicker/symbol2@bookTicker
         let streams: Vec<String> = symbols
             .iter()
             .map(|s| format!("{}@bookTicker", s.to_lowercase()))
@@ -84,13 +81,11 @@ impl MarketDataStream {
                                 continue;
                             }
 
-                        // Binance format: {"stream":"btcusdt@bookTicker","data":{...}}
                             let value: Value = serde_json::from_str(&txt)?;
                             let stream_name = value.get("stream")
                                 .and_then(|s| s.as_str())
                                 .ok_or_else(|| anyhow!("missing stream field"))?;
 
-                        // Extract symbol from stream name (e.g., "btcusdt@bookTicker" -> "BTCUSDT")
                             let symbol = stream_name
                                 .split('@')
                                 .next()
@@ -100,8 +95,6 @@ impl MarketDataStream {
                             let data = value.get("data")
                                 .ok_or_else(|| anyhow!("missing data field"))?;
 
-                        // Parse @bookTicker format
-                        // {"b":"50000.00","B":"1.5","a":"50001.00","A":"2.0"}
                             let bid_str = data.get("b")
                                 .and_then(|v| v.as_str())
                                 .ok_or_else(|| anyhow!("missing bid price"))?;
@@ -136,7 +129,6 @@ impl MarketDataStream {
                 Ok(None) => return Err(anyhow!("market data stream terminated")),
                 Err(_) => {
                     warn!("market data websocket timeout, reconnecting");
-                // Reconnect logic could be added here if needed
                     return Err(anyhow!("market data stream timeout"));
                 }
             }
@@ -147,7 +139,6 @@ impl MarketDataStream {
 impl UserDataStream {
 #[inline]
 fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
-    // USDⓈ-M Futures user data
         format!("wss://fstream.binance.com/ws/{}", listen_key)
     }
 
@@ -167,7 +158,6 @@ fn ws_url_for(_kind: UserStreamKind, listen_key: &str) -> String {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-        // resp.text() self'i tükettiği için status’u ÖNCE aldık
             let body = resp.text().await.unwrap_or_default();
             error!(status=?status, body=%body, "listenKey create failed");
             return Err(anyhow!("listenKey create failed: {} {}", status, body));
@@ -275,7 +265,6 @@ pub fn set_on_reconnect<F>(&mut self, callback: F)
     }
 
     async fn keep_alive(&mut self) -> Result<()> {
-    // Binance listenKey 60dk geçerli; biz 25dk'da bir yeniliyoruz
         if self.last_keep_alive.elapsed() < Duration::from_secs(60 * 25) {
             return Ok(());
         }
@@ -294,7 +283,6 @@ pub fn set_on_reconnect<F>(&mut self, callback: F)
             Self::create_listen_key(&self.client, &self.base, &self.api_key, self.kind).await?;
         self.listen_key = new_key;
 
-    // WS yeniden bağlan
         self.reconnect_ws().await?;
         Ok(())
     }
@@ -337,7 +325,6 @@ fn parse_decimal(value: &Value, key: &str) -> Decimal {
                             if txt.is_empty() {
                                 continue;
                             }
-                        // Uyarı: USDⓈ-M tarafında auth wrapper'da {"stream": "...", "data": {...}} gelebilir.
                             let value: Value = serde_json::from_str(&txt)?;
                             let data = value.get("data").cloned().unwrap_or_else(|| value.clone());
                             if let Some(event) = Self::map_event(&data)? {
@@ -388,10 +375,10 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                 if exec_type != "TRADE" {
                     return Ok(Some(UserEvent::Heartbeat));
                 }
-                let last_filled_qty = Self::parse_decimal(value, "l"); // last executed qty (incremental)
-                let cumulative_filled_qty = Self::parse_decimal(value, "z"); // cumulative filled qty (total)
-                let order_qty = Self::parse_decimal(value, "q"); // original order quantity
-                let price = Self::parse_decimal(value, "L"); // last executed price
+                let last_filled_qty = Self::parse_decimal(value, "l");
+                let cumulative_filled_qty = Self::parse_decimal(value, "z");
+                let order_qty = Self::parse_decimal(value, "q");
+                let price = Self::parse_decimal(value, "L");
                 let side =
                     Self::parse_side(value.get("S").and_then(Value::as_str).unwrap_or("SELL"));
                 let is_maker = value.get("m").and_then(Value::as_bool).unwrap_or(false);
@@ -437,10 +424,10 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                 if exec_type != "TRADE" {
                     return Ok(Some(UserEvent::Heartbeat));
                 }
-                let last_filled_qty = Self::parse_decimal(data, "l"); // last filled (incremental)
-                let cumulative_filled_qty = Self::parse_decimal(data, "z"); // cumulative filled qty (total)
-                let order_qty = Self::parse_decimal(data, "q"); // original order quantity
-                let price = Self::parse_decimal(data, "L"); // last price
+                let last_filled_qty = Self::parse_decimal(data, "l");
+                let cumulative_filled_qty = Self::parse_decimal(data, "z");
+                let order_qty = Self::parse_decimal(data, "q");
+                let price = Self::parse_decimal(data, "L");
                 let side =
                     Self::parse_side(data.get("S").and_then(Value::as_str).unwrap_or("SELL"));
                 let is_maker = data.get("m").and_then(Value::as_bool).unwrap_or(false);
@@ -449,9 +436,9 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                     symbol,
                     order_id,
                     side,
-                    qty: Qty(last_filled_qty), // Last executed qty (incremental)
-                    cumulative_filled_qty: Qty(cumulative_filled_qty), // Cumulative filled qty (total)
-                    order_qty: Some(Qty(order_qty)), // Original order quantity
+                    qty: Qty(last_filled_qty),
+                    cumulative_filled_qty: Qty(cumulative_filled_qty),
+                    order_qty: Some(Qty(order_qty)),
                     price: Px(price),
                     is_maker,
                     order_status: status.to_string(),
@@ -459,12 +446,10 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                 }));
             }
 
-        // ACCOUNT_UPDATE event - position and balance updates from WebSocket
             "ACCOUNT_UPDATE" => {
                 let mut positions = Vec::new();
                 let mut balances = Vec::new();
 
-            // Parse positions (a field)
                 if let Some(positions_data) = value.get("a").and_then(|v| v.get("P")) {
                     if let Some(positions_array) = positions_data.as_array() {
                         for pos_data in positions_array {
@@ -497,17 +482,15 @@ fn map_event(value: &Value) -> Result<Option<UserEvent>> {
                     }
                 }
 
-            // Parse balances (a field -> B array)
                 if let Some(balances_data) = value.get("a").and_then(|v| v.get("B")) {
                     if let Some(balances_array) = balances_data.as_array() {
                         for bal_data in balances_array {
                             if let (Some(asset), Some(available)) = (
                                 bal_data.get("a").and_then(Value::as_str),
-                                bal_data.get("wb").and_then(Value::as_str), // wallet balance
+                                bal_data.get("wb").and_then(Value::as_str),
                             ) {
                                 let available_balance = Decimal::from_str(available).unwrap_or(Decimal::ZERO);
 
-                            // Only track USDT and USDC
                                 if asset == "USDT" || asset == "USDC" {
                                     balances.push(AccountBalance {
                                         asset: asset.to_string(),

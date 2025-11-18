@@ -1,8 +1,3 @@
-// ORDERING: Order placement/closure, single position guarantee
-// Only handles order placement/closure, no trend or PnL logic
-// Listens to TradeSignal and CloseRequest events
-// Uses CONNECTION to send orders
-
 use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, EventBus, OrderUpdate, PositionUpdate, TradeSignal};
@@ -18,11 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-
-// ============================================================================
-// Balance Reservation Guard (RAII Pattern)
-// ============================================================================
 
 /// Cleanup message sent when BalanceReservation is dropped without explicit release
 #[derive(Clone)]
@@ -82,16 +72,13 @@ impl BalanceReservation {
         cleanup_tx: Option<mpsc::UnboundedSender<BalanceCleanupMessage>>,
         pending_cleanup: Option<Arc<std::sync::Mutex<Vec<BalanceCleanupMessage>>>>,
     ) -> Option<Self> {
-        // try_reserve() is atomic - it checks available balance and reserves in one operation
-        // Do not call available() separately - it would create a race condition
         if store.try_reserve(asset, amount) {
-            // Clone Arc before moving it into Self (store borrows balance_store)
             Some(Self {
                 balance_store: balance_store.clone(),
                 asset: asset.to_string(),
                 amount,
                 released: false,
-                order_id: None, // Will be set after order is placed
+                order_id: None,
                 allocation_timestamp: Instant::now(),
                 cleanup_tx,
                 pending_cleanup,
@@ -111,7 +98,6 @@ impl BalanceReservation {
         cleanup_tx: Option<mpsc::UnboundedSender<BalanceCleanupMessage>>,
         pending_cleanup: Option<Arc<std::sync::Mutex<Vec<BalanceCleanupMessage>>>>,
     ) -> Option<Self> {
-        // Clone Arc before acquiring lock to avoid borrow checker issues
         let balance_store_clone = balance_store.clone();
         let mut store = balance_store.write().await;
         Self::new_with_lock(balance_store_clone, &mut store, asset, amount, cleanup_tx, pending_cleanup)
@@ -125,7 +111,6 @@ impl BalanceReservation {
             let mut store = self.balance_store.write().await;
             store.release(&self.asset, self.amount);
             self.released = true;
-            // Clear cleanup_tx to prevent sending cleanup message on drop
             self.cleanup_tx = None;
 
             debug!(
@@ -140,10 +125,6 @@ impl BalanceReservation {
 
 impl Drop for BalanceReservation {
     fn drop(&mut self) {
-        // Drop cannot be async, so we cannot release balance here directly
-        // Solution: Send cleanup message to background task for async release
-        // Fallback: If channel is closed, add to pending_cleanup list (thread-safe)
-        // This ensures balance is released even on panic, shutdown, or early return
         if !self.released {
             let allocation_age = Instant::now().duration_since(self.allocation_timestamp);
             
@@ -155,7 +136,6 @@ impl Drop for BalanceReservation {
                     allocation_timestamp: self.allocation_timestamp,
                 };
                 
-            // Try to send cleanup message to background task
             let sent = if let Some(cleanup_tx) = self.cleanup_tx.take() {
                 cleanup_tx.send(cleanup_msg.clone()).is_ok()
             } else {
@@ -171,9 +151,7 @@ impl Drop for BalanceReservation {
                         "Balance reservation dropped without explicit release - cleanup task will release it"
                     );
                 } else {
-                // Channel closed or unavailable - use pending_cleanup list as fallback
                 if let Some(pending_cleanup) = &self.pending_cleanup {
-                    // Fallback: Add to pending cleanup list (thread-safe)
                     if let Ok(mut pending) = pending_cleanup.lock() {
                         pending.push(cleanup_msg);
                         tracing::warn!(
@@ -184,7 +162,6 @@ impl Drop for BalanceReservation {
                             "Balance reservation added to pending cleanup list (channel was closed)"
                         );
                     } else {
-                        // Lock poisoned - log critical error
                     tracing::error!(
                         asset = %self.asset,
                         amount = %self.amount,
@@ -196,7 +173,6 @@ impl Drop for BalanceReservation {
                     );
                 }
             } else {
-                    // No pending_cleanup available - log critical error
                 tracing::error!(
                     asset = %self.asset,
                     amount = %self.amount,
@@ -267,13 +243,10 @@ impl Ordering {
         shutdown_flag: Arc<AtomicBool>,
         shared_state: Arc<SharedState>,
     ) -> Self {
-        // Create cleanup channel for async balance release
         let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
         
-        // Create thread-safe pending cleanup list (fallback when channel is closed)
         let pending_cleanup = Arc::new(std::sync::Mutex::new(Vec::<BalanceCleanupMessage>::new()));
         
-        // Start background cleanup task
         let balance_store_for_cleanup = shared_state.balance_store.clone();
         let shutdown_flag_for_cleanup = shutdown_flag.clone();
         let pending_cleanup_for_task = pending_cleanup.clone();
@@ -308,13 +281,11 @@ impl Ordering {
         
         loop {
             tokio::select! {
-                // Handle cleanup messages (primary branch - process immediately)
                 msg = cleanup_rx.recv() => {
                     match msg {
                         Some(cleanup_msg) => {
                             let allocation_age = Instant::now().duration_since(cleanup_msg.allocation_timestamp);
                             
-                            // Release balance asynchronously
                             let mut store = balance_store.write().await;
                             store.release(&cleanup_msg.asset, cleanup_msg.amount);
                             
@@ -327,15 +298,11 @@ impl Ordering {
                             );
                         }
                         None => {
-                            // Channel closed - process pending cleanup list before exit
                             break;
                         }
                     }
                 }
-                // Check for shutdown and process pending cleanup periodically
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // Process pending cleanup list (fallback for when channel is closed)
-                    // Lock outside of async context to avoid Send issues
                     let pending_msgs: Vec<BalanceCleanupMessage> = {
                         let mut pending = pending_cleanup.lock().unwrap();
                         if !pending.is_empty() {
@@ -345,14 +312,12 @@ impl Ordering {
                         }
                     };
                     
-                    // Process messages asynchronously (after lock is released)
                     if !pending_msgs.is_empty() {
                         let balance_store_clone = balance_store.clone();
                         tokio::spawn(async move {
                             for cleanup_msg in pending_msgs {
                                 let allocation_age = Instant::now().duration_since(cleanup_msg.allocation_timestamp);
                                 
-                                // Release balance asynchronously
                                 let mut store = balance_store_clone.write().await;
                                 store.release(&cleanup_msg.asset, cleanup_msg.amount);
                                 
@@ -374,7 +339,6 @@ impl Ordering {
             }
         }
         
-        // Final cleanup: Process any remaining pending cleanup messages
         let pending_msgs: Vec<BalanceCleanupMessage> = {
             let mut pending = pending_cleanup.lock().unwrap();
             if !pending.is_empty() {
@@ -384,12 +348,10 @@ impl Ordering {
             }
         };
         
-        // Process messages asynchronously (after lock is released)
         if !pending_msgs.is_empty() {
             for cleanup_msg in pending_msgs {
                 let allocation_age = Instant::now().duration_since(cleanup_msg.allocation_timestamp);
                 
-                // Release balance asynchronously
                 let mut store = balance_store.write().await;
                 store.release(&cleanup_msg.asset, cleanup_msg.amount);
                 
@@ -406,30 +368,6 @@ impl Ordering {
         info!("ORDERING: Balance cleanup task stopped");
     }
 
-    /// Check if an error is permanent (should not retry)
-    /// Permanent errors: invalid parameters, insufficient balance, invalid symbol, etc.
-    /// Temporary errors: network errors, rate limits, timeouts, server errors
-    fn is_permanent_error(error: &anyhow::Error) -> bool {
-        let error_str = error.to_string();
-        let error_lower = error_str.to_lowercase();
-
-        // Permanent errors - don't retry
-        error_lower.contains("invalid")
-            || error_lower.contains("margin")
-            || error_lower.contains("insufficient balance")
-            || error_lower.contains("min notional")
-            || error_lower.contains("below min notional")
-            || error_lower.contains("invalid symbol")
-            || error_lower.contains("symbol not found")
-            || error_lower.contains("position not found")
-            || error_lower.contains("no position")
-            || error_lower.contains("position already closed")
-            || error_lower.contains("reduceonly")
-            || error_lower.contains("reduce only")
-            || error_lower.contains("-2011") // Binance: "Unknown order sent"
-            || error_lower.contains("-2019") // Binance: "Margin is insufficient"
-            || error_lower.contains("-2021") // Binance: "Order would immediately match"
-    }
 
     /// Start the ordering service and begin processing trade signals.
     ///
@@ -462,19 +400,13 @@ impl Ordering {
     /// // Service is now running and will place orders when TradeSignal events are received
     /// ```
     pub async fn start(&self) -> Result<()> {
-        // State restore is now handled by STORAGE module via event bus
-        // StorageModule will restore OrderingState on startup and update SharedState
         
-        // Position reconciliation on startup
-        // Problem: Crash sonrası orphan position'lar kalabilir
-        // Solution: Fetch all positions from exchange and restore to state
         Self::reconcile_positions_on_startup(
             &self.connection,
             &self.shared_state,
             &self.event_bus,
         ).await?;
 
-        // Start leak detection task for balance reservations
         Self::start_leak_detection_task(self.shared_state.clone(), self.shutdown_flag.clone());
 
         let event_bus = self.event_bus.clone();
@@ -483,7 +415,6 @@ impl Ordering {
         let shared_state = self.shared_state.clone();
         let cfg = self.cfg.clone();
 
-        // Spawn task for TradeSignal events
         let state_trade = shared_state.clone();
         let event_bus_trade = event_bus.clone();
         let connection_trade = connection.clone();
@@ -526,7 +457,6 @@ impl Ordering {
             ).await;
         });
 
-        // Spawn task for CloseRequest events
         let state_close = shared_state.clone();
         let event_bus_close = event_bus.clone();
         let connection_close = connection.clone();
@@ -558,7 +488,6 @@ impl Ordering {
             ).await;
         });
 
-        // Spawn task for OrderUpdate events (state sync)
         let state_order = shared_state.clone();
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
@@ -581,7 +510,6 @@ impl Ordering {
             ).await;
         });
 
-        // Spawn task for PositionUpdate events (state sync)
         let state_pos = shared_state.clone();
         let event_bus_pos = event_bus.clone();
         let shutdown_flag_pos = shutdown_flag.clone();
@@ -604,7 +532,6 @@ impl Ordering {
             ).await;
         });
 
-        // Start periodic position reconciliation task
         Self::start_position_reconciliation_task(
             connection.clone(),
             shared_state.clone(),
@@ -625,7 +552,7 @@ impl Ordering {
         shutdown_flag: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
-            const RECONCILIATION_INTERVAL_SECS: u64 = 30; // 30 seconds
+            const RECONCILIATION_INTERVAL_SECS: u64 = 30;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(RECONCILIATION_INTERVAL_SECS)).await;
@@ -634,35 +561,38 @@ impl Ordering {
                     break;
                 }
 
-                // Fetch all positions from exchange
                 match connection.get_all_positions().await {
                     Ok(exchange_positions) => {
-                        // Collect exchange symbols before loop (exchange_positions is moved in loop)
                         let exchange_symbols: Vec<String> = exchange_positions.iter().map(|(sym, _)| sym.clone()).collect();
                         
                         let mut state_guard = shared_state.ordering_state.lock().await;
 
-                        // Compare with internal state
                         for (symbol, exchange_pos) in exchange_positions {
                             if let Some(internal_pos) = &state_guard.open_position {
                                 if internal_pos.symbol == symbol {
-                                    // Compare qty and entry_price
+                                    let epsilon_qty = Decimal::new(1, 6);
+                                    const EPSILON_PRICE_PCT: f64 = 0.01;
+                                    
+                                    let should_update = Self::should_update_position(
+                                        internal_pos.qty.0,
+                                        internal_pos.entry_price.0,
+                                        exchange_pos.qty.0,
+                                        exchange_pos.entry.0,
+                                        epsilon_qty,
+                                        EPSILON_PRICE_PCT,
+                                    );
+                                    
+                                    use rust_decimal::prelude::ToPrimitive;
                                     let qty_diff = (internal_pos.qty.0 - exchange_pos.qty.0).abs();
                                     let entry_diff = (internal_pos.entry_price.0 - exchange_pos.entry.0).abs();
-                                    
-                                    // Epsilon for comparison (1 basis point for price, 0.000001 for qty)
-                                    let epsilon_qty = Decimal::new(1, 6); // 0.000001
-                                    const EPSILON_PRICE_PCT: f64 = 0.01; // 0.01% = 1 basis point
-                                    
                                     let price_diff_pct = if internal_pos.entry_price.0 > Decimal::ZERO {
-                                        (entry_diff / internal_pos.entry_price.0) * Decimal::from(100)
+                                        utils::calculate_percentage(entry_diff, internal_pos.entry_price.0)
                                     } else {
                                         entry_diff
                                     };
+                                    let price_diff_pct_f64 = utils::decimal_to_f64(price_diff_pct);
                                     
-                                    let price_diff_pct_f64 = price_diff_pct.to_f64().unwrap_or(0.0);
-                                    
-                                    if qty_diff >= epsilon_qty || price_diff_pct_f64 >= EPSILON_PRICE_PCT {
+                                    if should_update {
                                         warn!(
                                             symbol = %symbol,
                                             internal_qty = %internal_pos.qty.0,
@@ -674,7 +604,6 @@ impl Ordering {
                                             "ORDERING: Position mismatch detected, updating state"
                                         );
 
-                                        // Update internal state to match exchange
                                         state_guard.open_position = Some(OpenPosition {
                                             symbol: symbol.clone(),
                                             direction: if exchange_pos.qty.0.is_sign_positive() {
@@ -686,24 +615,16 @@ impl Ordering {
                                             entry_price: exchange_pos.entry,
                                         });
 
-                                        // Publish state update event
-                                        let state_to_publish = state_guard.clone();
-                                        drop(state_guard);
-                                        Self::publish_ordering_state_update(&state_to_publish, &event_bus);
-                                        
-                                        // Re-acquire lock for next iteration
+                                        Self::publish_state_and_drop(state_guard, &event_bus);
                                         state_guard = shared_state.ordering_state.lock().await;
                                     }
                                 } else {
-                                    // Exchange has position but internal state has different symbol
-                                    // This shouldn't happen, but handle it gracefully
                                     warn!(
                                         symbol = %symbol,
                                         internal_symbol = %internal_pos.symbol,
                                         "ORDERING: Exchange has position for different symbol - triggering reconciliation"
                                     );
 
-                                    // Trigger position update event
                                     let position_update = PositionUpdate {
                                         symbol: symbol.clone(),
                                         qty: exchange_pos.qty,
@@ -724,18 +645,14 @@ impl Ordering {
                                         );
                                     }
                                     
-                                    // Re-acquire lock for next iteration
                                     state_guard = shared_state.ordering_state.lock().await;
                                 }
                             } else {
-                                // Exchange has position but internal state doesn't
-                                // This shouldn't happen, but handle it gracefully
                                 warn!(
                                     symbol = %symbol,
                                     "ORDERING: Exchange has position but internal state doesn't - triggering reconciliation"
                                 );
 
-                                // Trigger position update event
                                 let position_update = PositionUpdate {
                                     symbol: symbol.clone(),
                                     qty: exchange_pos.qty,
@@ -756,12 +673,10 @@ impl Ordering {
                                     );
                                 }
                                 
-                                // Re-acquire lock for next iteration
                                 state_guard = shared_state.ordering_state.lock().await;
                             }
                         }
 
-                        // Check for orphaned internal positions (internal has but exchange doesn't)
                         if let Some(internal_pos) = &state_guard.open_position {
                             let exchange_has = exchange_symbols.iter().any(|sym| sym == &internal_pos.symbol);
                             if !exchange_has {
@@ -770,13 +685,8 @@ impl Ordering {
                                     "ORDERING: Internal state has position but exchange doesn't - clearing state"
                                 );
 
-                                // Clear internal state
-                                state_guard.open_position = None;
-
-                                // Publish state update event
-                                let state_to_publish = state_guard.clone();
-                                drop(state_guard);
-                                Self::publish_ordering_state_update(&state_to_publish, &event_bus);
+                                Self::clear_position(&mut state_guard);
+                                Self::publish_state_and_drop(state_guard, &event_bus);
                             }
                         }
                     }
@@ -796,7 +706,7 @@ impl Ordering {
     /// This is safer than attempting async cleanup in Drop trait (which can deadlock)
     fn start_leak_detection_task(shared_state: Arc<SharedState>, shutdown_flag: Arc<AtomicBool>) {
         tokio::spawn(async move {
-            const CHECK_INTERVAL_SECS: u64 = 10; // Check every 10 seconds (reduced from 60s to detect leaks faster in high-frequency trading scenarios)
+            const CHECK_INTERVAL_SECS: u64 = 10;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
@@ -807,12 +717,10 @@ impl Ordering {
 
                 let store = shared_state.balance_store.read().await;
 
-                // Check for balance leaks: reserved > total
                 let usdt_leak = store.reserved_usdt > store.usdt;
                 let usdc_leak = store.reserved_usdc > store.usdc;
 
                 if usdt_leak || usdc_leak {
-                    // Get open order info to help identify which order caused the leak
                     let open_order_info = {
                         let ordering_state = shared_state.ordering_state.lock().await;
                         ordering_state.open_order.as_ref().map(|order| {
@@ -831,13 +739,9 @@ impl Ordering {
                         open_order_info
                     );
 
-                    // Auto-fix: reset reserved balance to match total
-                    // If reserved > total, this is a leak - reset reserved to total
                     drop(store);
                     let mut store_write = shared_state.balance_store.write().await;
 
-                    // Reset reserved to total to fix leak (reserved cannot exceed total)
-                    // This fixes leaks while preserving legitimate reservations (if reserved <= total)
                     if usdt_leak {
                         let old_reserved = store_write.reserved_usdt;
                         store_write.reserved_usdt = store_write.usdt;
@@ -1302,22 +1206,8 @@ impl Ordering {
             }
         };
         
-        // Use coin's max leverage (if available), otherwise use config leverage
-        // Use coin's max leverage as requested
-        let leverage = if let Some(symbol_max_lev) = rules.max_leverage {
-            // Coin has max leverage - use it
-            symbol_max_lev
-        } else {
-            // No symbol max leverage - use config leverage
-            cfg.leverage.unwrap_or(cfg.exec.default_leverage) as u32
-        };
-        
-        debug!(
-            symbol = %signal.symbol,
-            leverage,
-            symbol_max_leverage = ?rules.max_leverage,
-            "ORDERING: Using coin's max leverage"
-        );
+        let desired_leverage = cfg.leverage.unwrap_or(cfg.exec.default_leverage);
+        let leverage = connection.get_clamped_leverage(&signal.symbol, desired_leverage).await;
         
         let margin_result = match Self::calculate_margin_for_trade(
             signal,
@@ -1367,64 +1257,26 @@ impl Ordering {
             "ORDERING: Position sizing calculated from balance and config"
         );
 
-        // 4. Balance validation is done atomically inside the lock (line 1271)
-        // Commission buffer was already subtracted in margin calculation (usable_balance),
-        // and margin is calculated from usable_balance, so balance is guaranteed to be sufficient
-        // This redundant check is removed to avoid confusion
 
-        // Get TIF from config (before lock to minimize lock time)
         let tif = match cfg.exec.tif.as_str() {
             "post_only" | "GTX" => Tif::PostOnly,
             "ioc" | "IOC" => Tif::Ioc,
             _ => Tif::Gtc,
         };
 
-        // Prepare order command (before lock to minimize lock time)
-        // Use calculated size, NOT signal.size (which is not set by TRENDING)
-        // ORDERING calculates size based on balance, margin, leverage, and entry price
         use crate::types::OrderCommand;
         let command = OrderCommand::Open {
             symbol: signal.symbol.clone(),
             side: signal.side,
             price: signal.entry_price,
-            qty: size, // Use calculated size, not signal.size
+            qty: size,
             tif,
         };
 
-        // ✅ CRITICAL: Single Lock Pattern - Atomic state check + balance reservation
-        //
-        // PROBLEM: Previous implementation had a race condition:
-        // - Thread A: Lock ordering_state → Check state (OK) → Release lock → Reserve balance → Place order
-        // - Thread B: Lock ordering_state → Check state (OK, Thread A hasn't updated yet) → Release lock → Reserve balance → Place order
-        // - Result: Both threads can reserve balance and place orders (double-spend!)
-        //
-        // ROOT CAUSE: ordering_state lock and balance_store lock are independent
-        // - BalanceReservation::new() acquires balance_store lock internally
-        // - ordering_state lock is released before balance reservation
-        // - Two threads can both pass state check and reserve balance
-        //
-        // SOLUTION: Single Lock Pattern - Everything in ordering_state lock
-        // 1. ✅ Lock ordering_state
-        // 2. ✅ Check state (no open position/order)
-        // 3. ✅ Check available balance (access balance_store inside lock)
-        // 4. ✅ Reserve balance atomically (update both balance_store and ordering_state.reserved_margin)
-        // 5. ✅ Release lock
-        // 6. ✅ Place order (balance already reserved)
-        //
-        // Lock order: ordering_state -> balance_store (always consistent, prevents deadlock)
-        //
-        // Flow (CORRECT ORDER):
-        // 1. ✅ Quick checks (timestamp, symbol) - done before lock (fast, no I/O)
-        // 2. ✅ Lock ordering_state: Check state + Reserve balance (atomic)
-        // 3. ✅ Release lock: Place order (balance already reserved)
-        // 4. ✅ Update state atomically (after order placement)
-        //
-        // Step 1: Atomic state check + balance reservation (inside single lock)
         let mut balance_reservation = {
             let mut state_guard = shared_state.ordering_state.lock().await;
 
 
-            // Position check - ensure no open position/order
             if state_guard.open_position.is_some() || state_guard.open_order.is_some() {
                 debug!(
                     symbol = %signal.symbol,
@@ -1435,25 +1287,15 @@ impl Ordering {
                 return Ok(());
             }
 
-            // ✅ NEW: Risk control check before order placement
-            // Check position size risk if we have an open position
-            // Note: This is a pre-check, actual risk control happens in follow_orders module
-            // But we can block new orders here if risk level is too high
-            // 
-            // IMPORTANT: We only check existing position, not the new order being placed
-            // because calculated_size hasn't been computed yet at this point
             if let Some(ref open_pos) = state_guard.open_position {
                 if open_pos.symbol == signal.symbol {
-                    // Calculate position size notional
                     let position_size_notional = (open_pos.entry_price.0 * open_pos.qty.0.abs())
                         .to_f64()
                         .unwrap_or(0.0);
                     
-                    // Calculate total active orders notional (from open_order if exists)
-                    // Note: We use open_order.qty, not calculated_size (which isn't computed yet)
                     let total_active_orders_notional = if let Some(ref open_order) = state_guard.open_order {
                         if open_order.symbol == signal.symbol {
-                            (signal.entry_price.0 * open_order.qty.0).to_f64().unwrap_or(0.0)
+                            utils::decimal_to_f64(signal.entry_price.0 * open_order.qty.0)
                         } else {
                             0.0
                         }
@@ -1461,7 +1303,6 @@ impl Ordering {
                         0.0
                     };
 
-                    // Create risk state
                     let risk_state = PositionRiskState {
                         position_size_notional,
                         total_active_orders_notional,
@@ -1469,11 +1310,8 @@ impl Ordering {
                         is_opportunity_mode: false,
                     };
 
-                    // Calculate effective leverage (use leverage from config/symbol rules)
-                    // Note: leverage is calculated earlier in the function
                     let effective_leverage = leverage as f64;
 
-                    // Check position size risk
                     let (risk_level, _max_position_size_usd, should_block_new_orders) = 
                         risk::check_position_size_risk(
                             &risk_state,
@@ -1482,7 +1320,6 @@ impl Ordering {
                             cfg,
                         );
 
-                    // Block new orders if risk level is Soft, Medium, or Hard
                     if should_block_new_orders {
                         warn!(
                             symbol = %signal.symbol,
@@ -1496,17 +1333,10 @@ impl Ordering {
                 }
             }
 
-            // Spread staleness check (inside lock to prevent race condition)
-            // Spread range validation was already done in TRENDING module
-            // ORDERING needs to check if signal is too stale (time-based check)
-            // ✅ CRITICAL: Increased from 1s to 5s to match signal age check and handle channel lagging
-            // Channel lagging can cause signals to arrive with delay, so we need more tolerance
-            // TRENDING already validates spread range, so this is just a safety check
             let spread_age = now.duration_since(signal.spread_timestamp);
-            const MAX_SPREAD_AGE_SECS: u64 = 5; // 5 seconds - matches signal age check, handles channel lagging
+            const MAX_SPREAD_AGE_SECS: u64 = 5;
 
             if spread_age.as_secs() > MAX_SPREAD_AGE_SECS {
-                // Signal is too stale - abort without expensive network call
                 warn!(
                     symbol = %signal.symbol,
                     spread_age_secs = spread_age.as_secs(),
@@ -1517,21 +1347,10 @@ impl Ordering {
                 return Ok(());
             }
 
-            // ✅ CRITICAL: Reserve balance atomically (inside ordering_state lock)
-            // Lock order: ordering_state -> balance_store (prevents deadlock)
-            // This ensures state check + balance reservation is truly atomic
-            // 
-            // IMPORTANT: Clone balance_store Arc BEFORE acquiring write lock
-            // This prevents borrow checker issues when moving balance_store into BalanceReservation
             let balance_store_clone = shared_state.balance_store.clone();
             
-            // ✅ CRITICAL: Acquire balance_store write lock INSIDE ordering_state lock
-                // This nested lock is safe because lock order is consistent: ordering_state -> balance_store
-            // Both locks are held simultaneously - prevents race condition
                 let mut balance_store_guard = shared_state.balance_store.write().await;
                 
-                // Check available balance (atomic with reservation)
-                // ✅ FIX: Use selected_quote_asset instead of cfg.quote_asset
                 let available_balance_atomic = balance_store_guard.available(&selected_quote_asset);
                 
                 if available_balance_atomic < required_margin {
@@ -1542,13 +1361,9 @@ impl Ordering {
                     quote_asset = %selected_quote_asset,
                         "ORDERING: Ignoring TradeSignal - insufficient balance (atomic check)"
                 );
-                // Both locks released here (balance_store_guard and state_guard)
                 return Ok(());
             }
 
-                // ✅ CRITICAL: Reserve balance atomically (using already-acquired lock)
-                // This prevents race condition: state check + balance reservation is atomic
-            // Both ordering_state and balance_store locks are held - no other thread can interfere
             let reservation = match BalanceReservation::new_with_lock(
                     balance_store_clone,
                     &mut balance_store_guard,
@@ -1558,14 +1373,10 @@ impl Ordering {
                     pending_cleanup.clone(),
                 ) {
                 Some(reservation) => {
-                    // Track reserved margin in ordering_state for additional safety
-                    // This update happens while BOTH locks are held - truly atomic
                     state_guard.reserved_margin += required_margin;
                     reservation
                 }
                 None => {
-                    // Reservation failed (should be rare because we hold both locks)
-                    // This can happen if try_reserve() fails internally (edge case)
                     debug!(
                         symbol = %signal.symbol,
                         required_margin = %required_margin,
@@ -1573,43 +1384,17 @@ impl Ordering {
                         quote_asset = %selected_quote_asset,
                             "ORDERING: Ignoring TradeSignal - balance reservation failed (insufficient balance)"
                     );
-                    // Both locks released here (balance_store_guard and state_guard)
                     return Ok(());
                 }
             };
             
-            // Drop balance_store_guard explicitly to make it clear when lock is released
-            // ordering_state lock (state_guard) is still held until end of block
             drop(balance_store_guard);
 
-            // Lock released here - balance is reserved, state is checked
             reservation
-        }; // ordering_state lock released here - order placement happens IMMEDIATELY next
+        };
 
-        // Balance Reservation Release Checklist
-        // Balance reserved - will be released automatically when balance_reservation is dropped
-        // Explicit release() should be called before returning (Drop will warn if forgotten)
-        //
-        // ALL early return paths MUST call balance_reservation.release().await:
-        //    ⚠️ If cancel fails, balance is kept reserved to prevent double-spend (acceptable leak)
-        //
-        // ⚠️ WARNING: If you add a new early return after this point, you MUST release the balance!
-        // Missing releases cause balance leaks and prevent future orders from being placed.
 
-        // Step 2: IMMEDIATELY place order (before spread can change)
-        // This minimizes the window where another thread can interfere
-        // Real-time spread validation ensures we don't place orders with bad spreads
-        //
-        // This prevents the race condition where another thread can reserve balance and place order
-        // while this thread is doing expensive validation
 
-        // Attempt order placement with retry logic
-        // Permanent errors return early with balance release
-        //
-        // (see connection.rs line 1130: clientOrderId is generated inside send_order)
-        // This ensures that each retry attempt uses a unique clientOrderId,
-        // preventing duplicate orders if a previous attempt timed out but Binance received it.
-        // The venue layer also generates unique clientOrderIds for its internal retries.
         let order_id = {
             let mut last_error: Option<anyhow::Error> = None;
             let mut order_id_result: Option<String> = None;
@@ -1625,13 +1410,11 @@ impl Ordering {
                 
                 match connection.send_order(command.clone()).await {
                     Ok(id) => {
-                        // ✅ CRITICAL: Reset circuit breaker on successful order placement
                         {
                             let mut state_guard = shared_state.ordering_state.lock().await;
                             state_guard.circuit_breaker.reset();
                         }
                         
-                        // Keep balance reserved until state is updated
                         info!(
                             symbol = %signal.symbol,
                             order_id = %id,
@@ -1640,33 +1423,28 @@ impl Ordering {
                             "ORDERING: Order placed successfully"
                         );
                         order_id_result = Some(id);
-                        break; // Success, exit retry loop
+                        break;
                     }
                     Err(e) => {
-                        // Check if error is permanent (don't retry)
-                        if Self::is_permanent_error(&e) {
+                        if utils::is_permanent_error(&e) {
                             warn!(
                                 error = %e,
                                 symbol = %signal.symbol,
                                 attempt = attempt + 1,
                                 "ORDERING: Permanent error, not retrying"
                             );
-                            // Permanent error - release balance and return early
-                            // Also update reserved_margin in ordering_state
                             {
                                 let mut state_guard = shared_state.ordering_state.lock().await;
-                                state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                                Self::release_reserved_margin(&mut state_guard, required_margin);
                             }
                             balance_reservation.release().await;
                             return Err(e);
                         }
 
-                        // Store error for final fallback (only if all retries fail)
                         last_error = Some(anyhow::format_err!("{}", e));
 
-                        // Temporary error - retry with exponential backoff
                         if attempt < MAX_RETRIES - 1 {
-                            let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                            let delay = utils::exponential_backoff(attempt, 100, 2);
                             warn!(
                                 error = %e,
                                 symbol = %signal.symbol,
@@ -1678,18 +1456,15 @@ impl Ordering {
                             tokio::time::sleep(delay).await;
                             continue;
                         } else {
-                            // All retries exhausted
                             warn!(
                                 error = %e,
                                 symbol = %signal.symbol,
                                 attempt = attempt + 1,
                                 "ORDERING: All retries exhausted"
                             );
-                            // All retries exhausted - release balance and return
-                            // Also update reserved_margin in ordering_state
                             {
                                 let mut state_guard = shared_state.ordering_state.lock().await;
-                                state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                                Self::release_reserved_margin(&mut state_guard, required_margin);
                             }
                             balance_reservation.release().await;
                             return Err(e);
@@ -1698,21 +1473,15 @@ impl Ordering {
                 }
             }
 
-            // Extract order_id if successful, otherwise return error
             match order_id_result {
                 Some(id) => {
-                    // Set order_id in reservation for leak tracking
-                    // This helps identify which order caused a leak if reservation is not released
                     balance_reservation.order_id = Some(id.clone());
                     id
                 }
                 None => {
-                    // This should never be reached if all paths above return or break correctly
-                    // But Rust requires this for the block to compile
-                    // Also update reserved_margin in ordering_state
                     {
                         let mut state_guard = shared_state.ordering_state.lock().await;
-                        state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                        Self::release_reserved_margin(&mut state_guard, required_margin);
                     }
                     balance_reservation.release().await;
                     return Err(
@@ -1722,16 +1491,11 @@ impl Ordering {
             }
         };
 
-        // Step 3: Post-order spread validation (AFTER order placement)
-        // This prevents the gap between validation and placement where spread can change
-        // If spread changed significantly, cancel the order to prevent slippage
         match connection.get_current_prices(&signal.symbol).await {
             Ok((current_bid, current_ask)) => {
-                // Calculate current spread
                 if !current_bid.0.is_zero() {
                     let current_spread_bps_f64 = crate::utils::calculate_spread_bps(current_bid, current_ask);
                     
-                    // Validate current spread against thresholds
                     let min_acceptable_spread_bps = cfg.trending.min_spread_bps;
                     let max_acceptable_spread_bps = cfg.trending.max_spread_bps;
                     
@@ -1748,7 +1512,6 @@ impl Ordering {
                             current_spread_bps_f64
                         );
                         
-                        // Cancel order immediately - spread is no longer acceptable
                         match connection.cancel_order(&order_id, &signal.symbol).await {
                             Ok(()) => {
                                 info!(
@@ -1756,31 +1519,25 @@ impl Ordering {
                                     order_id = %order_id,
                                     "ORDERING: Successfully canceled order due to spread change"
                                 );
-                                // Update reserved_margin in ordering_state
                                 {
                                     let mut state_guard = shared_state.ordering_state.lock().await;
-                                    state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                                    Self::release_reserved_margin(&mut state_guard, required_margin);
                                 }
                                 balance_reservation.release().await;
                                 return Ok(());
                             }
                             Err(cancel_err) => {
-                                // Cancel failed - order may have already filled
-                                // This is acceptable - order was placed with acceptable spread at that moment
                                 warn!(
                                     error = %cancel_err,
                                     symbol = %signal.symbol,
                                     order_id = %order_id,
                                     "ORDERING: Failed to cancel order after spread change (order may have already filled)"
                                 );
-                                // Continue with order - it was placed with acceptable spread at that moment
                             }
                         }
                     } else {
-                        // Spread is still acceptable - log if it changed significantly
                         let spread_change = (current_spread_bps_f64 - signal.spread_bps).abs();
                         if spread_change > 10.0 {
-                            // Spread changed by more than 10 bps but still within acceptable range
                             warn!(
                                 symbol = %signal.symbol,
                                 order_id = %order_id,
@@ -1796,9 +1553,6 @@ impl Ordering {
                 }
             }
             Err(e) => {
-                // Failed to get current prices - log warning but proceed with order
-                // This is a safety check, not a hard requirement
-                // If price cache is empty or REST API fails, we still proceed with order
                 warn!(
                     error = %e,
                     symbol = %signal.symbol,
@@ -1808,40 +1562,24 @@ impl Ordering {
             }
         }
 
-        // Step 4: Update state atomically (re-acquire lock for state update)
-        // The balance reservation prevents other threads from even starting the order placement process
-        // However, we still double-check state here as a safety measure in case of edge cases
-        // Balance reservation is still held - prevents other threads from reserving
-        // This completes the atomic operation: balance reserve + state check + order placement + state update
         {
             let mut state_guard = shared_state.ordering_state.lock().await;
 
-            // Double-check: if another thread placed an order while we were making the network call,
-            // we should cancel our order to prevent duplicate orders
-            // With Reserve-Before-Check pattern, this should be rare because balance reservation
-            // prevents other threads from starting the process, but we keep it as a safety net
             if state_guard.open_order.is_none() && state_guard.open_position.is_none() {
                 state_guard.open_order = Some(OpenOrder {
                     symbol: signal.symbol.clone(),
                     order_id: order_id.clone(),
                     side: signal.side,
-                    qty: calculated_size, // Use calculated size, not signal.size (which doesn't exist)
+                    qty: calculated_size,
                 });
 
-                // Update timestamp to reflect manual state change
-                // This ensures subsequent OrderUpdate events are compared against this timestamp
                 state_guard.last_order_update_timestamp = Some(Instant::now());
+                Self::publish_state_and_drop(state_guard, event_bus);
 
-                // Publish OrderingStateUpdate event for STORAGE module
-                let state_to_publish = state_guard.clone();
-                drop(state_guard); // Release lock before async call
-                Self::publish_ordering_state_update(&state_to_publish, event_bus);
-
-                // ✅ CRITICAL: Reset circuit breaker on successful order placement
                 {
                     let mut state_guard = shared_state.ordering_state.lock().await;
                     state_guard.circuit_breaker.reset();
-                    state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                    Self::release_reserved_margin(&mut state_guard, required_margin);
                 }
 
                 info!(
@@ -1851,35 +1589,29 @@ impl Ordering {
                     "ORDERING: Order placed successfully"
                 );
 
-                // ✅ NEW: Register timeout and spawn timeout task
                 let order_id_timeout = order_id.clone();
                 let symbol_timeout = signal.symbol.clone();
                 let connection_timeout = connection.clone();
                 let shared_state_timeout = shared_state.clone();
                 let required_margin_timeout = required_margin;
 
-                // Register timeout in state
                 {
                     let mut state_guard = shared_state_timeout.ordering_state.lock().await;
                     state_guard.order_timeouts.insert(
                         order_id_timeout.clone(),
-                        Instant::now() + Duration::from_secs(30), // 30 seconds timeout
+                        Instant::now() + Duration::from_secs(30),
                     );
                 }
 
-                // Spawn timeout task
                 tokio::spawn(async move {
                     const ORDER_TIMEOUT_SECS: u64 = 30;
                     
                     tokio::time::sleep(Duration::from_secs(ORDER_TIMEOUT_SECS)).await;
                     
-                    // Check if order is still open
                     let mut state_guard = shared_state_timeout.ordering_state.lock().await;
                     
-                    // Check if order still exists and hasn't been filled
                     if let Some(open_order) = &state_guard.open_order {
                         if open_order.order_id == order_id_timeout {
-                            // Order still open after timeout - cancel it
                             warn!(
                                 order_id = %order_id_timeout,
                                 symbol = %symbol_timeout,
@@ -1887,19 +1619,12 @@ impl Ordering {
                                 "ORDERING: Order timeout - canceling stale order"
                             );
                             
-                            // Update reserved_margin before canceling (balance will be released when OrderUpdate arrives)
-                            state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin_timeout);
-                            
-                            // Clear order from state (OrderUpdate will handle balance release)
-                            state_guard.open_order = None;
-                            
-                            // Remove timeout entry
+                            Self::release_reserved_margin(&mut state_guard, required_margin_timeout);
+                            Self::clear_order(&mut state_guard);
                             state_guard.order_timeouts.remove(&order_id_timeout);
                             
-                            // Release lock before async cancel call
                             drop(state_guard);
                             
-                            // Cancel order (OrderUpdate will handle balance release)
                             if let Err(e) = connection_timeout.cancel_order(&order_id_timeout, &symbol_timeout).await {
                                 error!(
                                     error = %e,
@@ -1908,32 +1633,23 @@ impl Ordering {
                                 );
                             }
                         } else {
-                            // Order already filled/canceled - remove timeout entry
                             state_guard.order_timeouts.remove(&order_id_timeout);
                         }
                     } else {
-                        // Order already removed - remove timeout entry
                         state_guard.order_timeouts.remove(&order_id_timeout);
                     }
                 });
 
-                // Release balance AFTER state is updated and timeout task spawned
                 balance_reservation.release().await;
             } else {
-                // Another thread placed an order/position while we were making the network call
-                // This is a race condition - cancel our order to prevent duplicate orders
                 warn!(
                     symbol = %signal.symbol,
                     order_id = %order_id,
                     "ORDERING: Race condition detected - another thread placed order/position, canceling our order"
                 );
 
-                // Cancel the order we just placed (lock released before async call)
                 drop(state_guard);
 
-                // Note: size is not available here (it was calculated earlier but not stored)
-                // We only need order_id and symbol to cancel
-                // Cancel FIRST, then release balance
                 match connection.cancel_order(&order_id, &signal.symbol).await {
                     Ok(()) => {
                         info!(
@@ -1941,32 +1657,25 @@ impl Ordering {
                             order_id = %order_id,
                             "ORDERING: Successfully canceled duplicate order after race condition"
                         );
-                        // Cancel succeeded - now safe to release balance
-                        // Also update reserved_margin in ordering_state
                         {
                             let mut state_guard = shared_state.ordering_state.lock().await;
-                            state_guard.reserved_margin = state_guard.reserved_margin.saturating_sub(required_margin);
+                            Self::release_reserved_margin(&mut state_guard, required_margin);
                         }
                         balance_reservation.release().await;
                     }
                     Err(cancel_err) => {
-                        // Cancel failed - order is still active on exchange
-                        // DO NOT release balance - keep it reserved to prevent double-spend
                         warn!(
                             error = %cancel_err,
                             symbol = %signal.symbol,
                             order_id = %order_id,
                             "ORDERING: Failed to cancel duplicate order after race condition, keeping balance reserved to prevent double-spend"
                         );
-                        // Balance leak is acceptable here (prevents double-spend)
-                        // Alternative: Track this order and retry cancel later, then release balance
-                        // For now, keeping balance reserved is safer than risking double-spend
                     }
                 }
 
                 return Ok(());
             }
-        } // Lock released
+        }
 
         Ok(())
     }
@@ -1985,15 +1694,6 @@ impl Ordering {
         shared_state: &Arc<SharedState>,
         _cfg: &Arc<AppCfg>,
     ) -> Result<()> {
-        // ⚠️ DESIGN LIMITATION: position_id is currently ignored
-        // CloseRequest.position_id field exists but is not used in the current implementation.
-        // The code always closes positions by symbol only, not by specific position_id.
-        // This is intentional for one-way mode (hedge_mode=false) where each symbol has only one position.
-        //
-        // FUTURE: If hedge mode support is added with multiple positions per symbol, position_id
-        // should be used to close specific positions. Until then, position_id is reserved for
-        // future use and will be logged if provided.
-        // But use if let for extra safety to prevent panic
         if let Some(position_id) = &request.position_id {
             warn!(
                 symbol = %request.symbol,
@@ -2003,8 +1703,6 @@ impl Ordering {
             );
         }
 
-        // Early check is only for logging/debugging
-        // flatten_position will handle the actual position check atomically
         let has_position = {
             let state_guard = shared_state.ordering_state.lock().await;
             state_guard
@@ -2015,8 +1713,6 @@ impl Ordering {
         };
 
         if !has_position {
-            // Position not in our state - might be already closed by another thread
-            // Still call flatten_position to be safe (it handles "position not found" gracefully)
             debug!(
                 symbol = %request.symbol,
                 reason = ?request.reason,
@@ -2024,39 +1720,18 @@ impl Ordering {
             );
         }
 
-        // Use MARKET order with reduceOnly=true for closing positions
-        // LIMIT orders are risky for close orders because:
-        // 1. They may not fill immediately if price moves away
-        // 2. TP/SL scenarios require immediate execution
-        // 3. Position may remain open if limit order doesn't fill
-        // Solution: Use flatten_position which sends MARKET orders with reduceOnly=true
-        // This guarantees immediate execution and prevents position from staying open
 
-        // Determine if this is a fast close scenario (TP/SL)
-        // Fast close requires use_market_only=true to prevent LIMIT fallback delays
         use crate::event_bus::CloseReason;
         let use_market_only = matches!(
             request.reason,
             CloseReason::TakeProfit | CloseReason::StopLoss
         );
 
-        // flatten_position handles all position checks atomically
-        // - Position verification (fetch_position)
-        // - "Position not found" errors (returns Ok(()))
-        // - Zero quantity positions (returns Ok(()))
-        // - Retry logic for partial fills
-        // - Multiple threads can call this simultaneously - it's safe
-        //
-        // ⚠️ DESIGN LIMITATION: flatten_position closes ALL positions for the symbol
-        // In one-way mode (hedge_mode=false), this is correct (one position per symbol).
-        // In hedge mode (hedge_mode=true), this closes both LONG and SHORT positions,
-        // which may not be desired. Future enhancement: support position_id-based closing.
         match connection
             .flatten_position(&request.symbol, use_market_only)
             .await
         {
             Ok(()) => {
-                // Success - position closed (or was already closed)
                 info!(
                     symbol = %request.symbol,
                     reason = ?request.reason,
@@ -2066,14 +1741,7 @@ impl Ordering {
                 Ok(())
             }
             Err(e) => {
-                let error_str = e.to_string().to_lowercase();
-
-                // Handle "position not found" errors gracefully
-                if error_str.contains("position not found")
-                    || error_str.contains("no position")
-                    || error_str.contains("-2011")
-                {
-                    // Binance: Unknown order (position not found)
+                if utils::is_position_not_found_error(&e) {
                     info!(
                         symbol = %request.symbol,
                         reason = ?request.reason,
@@ -2082,8 +1750,7 @@ impl Ordering {
                     return Ok(());
                 }
 
-                // Check if error is permanent (don't retry)
-                if Self::is_permanent_error(&e) {
+                if utils::is_permanent_error(&e) {
                     warn!(
                         error = %e,
                         symbol = %request.symbol,
@@ -2093,8 +1760,6 @@ impl Ordering {
                     return Err(e);
                 }
 
-                // Temporary error - flatten_position already has retry logic
-                // But we can log it for visibility
                 warn!(
                     error = %e,
                     symbol = %request.symbol,
@@ -2106,8 +1771,75 @@ impl Ordering {
         }
     }
 
-    /// Helper function to publish OrderingStateUpdate event
-    /// This is called after state changes to ensure persistence across restarts via STORAGE module
+    fn release_reserved_margin(state: &mut OrderingState, amount: Decimal) {
+        state.reserved_margin = state.reserved_margin.saturating_sub(amount);
+    }
+
+    fn should_update_position(
+        existing_qty: Decimal,
+        existing_price: Decimal,
+        update_qty: Decimal,
+        update_price: Decimal,
+        epsilon_qty: Decimal,
+        epsilon_price_pct: f64,
+    ) -> bool {
+        use rust_decimal::prelude::ToPrimitive;
+        let qty_diff = (update_qty - existing_qty).abs();
+        let price_diff_abs = (update_price - existing_price).abs();
+        let price_diff_pct = if existing_price > Decimal::ZERO {
+            utils::calculate_percentage(price_diff_abs, existing_price)
+        } else {
+            price_diff_abs
+        };
+        let price_diff_pct_f64 = utils::decimal_to_f64(price_diff_pct).max(100.0);
+        qty_diff >= epsilon_qty || price_diff_pct_f64 >= epsilon_price_pct
+    }
+
+    fn is_timestamp_newer(
+        update_timestamp: Instant,
+        last_timestamp: Option<Instant>,
+    ) -> bool {
+        last_timestamp
+            .map(|last_ts| update_timestamp > last_ts)
+            .unwrap_or(true)
+    }
+
+    fn is_timestamp_older(
+        update_timestamp: Instant,
+        last_timestamp: Option<Instant>,
+    ) -> bool {
+        last_timestamp
+            .map(|last_ts| last_ts > update_timestamp)
+            .unwrap_or(false)
+    }
+
+    fn clear_order(state: &mut OrderingState) {
+        state.open_order = None;
+    }
+
+    fn clear_order_with_timestamp(state: &mut OrderingState, timestamp: Instant) {
+        state.open_order = None;
+        state.last_order_update_timestamp = Some(timestamp);
+    }
+
+    fn clear_position(state: &mut OrderingState) {
+        state.open_position = None;
+    }
+
+    fn clear_position_with_timestamp(state: &mut OrderingState, timestamp: Instant) {
+        state.open_position = None;
+        state.last_position_update_timestamp = Some(timestamp);
+    }
+
+    fn publish_state_and_drop(
+        mut state_guard: tokio::sync::MutexGuard<'_, OrderingState>,
+        event_bus: &Arc<EventBus>,
+    ) {
+        let state_to_publish = state_guard.clone();
+        drop(state_guard);
+        Self::publish_ordering_state_update(&state_to_publish, event_bus);
+    }
+
     fn publish_ordering_state_update(state: &OrderingState, event_bus: &Arc<EventBus>) {
         use crate::event_bus::{OpenOrderSnapshot, OpenPositionSnapshot, OrderingStateUpdate};
 
@@ -2170,14 +1902,12 @@ impl Ordering {
     ) {
         let mut state_guard = shared_state.ordering_state.lock().await;
 
-        // Check if this update is newer than the last known update
-        let is_newer = state_guard
-            .last_order_update_timestamp
-            .map(|last_ts| update.timestamp > last_ts)
-            .unwrap_or(true);
+        let is_newer = Self::is_timestamp_newer(
+            update.timestamp,
+            state_guard.last_order_update_timestamp,
+        );
 
         if !is_newer {
-            // Stale update - ignore it
             tracing::debug!(
                 symbol = %update.symbol,
                 order_id = %update.order_id,
@@ -2188,30 +1918,20 @@ impl Ordering {
             return;
         }
 
-        // Update order state
         if let Some(ref mut order) = state_guard.open_order {
             if order.order_id == update.order_id {
                 match update.status {
                     crate::event_bus::OrderStatus::Filled => {
-                        // ✅ NEW: Clear timeout entry when order is filled
                         state_guard.order_timeouts.remove(&update.order_id);
                         
-                        // Check if OrderUpdate is newer than existing position
-                        //
-                        // Scenario: PositionUpdate arrives first and creates position with timestamp T1
-                        // Then OrderUpdate arrives with timestamp T0 (T0 < T1) - this is stale!
-                        // We should ignore the OrderUpdate to prevent overwriting newer position data
                         if let Some(ref existing_pos) = state_guard.open_position {
                             if existing_pos.symbol == update.symbol {
-                                // Position already exists - check if OrderUpdate is newer
-                                let position_is_newer = state_guard
-                                    .last_position_update_timestamp
-                                    .map(|pos_ts| pos_ts > update.timestamp)
-                                    .unwrap_or(false);
+                                let position_is_newer = Self::is_timestamp_older(
+                                    update.timestamp,
+                                    state_guard.last_position_update_timestamp,
+                                );
 
                                 if position_is_newer {
-                                    // Position is newer than this OrderUpdate - ignore stale OrderUpdate
-                                    // But still clear the order since it's filled
                                     tracing::debug!(
                                         symbol = %update.symbol,
                                         order_id = %update.order_id,
@@ -2219,61 +1939,43 @@ impl Ordering {
                                         position_timestamp = ?state_guard.last_position_update_timestamp,
                                         "ORDERING: Ignoring stale OrderUpdate - position is newer, but clearing order since it's filled"
                                     );
-                                    // Clear the order since it's filled (even though we're not updating position)
-                                    state_guard.open_order = None;
-                                    // Update order timestamp to acknowledge we received this update
-                                    state_guard.last_order_update_timestamp =
-                                        Some(update.timestamp);
+                                    Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
                                     return;
                                 }
                             }
                         }
 
-                        // Order filled, convert to position
-                        // Convert order side to position direction and ensure qty is positive
                         let direction = PositionDirection::from_order_side(update.side);
-                        let qty_abs = if update.filled_qty.0.is_sign_negative() {
-                            Qty(-update.filled_qty.0) // Make positive
-                        } else {
-                            update.filled_qty
-                        };
+                        let (_, qty_abs) = PositionDirection::direction_and_abs_qty(update.filled_qty);
 
-                        // Problem: Partial fills can change entry_price (weighted average)
-                        // Example: Fill 1: 1.0 BTC @ 50000 → entry = 50000
-                        //          Fill 2: 0.5 BTC @ 50100 → entry = 50033.33 (weighted avg)
-                        // If we only check qty, we would skip entry_price update!
-                        //
-                        // Solution: Check BOTH qty AND entry_price
-                        // - Only skip update if BOTH are unchanged (within epsilon)
-                        // - If either changed, update position (partial fills must update entry price)
                         let should_update_position = if let Some(ref existing_pos) = state_guard.open_position {
                             if existing_pos.symbol == update.symbol {
-                                // Position exists - check if qty AND entry_price changed
                                 let qty_abs_existing = existing_pos.qty.0;
                                 let existing_entry_price = existing_pos.entry_price.0;
                                 
-                                // Calculate differences for both qty and entry_price
-                                use rust_decimal::prelude::ToPrimitive;
-                                let epsilon_qty = Decimal::new(1, 6); // 0.000001 (absolute for qty is fine)
-                                const EPSILON_PRICE_PCT: f64 = 0.001; // 0.001% = 1 basis point
+                                let epsilon_qty = Decimal::new(1, 6);
+                                const EPSILON_PRICE_PCT: f64 = 0.001;
                                 
+                                use rust_decimal::prelude::ToPrimitive;
                                 let qty_diff = (qty_abs.0 - qty_abs_existing).abs();
                                 let price_diff_abs = (update.average_fill_price.0 - existing_entry_price).abs();
-                                
-                                // Calculate percentage difference for price
                                 let price_diff_pct = if existing_entry_price > Decimal::ZERO {
-                                    (price_diff_abs / existing_entry_price) * Decimal::from(100)
+                                    utils::calculate_percentage(price_diff_abs, existing_entry_price)
                                 } else {
                                     price_diff_abs
                                 };
+                                let price_diff_pct_f64 = utils::decimal_to_f64(price_diff_pct).max(100.0);
                                 
-                                let price_diff_pct_f64 = price_diff_pct.to_f64().unwrap_or(100.0);
-                                
-                                // Update if either qty OR entry_price changed
-                                let should_update = qty_diff >= epsilon_qty || price_diff_pct_f64 >= EPSILON_PRICE_PCT;
+                                let should_update = Self::should_update_position(
+                                    qty_abs_existing,
+                                    existing_entry_price,
+                                    qty_abs.0,
+                                    update.average_fill_price.0,
+                                    epsilon_qty,
+                                    EPSILON_PRICE_PCT,
+                                );
                                 
                                 if !should_update {
-                                    // Both qty and entry_price unchanged - skip redundant update
                                     tracing::debug!(
                                         symbol = %update.symbol,
                                         order_id = %update.order_id,
@@ -2290,11 +1992,9 @@ impl Ordering {
                                 
                                 should_update
                             } else {
-                                // Different symbol - always update
                                 true
                             }
                         } else {
-                            // No existing position - always create
                             true
                         };
 
@@ -2305,17 +2005,10 @@ impl Ordering {
                             symbol: update.symbol.clone(),
                             direction,
                             qty: qty_abs,
-                            entry_price: update.average_fill_price, // Use average fill price (weighted average of all fills)
+                            entry_price: update.average_fill_price,
                         });
-                        state_guard.open_order = None;
-
-                        // Update timestamp after state change
-                        state_guard.last_order_update_timestamp = Some(update.timestamp);
-
-                        // Publish state update event for STORAGE module
-                        let state_to_publish = state_guard.clone();
-                        drop(state_guard);
-                        Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                        Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
+                        Self::publish_state_and_drop(state_guard, event_bus);
 
                         info!(
                             symbol = %update.symbol,
@@ -2325,26 +2018,15 @@ impl Ordering {
                                 "ORDERING: Order filled, position opened/updated"
                             );
                         } else {
-                            // Position unchanged - only update order timestamp
                             state_guard.circuit_breaker.reset();
-                            
-                            state_guard.open_order = None;
-                            state_guard.last_order_update_timestamp = Some(update.timestamp);
+                            Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
                         }
                     }
                     crate::event_bus::OrderStatus::Canceled => {
                         state_guard.order_timeouts.remove(&update.order_id);
                         
-                        // Order canceled, clear state
-                        state_guard.open_order = None;
-
-                        // Update timestamp after state change
-                        state_guard.last_order_update_timestamp = Some(update.timestamp);
-
-                        // Publish state update event for STORAGE module
-                        let state_to_publish = state_guard.clone();
-                        drop(state_guard);
-                        Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                        Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
+                        Self::publish_state_and_drop(state_guard, event_bus);
 
                         info!(
                             symbol = %update.symbol,
@@ -2356,11 +2038,7 @@ impl Ordering {
                     | crate::event_bus::OrderStatus::ExpiredInMatch => {
                         state_guard.order_timeouts.remove(&update.order_id);
                         
-                        // Order expired, clear state (similar to canceled)
-                        state_guard.open_order = None;
-
-                        // Update timestamp after state change
-                        state_guard.last_order_update_timestamp = Some(update.timestamp);
+                        Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
 
                         info!(
                             symbol = %update.symbol,
@@ -2371,14 +2049,8 @@ impl Ordering {
                     }
                     crate::event_bus::OrderStatus::Rejected => {
                         state_guard.order_timeouts.remove(&update.order_id);
-                        
-                        // Order rejected, clear state
-                        state_guard.open_order = None;
+                        Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
 
-                        // Update timestamp after state change
-                        state_guard.last_order_update_timestamp = Some(update.timestamp);
-
-                        // Extract rejection reason from OrderUpdate
                         let rejection_reason = update.rejection_reason.as_deref();
                         let should_open_circuit = state_guard.circuit_breaker.record_rejection(rejection_reason);
                         
@@ -2401,10 +2073,8 @@ impl Ordering {
                         }
                     }
                     _ => {
-                        // Partial fill or other status, update order
                         order.qty = update.remaining_qty;
 
-                        // Update timestamp after state change
                         state_guard.last_order_update_timestamp = Some(update.timestamp);
                     }
                 }
@@ -2450,21 +2120,17 @@ impl Ordering {
     ) {
         let mut state_guard = shared_state.ordering_state.lock().await;
 
-        // Check if this update is newer than the last known PositionUpdate
-        let is_newer_position_update = state_guard
-            .last_position_update_timestamp
-            .map(|last_ts| update.timestamp > last_ts)
-            .unwrap_or(true);
+        let is_newer_position_update = Self::is_timestamp_newer(
+            update.timestamp,
+            state_guard.last_position_update_timestamp,
+        );
 
-        // Also check if PositionUpdate is newer than the last OrderUpdate
-        // (We trust exchange's position closed signal even if OrderUpdate is newer)
-        let order_update_is_newer = state_guard
-            .last_order_update_timestamp
-            .map(|order_ts| order_ts > update.timestamp)
-            .unwrap_or(false);
+        let order_update_is_newer = Self::is_timestamp_older(
+            update.timestamp,
+            state_guard.last_order_update_timestamp,
+        );
 
         if !is_newer_position_update {
-            // Stale PositionUpdate - ignore it
             tracing::debug!(
                 symbol = %update.symbol,
                 update_timestamp = ?update.timestamp,
@@ -2474,12 +2140,7 @@ impl Ordering {
             return;
         }
 
-        // If OrderUpdate is newer, be more cautious about accepting PositionUpdate
-        // Only accept if position is closed (trust exchange's position closed signal)
-        // This prevents stale PositionUpdate from overwriting fresh OrderUpdate data
         if order_update_is_newer && update.is_open {
-            // OrderUpdate is newer and position is still open - likely stale PositionUpdate
-            // Ignore it to prevent overwriting fresh OrderUpdate data
             tracing::debug!(
                 symbol = %update.symbol,
                 update_timestamp = ?update.timestamp,
@@ -2489,18 +2150,11 @@ impl Ordering {
             return;
         }
 
-        // Check if we have an existing position for this symbol
         if let Some(ref existing_pos) = state_guard.open_position {
             if existing_pos.symbol == update.symbol {
                 if !update.is_open {
-                    // Position closed - always trust this (from exchange)
-                    state_guard.open_position = None;
-                    state_guard.last_position_update_timestamp = Some(update.timestamp);
-
-                    // Publish state update event for STORAGE module
-                    let state_to_publish = state_guard.clone();
-                    drop(state_guard);
-                    Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                    Self::clear_position_with_timestamp(&mut state_guard, update.timestamp);
+                    Self::publish_state_and_drop(state_guard, event_bus);
 
                     info!(
                         symbol = %update.symbol,
@@ -2509,62 +2163,32 @@ impl Ordering {
                     return;
                 }
 
-                // Race condition prevention - check if qty AND entry_price are unchanged
-                //
-                // Problem: OrderUpdate and PositionUpdate may arrive out of order or with same data
-                //
-                // Scenario 1: Redundant update (same data)
-                // - OrderUpdate::Filled creates position (qty=1.5, entry=100.0, timestamp=T1)
-                // - PositionUpdate arrives immediately after (qty=1.5, entry=100.0, timestamp=T2)
-                // - Both have valid timestamps, but qty AND entry_price are same → skip redundant update
-                //
-                // Scenario 2: Partial fills with entry price changes
-                // - Order partially filled: 1.0 BTC @ 50000 → OrderUpdate creates position (qty=1.0, entry=50000)
-                // - Order partially filled again: 0.5 BTC @ 50100 → OrderUpdate updates position (qty=1.5, entry=50033.33)
-                // - PositionUpdate arrives: (qty=1.5, entry=50033.33) → qty same but entry changed from original!
-                // - If we only check qty, we would skip this update and lose the correct entry price!
-                //
-                // Solution: Check BOTH qty AND entry_price
-                // - Only skip if BOTH are unchanged (within epsilon)
-                // - If either changed, update position (partial fills must update entry price)
-                //
-                // Example: First fill 1.0 @ 100.0, second fill 0.5 @ 101.0
-                // - Weighted average entry_price = (1.0*100.0 + 0.5*101.0) / 1.5 = 100.33
-                // - Qty may be same in some cases, but entry_price changes → must update!
                 let qty_abs_update = update.qty.0.abs();
                 let qty_abs_existing = existing_pos.qty.0;
                 let existing_entry_price = existing_pos.entry_price.0;
 
-                // Calculate differences for both qty and entry_price
-                // Problem: Absolute epsilon (0.01 USD) doesn't work for high-priced assets
-                // - BTC price ~$100,000 → 0.01 = 0.0001% (too small, causes false positives)
-                // - OrderUpdate: entry=50033.333333... (exact weighted average)
-                // - PositionUpdate: entry=50033.33 (rounded)
-                // - Difference: 0.003333 < 0.01 → Update SKIPPED ❌ (should update!)
-                //
-                // Solution: Use percentage-based epsilon (0.001% = 1 basis point)
-                // - Works for all price ranges (BTC, ETH, low-cap coins)
-                // - 0.001% of $100,000 = $1.00 (reasonable threshold)
-                // - 0.001% of $1.00 = $0.00001 (still reasonable for low prices)
-                let epsilon_qty = Decimal::new(1, 6); // 0.000001 (absolute for qty is fine)
-                const EPSILON_PRICE_PCT: f64 = 0.001; // 0.001% = 1 basis point
+                let epsilon_qty = Decimal::new(1, 6);
+                const EPSILON_PRICE_PCT: f64 = 0.001;
 
+                let should_update = Self::should_update_position(
+                    qty_abs_existing,
+                    existing_entry_price,
+                    qty_abs_update,
+                    update.entry_price.0,
+                    epsilon_qty,
+                    EPSILON_PRICE_PCT,
+                );
+                let should_skip = !should_update;
+                
+                use rust_decimal::prelude::ToPrimitive;
                 let qty_diff = (qty_abs_update - qty_abs_existing).abs();
                 let price_diff_abs = (update.entry_price.0 - existing_entry_price).abs();
-                
-                // Calculate percentage difference for price
                 let price_diff_pct = if existing_entry_price > Decimal::ZERO {
-                    (price_diff_abs / existing_entry_price) * Decimal::from(100)
+                    utils::calculate_percentage(price_diff_abs, existing_entry_price)
                 } else {
-                    // If existing price is zero, use absolute difference (shouldn't happen, but safe)
                     price_diff_abs
                 };
-
-                // Check BOTH qty AND entry_price
-                // Extract values for logging before mutating state_guard
-                use rust_decimal::prelude::ToPrimitive;
-                let price_diff_pct_f64 = price_diff_pct.to_f64().unwrap_or(100.0); // Default to 100% if conversion fails
-                let should_skip = qty_diff < epsilon_qty && price_diff_pct_f64 < EPSILON_PRICE_PCT;
+                let price_diff_pct_f64 = utils::decimal_to_f64(price_diff_pct).max(100.0);
                 let existing_qty_for_log = qty_abs_existing;
                 let update_qty_for_log = qty_abs_update;
                 let existing_entry_for_log = existing_entry_price;
@@ -2574,8 +2198,6 @@ impl Ordering {
                 let price_diff_pct_for_log = price_diff_pct_f64;
 
                 if should_skip {
-                    // Both qty and entry_price unchanged - this is likely a redundant update from race condition
-                    // Only update timestamp to acknowledge we received this update
                     state_guard.last_position_update_timestamp = Some(update.timestamp);
 
                     tracing::debug!(
@@ -2594,16 +2216,8 @@ impl Ordering {
                     return;
                 }
 
-                // Position is open and qty OR entry_price changed - update position
 
-                // Update position (timestamp check already passed, qty changed)
-                // Determine direction from qty sign and ensure qty is positive
-                let direction = PositionDirection::from_qty_sign(update.qty.0);
-                let qty_abs = if update.qty.0.is_sign_negative() {
-                    Qty(-update.qty.0) // Make positive
-                } else {
-                    update.qty
-                };
+                let (direction, qty_abs) = PositionDirection::direction_and_abs_qty(update.qty);
 
                 state_guard.open_position = Some(OpenPosition {
                     symbol: update.symbol.clone(),
@@ -2613,10 +2227,7 @@ impl Ordering {
                 });
                 state_guard.last_position_update_timestamp = Some(update.timestamp);
 
-                // Persist state after change
-                let state_to_publish = state_guard.clone();
-                drop(state_guard);
-                Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                Self::publish_state_and_drop(state_guard, event_bus);
 
                 info!(
                     symbol = %update.symbol,
@@ -2629,14 +2240,10 @@ impl Ordering {
             }
         }
 
-        // No existing position - create new one if position is open
         if update.is_open {
-            // Determine position direction from quantity sign:
-            // - Long position: qty > 0 (opened with BUY order)
-            // - Short position: qty < 0 (opened with SELL order)
             let direction = PositionDirection::from_qty_sign(update.qty.0);
             let qty_abs = if update.qty.0.is_sign_negative() {
-                Qty(-update.qty.0) // Make positive
+                Qty(-update.qty.0)
             } else {
                 update.qty
             };
@@ -2648,20 +2255,14 @@ impl Ordering {
                 entry_price: update.entry_price,
             });
             state_guard.last_position_update_timestamp = Some(update.timestamp);
-
-            // ✅ CRITICAL: Persist state after change
-            let state_to_publish = state_guard.clone();
-            drop(state_guard);
-            Self::publish_ordering_state_update(&state_to_publish, event_bus);
+            Self::publish_state_and_drop(state_guard, event_bus);
 
             info!(
                 symbol = %update.symbol,
                 "ORDERING: Position created from PositionUpdate"
             );
         } else {
-            // Position is closed and no existing position - just update timestamp
             state_guard.last_position_update_timestamp = Some(update.timestamp);
-            // No state change, no need to persist
         }
     }
     
@@ -2678,13 +2279,11 @@ impl Ordering {
     ) -> Result<()> {
         info!("ORDERING: Starting position reconciliation on startup");
         
-        // Fetch all positions from exchange via REST API
         match connection.get_all_positions().await {
             Ok(exchange_positions) => {
                 if exchange_positions.is_empty() {
                     info!("ORDERING: No open positions found on exchange");
                     
-                    // Check if internal state has orphaned positions
                     let mut state_guard = shared_state.ordering_state.lock().await;
                     if let Some(internal_pos) = &state_guard.open_position {
                         warn!(
@@ -2692,13 +2291,8 @@ impl Ordering {
                             "ORDERING: Internal state has position but exchange doesn't - clearing orphaned position"
                         );
                         
-                        // Clear orphaned position
-                        state_guard.open_position = None;
-                        
-                        // Publish state update
-                        let state_to_publish = state_guard.clone();
-                        drop(state_guard);
-                        Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                        Self::clear_position(&mut state_guard);
+                        Self::publish_state_and_drop(state_guard, event_bus);
                     }
                 } else {
                     let position_count = exchange_positions.len();
@@ -2708,11 +2302,8 @@ impl Ordering {
                         position_count
                     );
                     
-                    // Collect exchange symbols before loop (exchange_positions is moved in loop)
                     let exchange_symbols: Vec<String> = exchange_positions.iter().map(|(sym, _)| sym.clone()).collect();
                     
-                    // Restore each position by sending PositionUpdate events
-                    // This ensures handle_position_update is called, which properly restores state
                     for (symbol, exchange_pos) in exchange_positions {
                         let position_update = PositionUpdate {
                             symbol: symbol.clone(),
@@ -2725,7 +2316,6 @@ impl Ordering {
                             timestamp: Instant::now(),
                         };
                         
-                        // Send PositionUpdate event - handle_position_update will process it
                         if let Err(e) = event_bus.position_update_tx.send(position_update) {
                             error!(
                                 error = ?e,
@@ -2742,11 +2332,8 @@ impl Ordering {
                         }
                     }
                     
-                    // Wait a bit for PositionUpdate events to be processed
-                    // This ensures state is fully restored before continuing
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     
-                    // Check for orphaned internal positions (internal has but exchange doesn't)
                     let mut state_guard = shared_state.ordering_state.lock().await;
                     if let Some(internal_pos) = &state_guard.open_position {
                         let exchange_has = exchange_symbols.iter().any(|sym| sym == &internal_pos.symbol);
@@ -2756,13 +2343,8 @@ impl Ordering {
                                 "ORDERING: Internal state has position but exchange doesn't - clearing orphaned position"
                             );
                             
-                            // Clear orphaned position
-                            state_guard.open_position = None;
-                            
-                            // Publish state update
-                            let state_to_publish = state_guard.clone();
-                            drop(state_guard);
-                            Self::publish_ordering_state_update(&state_to_publish, event_bus);
+                            Self::clear_position(&mut state_guard);
+                            Self::publish_state_and_drop(state_guard, event_bus);
                         }
                     }
                     
@@ -2770,8 +2352,6 @@ impl Ordering {
                 }
             }
             Err(e) => {
-                // If we can't fetch positions, log warning but don't fail startup
-                // WebSocket ACCOUNT_UPDATE events will restore positions later
                 warn!(
                     error = %e,
                     "ORDERING: Failed to fetch positions from exchange on startup - positions will be restored via WebSocket events"

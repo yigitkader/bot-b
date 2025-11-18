@@ -1,25 +1,16 @@
-// Position management module
-// Smart position closing with 11 different closing conditions
-// Based on reference project with adaptations for our event-driven architecture
 
 use crate::types::{Px, PositionInfo, PositionDirection, Side};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::time::Instant;
 
-// ============================================================================
-// Constants
-// ============================================================================
 
 /// Maximum position duration in seconds (market making positions shouldn't stay open too long)
-pub const MAX_POSITION_DURATION_SEC: f64 = 300.0; // 5 minutes
+pub const MAX_POSITION_DURATION_SEC: f64 = 300.0;
 
 /// Maximum loss duration in seconds (if position is in loss for this long, force close)
-pub const MAX_LOSS_DURATION_SEC: f64 = 120.0; // 2 minutes
+pub const MAX_LOSS_DURATION_SEC: f64 = 120.0;
 
-// ============================================================================
-// Position State (for smart closing)
-// ============================================================================
 
 /// Position state for smart closing decisions
 #[derive(Debug, Clone)]
@@ -62,21 +53,16 @@ impl PositionState {
     /// Update PnL history and peak PnL
     pub fn update_pnl(&mut self, current_pnl: Decimal) {
         self.pnl_history.push(current_pnl);
-        // Keep only last 100 entries to prevent memory growth
         if self.pnl_history.len() > 100 {
             self.pnl_history.remove(0);
         }
         
-        // Update peak PnL
         if current_pnl > self.peak_pnl {
             self.peak_pnl = current_pnl;
         }
     }
 }
 
-// ============================================================================
-// Smart Position Closing
-// ============================================================================
 
 /// Check if position should be closed based on profit/loss and multiple conditions
 /// Returns (should_close, reason)
@@ -113,7 +99,6 @@ pub fn should_close_position_smart(
         return result;
     }
 
-    // Rule 4 & 5: Timeout checks (require entry_time)
     let entry_time = match state.entry_time {
         Some(t) => t,
         None => return (false, "no_entry_time".to_string()),
@@ -124,8 +109,6 @@ pub fn should_close_position_smart(
         return result;
     }
 
-    // Rule 6: Time-weighted Profit Thresholds
-    // Younger positions need less profit to close (faster turnover)
     let time_weighted_threshold = if age_secs <= 10.0 {
         min_profit_usd * 0.6
     } else if age_secs <= 20.0 {
@@ -136,18 +119,15 @@ pub fn should_close_position_smart(
         min_profit_usd * 0.2
     };
 
-    // Rule 7: Trend Alignment
     let trend_factor = calculate_trend_factor(position, state);
     let momentum_factor = calculate_momentum_factor(state);
     let volatility_factor = calculate_volatility_factor(state);
     let (should_close_trailing, should_close_drawdown, should_close_recovery) =
         evaluate_trailing_rules(state, net_pnl_ctx.net_pnl, min_profit_usd);
 
-    // Combined threshold (time-weighted + factors)
     let combined_threshold = time_weighted_threshold / (trend_factor * momentum_factor * volatility_factor);
     let should_close_by_threshold = net_pnl_ctx.net_pnl >= combined_threshold;
 
-    // Return result (priority order)
     if should_close_by_threshold {
         (true, format!("smart_threshold_{:.2}_usd", net_pnl_ctx.net_pnl))
     } else if should_close_trailing {

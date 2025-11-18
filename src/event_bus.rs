@@ -1,7 +1,4 @@
-// Event bus system for module communication
-// All modules communicate through events, no direct coupling
 
-// Re-export all event types from types.rs for convenience
 pub use crate::types::{
     BalanceUpdate, CloseReason, CloseRequest, FillHistoryAction, FillHistoryData,
     LogEvent, MarketTick, OpenOrderSnapshot, OpenPositionSnapshot,
@@ -9,9 +6,6 @@ pub use crate::types::{
     PositionUpdate, TradeSignal,
 };
 
-// ============================================================================
-// Event Bus
-// ============================================================================
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -65,8 +59,6 @@ impl EventBus {
     /// let event_bus = EventBus::new_with_config(&cfg);
     /// ```
     pub fn new_with_config(cfg: &crate::config::EventBusCfg) -> Self {
-        // ✅ CRITICAL: Broadcast channel capacity cannot be zero
-        // Ensure minimum capacity of 1 to prevent panic
         let market_tick_buffer = cfg.market_tick_buffer.max(1);
         let trade_signal_buffer = cfg.trade_signal_buffer.max(1);
         let close_request_buffer = cfg.close_request_buffer.max(1);
@@ -80,8 +72,8 @@ impl EventBus {
         let (order_update_tx, _) = broadcast::channel(order_update_buffer);
         let (position_update_tx, _) = broadcast::channel(position_update_buffer);
         let (balance_update_tx, _) = broadcast::channel(balance_update_buffer);
-        let (ordering_state_update_tx, _) = broadcast::channel(1000); // Buffer for state updates
-        let (order_fill_history_update_tx, _) = broadcast::channel(1000); // Buffer for fill history updates
+        let (ordering_state_update_tx, _) = broadcast::channel(1000);
+        let (order_fill_history_update_tx, _) = broadcast::channel(1000);
         let (log_event_tx, _) = mpsc::unbounded_channel();
         
         Self {

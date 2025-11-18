@@ -1,6 +1,3 @@
-// BALANCE: Balance tracking (USDT/USDC)
-// Only reads and maintains USDT/USDC balance
-// Provides availableBalance to other modules via shared state
 
 use crate::connection::Connection;
 use crate::event_bus::{BalanceUpdate, EventBus};
@@ -93,8 +90,6 @@ impl Balance {
     /// // Balance tracking is now active
     /// ```
     pub async fn start(&self) -> Result<()> {
-        // Fetch balance immediately on startup (REST API fallback)
-        // Retry with exponential backoff if initial fetch fails
         if let Err(e) = self.fetch_and_update_balance_with_retry().await {
             warn!(
                 error = %e,
@@ -102,7 +97,6 @@ impl Balance {
             );
         }
         
-        // Listen to BalanceUpdate events from WebSocket (preferred method)
         let balance_store = self.shared_state.balance_store.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let event_bus = self.event_bus.clone();
@@ -119,14 +113,9 @@ impl Balance {
                             break;
                         }
                         
-                        // ✅ CRITICAL: Update shared state from WebSocket event
-                        // WebSocket updates are prioritized (real-time, more accurate)
-                        // Always accept WebSocket updates (they are more recent and accurate)
                         {
                             let mut store = balance_store.write().await;
                             
-                            // WebSocket updates are always accepted (they are real-time and prioritized)
-                            // Even if REST API update is pending, WebSocket update should overwrite it
                             store.usdt = update.usdt;
                             store.usdc = update.usdc;
                             store.last_updated = update.timestamp;
@@ -171,9 +160,7 @@ impl Balance {
                     last_error = Some(e);
                     
                     if attempt < MAX_RETRIES - 1 {
-                        let delay_secs = INITIAL_DELAY_SECS * (1 << attempt); // Exponential backoff
-                        // ✅ CRITICAL: Safe unwrap - last_error was just set to Some(e) above
-                        // But use if let for extra safety
+                        let delay_secs = INITIAL_DELAY_SECS * (1 << attempt);
                         if let Some(ref err) = last_error {
                             warn!(
                                 error = %err,
@@ -189,7 +176,6 @@ impl Balance {
             }
         }
         
-        // All retries failed
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Failed to fetch balance after {} attempts", MAX_RETRIES)))
     }
 
@@ -200,20 +186,14 @@ impl Balance {
         
         let timestamp = Instant::now();
         
-        // CRITICAL: Event-first approach - send event BEFORE updating store
-        // This ensures event-driven consistency: subscribers process event before store is updated
-        // Prevents race condition where another thread reads updated store before event is processed
         let balance_update = BalanceUpdate {
             usdt: usdt_balance,
             usdc: usdc_balance,
             timestamp,
         };
         
-        // Send event first (non-blocking, but ensures event is queued before store update)
-        // Check if there are subscribers before sending to avoid unnecessary errors
         let receiver_count = self.event_bus.balance_update_tx.receiver_count();
         if receiver_count == 0 {
-            // No subscribers - skip sending (not an error, just no consumers yet)
             debug!("BALANCE: No BalanceUpdate subscribers, skipping event");
         } else {
             if let Err(e) = self.event_bus.balance_update_tx.send(balance_update) {
@@ -225,25 +205,14 @@ impl Balance {
             }
         }
         
-        // ✅ CRITICAL: Update shared state AFTER event is sent, but check timestamp first
-        // WebSocket updates are prioritized - if WebSocket already updated balance with newer timestamp,
-        // don't overwrite it with stale REST API data
-        // ✅ CRITICAL FIX: Single atomic check - no race window
-        // Lock is held during the entire check and update, so no WebSocket update can interleave
-        // Single check is sufficient because lock prevents concurrent updates
         {
             let mut store = self.shared_state.balance_store.write().await;
             
-            // ✅ Single atomic check - no race window
-            // Lock is held, so no WebSocket update can arrive between check and update
-            // If timestamp is valid (REST API data is newer or equal), update atomically
             if store.last_updated <= timestamp {
-                // Timestamp check passed - safe to update atomically
                 store.usdt = usdt_balance;
                 store.usdc = usdc_balance;
                 store.last_updated = timestamp;
             } else {
-                // Stale data, skip
                 warn!(
                     usdt_rest = %usdt_balance,
                     usdc_rest = %usdc_balance,

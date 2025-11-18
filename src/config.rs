@@ -1,12 +1,7 @@
-// Configuration structures and loading logic
-// Clean architecture - minimal config for event-driven modules
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
-// ============================================================================
-// Configuration Structures
-// ============================================================================
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RiskCfg {
@@ -379,9 +374,6 @@ impl Default for AppCfg {
     }
 }
 
-// ============================================================================
-// Default Value Functions
-// ============================================================================
 
 fn default_max_leverage() -> u32 {
     50
@@ -396,11 +388,11 @@ fn default_max_position_notional_usd() -> f64 {
 }
 
 fn default_maker_commission_pct() -> f64 {
-    0.02 // 0.02% (Binance futures standard maker fee)
+    0.02
 }
 
 fn default_taker_commission_pct() -> f64 {
-    0.04 // 0.04% (Binance futures standard taker fee)
+    0.04
 }
 
 fn default_min_spread_bps() -> f64 {
@@ -412,31 +404,31 @@ fn default_max_spread_bps() -> f64 {
 }
 
 fn default_signal_cooldown_seconds() -> u64 {
-    5 // Default: 5 seconds cooldown between signals for same symbol (optimized for high-frequency trading)
+    5
 }
 
 fn default_hft_mode() -> bool {
-    true // Default: HFT mode enabled for high-frequency trading
+    true
 }
 
 fn default_require_volume_confirmation() -> bool {
-    false // Default: Volume confirmation not required in HFT mode
+    false
 }
 
 fn default_use_trailing_stop() -> bool {
-    false // Default: Trailing stop disabled (can be enabled in config)
+    false
 }
 
 fn default_trailing_stop_callback_rate() -> f64 {
-    0.001 // Default: 0.1% callback rate (0.001 = 0.1%)
+    0.001
 }
 
 fn default_rsi_min_avg_loss() -> f64 {
-    0.0001 // Default: 0.0001 (prevents division by very small numbers)
+    0.0001
 }
 
 fn default_atr_period() -> usize {
-    14 // Default: 14 periods for ATR calculation
+    14
 }
 
 fn default_atr_sl_multiplier() -> f64 {
@@ -448,111 +440,111 @@ fn default_atr_tp_multiplier() -> f64 {
 }
 
 fn default_low_volatility_threshold() -> f64 {
-    0.5 // Default: 0.5% ATR = ranging market
+    0.5
 }
 
 fn default_high_volatility_threshold() -> f64 {
-    2.0 // Default: 2.0% ATR = volatile market
+    2.0
 }
 
 fn default_base_volatility() -> f64 {
-    0.02 // Default: 2% base volatility for normalization
+    0.02
 }
 
 fn default_base_min_score() -> f64 {
-    3.5 // Default: Base minimum score threshold
+    3.5
 }
 
 fn default_regime_multiplier_trending() -> f64 {
-    0.95 // Default: Trending markets use 95% of base score
+    0.95
 }
 
 fn default_regime_multiplier_ranging() -> f64 {
-    1.1 // Default: Ranging markets use 110% of base score
+    1.1
 }
 
 fn default_regime_multiplier_volatile() -> f64 {
-    1.15 // Default: Volatile markets use 115% of base score
+    1.15
 }
 
 fn default_regime_multiplier_unknown() -> f64 {
-    1.0 // Default: Unknown markets use 100% of base score
+    1.0
 }
 
 fn default_volume_multiplier_hft() -> f64 {
-    1.1 // Default: HFT mode requires 1.1x average volume
+    1.1
 }
 
 fn default_volume_multiplier_normal() -> f64 {
-    1.3 // Default: Normal mode requires 1.3x average volume
+    1.3
 }
 
 fn default_trend_threshold_hft() -> f64 {
-    0.5 // Default: HFT mode requires 50% trend alignment
+    0.5
 }
 
 fn default_trend_threshold_normal() -> f64 {
-    0.7 // Default: Normal mode requires 70% trend alignment
+    0.7
 }
 
 fn default_weak_trend_score_multiplier() -> f64 {
-    1.1 // Default: Weak trends with volume require 10% higher score
+    1.1
 }
 
 fn default_rsi_lower_long() -> f64 {
-    55.0 // Default: RSI lower bound for long signals
+    55.0
 }
 
 fn default_rsi_upper_long() -> f64 {
-    70.0 // Default: RSI upper bound for long signals
+    70.0
 }
 
 fn default_rsi_lower_short() -> f64 {
-    25.0 // Default: RSI lower bound for short signals
+    25.0
 }
 
 fn default_rsi_upper_short() -> f64 {
-    50.0 // Default: RSI upper bound for short signals
+    50.0
 }
 
 fn default_ema_short_score() -> f64 {
-    2.5 // Default: Score weight for short-term EMA alignment
+    2.5
 }
 
 fn default_ema_mid_score() -> f64 {
-    2.0 // Default: Score weight for mid-term EMA alignment
+    2.0
 }
 
 fn default_slope_score() -> f64 {
-    1.5 // Default: Score weight for slope strength
+    1.5
 }
 
 fn default_rsi_score() -> f64 {
-    1.5 // Default: Score weight for RSI confirmation
+    1.5
 }
 
 fn default_min_analysis_interval_ms() -> u64 {
-    100 // Default: 100ms minimum interval (10 analyses per second max)
+    100
 }
 
 fn default_default_spread_quality() -> f64 {
-    0.5 // Default: 0.5 = medium spread quality when range is zero
+    0.5
 }
 
 fn default_min_commission_buffer_usd() -> f64 {
-    0.5 // Default: 0.5 USD minimum commission buffer
+    0.5
 }
 
 fn default_min_margin_usd() -> f64 {
-    10.0 // Minimum margin: 10 USD
+    10.0
 }
 
 fn default_max_margin_usd() -> f64 {
-    100.0 // Maximum margin: 100 USD
+    100.0
 }
 
 fn default_margin_strategy() -> String {
-    "fixed".to_string() // Default: Fixed margin (use max_usd_per_order)
+    "fixed".to_string()
 }
 
 fn default_tif() -> String {
@@ -620,17 +612,7 @@ fn default_stop_loss_pct() -> f64 {
 }
 
 fn default_market_tick_buffer() -> usize {
-    // ✅ CRITICAL: MarketTick events are high-frequency (100 symbols × 1 tick/sec = 100 events/sec)
-    // Buffer size calculation:
-    // - 100 events/sec × 10 seconds = 1000 events (minimum for normal operation)
-    // - 100 events/sec × 100 seconds = 10000 events (recommended for high-frequency trading)
-    // - With slow subscribers or network delays, buffer can fill up quickly
-    // - When buffer is full, new events are dropped (RecvError::Lagged)
-    // - Larger buffer prevents event loss during subscriber lag spikes
-    //
-    // Recommendation: Use 10000 for high-frequency trading, 5000 for normal operation
-    // This provides ~100 seconds of buffer at 100 events/sec, or ~50 seconds at 200 events/sec
-    10000 // Increased from 1000 to handle high-frequency events and subscriber lag
+    10000
 }
 
 fn default_trade_signal_buffer() -> usize {
@@ -642,48 +624,45 @@ fn default_default_event_buffer() -> usize {
 }
 
 fn default_dynamic_symbol_selection_enabled() -> bool {
-    false // Default: disabled (use manual symbols or auto_discover_quote)
+    false
 }
 
 fn default_max_symbols() -> usize {
-    30 // Default: 30 symbols max (CPU limit)
+    30
 }
 
 fn default_rotation_interval_minutes() -> u64 {
-    15 // Default: rotate every 15 minutes
+    15
 }
 
 fn default_min_volatility_pct() -> f64 {
-    1.5 // Default: minimum 1.5% daily volatility
+    1.5
 }
 
 fn default_min_quote_volume() -> f64 {
-    1_000_000.0 // Default: minimum 1M USD volume
+    1_000_000.0
 }
 
 fn default_min_trades_24h() -> u64 {
-    1000 // Default: minimum 1000 trades in 24h
+    1000
 }
 
 fn default_volatility_weight() -> f64 {
-    2.0 // Default: volatility is 2x important
+    2.0
 }
 
 fn default_volume_weight() -> f64 {
-    1.0 // Default: volume weight
+    1.0
 }
 
 fn default_trades_weight() -> f64 {
-    0.5 // Default: trades weight
+    0.5
 }
 
 fn default_spread_weight() -> f64 {
-    1.0 // Default: spread weight
+    1.0
 }
 
-// ============================================================================
-// Configuration Loading
-// ============================================================================
 
 /// Load application configuration from file or command line arguments.
 ///
@@ -758,7 +737,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         return Err(anyhow!("max_usd_per_order must be positive"));
     }
 
-    // Quote asset validation: Only USDC or USDT accepted
     let quote_upper = cfg.quote_asset.to_uppercase();
     if quote_upper != "USDC" && quote_upper != "USDT" {
         return Err(anyhow!(
@@ -767,7 +745,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // API key validation
     if cfg.binance.api_key.trim().is_empty() {
         return Err(anyhow!(
             "binance.api_key is required but is empty. Please set your API key in config.yaml"
@@ -779,7 +756,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // API key format check (Binance API keys are typically 64 characters)
     if cfg.binance.api_key.len() < 20 {
         return Err(anyhow!(
             "binance.api_key appears to be invalid (too short). Binance API keys are typically 64 characters long"
@@ -791,30 +767,12 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // Leverage validation
-    // ✅ FIX: Removed max_leverage limit check
-    // User requirement: Each coin can have different max leverage (100x, 125x, etc.)
-    // Coin's max leverage comes from exchange (rules.max_leverage) and is always correct
-    // Config leverage is only used as fallback when coin doesn't have max leverage info
-    // Therefore, we should not limit config leverage - exchange will enforce correct limits
     if let Some(leverage) = cfg.leverage {
         if leverage == 0 {
             return Err(anyhow!("leverage must be greater than 0"));
         }
-        // Removed: leverage > cfg.risk.max_leverage check
-        // Reason: Coin's max leverage (from exchange) may exceed config max_leverage
-        // Exchange will enforce correct leverage limits per symbol
     }
     
-    // CRITICAL: Cross margin mode validation
-    // TP/SL PnL calculation in follow_orders.rs assumes isolated margin
-    // Cross margin uses shared account equity, which requires different PnL calculation
-    // Formula for isolated: PnL% = PriceChange% × Leverage
-    // Formula for cross: PnL% = (PriceChange% × PositionNotional) / TotalAccountEquity
-    // Using isolated formula with cross margin causes incorrect TP/SL triggers:
-    // - Premature or delayed TP/SL triggers
-    // - Incorrect risk management
-    // - Potential financial losses
     if !cfg.risk.use_isolated_margin {
         return Err(anyhow!(
             "CRITICAL: Cross margin mode is NOT supported for TP/SL. \
@@ -824,19 +782,10 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
     
-    // Also validate exec.default_leverage
-    // ✅ FIX: Removed max_leverage limit check for default_leverage
-    // User requirement: Each coin can have different max leverage (100x, 125x, etc.)
-    // Default leverage is only used as fallback when coin doesn't have max leverage info
-    // Exchange will enforce correct leverage limits per symbol
     if cfg.exec.default_leverage == 0 {
         return Err(anyhow!("exec.default_leverage must be greater than 0"));
     }
-    // Removed: default_leverage > cfg.risk.max_leverage check
-    // Reason: Coin's max leverage (from exchange) may exceed config max_leverage
-    // Exchange will enforce correct leverage limits per symbol
 
-    // Take profit percentage validation
     if cfg.take_profit_pct <= 0.0 {
         return Err(anyhow!("take_profit_pct must be greater than 0"));
     }
@@ -844,7 +793,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         return Err(anyhow!("take_profit_pct must be less than 100"));
     }
 
-    // Stop loss percentage validation
     if cfg.stop_loss_pct <= 0.0 {
         return Err(anyhow!("stop_loss_pct must be greater than 0"));
     }
@@ -856,7 +804,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // Order size validation (legacy)
     if cfg.max_usd_per_order <= cfg.min_usd_per_order {
         return Err(anyhow!(
             "max_usd_per_order ({}) must be greater than min_usd_per_order ({})",
@@ -868,7 +815,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         return Err(anyhow!("min_usd_per_order must be greater than 0"));
     }
 
-    // Dynamic margin range validation
     if cfg.min_margin_usd <= 0.0 {
         return Err(anyhow!("min_margin_usd must be greater than 0"));
     }
@@ -879,7 +825,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.min_margin_usd
         ));
     }
-    // Clamp max_usd_per_order to [min_margin_usd, max_margin_usd] range
     if cfg.max_usd_per_order < cfg.min_margin_usd || cfg.max_usd_per_order > cfg.max_margin_usd {
         return Err(anyhow!(
             "max_usd_per_order ({}) must be within [min_margin_usd ({}), max_margin_usd ({})] range",
@@ -888,7 +833,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
             cfg.max_margin_usd
         ));
     }
-    // Validate margin strategy
     let valid_strategies = ["fixed", "dynamic", "trend_based", "balance_based", "max_balance"];
     if !valid_strategies.contains(&cfg.margin_strategy.as_str()) {
         return Err(anyhow!(
@@ -897,60 +841,22 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // Minimum quote balance validation
     if cfg.min_quote_balance_usd <= 0.0 {
         return Err(anyhow!("min_quote_balance_usd must be greater than 0"));
     }
 
-    // Note: min_quote_balance_usd is NOT required to be >= max_margin_usd
-    // For small balances (< max_margin_usd), we use dynamic threshold:
-    // - Minimum balance = min_margin_usd + commission buffer (e.g., 10 + 5 = 15 USD)
-    // - The system will use all available balance (up to max_margin_usd) for margin
-    // - Example: 20 USD balance → use 20 USD margin (all available, up to max 100 USD)
-    // This allows trading with any balance >= min_margin_usd + commission buffer
 
-    // ✅ CRITICAL: Validate that profitable trades are possible
-    // For a trade to be profitable, take_profit_pct must exceed stop_loss_pct + total costs
-    // Total costs = entry commission + exit commission + spread + slippage + funding rate
-    // 
-    // Mathematical model:
-    // - Entry commission: taker_commission_pct (worst case: market order)
-    // - Exit commission (TP): taker_commission_pct (on exit price)
-    // - Exit commission (SL): taker_commission_pct (on exit price)
-    // - Spread cost: average spread (bps) / 10000 (convert to percentage)
-    // - Slippage: estimated 0.01% for liquid pairs (conservative)
-    // - Funding rate: estimated 0.01% per 8 hours (perpetual futures)
-    //   For HFT, average trade duration is short (< 1 hour), but we include it for safety
-    //
-    // Worst case total cost = 2 * taker_commission_pct + spread_pct + slippage_pct + funding_rate_pct
-    // We need: take_profit_pct > stop_loss_pct + total_cost
-    //
-    // For HFT with 0.5$ profit target:
-    // - Margin: 10-100 USD
-    // - Leverage: 100x (max)
-    // - Notional: 1000-10000 USD
-    // - Target profit: 0.5 USD = 0.05% of 1000 USD notional (worst case)
-    // - This means TP% must be at least 0.05% + costs
     let total_commission_pct = 2.0 * cfg.risk.taker_commission_pct;
     
-    // Estimate spread cost: average spread in bps / 10000
-    // Default: assume 0.02% spread (2 bps) for major pairs
     let avg_spread_bps = (cfg.trending.min_spread_bps + cfg.trending.max_spread_bps) / 2.0;
     let spread_pct = avg_spread_bps / 10000.0;
     
-    // Slippage estimate: 0.01% for liquid pairs (conservative)
     const SLIPPAGE_PCT: f64 = 0.01;
     
-    // Funding rate estimate: 0.01% per 8 hours (typical for perpetual futures)
-    // For HFT, average trade duration is short (< 1 hour), but we include it for safety
-    // Conservative estimate: assume 1 hour average trade duration = 0.01% / 8 = 0.00125%
-    // For simplicity, use 0.01% as worst case (if trade lasts full 8 hours)
-    const ESTIMATED_FUNDING_RATE_PCT: f64 = 0.01; // 0.01% per 8 hours (worst case)
+    const ESTIMATED_FUNDING_RATE_PCT: f64 = 0.01;
     
-    // Total cost = commission + spread + slippage + funding rate
     let total_cost_pct = total_commission_pct + spread_pct + SLIPPAGE_PCT + ESTIMATED_FUNDING_RATE_PCT;
     
-    // Minimum required TP = SL% + total costs
     let min_required_tp = cfg.stop_loss_pct + total_cost_pct;
     
     if cfg.take_profit_pct <= min_required_tp {
@@ -972,17 +878,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
     
-    // Additional validation for HFT strategy (0.5$ profit target)
-    // With 100x leverage and 10-100 USD margin:
-    // - Min notional: 10 * 100 = 1000 USD
-    // - Max notional: 100 * 100 = 10000 USD
-    // - Target profit: 0.5 USD
-    // - Min profit %: 0.5 / 10000 = 0.005% (worst case, max notional)
-    // - Max profit %: 0.5 / 1000 = 0.05% (best case, min notional)
-    // 
-    // For consistency, TP% should be at least 0.05% to achieve 0.5$ profit on min notional
-    // But this is too small - we need TP% to cover costs + profit
-    // Recommended: TP% >= 0.1% for HFT strategy (allows 0.5$ profit after costs)
     const MIN_HFT_TP_PCT: f64 = 0.1;
     if cfg.take_profit_pct < MIN_HFT_TP_PCT {
         eprintln!(
@@ -994,7 +889,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         );
     }
 
-    // Validate trending spread configuration
     if cfg.trending.min_spread_bps < 0.0 {
         return Err(anyhow!("trending.min_spread_bps must be non-negative"));
     }
@@ -1009,28 +903,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // CRITICAL: Validate hedge mode configuration
-    // Hedge mode support is incomplete and causes system failures
-    // 
-    // Problem: Current implementation cannot handle hedge mode correctly
-    // - Position struct only supports single position per symbol (one qty, one entry)
-    // - TP/SL tracking is symbol-based, not position-side-based
-    // - If both LONG and SHORT positions exist, only one is tracked (the other is lost)
-    // - flatten_position closes ALL positions for the symbol (both LONG and SHORT)
-    // - Position tracking is incomplete - LONG and SHORT should be tracked separately
-    // 
-    // This causes:
-    // - Incorrect TP/SL triggers (only one position tracked)
-    // - Unintended position closures (both LONG and SHORT closed when closing one)
-    // - Position data loss (one position ignored)
-    // - System instability and potential financial losses
-    // 
-    // Full hedge mode support requires:
-    // - Position struct to support multiple positions per symbol (LONG and SHORT separately)
-    // - Separate TP/SL tracking for LONG and SHORT positions
-    // - position_id-based closing (CloseRequest.position_id)
-    // - Separate position tracking in ORDERING state
-    // - HashMap<(String, PositionSide), PositionInfo> for TP/SL tracking
     if cfg.binance.hedge_mode {
         return Err(anyhow!(
             "CRITICAL: Hedge mode (hedge_mode=true) is NOT supported. \
@@ -1052,8 +924,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         ));
     }
 
-    // ⚠️ CRITICAL: Validate margin mode configuration
-    // TP/SL PnL calculation assumes isolated margin - warn if cross margin is used
     if !cfg.risk.use_isolated_margin {
         eprintln!("⚠️  WARNING: Cross margin mode (use_isolated_margin=false) is enabled.");
         eprintln!("   - TP/SL PnL calculation assumes isolated margin");
@@ -1063,10 +933,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
         eprintln!("   RECOMMENDATION: Use use_isolated_margin=true for correct TP/SL behavior.");
     }
 
-    // ✅ CRITICAL: Validate signal size consistency
-    // TRENDING generates signals using: notional = max_usd_per_order * leverage
-    // ORDERING validates: notional <= max_position_notional_usd
-    // These must be consistent to avoid signals being systematically rejected
     let leverage = cfg.leverage.unwrap_or(cfg.exec.default_leverage);
     let expected_notional = cfg.max_usd_per_order * leverage as f64;
     if expected_notional > cfg.risk.max_position_notional_usd {
@@ -1082,9 +948,6 @@ fn validate_config(cfg: &AppCfg) -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// Internal Config Default Functions
-// ============================================================================
 
 fn default_max_position_size_buffer() -> f64 {
     1.5
@@ -1111,9 +974,9 @@ fn default_pnl_alert_interval_sec() -> u64 {
 }
 
 fn default_pnl_alert_threshold_positive() -> f64 {
-    0.1 // 10%
+    0.1
 }
 
 fn default_pnl_alert_threshold_negative() -> f64 {
-    -0.05 // -5%
+    -0.05
 }

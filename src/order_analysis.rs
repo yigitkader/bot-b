@@ -1,6 +1,3 @@
-// Order analysis and fill rate tracking module
-// Stale order detection, fill rate tracking (EWMA), and order synchronization
-// Based on reference project with adaptations for our event-driven architecture
 
 use crate::config::AppCfg;
 use crate::types::{Px, Qty, Side};
@@ -10,9 +7,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{info, warn};
 
-// ============================================================================
-// Order Analysis
-// ============================================================================
 
 /// Order information for analysis
 #[derive(Clone, Debug)]
@@ -51,7 +45,6 @@ pub fn analyze_orders(
 
         let order_age_ms = order.created_at.elapsed().as_millis() as u64;
 
-        // Calculate market distance (how far order is from current market price)
         let market_distance_pct = match order.side {
             Side::Buy => {
                 let ask_f64 = ask.0.to_f64().unwrap_or(0.0);
@@ -71,18 +64,14 @@ pub fn analyze_orders(
             }
         };
 
-        // Maximum allowed distance from market (depends on position)
         let max_distance_pct = if position_size_notional > 0.0 {
-            0.01 // 1% when position exists
+            0.01
         } else {
-            0.02 // 2% when no position
+            0.02
         };
 
-        // Check if order is too far from market
         let should_cancel_far = market_distance_pct.abs() > max_distance_pct;
 
-        // Check if order is stale (too old)
-        // If we have a position, use shorter timeout (2/3 of max age)
         let max_age_for_stale = if position_size_notional > 0.0 {
             (max_order_age_ms * 2) / 3
         } else {
@@ -107,9 +96,6 @@ pub fn analyze_orders(
     orders_to_cancel
 }
 
-// ============================================================================
-// Fill Rate Tracking
-// ============================================================================
 
 /// Fill rate state for tracking order fill performance
 #[derive(Debug, Clone)]
@@ -129,7 +115,7 @@ pub struct FillRateState {
 impl FillRateState {
     pub fn new() -> Self {
         Self {
-            fill_rate: 0.5, // Initial fill rate (neutral)
+            fill_rate: 0.5,
             consecutive_no_fills: 0,
             last_fill_time: None,
             last_decay_check: None,
@@ -166,7 +152,6 @@ pub fn apply_fill_rate_decay(
 ) {
     let now = Instant::now();
     
-    // Check if enough time has passed since last decay
     let should_decay = state.last_decay_check
         .map(|last| now.duration_since(last).as_secs() >= decay_interval_sec)
         .unwrap_or(true);
@@ -175,7 +160,6 @@ pub fn apply_fill_rate_decay(
         state.fill_rate = (state.fill_rate * decay_factor).max(0.0);
         state.last_decay_check = Some(now);
         
-        // Track decay period for optimization
         if let Some(last_period) = state.last_decay_period {
             if last_period != decay_interval_sec {
                 state.last_decay_period = Some(decay_interval_sec);
@@ -204,19 +188,14 @@ pub fn calculate_fill_rate_from_history(
     time_window_sec: u64,
 ) -> f64 {
     if total_orders == 0 {
-        return 0.5; // Default fill rate
+        return 0.5;
     }
     
     let fill_rate = filled_orders as f64 / total_orders as f64;
     
-    // Apply time decay (older orders have less weight)
-    // Simplified: just return the ratio for now
     fill_rate.max(0.0).min(1.0)
 }
 
-// ============================================================================
-// Order Synchronization Helpers
-// ============================================================================
 
 /// Compare local orders with API orders and return differences
 #[derive(Debug, Clone)]
@@ -246,7 +225,6 @@ pub fn compare_orders(
 ) -> OrderSyncResult {
     let mut result = OrderSyncResult::new();
 
-    // Find new orders (in API but not in local)
     for order_id in api_order_ids {
         if !local_order_ids.contains(order_id) {
             result.new_orders.push(order_id.clone());
@@ -255,7 +233,6 @@ pub fn compare_orders(
         }
     }
 
-    // Find removed orders (in local but not in API)
     for order_id in local_order_ids {
         if !api_order_ids.contains(order_id) {
             result.removed_orders.push(order_id.clone());
@@ -265,9 +242,6 @@ pub fn compare_orders(
     result
 }
 
-// ============================================================================
-// Order Validation
-// ============================================================================
 
 /// Validate order parameters before placement
 pub fn validate_order(
@@ -278,17 +252,14 @@ pub fn validate_order(
     side: Side,
     min_notional: Option<Decimal>,
 ) -> Result<(), String> {
-    // Check price validity
     if price.0 <= Decimal::ZERO {
         return Err("Order price must be positive".to_string());
     }
 
-    // Check quantity validity
     if qty.0 <= Decimal::ZERO {
         return Err("Order quantity must be positive".to_string());
     }
 
-    // Check price is within reasonable range (not too far from market)
     let market_price = match side {
         Side::Buy => ask.0,
         Side::Sell => bid.0,
@@ -298,7 +269,6 @@ pub fn validate_order(
         return Err("Market price is invalid".to_string());
     }
 
-    // Check min notional
     if let Some(min_not) = min_notional {
         let notional = price.0 * qty.0;
         if notional < min_not {

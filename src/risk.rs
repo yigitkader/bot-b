@@ -1,6 +1,3 @@
-// Risk management module
-// Multi-level risk control system with position size risk, PnL alerts, and risk level handling
-// Based on reference project with adaptations for our event-driven architecture
 
 use crate::config::AppCfg;
 use crate::types::{Px, Qty, Position};
@@ -9,9 +6,6 @@ use rust_decimal::Decimal;
 use std::time::Instant;
 use tracing::{info, warn};
 
-// ============================================================================
-// Core Risk Types and Limits
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct RiskLimits {
@@ -33,14 +27,11 @@ pub enum RiskAction {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PositionRiskLevel {
     Ok,
-    Soft,   // Block new orders
-    Medium, // Reduce existing orders
-    Hard,   // Force close
+    Soft,
+    Medium,
+    Hard,
 }
 
-// ============================================================================
-// Core Risk Checking
-// ============================================================================
 
 /// Check risk based on position, inventory, liquidation gap, and drawdown
 pub fn check_risk(
@@ -66,9 +57,6 @@ pub fn check_risk(
     RiskAction::Ok
 }
 
-// ============================================================================
-// Position Size Risk Management
-// ============================================================================
 
 /// State structure for position risk checking
 /// This is a simplified version adapted for our event-driven architecture
@@ -172,9 +160,6 @@ pub fn update_peak_pnl(peak_pnl: &mut Decimal, current_pnl: Decimal) {
     }
 }
 
-// ============================================================================
-// Risk Level Handling
-// ============================================================================
 
 /// Handle risk level actions (Hard, Medium, Soft, Ok)
 /// Returns true if trading should continue, false if position was closed
@@ -187,7 +172,7 @@ pub fn determine_risk_actions(
     position_size_notional: f64,
     total_exposure: f64,
     max_allowed: f64,
-    active_orders: &[(String, Instant)], // (order_id, created_at)
+    active_orders: &[(String, Instant)],
 ) -> RiskActions {
     match risk_level {
         PositionRiskLevel::Hard => {
@@ -211,11 +196,9 @@ pub fn determine_risk_actions(
                 "MEDIUM LIMIT: reducing active orders"
             );
             
-            // Sort orders by creation time (oldest first)
             let mut sorted_orders: Vec<_> = active_orders.iter().collect();
             sorted_orders.sort_by_key(|(_, t)| *t);
             
-            // Cancel half of the orders (at least 1)
             let to_cancel_count = (sorted_orders.len() / 2).max(1);
             let orders_to_cancel: Vec<String> = sorted_orders
                 .iter()

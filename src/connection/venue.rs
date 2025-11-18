@@ -1,6 +1,3 @@
-// Venue trait and Binance Futures implementation
-// Exchange API implementations (REST API calls, order placement, position management)
-// All Binance-specific exchange logic
 
 use crate::types::{
     FutExchangeInfo, FutExchangeSymbol, FutFilter, Position, PriceUpdate, Px, Qty, Side,
@@ -25,9 +22,6 @@ use tokio::time::Duration;
 use tracing::{error, info, warn};
 use urlencoding::encode;
 
-// ============================================================================
-// Venue Trait
-// ============================================================================
 
 /// Exchange interface trait
 /// Implemented by BinanceFutures
@@ -58,16 +52,12 @@ pub trait Venue: Send + Sync {
         &self,
         symbol: &str,
         activation_price: Px,
-        callback_rate: f64, // 0.001 = 0.1%
+        callback_rate: f64,
         quantity: Qty,
     ) -> Result<String>;
     async fn available_balance(&self, asset: &str) -> Result<Decimal>;
 }
 
-// ============================================================================
-// Binance Exchange Types (from types.rs)
-// ============================================================================
-// FutFilter, FutExchangeInfo, FutExchangeSymbol are imported from crate::types
 
 pub static FUT_RULES: Lazy<DashMap<String, Arc<SymbolRules>>> = Lazy::new(|| DashMap::new());
 
@@ -107,7 +97,7 @@ fn str_dec<S: AsRef<str>>(s: S) -> Decimal {
 
 fn scale_from_step(step: Decimal) -> usize {
     if step.is_zero() {
-        return 8; // Default precision
+        return 8;
     }
     if step >= Decimal::ONE {
         return 0;
@@ -155,7 +145,6 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         }
     }
 
-// Precision calculation: use API value directly, not scale_from_step
     let p_prec = sym.price_precision.unwrap_or_else(|| {
         let calc = scale_from_step(tick);
         tracing::warn!(
@@ -178,17 +167,16 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         calc
     });
 
-// Use more reasonable fallback values
     let final_tick = if tick.is_zero() {
         tracing::warn!(symbol = %sym.symbol, "tickSize is zero, using fallback 0.01");
-        Decimal::new(1, 2) // 0.01
+        Decimal::new(1, 2)
     } else {
         tick
     };
 
     let final_step = if step.is_zero() {
         tracing::warn!(symbol = %sym.symbol, "stepSize is zero, using fallback 0.001");
-        Decimal::new(1, 3) // 0.001
+        Decimal::new(1, 3)
     } else {
         step
     };
@@ -209,12 +197,10 @@ fn rules_from_fut_symbol(sym: FutExchangeSymbol) -> SymbolRules {
         price_precision: p_prec,
         qty_precision: q_prec,
         min_notional,
-        // For now, set to None (will use config max_leverage instead)
         max_leverage: None,
     }
 }
 
-// ---- Ortak ----
 
 /// Binance API common configuration
 ///
@@ -249,7 +235,6 @@ fn sign(&self, qs: &str) -> String {
                     secret_key_length = self.secret_key.len(),
                     "CRITICAL: HMAC key initialization failed, returning empty signature (API call will fail)"
                 );
-            // Return empty signature - API call will fail gracefully
                 return String::new();
             }
         };
@@ -258,13 +243,12 @@ fn sign(&self, qs: &str) -> String {
     }
 }
 
-// ---- USDT-M Futures ----
 
 #[derive(Clone)]
 pub struct BinanceFutures {
-    pub base: String, // e.g. https://fapi.binance.com
+    pub base: String,
     pub common: BinanceCommon,
-    pub hedge_mode: bool, // Is hedge mode (dual-side position) enabled?
+    pub hedge_mode: bool,
 }
 
 #[derive(Deserialize)]
@@ -307,9 +291,9 @@ struct FutPosition {
 #[serde(rename = "liquidationPrice")]
     liquidation_price: String,
 #[serde(rename = "positionSide", default)]
-    position_side: Option<String>, // "LONG" | "SHORT" | "BOTH" (hedge mode) or None (one-way mode)
+    position_side: Option<String>,
 #[serde(rename = "marginType", default)]
-    margin_type: String, // "isolated" or "cross"
+    margin_type: String,
 }
 
 
@@ -344,8 +328,6 @@ pub fn from_config(
 /// Must be set explicitly for each symbol at startup
 /// Uses /fapi/v1/leverage endpoint for per-symbol leverage
     pub async fn set_leverage(&self, sym: &str, leverage: u32) -> Result<u32> {
-        // Try leverage values in descending order if initial attempt fails
-        // Common valid leverage values: 1, 2, 3, 5, 10, 20, 25, 50, 75, 100
         let leverage_candidates = if leverage > 100 {
             vec![100, 75, 50, 25, 20, 10, 5, 1]
         } else if leverage > 50 {
@@ -394,12 +376,9 @@ pub fn from_config(
                 }
                 Err(e) => {
                     last_error = Some(e);
-                    // ✅ CRITICAL: Safe unwrap - last_error is Some(e) just above
-                    // But use if let for extra safety to prevent panic
                     if let Some(ref error) = last_error {
                         let error_str = error.to_string().to_lowercase();
                         if error_str.contains("leverage") && (error_str.contains("not valid") || error_str.contains("-4028")) {
-                            // Continue to next lower leverage value
                             tracing::debug!(
                                 symbol = %sym,
                                 attempted_leverage = lev,
@@ -408,20 +387,16 @@ pub fn from_config(
                             );
                             continue;
                         } else {
-                            // Other error (network, auth, etc.) - return immediately
                             warn!(symbol = %sym, leverage = lev, error = ?last_error, "Failed to set leverage (non-leverage error)");
-                            // Safe unwrap - last_error is Some(e) from above
                             return Err(last_error.unwrap());
                         }
                     } else {
-                        // Should never happen, but defensive programming
                         return Err(anyhow!("Unknown error setting leverage"));
                     }
                 }
             }
         }
         
-        // All leverage values failed
         Err(last_error.unwrap_or_else(|| anyhow!("All leverage values failed for symbol {}", sym)))
     }
 
@@ -454,15 +429,13 @@ pub fn from_config(
                 Ok(())
             }
             Err(e) => {
-                // ✅ CRITICAL: Binance returns -4059 "No need to change position side" when already set correctly
-                // This is not an error - the position side is already in the desired state
                 let error_str = e.to_string();
                 if error_str.contains("-4059") || error_str.contains("No need to change position side") {
                     info!(
                         dual_side = dual,
                         "position side mode already set correctly (no change needed)"
                     );
-                    Ok(()) // Treat as success
+                    Ok(())
                 } else {
                     warn!(dual_side = dual, error = %e, "failed to set position side mode");
                     Err(e)
@@ -496,8 +469,6 @@ pub fn from_config(
                 Ok(())
             }
             Err(e) => {
-                // ✅ CRITICAL: Binance returns -4046 "No need to change margin type" when already set correctly
-                // This is not an error - the margin type is already in the desired state
                 let error_str = e.to_string();
                 if error_str.contains("-4046") || error_str.contains("No need to change margin type") {
                     info!(
@@ -505,7 +476,7 @@ pub fn from_config(
                         margin_type = %margin_type,
                         "margin type already set correctly (no change needed)"
                     );
-                    Ok(()) // Treat as success
+                    Ok(())
                 } else {
                     warn!(%sym, margin_type = %margin_type, error = %e, "failed to set margin type");
                     Err(e)
@@ -519,8 +490,6 @@ pub fn from_config(
     /// ✅ CRITICAL: This endpoint requires authentication (signature + API key)
     /// Public so it can be called directly when coin's max leverage is needed
     pub async fn fetch_max_leverage(&self, sym: &str) -> Option<u32> {
-        // Helper function to deserialize u32 from string or number
-        // Binance API returns bracket and initialLeverage as strings in some cases
         fn deserialize_u32_flexible<'de, D>(deserializer: D) -> Result<u32, D::Error>
         where
             D: serde::Deserializer<'de>,
@@ -557,8 +526,6 @@ pub fn from_config(
         
         #[derive(Deserialize)]
         struct LeverageBracket {
-            // ✅ CRITICAL FIX: bracket and initialLeverage can be string or number
-            // Binance API returns them as strings in some cases
             #[serde(deserialize_with = "deserialize_u32_flexible")]
             bracket: u32,
             #[serde(rename = "initialLeverage", deserialize_with = "deserialize_u32_flexible")]
@@ -577,8 +544,6 @@ pub fn from_config(
             brackets: Vec<LeverageBracket>,
         }
         
-        // ✅ CRITICAL: This endpoint requires authentication
-        // Build authenticated request with signature
         let qs = format!(
             "timestamp={}&recvWindow={}",
             BinanceCommon::ts(),
@@ -587,7 +552,6 @@ pub fn from_config(
         let sig = self.common.sign(&qs);
         let url = format!("{}/fapi/v1/leverageBrackets?{}&signature={}", self.base, qs, sig);
         
-        // Try to fetch leverage brackets with better error handling
         let resp = match self.common
             .client
             .get(&url)
@@ -606,7 +570,6 @@ pub fn from_config(
             }
         };
 
-        // Check HTTP status
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -619,10 +582,8 @@ pub fn from_config(
             return None;
         }
 
-        // Try to parse response - handle both single symbol and array responses
         match resp.json::<serde_json::Value>().await {
             Ok(json) => {
-                // Log raw response for debugging (first 500 chars to avoid huge logs)
                 let json_str = serde_json::to_string(&json).unwrap_or_default();
                 let preview = if json_str.len() > 500 {
                     format!("{}...", &json_str[..500])
@@ -635,18 +596,10 @@ pub fn from_config(
                     "Leverage brackets API response received"
                 );
                 
-                // Handle different response formats:
-                // 1. Array of LeverageBracketsResponse: [{"symbol": "...", "brackets": [...]}]
-                // 2. Single object: {"symbol": "...", "brackets": [...]}
-                // 3. Array of brackets directly: [{"bracket": ..., "initialLeverage": ...}]
-                // 4. New format: brackets array might not have "bracket" field (optional)
                 
-                // Try different response formats with more flexible parsing
                 let brackets_result: Result<Vec<LeverageBracketsResponse>, _> = if json.is_array() {
-                    // Try to parse as array of LeverageBracketsResponse
                     serde_json::from_value::<Vec<LeverageBracketsResponse>>(json.clone())
                         .or_else(|_| {
-                            // Try to parse as array of LeverageBracket (direct brackets) - wrap in LeverageBracketsResponse
                             serde_json::from_value::<Vec<LeverageBracket>>(json.clone())
                                 .map(|brackets| vec![LeverageBracketsResponse {
                                     symbol: sym.to_string(),
@@ -654,31 +607,22 @@ pub fn from_config(
                                 }])
                         })
                         .or_else(|_| {
-                            // Try flexible parsing: brackets might have different field names
-                            // Parse manually from JSON value
                             if let Some(arr) = json.as_array() {
                                 let mut all_brackets = Vec::new();
                                 for item in arr {
                                     if let Some(obj) = item.as_object() {
-                                        // Check if this is a symbol entry with brackets
                                         if let (Some(symbol_val), Some(brackets_val)) = (obj.get("symbol"), obj.get("brackets")) {
                                             if let (Some(symbol_str), Some(brackets_arr)) = (symbol_val.as_str(), brackets_val.as_array()) {
                                                 let mut brackets = Vec::new();
                                                 for bracket_item in brackets_arr {
                                                     if let Some(bracket_obj) = bracket_item.as_object() {
-                                                        // Try to extract initialLeverage (required)
-                                                        // ✅ CRITICAL FIX: initialLeverage can be string or number
-                                                        // API returns "50" as string, not 50 as number
                                                         let initial_leverage = bracket_obj.get("initialLeverage")
                                                             .and_then(|v| {
-                                                                // Try as number first
                                                                 v.as_u64()
-                                                                    // If not number, try as string and parse
                                                                     .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
                                                             });
                                                         
                                                         if let Some(lev) = initial_leverage {
-                                                            // ✅ CRITICAL FIX: bracket can also be string or number
                                                             let bracket_num = bracket_obj.get("bracket")
                                                                 .and_then(|v| {
                                                                     v.as_u64()
@@ -709,23 +653,19 @@ pub fn from_config(
                                 if !all_brackets.is_empty() {
                                     Ok(all_brackets)
                                 } else {
-                                    // Return parse error - will be caught and logged below
                                     serde_json::from_value::<Vec<LeverageBracketsResponse>>(serde_json::json!([]))
                                 }
                             } else {
-                                // Return parse error - will be caught and logged below
                                 serde_json::from_value::<Vec<LeverageBracketsResponse>>(serde_json::json!({}))
                             }
                         })
                 } else {
-                    // Try to parse as single LeverageBracketsResponse
                     serde_json::from_value::<LeverageBracketsResponse>(json)
                         .map(|r| vec![r])
                 };
 
                 match brackets_result {
                     Ok(brackets_vec) => {
-                        // Find brackets for this symbol or use first if single symbol
                         let symbol_brackets = match brackets_vec.iter()
                             .find(|b| b.symbol.eq_ignore_ascii_case(sym))
                             .or_else(|| brackets_vec.first())
@@ -737,7 +677,6 @@ pub fn from_config(
                             }
                         };
 
-                        // Max leverage is the highest initial_leverage in brackets
                         let max_lev = symbol_brackets.brackets
                             .iter()
                             .map(|b| b.initial_leverage)
@@ -752,7 +691,6 @@ pub fn from_config(
                         Some(max_lev)
                     }
                     Err(e) => {
-                        // Log full error and response for debugging
                         tracing::debug!(
                             error = %e,
                             symbol = %sym,
@@ -764,7 +702,6 @@ pub fn from_config(
                 }
             }
             Err(e) => {
-                // JSON parse error
                 tracing::debug!(
                     error = %e,
                     symbol = %sym,
@@ -779,15 +716,12 @@ pub fn from_config(
 /// Does not use global fallback - real rules required for each symbol
 /// Using fallback can cause LOT_SIZE and PRICE_FILTER errors
     pub async fn rules_for(&self, sym: &str) -> Result<Arc<SymbolRules>> {
-    // Double-check locking pattern - prevent race condition
-    // First check: Is it in cache?
         if let Some(r) = FUT_RULES.get(sym) {
             return Ok(r.clone());
         }
 
-    // Geçici hata durumunda retry mekanizması (max 2 retry)
     const MAX_RETRIES: u32 = 2;
-    const INITIAL_BACKOFF_MS: u64 = 100; // Exponential backoff başlangıç değeri
+    const INITIAL_BACKOFF_MS: u64 = 100;
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -800,12 +734,10 @@ pub fn from_config(
                         .next()
                         .ok_or_else(|| anyhow!("symbol info missing"))?;
 
-                // Double-check - another thread might have added it
                     if let Some(existing) = FUT_RULES.get(sym) {
                         return Ok(existing.clone());
                     }
 
-                    // Fetch max leverage from leverage brackets API
                     let max_leverage = self.fetch_max_leverage(sym).await;
                     
                     let mut rules = rules_from_fut_symbol(sym_rec);
@@ -818,8 +750,8 @@ pub fn from_config(
                 Err(err) => {
                     last_error = Some(err);
                     if attempt < MAX_RETRIES {
-                    // Use exponential backoff for rate limit handling
-                        let backoff_ms = INITIAL_BACKOFF_MS * 2_u64.pow(attempt);
+                        let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 2);
+                        let backoff_ms = backoff.as_millis() as u64;
                         warn!(
                             error = ?last_error,
                             %sym,
@@ -835,7 +767,6 @@ pub fn from_config(
             }
         }
 
-    // All retries failed - return error
         error!(
             error = ?last_error,
             %sym,
@@ -882,8 +813,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             return Ok(*balance);
         }
 
-    // Fallback to REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
-        // This is normal during startup, so log at DEBUG level instead of WARN
         tracing::debug!(
             asset = %asset,
             "BALANCE_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
@@ -914,7 +843,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
         let amt = match bal {
             Some(b) => {
                 let balance = Decimal::from_str(&b.available_balance)?;
-            // Update cache with REST API result (for startup sync)
                 BALANCE_CACHE.insert(asset.to_string(), balance);
                 balance
             }
@@ -960,7 +888,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             });
         }
 
-    // Update cache with REST API result (for startup sync)
         if !res.is_empty() {
             OPEN_ORDERS_CACHE.insert(sym.to_string(), res.clone());
         }
@@ -996,7 +923,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
         for pos in positions {
             let qty = Decimal::from_str(&pos.position_amt).unwrap_or(Decimal::ZERO);
             
-            // Only include positions with non-zero qty
             if !qty.is_zero() {
                 let symbol = pos.symbol.clone();
                 let entry = Decimal::from_str(&pos.entry_price)?;
@@ -1031,11 +957,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
         &self,
         sym: &str,
         activation_price: Px,
-        callback_rate: f64, // 0.001 = 0.1%
+        callback_rate: f64,
         qty: Qty,
     ) -> Result<String> {
         let rules = self.rules_for(sym).await?;
-        // Calculate effective precision from tick_size/step_size (source of truth)
         let effective_price_precision = if rules.tick_size.is_zero() {
             rules.price_precision
         } else {
@@ -1049,8 +974,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
         let qty_str = crate::utils::format_decimal_fixed(qty.0, effective_qty_precision);
         let activation_price_str = crate::utils::format_decimal_fixed(activation_price.0, effective_price_precision);
         
-        // Binance expects callback rate as percentage (0.1 not 0.001)
-        // Example: callback_rate = 0.001 (0.1%) → callback_rate_pct = 0.1
         let callback_rate_pct = callback_rate * 100.0;
         
         let mut params = vec![
@@ -1065,7 +988,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
         ];
         
         if self.hedge_mode {
-            // Determine position side from quantity sign
             let position_side = if qty.0.is_sign_positive() {
                 "LONG"
             } else {
@@ -1091,7 +1013,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             return Ok(position.clone());
         }
 
-        // This is normal during startup, so log at DEBUG level instead of WARN
         tracing::debug!(
             symbol = %sym,
             "POSITION_CACHE empty, falling back to REST API (normal during startup - WebSocket will populate cache)"
@@ -1124,7 +1045,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             return Err(anyhow!("position not found for symbol"));
         }
 
-    // In one-way mode, positionSide should be "BOTH" or None, not "LONG"/"SHORT"
         if !self.hedge_mode {
             for pos in &matching_positions {
                 if let Some(ref ps) = pos.position_side {
@@ -1140,13 +1060,11 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 }
             }
 
-        // Tek-yön modunda: Net pozisyonu hesapla (birden fazla pozisyon olmamalı ama kontrol edelim)
             let net_qty: Decimal = matching_positions
                 .iter()
                 .map(|p| Decimal::from_str(&p.position_amt).unwrap_or(Decimal::ZERO))
                 .sum();
 
-        // Tek-yön modunda sadece bir pozisyon olmalı (net pozisyon)
             let pos = matching_positions[0];
             let qty = Decimal::from_str(&pos.position_amt)?;
             let entry = Decimal::from_str(&pos.entry_price)?;
@@ -1158,7 +1076,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 None
             };
 
-        // In one-way mode, if multiple positions exist, use net position
             if matching_positions.len() > 1 {
                 warn!(
                     symbol = %sym,
@@ -1167,15 +1084,13 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     hedge_mode = self.hedge_mode,
                     "WARNING: Multiple positions found in one-way mode, using net position"
                 );
-            // Net pozisyonu kullan (LONG - SHORT)
                 let position = Position {
                     symbol: sym.to_string(),
                     qty: Qty(net_qty),
-                    entry: Px(entry), // İlk pozisyonun entry'si (net pozisyon için ortalama hesaplanabilir ama basit tutuyoruz)
+                    entry: Px(entry),
                     leverage,
                     liq_px,
                 };
-            // Update cache with REST API result (for startup sync)
                 POSITION_CACHE.insert(sym.to_string(), position.clone());
                 Ok(position)
             } else {
@@ -1186,24 +1101,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     leverage,
                     liq_px,
                 };
-            // Update cache with REST API result (for startup sync)
                 POSITION_CACHE.insert(sym.to_string(), position.clone());
                 Ok(position)
             }
         } else {
-            // ✅ CRITICAL: Hedge mode is NOT supported (config validation should prevent this)
-            // This code should never execute if config validation is working correctly
-            // But we keep it for defensive programming and clear error messages
-            //
-            // Problem: Position struct only supports single position per symbol
-            // If both LONG and SHORT positions exist, only one can be returned
-            // This causes:
-            // - SHORT position loss (not tracked)
-            // - TP/SL won't work for untracked position
-            // - System instability and potential financial losses
-            //
-            // NOTE: Config validation (config.rs line 548) should prevent hedge_mode=true
-            // If this code executes, it means config validation was bypassed or config changed at runtime
             error!(
                 symbol = %sym,
                 "CRITICAL: Hedge mode detected but NOT supported! Config validation should have prevented this. This indicates a configuration error or runtime config change."
@@ -1224,7 +1125,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 let lev = pos.leverage.parse::<u32>().unwrap_or(1);
                 let liq = Decimal::from_str(&pos.liquidation_price).unwrap_or(Decimal::ZERO);
 
-            // positionSide check - in hedge mode should be "LONG" or "SHORT"
                 match pos.position_side.as_deref() {
                     Some("LONG") => {
                         long_qty = qty;
@@ -1235,7 +1135,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         }
                     }
                     Some("SHORT") => {
-                    // SHORT pozisyon için qty negatif olabilir, mutlak değerini al
                         short_qty = qty.abs();
                         short_entry = entry;
                         short_leverage = lev;
@@ -1244,14 +1143,12 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         }
                     }
                     Some("BOTH") | None => {
-                    // In hedge mode, "BOTH" or None is not expected, log warning
                         warn!(
                             symbol = %sym,
                             position_side = ?pos.position_side,
                             hedge_mode = self.hedge_mode,
                             "WARNING: positionSide is 'BOTH' or None in hedge mode - possible API inconsistency"
                         );
-                    // Net pozisyonu hesapla (qty zaten net olabilir)
                         long_qty = qty.max(Decimal::ZERO);
                         short_qty = (-qty).max(Decimal::ZERO);
                         long_entry = entry;
@@ -1274,9 +1171,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 }
             }
 
-            // ✅ CRITICAL: If both LONG and SHORT positions exist, return error
-            // This prevents silent data loss where SHORT position is ignored
-            // SHORT position loss would cause TP/SL to fail for that position
             if long_qty > Decimal::ZERO && short_qty > Decimal::ZERO {
                 return Err(anyhow!(
                     "CRITICAL: Both LONG and SHORT positions exist for symbol {} in hedge mode. \
@@ -1298,13 +1192,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
             }
 
             let (final_qty, final_entry, final_leverage, final_liq_px) = if long_qty > Decimal::ZERO {
-            // Only LONG position exists
                 (long_qty, long_entry, long_leverage, long_liq_px)
             } else if short_qty > Decimal::ZERO {
-            // Only SHORT position exists
                 (short_qty, short_entry, short_leverage, short_liq_px)
             } else {
-            // No position (zero)
                 (Decimal::ZERO, Decimal::ZERO, 1u32, None)
             };
 
@@ -1315,7 +1206,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 leverage: final_leverage,
                 liq_px: final_liq_px,
             };
-        // Update cache with REST API result
             POSITION_CACHE.insert(sym.to_string(), position.clone());
             Ok(position)
         }
@@ -1325,7 +1215,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
         let initial_pos = match self.fetch_position(sym).await {
             Ok(pos) => pos,
             Err(e) => {
-                if is_position_not_found_error(&e) {
+                if crate::utils::is_position_not_found_error(&e) {
                     info!(symbol = %sym, "position already closed (manual intervention detected), skipping close");
                     return Ok(());
                 }
@@ -1335,7 +1225,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
         let initial_qty = initial_pos.qty.0;
 
         if initial_qty.is_zero() {
-        // Pozisyon zaten kapalı
             info!(symbol = %sym, "position already closed (zero quantity), skipping close");
             return Ok(());
         }
@@ -1354,12 +1243,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
 
 
         let max_attempts = 3;
-        // ✅ Note: limit_fallback_attempted is set in inner scopes but checked at loop start (line 1428)
-        // Compiler may warn about unused assignments, but the variable is actually used
         #[allow(unused_assignments)]
         let mut limit_fallback_attempted = false;
         let mut growth_event_count = 0u32;
-    const MAX_RETRIES_ON_GROWTH: u32 = 8; // Max retries allowed when position grows (increased from 2 to 8 to handle volatile markets with multiple simultaneous fills)
+    const MAX_RETRIES_ON_GROWTH: u32 = 8;
 
         for attempt in 0..max_attempts {
             if limit_fallback_attempted {
@@ -1368,25 +1255,19 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 ));
             }
 
-        // Check current position on each attempt
             let current_pos = match self.fetch_position(sym).await {
                 Ok(pos) => pos,
                 Err(e) => {
-                // Only handle specific "position not found" errors
-                    if is_position_not_found_error(&e) {
+                    if crate::utils::is_position_not_found_error(&e) {
                         info!(symbol = %sym, attempt, "position already closed during retry (manual intervention detected)");
                         return Ok(());
                     }
-                // Other errors (network, API errors, etc.) should be retried
                     return Err(e);
                 }
             };
             let current_qty = current_pos.qty.0;
 
-            // ✅ CRITICAL: Early absolute limit check before attempting to close
-            // Check if position has grown beyond 1.5x initial before even trying to close
-            // Position büyümesi infinite loop'a yol açabilir - 1.5x'den fazla büyürse abort et
-            const MAX_POSITION_MULTIPLIER: f64 = 1.5; // 1.5x = 50% growth - abort threshold
+            const MAX_POSITION_MULTIPLIER: f64 = 1.5;
             let early_position_multiplier = if initial_qty.abs() > Decimal::ZERO {
                 current_qty.abs() / initial_qty.abs()
             } else {
@@ -1415,7 +1296,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             }
 
             if current_qty.is_zero() {
-            // Pozisyon tamamen kapatıldı
                 if attempt > 0 {
                     info!(
                         symbol = %sym,
@@ -1427,22 +1307,18 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 return Ok(());
             }
 
-        // Kalan pozisyon miktarını hesapla (quantize et)
             let remaining_qty = crate::utils::quantize_decimal(current_qty.abs(), rules.step_size);
 
             if remaining_qty <= Decimal::ZERO {
-            // Quantize sonrası sıfır oldu, pozisyon zaten kapalı sayılabilir
                 return Ok(());
             }
 
-        // Side belirleme (pozisyon yönüne göre)
             let side = if current_qty.is_sign_positive() {
-                Side::Sell // Long → Sell
+                Side::Sell
             } else {
-                Side::Buy // Short → Buy
+                Side::Buy
             };
 
-            // Calculate effective precision from step_size (source of truth)
             let effective_qty_precision = if rules.step_size.is_zero() {
                 rules.qty_precision
             } else {
@@ -1450,7 +1326,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             };
             let qty_str = crate::utils::format_decimal_fixed(remaining_qty, effective_qty_precision);
 
-        // Add positionSide parameter if hedge mode is enabled
             let position_side = if self.hedge_mode {
                 if current_qty.is_sign_positive() {
                     Some("LONG")
@@ -1461,7 +1336,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 None
             };
 
-        // Ensure reduceOnly=true and type=MARKET
             let mut params = vec![
                 format!("symbol={}", sym),
                 format!(
@@ -1472,14 +1346,13 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         "SELL"
                     }
                 ),
-                "type=MARKET".to_string(), // Post-only değil, market order
+                "type=MARKET".to_string(),
                 format!("quantity={}", qty_str),
-                "reduceOnly=true".to_string(), // KRİTİK: Yeni pozisyon açmayı önle
+                "reduceOnly=true".to_string(),
                 format!("timestamp={}", BinanceCommon::ts()),
                 format!("recvWindow={}", self.common.recv_window_ms),
             ];
 
-        // Hedge mode açıksa positionSide ekle
             if let Some(pos_side) = position_side {
                 params.push(format!("positionSide={}", pos_side));
             }
@@ -1488,7 +1361,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             let sig = self.common.sign(&qs);
             let url = format!("{}/fapi/v1/order?{}&signature={}", self.base, qs, sig);
 
-        // Emir gönder
             match send_void(
                 self.common
                     .client
@@ -1498,12 +1370,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
                 .await
             {
                 Ok(_) => {
-                    tokio::time::sleep(Duration::from_millis(1000)).await; // Exchange işlemesi için 1000ms bekle (Binance)
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
                     let verify_pos = if let Some(position) = POSITION_CACHE.get(sym) {
                         position.clone()
                     } else {
-                    // Fallback to REST API only if cache is empty (normal during startup)
-                        // This is normal during startup, so log at DEBUG level instead of WARN
                         tracing::debug!(
                             symbol = %sym,
                             "POSITION_CACHE empty during position verification, falling back to REST API"
@@ -1513,7 +1383,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     let verify_qty = verify_pos.qty.0;
 
                     if verify_qty.is_zero() {
-                    // Pozisyon tamamen kapatıldı
                         info!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -1525,11 +1394,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         let position_grew_from_attempt = verify_qty.abs() > current_qty.abs();
                         let position_grew_from_initial = verify_qty.abs() > initial_qty.abs();
 
-                        // ✅ CRITICAL: Absolute limit check - abort immediately if position > 1.5x initial
-                        // Position büyümesi infinite loop'a yol açabilir - 1.5x'den fazla büyürse abort et
-                        // This prevents infinite loops in volatile markets where position keeps growing
-                        // Example: Position 0.5 BTC → NEW order fills +0.3 BTC → Position 0.8 BTC (1.6x) → ABORT
-                        const MAX_POSITION_MULTIPLIER: f64 = 1.5; // 1.5x = 50% growth - abort threshold
+                        const MAX_POSITION_MULTIPLIER: f64 = 1.5;
                         let position_multiplier = if initial_qty.abs() > Decimal::ZERO {
                             verify_qty.abs() / initial_qty.abs()
                         } else {
@@ -1559,23 +1424,19 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         }
 
                         if position_grew_from_attempt || position_grew_from_initial {
-                        // Position büyümesi tespit edildi - büyüme yüzdesini hesapla
                             let growth_from_initial = if initial_qty.abs() > Decimal::ZERO {
-                                ((verify_qty.abs() - initial_qty.abs()) / initial_qty.abs() * Decimal::from(100))
-                                    .to_f64()
-                                    .unwrap_or(0.0)
+                                crate::utils::decimal_to_f64(
+                                    crate::utils::calculate_percentage(verify_qty.abs() - initial_qty.abs(), initial_qty.abs())
+                                )
                             } else {
                                 0.0
                             };
 
                         const MAX_ACCEPTABLE_GROWTH_PCT: f64 = 10.0;
 
-                        // Position growth detection with abort mechanism
                             if growth_from_initial > MAX_ACCEPTABLE_GROWTH_PCT {
                                 growth_event_count += 1;
 
-                            // ✅ CRITICAL: If growth events exceed threshold, log critical warning
-                            // This indicates position is growing faster than we can close it
                                 const CRITICAL_GROWTH_THRESHOLD: u32 = 3;
                                 if growth_event_count > CRITICAL_GROWTH_THRESHOLD && growth_event_count <= MAX_RETRIES_ON_GROWTH {
                                     tracing::error!(
@@ -1591,7 +1452,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     );
                                 }
 
-                            // Too many growth events - abort to prevent infinite loop
                                 if growth_event_count > MAX_RETRIES_ON_GROWTH {
                                     tracing::error!(
                                         symbol = %sym,
@@ -1615,8 +1475,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     ));
                                 }
 
-                            // ⚠️ WARNING: Position %10'dan fazla büyüdü - volatile market'te normal olabilir
-                            // Aynı anda birden fazla fill olabilir, devam et (ama growth event sayısını artır)
                                 tracing::warn!(
                                     symbol = %sym,
                                     attempt = attempt + 1,
@@ -1635,7 +1493,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     MAX_RETRIES_ON_GROWTH
                                 );
                             } else {
-                            // Position grew but below 10% threshold - may be normal in volatile markets
                                 tracing::warn!(
                                     symbol = %sym,
                                     attempt = attempt + 1,
@@ -1652,7 +1509,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             }
                         }
 
-                    // Calculate how much was closed in this attempt
                         let closed_amount = current_qty.abs() - verify_qty.abs();
                         let close_ratio = if current_qty.abs() > Decimal::ZERO {
                             closed_amount / current_qty.abs()
@@ -1660,11 +1516,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             Decimal::ZERO
                         };
 
-                    // Kalan pozisyon yüzdesi (initial'a göre)
                         let remaining_pct = if initial_qty.abs() > Decimal::ZERO {
-                            (verify_qty.abs() / initial_qty.abs() * Decimal::from(100))
-                                .to_f64()
-                                .unwrap_or(0.0)
+                            crate::utils::decimal_to_f64(
+                                crate::utils::calculate_percentage(verify_qty.abs(), initial_qty.abs())
+                            )
                         } else {
                             0.0
                         };
@@ -1682,10 +1537,8 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         );
 
                         if attempt < max_attempts - 1 {
-                        // Son deneme değilse devam et
                             continue;
                         } else {
-                        // Son denemede hala pozisyon varsa hata döndür
                             return Err(anyhow::anyhow!(
                                 "Failed to fully close position after {} attempts. Initial: {}, Remaining: {}, Closed in last attempt: {}",
                                 max_attempts,
@@ -1697,11 +1550,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     }
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-                    let _error_lower = error_str.to_lowercase();
-
-
-                    if is_position_already_closed_error(&e) {
+                    if crate::utils::is_position_already_closed_error(&e) {
                         info!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -1712,7 +1561,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                     }
 
                     if use_market_only {
-                    // Hızlı kapanış gereksiniminde: Retry yap veya hata döndür, LIMIT fallback yapma
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -1732,34 +1580,28 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         }
                     }
 
-                    if is_min_notional_error(&e) && !limit_fallback_attempted
+                    if crate::utils::is_min_notional_error(&e) && !limit_fallback_attempted
                     {
-                        // ✅ CRITICAL: Invalidate cache immediately on MIN_NOTIONAL error
-                        // This ensures limit fallback uses fresh rules
                         warn!(symbol = %sym, "MIN_NOTIONAL error detected in flatten_position, invalidating rules cache");
                         self.refresh_rules_for(sym);
                         
-                        // Re-fetch rules with fresh data
                         let rules = match self.rules_for(sym).await {
                             Ok(fresh_rules) => fresh_rules,
                             Err(e2) => {
                                 warn!(symbol = %sym, error = %e2, "failed to refresh rules after MIN_NOTIONAL error, using existing rules");
-                                // Continue with existing rules if refresh fails
                                 rules.clone()
                             }
                         };
                         
                         let (best_bid, best_ask) = {
-                        // Try WebSocket cache first (fastest, most up-to-date)
                             if let Some(price_update) = PRICE_CACHE.get(sym) {
                                 (price_update.bid, price_update.ask)
                             } else {
-                            // Fallback to REST API only if cache is empty (should be rare)
                                 match self.best_prices(sym).await {
                                     Ok(prices) => prices,
                                     Err(e2) => {
                                         warn!(symbol = %sym, error = %e2, "failed to fetch best prices for dust check (WebSocket cache empty and REST API failed)");
-                                        let assumed_min_price = Decimal::new(1, 2); // 0.01 (very conservative)
+                                        let assumed_min_price = Decimal::new(1, 2);
                                         let dust_threshold = rules.min_notional / assumed_min_price;
 
                                         warn!(
@@ -1780,7 +1622,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                             );
                                             return Ok(());
                                         }
-                                    // Price fetch failed but not dust - continue to LIMIT fallback
                                         return Err(anyhow!(
                                             "MIN_NOTIONAL error and failed to fetch prices for dust check: {}",
                                             e2
@@ -1790,32 +1631,20 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             }
                         };
 
-                        let dust_threshold = {
-                            let current_price = if matches!(side, Side::Buy) {
-                            // Short position closing: use ask price (BUY orders execute at ask)
-                                best_ask.0
-                            } else {
-                            // Long position closing: use bid price (SELL orders execute at bid)
-                                best_bid.0
-                            };
-
-                            if !current_price.is_zero() {
-                                rules.min_notional / current_price
-                            } else {
-                                let assumed_min_price = Decimal::new(1, 2); // 0.01 (very conservative)
-                                let conservative_threshold = rules.min_notional / assumed_min_price;
-
-                                warn!(
-                                    symbol = %sym,
-                                    min_notional = %rules.min_notional,
-                                    assumed_price = %assumed_min_price,
-                                    conservative_threshold = %conservative_threshold,
-                                    "Price is zero, using very conservative dust threshold (assumes price=0.01)"
-                                );
-
-                                conservative_threshold
-                            }
+                        let current_price = if matches!(side, Side::Buy) {
+                            best_ask.0
+                        } else {
+                            best_bid.0
                         };
+                        let dust_threshold = crate::utils::calculate_dust_threshold(rules.min_notional, current_price);
+                        if current_price.is_zero() {
+                            warn!(
+                                symbol = %sym,
+                                min_notional = %rules.min_notional,
+                                dust_threshold = %dust_threshold,
+                                "Price is zero, using very conservative dust threshold (assumes price=0.01)"
+                            );
+                        }
 
                         if remaining_qty < dust_threshold {
                             info!(
@@ -1828,8 +1657,7 @@ pub fn refresh_rules_for(&self, sym: &str) {
                             return Ok(());
                         }
 
-                        // ✅ Set flag to prevent retry - will be checked at loop start (line 1428)
-                        limit_fallback_attempted = true; // LIMIT fallback'i işaretle (tekrar denenmeyecek)
+                        limit_fallback_attempted = true;
                         warn!(
                             symbol = %sym,
                             attempt = attempt + 1,
@@ -1847,7 +1675,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         };
 
                         let limit_price_quantized = crate::utils::quantize_decimal(limit_price, tick_size);
-                        // Calculate effective precision from tick_size (source of truth)
                         let effective_price_precision = if rules.tick_size.is_zero() {
                             rules.price_precision
                         } else {
@@ -1856,7 +1683,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                         let limit_price_str =
                             crate::utils::format_decimal_fixed(limit_price_quantized, effective_price_precision);
 
-                    // Limit reduce-only emri gönder
                         let mut limit_params = vec![
                             format!("symbol={}", sym),
                             format!(
@@ -1902,7 +1728,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     qty = %remaining_qty,
                                     "MIN_NOTIONAL fallback: limit reduce-only order placed successfully"
                                 );
-                            // Limit emri başarılı, pozisyon kapatılacak (emir fill olunca)
                                 return Ok(());
                             }
                             Err(e2) => {
@@ -1912,35 +1737,20 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     "MIN_NOTIONAL fallback: limit reduce-only order also failed"
                                 );
 
-                            // LIMIT fallback failed, check if remaining qty is dust
-                            // Recalculate dust threshold with current prices (may have changed)
-                                let dust_threshold = {
-                                    let current_price = if matches!(side, Side::Buy) {
-                                    // Short position closing: use ask price (BUY orders execute at ask)
-                                        best_ask.0
-                                    } else {
-                                    // Long position closing: use bid price (SELL orders execute at bid)
-                                        best_bid.0
-                                    };
-                                // Calculate dust threshold as min_notional / price (more accurate)
-                                    if !current_price.is_zero() {
-                                        rules.min_notional / current_price
-                                    } else {
-                                    // Price is zero - use very conservative threshold
-                                        let assumed_min_price = Decimal::new(1, 2); // 0.01 (very conservative)
-                                        let conservative_threshold = rules.min_notional / assumed_min_price;
-
-                                        warn!(
-                                            symbol = %sym,
-                                            min_notional = %rules.min_notional,
-                                            assumed_price = %assumed_min_price,
-                                            conservative_threshold = %conservative_threshold,
-                                            "Price is zero, using very conservative dust threshold (assumes price=0.01)"
-                                        );
-
-                                        conservative_threshold
-                                    }
+                                let current_price = if matches!(side, Side::Buy) {
+                                    best_ask.0
+                                } else {
+                                    best_bid.0
                                 };
+                                let dust_threshold = crate::utils::calculate_dust_threshold(rules.min_notional, current_price);
+                                if current_price.is_zero() {
+                                    warn!(
+                                        symbol = %sym,
+                                        min_notional = %rules.min_notional,
+                                        dust_threshold = %dust_threshold,
+                                        "Price is zero, using very conservative dust threshold (assumes price=0.01)"
+                                    );
+                                }
 
                                 if remaining_qty < dust_threshold {
                                     info!(
@@ -1953,7 +1763,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     return Ok(());
                                 }
 
-                            // LIMIT fallback failed and not dust - set flag to prevent retry
                                 limit_fallback_attempted = true;
                                 warn!(
                                     symbol = %sym,
@@ -1963,13 +1772,10 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                     min_notional = %rules.min_notional,
                                     "MIN_NOTIONAL: LIMIT fallback failed, will exit retry loop to prevent infinite loop"
                                 );
-                            // Retry loop'un başındaki kontrolle çıkış yapılacak
-                            // continue ile retry loop'un başına dön, orada limit_fallback_attempted kontrolü yapılacak
                                 continue;
                             }
                         }
                     } else {
-                    // MIN_NOTIONAL hatası değil, normal retry
                         if attempt < max_attempts - 1 {
                             warn!(
                                 symbol = %sym,
@@ -1977,7 +1783,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
                                 error = %e,
                                 "failed to close position, retrying..."
                             );
-                        // Wait before retry to avoid overloading exchange
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
                         } else {
@@ -1988,7 +1793,6 @@ pub fn refresh_rules_for(&self, sym: &str) {
             }
         }
 
-    // Buraya gelmemeli (yukarıdaki return'ler ile çıkılmalı)
         Err(anyhow::anyhow!("Unexpected error in flatten_position"))
     }
 }
@@ -2009,7 +1813,7 @@ impl Venue for BinanceFutures {
             Side::Sell => "SELL",
         };
         let tif_str = match tif {
-            Tif::PostOnly => "GTX", // Binance GTX: Post-only, cross ederse otomatik iptal
+            Tif::PostOnly => "GTX",
             Tif::Gtc => "GTC",
             Tif::Ioc => "IOC",
         };
@@ -2033,8 +1837,6 @@ impl Venue for BinanceFutures {
             "order validation guard passed, submitting order"
         );
 
-        // Store validated price/qty strings for reuse in retry loop
-        // These may be updated if rules refresh is needed
         let mut current_price_str = price_str;
         let mut current_qty_str = qty_str;
 
@@ -2044,25 +1846,16 @@ impl Venue for BinanceFutures {
         let mut last_error = None;
         let mut order_result: Option<FutPlacedOrder> = None;
 
-        // ✅ CRITICAL: Generate base clientOrderId for tracking
-        // Each retry will append attempt number to ensure uniqueness
-        // This prevents duplicate orders if first request times out but Binance received it
         let base_client_order_id = if !client_order_id.is_empty() {
             client_order_id.to_string()
         } else {
-            // If no clientOrderId provided, generate one
             format!("{}", BinanceCommon::ts())
         };
 
         for attempt in 0..=MAX_RETRIES {
-            // ✅ CRITICAL: Before retrying, check if previous order exists to prevent duplicates
-            // Problem: If first request times out but Binance received it, retry would create duplicate order
-            // Solution: Check if order with base clientOrderId exists before retrying
             if attempt > 0 {
-                // Check if previous order exists (query by origClientOrderId)
                 match self.query_order_by_client_id(sym, &base_client_order_id).await {
                     Ok(Some(existing_order)) => {
-                        // Previous order exists - return it instead of creating duplicate
                         info!(
                             %sym,
                             base_client_order_id = %base_client_order_id,
@@ -2073,7 +1866,6 @@ impl Venue for BinanceFutures {
                         return Ok((existing_order.order_id.to_string(), existing_order.client_order_id));
                     }
                     Ok(None) => {
-                        // Order doesn't exist - safe to retry
                         tracing::debug!(
                             %sym,
                             base_client_order_id = %base_client_order_id,
@@ -2082,7 +1874,6 @@ impl Venue for BinanceFutures {
                         );
                     }
                     Err(e) => {
-                        // Query failed - log warning but continue with retry (better to retry than skip)
                         warn!(
                             %sym,
                             base_client_order_id = %base_client_order_id,
@@ -2094,23 +1885,14 @@ impl Venue for BinanceFutures {
                 }
             }
 
-            // ✅ CRITICAL: Generate unique clientOrderId for each retry attempt
-            // Use timestamp + random suffix for retries to ensure uniqueness
-            // Format: "{base}-{timestamp}-{random}" (e.g., "1234567890-1234567890123-abc")
             let unique_client_order_id = if attempt == 0 {
-                // First attempt: use original clientOrderId
                 base_client_order_id.clone()
             } else {
-                // Retry attempts: append timestamp + random suffix to ensure uniqueness
-                // This is more unique than just "-1", "-2" and prevents collisions
                 let retry_timestamp = BinanceCommon::ts();
-                // Use last 6 digits of timestamp as random component (simple but effective)
                 let random_suffix = retry_timestamp % 1000000;
                 format!("{}-{}-{}", base_client_order_id, retry_timestamp, random_suffix)
             };
 
-            // Build params with unique clientOrderId for this attempt
-            // Use current_price_str and current_qty_str (may be updated after rules refresh)
             let mut attempt_params = vec![
                 format!("symbol={}", sym),
                 format!("side={}", s_side),
@@ -2131,9 +1913,7 @@ impl Venue for BinanceFutures {
                 attempt_params.push(format!("positionSide={}", position_side));
             }
 
-            // Add unique clientOrderId for this attempt
             if !unique_client_order_id.is_empty() {
-                // Binance: max 36 karakter, alphanumeric
                 if unique_client_order_id.len() <= 36
                     && unique_client_order_id
                         .chars()
@@ -2150,7 +1930,6 @@ impl Venue for BinanceFutures {
                 }
             }
 
-            // Her retry'de yeni request oluştur (unique clientOrderId ile)
             let retry_qs = attempt_params.join("&");
             let retry_sig = self.common.sign(&retry_qs);
             let retry_url = format!(
@@ -2172,13 +1951,13 @@ impl Venue for BinanceFutures {
                         match resp.json::<FutPlacedOrder>().await {
                             Ok(order) => {
                                 order_result = Some(order);
-                                break; // Başarılı, döngüden çık
+                                break;
                             }
                             Err(e) => {
                                 if attempt < MAX_RETRIES {
-                                    let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                                    tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms, "json parse error, retrying");
-                                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                    let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
+                                    tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms = backoff.as_millis(), "json parse error, retrying");
+                                    tokio::time::sleep(backoff).await;
                                     last_error = Some(anyhow!("json parse error: {}", e));
                                     continue;
                                 } else {
@@ -2191,13 +1970,8 @@ impl Venue for BinanceFutures {
                         let body_lower = body.to_lowercase();
                         let should_refresh_rules = body_lower.contains("precision is over")
                             || body_lower.contains("-1111")
-                            || body_lower.contains("-1013")
-                            || body_lower.contains("min notional")
-                            || body_lower.contains("min_notional")
-                            || body_lower.contains("below min notional");
+                            || crate::utils::contains_min_notional(&body_lower);
 
-                        // ✅ CRITICAL: Invalidate cache immediately on rules-related errors
-                        // This must happen regardless of retry attempts, as the cache is stale
                         if should_refresh_rules {
                             let error_type = if body_lower.contains("precision is over") || body_lower.contains("-1111") {
                                 "precision error (-1111)"
@@ -2205,31 +1979,21 @@ impl Venue for BinanceFutures {
                                 "MIN_NOTIONAL error (-1013)"
                             };
                             
-                            // Always invalidate cache when rules-related errors occur
                             warn!(%sym, error_type, "rules-related error detected, invalidating cache immediately");
                             self.refresh_rules_for(sym);
 
                             if attempt < MAX_RETRIES {
                                 warn!(%sym, attempt = attempt + 1, error_type, "refreshing rules and retrying");
 
-                            // Fresh rules çek
                                 match self.rules_for(sym).await {
                                     Ok(new_rules) => {
-                                    // Yeni rules ile yeniden validate et
                                         match Self::validate_and_format_order_params(
                                             px, qty, &new_rules, sym,
                                         ) {
                                             Ok((new_price_str, new_qty_str, _, _)) => {
-                                            // Yeni değerlerle retry
-                                                let backoff_ms =
-                                                    INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                                                tokio::time::sleep(Duration::from_millis(
-                                                    backoff_ms,
-                                                ))
-                                                    .await;
+                                                let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
+                                                tokio::time::sleep(backoff).await;
 
-                                            // Update price/qty strings for next iteration
-                                                // These will be used to build attempt_params in the next loop iteration
                                                 current_price_str = new_price_str;
                                                 current_qty_str = new_qty_str;
 
@@ -2262,7 +2026,6 @@ impl Venue for BinanceFutures {
                             }
                         }
 
-                    // Kalıcı hata kontrolü
                         if is_permanent_error(status.as_u16(), &body) {
                             tracing::error!(%status, %body, attempt, "permanent error, no retry");
                             return Err(anyhow!(
@@ -2272,26 +2035,23 @@ impl Venue for BinanceFutures {
                             ));
                         }
 
-                    // Transient hata kontrolü
                         if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
-                            let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                            tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms, "transient error, retrying with exponential backoff (unique clientOrderId)");
-                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                            let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
+                            tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms = backoff.as_millis(), "transient error, retrying with exponential backoff (unique clientOrderId)");
+                            tokio::time::sleep(backoff).await;
                             last_error = Some(anyhow!("binance api error: {} - {}", status, body));
                             continue;
                         } else {
-                        // Transient değil veya max retry'ye ulaşıldı
                             tracing::error!(%status, %body, attempt, "error after retries");
                             return Err(anyhow!("binance api error: {} - {}", status, body));
                         }
                     }
                 }
                 Err(e) => {
-                // Network hatası
                     if attempt < MAX_RETRIES {
-                        let backoff_ms = INITIAL_BACKOFF_MS * 3_u64.pow(attempt);
-                        tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms, "network error, retrying with exponential backoff (unique clientOrderId)");
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
+                        tracing::warn!(error = %e, attempt = attempt + 1, backoff_ms = backoff.as_millis(), "network error, retrying with exponential backoff (unique clientOrderId)");
+                        tokio::time::sleep(backoff).await;
                         last_error = Some(e.into());
                         continue;
                     } else {
@@ -2302,7 +2062,6 @@ impl Venue for BinanceFutures {
             }
         }
 
-    // Başarılı sonuç döndür
         let order = order_result
             .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("unknown error after retries")))?;
 
@@ -2383,7 +2142,6 @@ impl Venue for BinanceFutures {
     }
 
     async fn available_balance(&self, asset: &str) -> Result<Decimal> {
-    // Call BinanceFutures::available_balance method (not trait method to avoid recursion)
         BinanceFutures::available_balance(self, asset).await
     }
 }
@@ -2421,7 +2179,6 @@ impl BinanceFutures {
                     match resp.json::<FutPlacedOrder>().await {
                         Ok(order) => Ok(Some(order)),
                         Err(e) => {
-                            // JSON parse error - treat as order not found
                             tracing::debug!(
                                 %sym,
                                 client_order_id = %client_order_id,
@@ -2435,18 +2192,14 @@ impl BinanceFutures {
                     let body = resp.text().await.unwrap_or_default();
                     let body_lower = body.to_lowercase();
                     
-                    // Check if error is "order not found" (-2013)
                     if body_lower.contains("-2013") || body_lower.contains("order does not exist") {
-                        // Order doesn't exist - this is expected, return None
                         Ok(None)
                     } else {
-                        // Other error - return error
                         Err(anyhow!("binance api error querying order: {} - {}", status, body))
                     }
                 }
             }
             Err(e) => {
-                // Network error - return error (caller will handle)
                 Err(e.into())
             }
         }
@@ -2458,54 +2211,33 @@ impl BinanceFutures {
         rules: &SymbolRules,
         sym: &str,
     ) -> Result<(String, String, Decimal, Decimal)> {
-        // ✅ CRITICAL FIX: Calculate precision from tick_size/step_size instead of API precision
-        // Problem: API precision might be incorrect or stale, causing "Precision is over" errors (-1111)
-        // Solution: Always calculate precision from tick_size/step_size, which are the source of truth
-        // Binance requires that formatted values match the precision implied by tick_size/step_size
         
-        // Calculate price precision from tick_size (source of truth)
         let price_precision_from_tick = if rules.tick_size.is_zero() {
-            rules.price_precision // Fallback to API precision if tick_size is zero
+            rules.price_precision
         } else {
             rules.tick_size.scale() as usize
         };
         
-        // Calculate quantity precision from step_size (source of truth)
         let qty_precision_from_step = if rules.step_size.is_zero() {
-            rules.qty_precision // Fallback to API precision if step_size is zero
+            rules.qty_precision
         } else {
             rules.step_size.scale() as usize
         };
         
-        // Use the minimum of API precision and calculated precision (safety)
-        // This ensures we never exceed Binance's actual requirements
         let effective_price_precision = rules.price_precision.min(price_precision_from_tick);
         let effective_qty_precision = rules.qty_precision.min(qty_precision_from_step);
 
-    // 1. Quantize: step_size'a göre floor
         let price_quantized = crate::utils::quantize_decimal(px.0, rules.tick_size);
         let qty_quantized = crate::utils::quantize_decimal(qty.0.abs(), rules.step_size);
 
-    // 2. Round: precision'a göre round et
-    // Use ToNegativeInfinity (floor) instead of ToZero for safety
         let price = price_quantized
             .round_dp_with_strategy(effective_price_precision as u32, RoundingStrategy::ToNegativeInfinity);
         let qty_rounded =
             qty_quantized.round_dp_with_strategy(effective_qty_precision as u32, RoundingStrategy::ToNegativeInfinity);
 
-    // ✅ CRITICAL: Check if qty_rounded is zero after rounding
-    // Problem: If qty_precision is too small, rounding can make quantity zero
-    // Example: qty_quantized = 227197.118, qty_precision = 0 → qty_rounded = 227197 (OK)
-    //          qty_quantized = 0.001, qty_precision = 0 → qty_rounded = 0 (BAD)
-    // Solution: If qty_rounded is zero but qty_quantized is not, use qty_quantized instead
-    // This prevents "below min notional after validation (0 < 100)" errors
     let qty_rounded = if qty_rounded.is_zero() && !qty_quantized.is_zero() {
-        // qty_rounded is zero but qty_quantized is not - rounding precision issue
-        // Use qty_quantized but ensure it's still quantized to step_size
-        // Re-quantize to ensure it's still a multiple of step_size
         let re_quantized = crate::utils::quantize_decimal(qty_quantized, rules.step_size);
         if re_quantized.is_zero() {
-            // Even re-quantized is zero - this is a real problem
             return Err(anyhow!(
                 "Quantity becomes zero after quantization: qty_quantized={}, step_size={}, effective_qty_precision={}",
                 qty_quantized,
@@ -2518,11 +2250,9 @@ impl BinanceFutures {
         qty_rounded
     };
 
-    // 3. Format: precision'a göre string'e çevir
         let price_str = crate::utils::format_decimal_fixed(price, effective_price_precision);
         let qty_str = crate::utils::format_decimal_fixed(qty_rounded, effective_qty_precision);
 
-    // 4. KRİTİK: Son kontrol - fractional_digits kontrolü
         let price_fractional = if let Some(dot_pos) = price_str.find('.') {
             price_str[dot_pos + 1..].len()
         } else {
@@ -2552,7 +2282,6 @@ impl BinanceFutures {
             return Err(anyhow!(error_msg));
         }
 
-    // 5. Min notional kontrolü
         let notional = price * qty_rounded;
         if !rules.min_notional.is_zero() && notional < rules.min_notional {
             return Err(anyhow!(
@@ -2566,54 +2295,14 @@ impl BinanceFutures {
     }
 }
 
-// ---- helpers ----
 
-/// Check if error indicates position not found (already closed)
-///
-/// Returns true if error message contains position not found indicators.
-/// This is used to handle cases where position was manually closed or doesn't exist.
-fn is_position_not_found_error(error: &anyhow::Error) -> bool {
-    let error_str = error.to_string().to_lowercase();
-    error_str.contains("position not found")
-        || error_str.contains("no position")
-        || error_str.contains("-2011") // Binance: Unknown order (position not found)
-}
 
-/// Check if error indicates MIN_NOTIONAL error
-///
-/// Returns true if error message contains MIN_NOTIONAL error indicators.
-/// This is used to trigger LIMIT fallback for small position sizes.
-fn is_min_notional_error(error: &anyhow::Error) -> bool {
-    let error_str = error.to_string().to_lowercase();
-    error_str.contains("-1013")
-        || error_str.contains("min notional")
-        || error_str.contains("min_notional")
-}
-
-/// Check if error indicates position already closed or invalid state
-///
-/// Returns true if error message indicates position is already closed or in invalid state.
-/// This is used to treat certain errors as success (position already closed).
-fn is_position_already_closed_error(error: &anyhow::Error) -> bool {
-    let error_str = error.to_string().to_lowercase();
-    error_str.contains("position not found")
-        || error_str.contains("no position")
-        || error_str.contains("position already closed")
-        || error_str.contains("reduceonly")
-        || error_str.contains("reduce only")
-        || error_str.contains("-2011") // Binance: "Unknown order sent"
-        || error_str.contains("-2019") // Binance: "Margin is insufficient"
-        || error_str.contains("-2021") // Binance: "Order would immediately match"
-}
-
-// quantize_decimal and format_decimal_fixed are in utils.rs
 
 async fn ensure_success(resp: Response) -> Result<Response> {
     let status = resp.status();
     if status.is_success() {
         Ok(resp)
     } else {
-        // ✅ NEW: Handle 429 Too Many Requests with Retry-After header
         if status == 429 {
             let retry_after = resp.headers()
                 .get("retry-after")
@@ -2627,10 +2316,8 @@ async fn ensure_success(resp: Response) -> Result<Response> {
                     "Binance API rate limit exceeded (429), waiting {} seconds before retry",
                     seconds
                 );
-                // Wait for retry-after duration
                 tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
             } else {
-                // No retry-after header, use default 1 second
                 tracing::warn!(
                     status = %status,
                     "Binance API rate limit exceeded (429), no Retry-After header, waiting 1 second"
@@ -2641,12 +2328,6 @@ async fn ensure_success(resp: Response) -> Result<Response> {
         
         let body = resp.text().await.unwrap_or_default();
         
-        // ✅ CRITICAL: Some Binance errors are not actual errors but informational messages
-        // -4046: "No need to change margin type" - margin type already set correctly
-        // -4059: "No need to change position side" - position side already set correctly
-        // -4028: "Leverage X is not valid" - leverage not valid for symbol (expected, system will try lower)
-        // These are handled as success or retry in their respective functions
-        // Log them at appropriate level instead of ERROR to reduce log noise
         let is_benign_error = body.contains("-4046") || body.contains("-4059")
             || body.contains("No need to change margin type")
             || body.contains("No need to change position side");
@@ -2656,12 +2337,8 @@ async fn ensure_success(resp: Response) -> Result<Response> {
         if is_benign_error {
             tracing::debug!(%status, %body, "binance api response (benign - already set correctly)");
         } else if is_leverage_error {
-            // Leverage errors are expected - system will automatically try lower leverage
-            // Log as WARN instead of ERROR to reduce noise
             tracing::warn!(%status, %body, "binance api error (leverage not valid - will try lower)");
         } else if status == 429 {
-            // 429 already logged above with retry-after info
-            // Don't log again as ERROR
         } else {
             tracing::error!(%status, %body, "binance api error");
         }
@@ -2672,13 +2349,13 @@ async fn ensure_success(resp: Response) -> Result<Response> {
 
 fn is_transient_error(status: u16, _body: &str) -> bool {
     match status {
-        408 => true,       // Request Timeout
-        429 => true,       // Too Many Requests
-        500..=599 => true, // Server Errors
+        408 => true,
+        429 => true,
+        500..=599 => true,
         400 => {
             false
         }
-        _ => false, // Other errors are permanent
+        _ => false,
     }
 }
 
@@ -2688,14 +2365,10 @@ fn is_permanent_error(status: u16, body: &str) -> bool {
     if status == 400 {
         let body_lower = body.to_lowercase();
         if body_lower.contains("precision is over") || body_lower.contains("-1111") {
-            return false; // Precision error can be retried
+            return false;
         }
-        if body_lower.contains("-1013")
-            || body_lower.contains("min notional")
-            || body_lower.contains("min_notional")
-            || body_lower.contains("below min notional")
-        {
-            return false; // MIN_NOTIONAL hatası retry edilebilir (rules refresh ile)
+        if crate::utils::contains_min_notional(&body_lower) {
+            return false;
         }
         body_lower.contains("invalid")
             || body_lower.contains("margin")
@@ -2721,7 +2394,4 @@ async fn send_void(builder: RequestBuilder) -> Result<()> {
 }
 
 
-// ============================================================================
-// Binance WebSocket Module (from binance_ws.rs)
-// ============================================================================
 

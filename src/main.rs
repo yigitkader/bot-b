@@ -1,5 +1,3 @@
-// Main application entry point
-// Clean architecture: event-driven modules with WebSocket-first approach
 
 mod config;
 mod types;
@@ -36,22 +34,17 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Create logs directory if it doesn't exist
     std::fs::create_dir_all("logs")?;
     
-    // Clear previous log file (truncate on open)
     let _log_file = std::fs::File::create("logs/console.log")?;
-    drop(_log_file); // Close file before using it
+    drop(_log_file);
     
-    // Initialize logging with both console and file output
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
     
-    // Create file appender (truncates file on each run)
     let file_appender = tracing_appender::rolling::never("logs", "console.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     
-    // Create layers: one for console, one for file
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     
@@ -60,26 +53,21 @@ async fn main() -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(true)
-                .with_writer(std::io::stdout) // Console output
+                .with_writer(std::io::stdout)
         )
         .with(
             tracing_subscriber::fmt::layer()
-                .with_ansi(false) // No ANSI codes in file
-                .with_writer(non_blocking) // File output
+                .with_ansi(false)
+                .with_writer(non_blocking)
         )
         .init();
     
-    // Keep guard alive for the duration of the program
-    // Note: _guard will be dropped at end of main, but that's OK since we're shutting down
     let _file_guard = _guard;
 
-    // Load configuration
     let cfg = Arc::new(load_config()?);
     
-    // Initialize logger
     let (json_logger, _logger_handle) = crate::logging::create_logger("logs/trading_events.json")?;
     
-    // Create shutdown flag
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = shutdown_flag.clone();
     
@@ -90,30 +78,22 @@ async fn main() -> Result<()> {
         }
     });
     
-    // Create shared state
     let shared_state = Arc::new(SharedState::new());
     
-    // Create event bus with configuration
     let event_bus = Arc::new(EventBus::new_with_config(&cfg.event_bus));
     
-    // Initialize CONNECTION module (only module that creates exchange connection)
-    // Pass shared_state for balance validation
     let connection = Arc::new(Connection::from_config(
         cfg.clone(),
         event_bus.clone(),
         shutdown_flag.clone(),
-        Some(shared_state.clone()), // Pass shared_state for balance validation
+        Some(shared_state.clone()),
     )?);
     
-    // Get symbols from config or discover them
     let symbols = if !cfg.symbols.is_empty() {
-        // Use manually specified symbols
         cfg.symbols.clone()
     } else if let Some(symbol) = &cfg.symbol {
-        // Use single symbol from config
         vec![symbol.clone()]
     } else if cfg.auto_discover_quote {
-        // Auto-discover symbols based on quote asset
         info!("Auto-discovering symbols with quote asset: {}", cfg.quote_asset);
         match connection.discover_symbols().await {
             Ok(discovered) => {
@@ -136,14 +116,11 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        // No symbols specified and auto-discovery is disabled
         return Err(anyhow!("No symbols specified and auto_discover_quote is false. Please specify symbols in config or enable auto_discover_quote."));
     };
     
-    // Start CONNECTION
     connection.start(symbols).await?;
     
-    // Initialize BALANCE module
     let balance = Balance::new(
         connection.clone(),
         event_bus.clone(),
@@ -152,7 +129,6 @@ async fn main() -> Result<()> {
     );
     balance.start().await?;
     
-    // Initialize ORDERING module
     let ordering = OrderingModule::new(
         cfg.clone(),
         connection.clone(),
@@ -162,7 +138,6 @@ async fn main() -> Result<()> {
     );
     ordering.start().await?;
     
-    // Initialize FOLLOW_ORDERS module
     let follow_orders = FollowOrders::new(
         cfg.clone(),
         event_bus.clone(),
@@ -171,7 +146,6 @@ async fn main() -> Result<()> {
     );
     follow_orders.start().await?;
     
-    // Initialize TRENDING module
     let trending = Trending::new(
         cfg.clone(),
         event_bus.clone(),
@@ -179,7 +153,6 @@ async fn main() -> Result<()> {
     );
     trending.start().await?;
     
-    // Initialize LOGGING module
     let logging = Logging::new(
         event_bus.clone(),
         json_logger,
@@ -187,7 +160,6 @@ async fn main() -> Result<()> {
     );
     logging.start().await?;
     
-    // Initialize AI_ANALYZER module (intelligent log analysis and error detection)
     let ai_analyzer = Arc::new(AiAnalyzer::new(
         event_bus.clone(),
         shutdown_flag.clone(),
@@ -196,7 +168,6 @@ async fn main() -> Result<()> {
     
     info!("All modules started, waiting for shutdown signal...");
     
-    // Start dynamic symbol rotation task if enabled
     if cfg.dynamic_symbol_selection.enabled {
         start_dynamic_symbol_rotation(
             connection.clone(),
@@ -206,7 +177,6 @@ async fn main() -> Result<()> {
         );
     }
     
-    // Start health check task
     let event_bus_health = event_bus.clone();
     let ai_analyzer_health = ai_analyzer.clone();
     let shutdown_flag_health = shutdown_flag.clone();
@@ -221,13 +191,11 @@ async fn main() -> Result<()> {
                 break;
             }
             
-            // Perform health check
             let uptime_secs = app_start_time.elapsed().as_secs();
             perform_health_check(&event_bus_health, &ai_analyzer_health, uptime_secs).await;
         }
     });
     
-    // Wait for shutdown signal
     while !shutdown_flag.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -242,7 +210,6 @@ async fn main() -> Result<()> {
 async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, uptime_secs: u64) {
     let health = event_bus.health_stats();
     
-    // Check if any critical channels have no receivers (potential issue)
     let mut warnings = Vec::new();
     if health.order_update_receivers == 0 {
         warnings.push("OrderUpdate: no subscribers");
@@ -254,7 +221,6 @@ async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, up
         warnings.push("TradeSignal: no subscribers");
     }
     
-    // Log health status
     if warnings.is_empty() {
         info!(
             uptime_secs,
@@ -280,9 +246,6 @@ async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, up
         );
     }
     
-    // Log memory usage (basic check)
-    // Note: More detailed memory profiling would require additional dependencies
-    // This is a basic health check to ensure the process is still running
     let memory_info = get_memory_info();
     if let Some(mem_mb) = memory_info {
         info!(
@@ -291,12 +254,10 @@ async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, up
         );
     }
     
-    // ✅ Use AI analyzer public API methods to check system health
     let trade_stats = ai_analyzer.get_trade_stats().await;
     let order_stats = ai_analyzer.get_order_stats().await;
     let recent_anomalies = ai_analyzer.get_recent_anomalies(5).await;
     
-    // Log AI analyzer statistics
     if !trade_stats.is_empty() {
         let total_trades: u64 = trade_stats.values().map(|s| s.total_trades).sum();
         let total_pnl: f64 = trade_stats.values().map(|s| s.total_pnl).sum();
@@ -323,7 +284,6 @@ async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, up
         );
     }
     
-    // Log recent anomalies if any
     if !recent_anomalies.is_empty() {
         let high_severity = recent_anomalies.iter()
             .filter(|a| matches!(a.severity, crate::ai_analyzer::Severity::High))
@@ -355,14 +315,12 @@ async fn perform_health_check(event_bus: &EventBus, ai_analyzer: &AiAnalyzer, up
 fn get_memory_info() -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
-        // Read from /proc/self/status on Linux
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
                 if line.starts_with("VmRSS:") {
-                    // Format: "VmRSS:    12345 kB"
                     if let Some(kb_str) = line.split_whitespace().nth(1) {
                         if let Ok(kb) = kb_str.parse::<u64>() {
-                            return Some(kb as f64 / 1024.0); // Convert KB to MB
+                            return Some(kb as f64 / 1024.0);
                         }
                     }
                 }
@@ -372,14 +330,10 @@ fn get_memory_info() -> Option<f64> {
     
     #[cfg(target_os = "macos")]
     {
-        // On macOS, we could use task_info, but it's complex
-        // For now, return None - can be enhanced later
     }
     
     #[cfg(target_os = "windows")]
     {
-        // On Windows, we could use GetProcessMemoryInfo, but it's complex
-        // For now, return None - can be enhanced later
     }
     
     None
@@ -397,7 +351,6 @@ fn start_dynamic_symbol_rotation(
     let max_symbols = cfg.dynamic_symbol_selection.max_symbols;
 
     tokio::spawn(async move {
-        // First rotation immediately, then wait for interval
         let mut first_rotation = true;
         
         loop {
@@ -407,13 +360,10 @@ fn start_dynamic_symbol_rotation(
 
             info!("Starting symbol rotation...");
 
-            // 1. Tüm symbol'leri çek ve skorla
             match connection.discover_and_rank_symbols().await {
                 Ok(mut scored_symbols) => {
-                    // 2. En iyi N tanesini seç
                     scored_symbols.truncate(max_symbols);
 
-                    // 3. Seçilen symbol'leri logla
                     info!("Top {} symbols selected:", scored_symbols.len());
                     for (i, scored) in scored_symbols.iter().enumerate().take(10) {
                         info!(
@@ -426,13 +376,11 @@ fn start_dynamic_symbol_rotation(
                         );
                     }
 
-                    // 4. YENİ symbol listesiyle WebSocket'leri yeniden başlat
                     let new_symbols: Vec<String> = scored_symbols
                         .iter()
                         .map(|s| s.symbol.clone())
                         .collect();
 
-                    // ÖNEMLİ: Mevcut WebSocket'leri kapat, yenilerini başlat
                     if let Err(e) = connection.restart_market_streams(new_symbols).await {
                         error!(error = %e, "Failed to restart market streams");
                     }
@@ -442,13 +390,9 @@ fn start_dynamic_symbol_rotation(
                 }
             }
 
-            // 5. Bir sonraki rotasyonu bekle
-            // First rotation happens immediately, subsequent rotations wait for interval
             if first_rotation {
                 first_rotation = false;
-                // Continue to next iteration immediately for first rotation
             } else {
-                // Wait for interval before next rotation
                 tokio::time::sleep(Duration::from_secs(rotation_interval * 60)).await;
             }
         }

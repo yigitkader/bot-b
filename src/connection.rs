@@ -1,8 +1,3 @@
-// CONNECTION: Exchange WS & REST single gateway
-// All external world (WS/REST) goes through here
-// Rate limit & reconnect management
-//
-// Single responsibility: Connection management (WebSocket + REST coordination)
 
 mod venue;
 mod websocket;
@@ -27,22 +22,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-// ============================================================================
-// CONNECTION Module (Public API)
-// ============================================================================
 
-// OrderFillHistory is defined in types.rs
 
 pub struct Connection {
     venue: Arc<BinanceFutures>,
     cfg: Arc<AppCfg>,
     event_bus: Arc<EventBus>,
     shutdown_flag: Arc<AtomicBool>,
-    // Rate limiting: simple token bucket
     rate_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
-    // Shared state for balance validation (optional, set after initialization)
     shared_state: Option<Arc<SharedState>>,
-    // Order fill history: order_id -> fill history (for average fill price calculation)
     order_fill_history: Arc<DashMap<String, OrderFillHistory>>,
 }
 
@@ -63,52 +51,42 @@ impl RateLimiter {
         }
     }
     
-    /// Check if order request is allowed (300 per 5 minutes)
-    async fn check_order_rate(&mut self) {
+    async fn check_rate_limit(
+        requests: &mut Vec<Instant>,
+        window: Duration,
+        max_requests: usize,
+    ) {
         let now = Instant::now();
-        let window = Duration::from_secs(5 * 60); // 5 minutes
+        requests.retain(|&t| now.duration_since(t) < window);
         
-        // Remove old requests outside window
-        self.order_requests.retain(|&t| now.duration_since(t) < window);
-        
-        // If limit reached, wait
-        if self.order_requests.len() >= 300 {
-        if let Some(oldest) = self.order_requests.first() {
-            let wait_time = window.saturating_sub(now.duration_since(*oldest));
-            if !wait_time.is_zero() {
-                tokio::time::sleep(wait_time).await;
-                // Clean up again after wait
-                let now = Instant::now();
-                self.order_requests.retain(|&t| now.duration_since(t) < window);
+        if requests.len() >= max_requests {
+            if let Some(oldest) = requests.first() {
+                let wait_time = window.saturating_sub(now.duration_since(*oldest));
+                if !wait_time.is_zero() {
+                    tokio::time::sleep(wait_time).await;
+                    let now = Instant::now();
+                    requests.retain(|&t| now.duration_since(t) < window);
+                }
             }
         }
-        }
         
-        self.order_requests.push(now);
+        requests.push(now);
+    }
+
+    async fn check_order_rate(&mut self) {
+        Self::check_rate_limit(
+            &mut self.order_requests,
+            Duration::from_secs(5 * 60),
+            300,
+        ).await;
     }
     
-    /// Check if balance request is allowed (1200 per minute)
     async fn check_balance_rate(&mut self) {
-        let now = Instant::now();
-        let window = Duration::from_secs(60); // 1 minute
-        
-        // Remove old requests outside window
-        self.balance_requests.retain(|&t| now.duration_since(t) < window);
-        
-        // If limit reached, wait
-        if self.balance_requests.len() >= 1200 {
-        if let Some(oldest) = self.balance_requests.first() {
-            let wait_time = window.saturating_sub(now.duration_since(*oldest));
-            if !wait_time.is_zero() {
-                tokio::time::sleep(wait_time).await;
-                // Clean up again after wait
-                let now = Instant::now();
-                self.balance_requests.retain(|&t| now.duration_since(t) < window);
-            }
-        }
-        }
-        
-        self.balance_requests.push(now);
+        Self::check_rate_limit(
+            &mut self.balance_requests,
+            Duration::from_secs(60),
+            1200,
+        ).await;
     }
 }
 
@@ -153,19 +131,12 @@ impl Connection {
         }
     }
 
-    /// Get clamped leverage for a symbol
-    /// ✅ CRITICAL: Always uses coin's max leverage from exchangeInfo/leverage brackets
-    /// Clamps desired leverage to symbol's max leverage (fetched from coin info)
-    /// This centralizes leverage clamping logic to avoid duplication
-    async fn get_clamped_leverage(&self, symbol: &str, desired_leverage: u32) -> u32 {
-        // Use config default_leverage as safe fallback only if coin info is unavailable
+    pub async fn get_clamped_leverage(&self, symbol: &str, desired_leverage: u32) -> u32 {
         let safe_leverage_fallback = self.cfg.exec.default_leverage;
         
         match self.venue.rules_for(symbol).await {
             Ok(rules) => {
-                // ✅ CRITICAL: Always use coin's max leverage if available
                 if let Some(symbol_max_lev) = rules.max_leverage {
-                    // Coin has max leverage - clamp to it (this is the coin's actual max)
                     let clamped = desired_leverage.min(symbol_max_lev);
                     if clamped < desired_leverage {
                         debug!(
@@ -178,10 +149,7 @@ impl Connection {
                     }
                     clamped
                 } else {
-                    // Coin's max leverage not available - try to fetch it directly
-                    // This can happen if leverage brackets API failed during rules_for()
                     if let Some(coin_max_lev) = self.venue.fetch_max_leverage(symbol).await {
-                        // Successfully fetched coin's max leverage - use it
                         let clamped = desired_leverage.min(coin_max_lev);
                         if clamped < desired_leverage {
                             debug!(
@@ -194,7 +162,6 @@ impl Connection {
                         }
                         clamped
                     } else {
-                        // Coin's max leverage unavailable - use safe fallback as last resort
                         let clamped = desired_leverage.min(safe_leverage_fallback);
                         warn!(
                             symbol = %symbol,
@@ -209,9 +176,7 @@ impl Connection {
                 }
             }
             Err(e) => {
-                // Failed to fetch rules - try to fetch max leverage directly
                 if let Some(coin_max_lev) = self.venue.fetch_max_leverage(symbol).await {
-                    // Successfully fetched coin's max leverage - use it
                     let clamped = desired_leverage.min(coin_max_lev);
                     debug!(
                         symbol = %symbol,
@@ -222,7 +187,6 @@ impl Connection {
                     );
                     clamped
                 } else {
-                    // All attempts failed - use safe fallback as last resort
                     warn!(
                         error = %e,
                         symbol = %symbol,
@@ -238,8 +202,6 @@ impl Connection {
 
     pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
 
-        // Set hedge mode according to config (must be done before any orders)
-        // Note: set_position_side_dual handles -4059 "No need to change" as success
         let hedge_mode = self.cfg.binance.hedge_mode;
         if let Err(e) = self.venue.set_position_side_dual(hedge_mode).await {
             warn!(
@@ -258,11 +220,7 @@ impl Connection {
         let use_isolated_margin = self.cfg.risk.use_isolated_margin;
 
         for symbol in &symbols {
-            // ✅ CRITICAL: Clamp leverage to symbol's max leverage (if available)
-            // Use centralized clamping function to avoid code duplication
             let leverage = self.get_clamped_leverage(symbol, desired_leverage).await;
-            // Set margin type (isolated or cross)
-            // Note: set_margin_type handles -4046 "No need to change" as success
             if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {
                 error!(
                     error = %e,
@@ -285,8 +243,6 @@ impl Connection {
 
             if let Ok(position) = self.venue.get_position(symbol).await {
                 if !position.qty.0.is_zero() {
-                    // Position is OPEN - leverage cannot be changed
-                    // Use clamped leverage for comparison
                     if position.leverage != leverage {
                         error!(
                             symbol = %symbol,
@@ -309,9 +265,6 @@ impl Connection {
                         );
                     }
                 } else {
-                    // Position is CLOSED - safe to set leverage
-                    // ✅ CRITICAL: Re-fetch symbol rules to get max leverage (may have changed or not been fetched yet)
-                    // Use centralized clamping function to ensure consistency
                     let final_leverage = self.get_clamped_leverage(symbol, leverage).await;
                     
                     if position.leverage != final_leverage {
@@ -324,7 +277,6 @@ impl Connection {
                         );
                         match self.venue.set_leverage(symbol, final_leverage).await {
                             Ok(actual_leverage) => {
-                                // Leverage set successfully (may be lower than final_leverage due to step-down)
                                 if actual_leverage != final_leverage {
                                     warn!(
                                         symbol = %symbol,
@@ -334,7 +286,6 @@ impl Connection {
                                         "CONNECTION: Leverage set to lower value than clamped (step-down mechanism)"
                                     );
                                 }
-                                // Verify the fix worked
                                 if let Ok(updated_position) = self.venue.get_position(symbol).await {
                                     if updated_position.leverage == actual_leverage {
                                         info!(
@@ -381,9 +332,6 @@ impl Connection {
                     }
                 }
             } else {
-                // No position exists - safe to set leverage
-                // Leverage is already clamped above (in the for loop), so use it directly
-                // Set leverage (for new positions or to ensure it's set correctly)
                 match self.venue.set_leverage(symbol, leverage).await {
                     Ok(actual_leverage) => {
                         if actual_leverage != leverage {
@@ -418,19 +366,14 @@ impl Connection {
             }
         }
 
-        // Start market data stream
         self.start_market_data_stream(symbols.clone()).await?;
 
-        // Start user data stream (pass symbols for missed events sync)
         self.start_user_data_stream(symbols.clone()).await?;
 
-        // Start periodic rules refresh task
         self.start_rules_refresh_task().await;
 
-        // Start periodic order fill history cleanup task
         self.start_order_fill_history_cleanup_task().await;
 
-        // ✅ NEW: Start order monitoring fallback task
         self.start_order_monitoring_fallback_task().await;
 
         info!("CONNECTION: All streams started");
@@ -442,12 +385,8 @@ impl Connection {
         let shutdown_flag = self.shutdown_flag.clone();
 
         tokio::spawn(async move {
-        // ✅ CRITICAL: Reduced cleanup interval from 1 hour to 10 minutes for HFT
-        // HFT requires faster cleanup to prevent memory accumulation
-        const CLEANUP_INTERVAL_SECS: u64 = 600; // 10 minutes (HFT optimized, was 1 hour)
-        // ✅ CRITICAL: Reduced max age from 24 hours to 1 hour for HFT
-        // 24 hours is too long for HFT - filled orders should be cleaned up faster
-        const MAX_AGE_SECS: u64 = 3600; // 1 hour (HFT optimized, was 24 hours)
+        const CLEANUP_INTERVAL_SECS: u64 = 600;
+        const MAX_AGE_SECS: u64 = 3600;
 
         loop {
             tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
@@ -459,26 +398,10 @@ impl Connection {
             let now = Instant::now();
             let initial_count = order_fill_history.len();
             order_fill_history.retain(|order_id, history| {
-                // ✅ CRITICAL: Fixed memory leak - remove filled orders after short delay
-                // Problem: Previous code kept entries even when orders were filled/cancelled (not in cache)
-                // This caused memory leak: 100 orders/day × 30 days = 3000 entries (only cleaned after 24 hours)
-                //
-                // Solution: Three-tier cleanup strategy
-                // 1. Force remove very old entries (1+ hour) - prevents leaks from stale cache (HFT optimized)
-                // 2. Remove filled/cancelled orders after short delay (30 seconds) - prevents accumulation (HFT optimized)
-                // 3. Keep active orders (in cache) - protects ongoing orders
                 let age = now.duration_since(history.last_update);
                 let age_secs = age.as_secs();
 
-                // Step 1: AGE CHECK FIRST (prevents leak even if cache is stale)
-                // If entry is very old (1+ hour), force remove to prevent memory leak (HFT optimized)
-                // This handles cases where:
-                // - Order was filled/cancelled but WebSocket update delayed
-                // - Cache still shows order as "open" but history is very old
-                // - Order has been open for more than 1 hour (unlikely but possible)
                 if age_secs > MAX_AGE_SECS {
-                    // Very old entry - force remove regardless of cache status
-                    // This prevents memory leaks from stale cache or very long-lived orders
                     warn!(
                         order_id = %order_id,
                         history_age_secs = age_secs,
@@ -486,46 +409,28 @@ impl Connection {
                         "CONNECTION: Order fill history is very old ({} hours), force removing to prevent memory leak",
                         age_secs / 3600
                     );
-                    return false; // FORCE REMOVE - prevent memory leak
+                    return false;
                 }
 
-                // Step 2: CACHE CHECK (for recent entries)
-                // Check if order is still active in cache
                 let is_in_cache = OPEN_ORDERS_CACHE.iter().any(|entry| {
                     entry.value().iter().any(|o| o.order_id == *order_id)
                 });
 
                 if is_in_cache {
-                    // Order is in cache and history is recent - keep it (active order)
-                    true // Keep - order is still active
+                    true
                 } else {
-                    // Order NOT in cache (filled/cancelled) - remove after short delay
-                    // This prevents memory leak from accumulating filled order histories
-                    // ✅ CRITICAL: Reduced from 5 minutes to 30 seconds for HFT
-                    // - Order fill olduktan 1 saniye sonra cache'den çıkar
-                    // - WebSocket events genellikle < 1 saniye içinde gelir
-                    // - 30 saniye late-arriving events için yeterli buffer
-                    // - HFT için 5 dakika çok uzun (memory leak riski)
-                    const SHORT_DELAY_SECS: u64 = 30; // 30 seconds - enough time for late-arriving events (HFT optimized)
+                    const SHORT_DELAY_SECS: u64 = 30;
                     
                     if age_secs > SHORT_DELAY_SECS {
-                        // Order not in cache and history is older than 30 seconds - remove it
-                        // This handles:
-                        // - Orders that were filled/cancelled (not in cache)
-                        // - Late-arriving WebSocket events (30 seconds is enough buffer for HFT)
-                        // - Prevents accumulation of filled order histories (memory leak prevention)
                         debug!(
                             order_id = %order_id,
                             history_age_secs = age_secs,
                             "CONNECTION: Order fill history not in cache (filled/cancelled), removing after {} seconds delay",
                             age_secs
                         );
-                        false // Remove - order is filled/cancelled
+                        false
                     } else {
-                        // Order not in cache but history is very recent (< 30 seconds)
-                        // Keep for now - may receive late-arriving fill events or order may be closing
-                        // Will be cleaned up on next cleanup cycle if still inactive
-                        true // Keep - recent entry, may receive late events
+                        true
                     }
                 }
             });
@@ -533,7 +438,6 @@ impl Connection {
             let final_count = order_fill_history.len();
             let removed_count = initial_count.saturating_sub(final_count);
 
-            // Count protected orders (active orders that were kept)
             let protected_count = order_fill_history.iter()
                 .filter(|entry| {
                     OPEN_ORDERS_CACHE.iter().any(|cache_entry| {
@@ -577,7 +481,7 @@ impl Connection {
         let shutdown_flag = self.shutdown_flag.clone();
 
         tokio::spawn(async move {
-            const MONITORING_INTERVAL_SECS: u64 = 15; // 15 seconds
+            const MONITORING_INTERVAL_SECS: u64 = 15;
 
             loop {
                 tokio::time::sleep(Duration::from_secs(MONITORING_INTERVAL_SECS)).await;
@@ -586,16 +490,11 @@ impl Connection {
                     break;
                 }
 
-                // Get all open positions from exchange
                 match venue.get_all_positions().await {
                     Ok(positions) => {
                         for (symbol, position) in positions {
-                            // Check if position has TP/SL orders
                             match venue.get_open_orders(&symbol).await {
                                 Ok(orders) => {
-                                    // Check if any order is a TP/SL order (reduce-only order)
-                                    // For now, we check if there are any open orders
-                                    // In the future, we could check order type or reduceOnly flag
                                     let has_open_orders = !orders.is_empty();
 
                                     if !has_open_orders && !position.qty.0.is_zero() {
@@ -605,9 +504,6 @@ impl Connection {
                                             "CONNECTION: TP/SL missing for open position, triggering re-placement"
                                         );
 
-                                        // This requires FOLLOW_ORDERS to listen to this event
-                                        // For now, just log the warning
-                                        // In the future, we can send a PositionUpdate event to trigger TP/SL placement
                                     }
                                 }
                                 Err(e) => {
@@ -651,7 +547,6 @@ impl Connection {
             );
         }
 
-        // Binance URL limit: max 200 chars, so we need to split symbols into groups
         const MAX_SYMBOLS_PER_STREAM: usize = 10;
 
         info!(
@@ -660,19 +555,14 @@ impl Connection {
             "CONNECTION: setting up market data websocket streams"
         );
 
-        // Split symbols into groups
         for chunk in unique_symbols.chunks(MAX_SYMBOLS_PER_STREAM) {
             let symbols_chunk = chunk.to_vec();
             let event_bus = self.event_bus.clone();
             let shutdown_flag = self.shutdown_flag.clone();
 
             tokio::spawn(async move {
-                // Exponential backoff configuration
-                // ✅ CRITICAL: Reduced max delay from 60s to 10s for HFT
-                // HFT requires fast reconnection - 60 seconds is too long
-                // Exponential backoff sequence: 1s → 2s → 4s → 8s → 10s (max)
                 const INITIAL_DELAY_SECS: u64 = 1;
-                const MAX_DELAY_SECS: u64 = 10; // 10 seconds max (HFT optimized, was 60s)
+                const MAX_DELAY_SECS: u64 = 10;
                 let mut connection_retry_delay = INITIAL_DELAY_SECS;
                 let mut stream_retry_delay = INITIAL_DELAY_SECS;
 
@@ -683,7 +573,6 @@ impl Connection {
 
                     match MarketDataStream::connect(&symbols_chunk).await {
                         Ok(mut stream) => {
-                            // Connection successful - reset connection retry delay
                             connection_retry_delay = INITIAL_DELAY_SECS;
 
                             info!(
@@ -699,42 +588,28 @@ impl Connection {
 
                                 match stream.next_price_update().await {
                                     Ok(price_update) => {
-                                        // Clone symbol once for reuse
                                         let symbol = price_update.symbol.clone();
 
-                                        // Update price cache (for backward compatibility)
-                                    // DashMap is thread-safe and atomic
-                                    // If multiple streams subscribe to the same symbol, the last write wins
-                                        // Move price_update into cache (no unnecessary clone)
                                         PRICE_CACHE.insert(symbol.clone(), price_update.clone());
 
-                                        // Publish MarketTick event
                                         let market_tick = MarketTick {
                                             symbol,
                                             bid: price_update.bid,
                                             ask: price_update.ask,
-                                            mark_price: None, // Can be fetched if needed
-                                            volume: None, // Can be added if needed
+                                            mark_price: None,
+                                            volume: None,
                                             timestamp: Instant::now(),
                                         };
 
-                                    // Handle backpressure - if channel is full, log warning but continue
                                         let receiver_count = event_bus.market_tick_tx.receiver_count();
                                         if receiver_count == 0 {
-                                            // No subscribers, skip sending (but still update cache)
                                             tracing::debug!(
                                                 symbol = %price_update.symbol,
                                                 "CONNECTION: No MarketTick subscribers, skipping event"
                                             );
                                         } else {
-                                            // ✅ CRITICAL: Handle buffer overflow gracefully
-                                            // Problem: If buffer is full, send() returns error and event is dropped
-                                            // Solution: Log warning when buffer is full to detect backpressure
-                                            // Subscribers will receive RecvError::Lagged and handle it
                                             match event_bus.market_tick_tx.send(market_tick) {
                                                 Ok(receiver_count) => {
-                                                    // Successfully sent - receiver_count indicates how many subscribers received it
-                                                    // If receiver_count is 0, no subscribers are listening (not an error, just no consumers)
                                                     if receiver_count == 0 {
                                                         tracing::debug!(
                                                             symbol = %price_update.symbol,
@@ -743,9 +618,6 @@ impl Connection {
                                                     }
                                                 }
                                                 Err(_) => {
-                                                    // Buffer is full - event was dropped
-                                                    // This indicates subscribers are lagging behind
-                                                    // Subscribers will receive RecvError::Lagged and handle it
                                                     warn!(
                                                         symbol = %price_update.symbol,
                                                         receiver_count = event_bus.market_tick_tx.receiver_count(),
@@ -765,10 +637,9 @@ impl Connection {
                                         );
                                         tokio::time::sleep(Duration::from_secs(stream_retry_delay)).await;
 
-                                        // Exponential backoff: double delay, cap at MAX_DELAY_SECS
                                         stream_retry_delay = (stream_retry_delay * 2).min(MAX_DELAY_SECS);
 
-                                        break; // Reconnect (only this chunk, others continue)
+                                        break;
                                     }
                                 }
                             }
@@ -783,7 +654,6 @@ impl Connection {
                             );
                             tokio::time::sleep(Duration::from_secs(connection_retry_delay)).await;
 
-                            // Exponential backoff: double delay, cap at MAX_DELAY_SECS
                             connection_retry_delay = (connection_retry_delay * 2).min(MAX_DELAY_SECS);
                         }
                     }
@@ -831,21 +701,16 @@ impl Connection {
                 Ok(mut stream) => {
                     info!(?kind, "CONNECTION: connected to Binance user data stream");
 
-                    // After reconnect, verify with REST API
-                    // Binance WebSocket automatically sends ACCOUNT_UPDATE and ORDER_TRADE_UPDATE
-                    // Extra validation can catch missed events
                     let venue_for_validation = venue.clone();
                     let symbols_for_validation = symbols.clone();
                     let shared_state_for_validation_clone = shared_state_for_validation.clone();
                     stream.set_on_reconnect(move || {
                         info!("CONNECTION: WebSocket reconnected - Binance will automatically send state updates via ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events");
 
-                        // Spawn background validation task
                         let venue_clone = venue_for_validation.clone();
                         let symbols_clone = symbols_for_validation.clone();
                         let shared_state_for_validation = shared_state_for_validation_clone.clone();
                         tokio::spawn(async move {
-                            // Wait a bit for ACCOUNT_UPDATE events to arrive (Binance sends them after reconnect)
                             tokio::time::sleep(Duration::from_secs(2)).await;
 
                             info!(
@@ -853,23 +718,11 @@ impl Connection {
                                 "CONNECTION: Validating state after WebSocket reconnect (priority-based validation)"
                             );
 
-                            // ✅ PRIORITY-BASED VALIDATION: Validate symbols in priority order
-                            // Problem: Validating all 37 symbols takes ~15 seconds, blocking new trade signals
-                            // Solution: Validate high-priority symbols first (active positions), then others in background
-                            //
-                            // Priority 1: Symbols with open positions/orders (validate immediately, ~1-5 symbols)
-                            // Priority 2: Symbols with cached positions (validate next, ~5-10 symbols)
-                            // Priority 3: All other symbols (validate in background, non-blocking)
-                            //
-                            // This ensures critical state is validated quickly (< 2 seconds) while
-                            // non-critical validation happens in background without blocking trading
 
-                            // Get priority symbols from shared state
                             let (priority_symbols, cached_symbols, remaining_symbols) = {
                                 let mut priority = Vec::new();
                                 let mut cached = Vec::new();
                                 
-                                // Priority 1: Symbols with open positions/orders (from shared_state)
                                 if let Some(shared_state) = &shared_state_for_validation {
                                     let ordering_state = shared_state.ordering_state.lock().await;
                                     if let Some(position) = &ordering_state.open_position {
@@ -882,7 +735,6 @@ impl Connection {
                                     }
                                 }
                                 
-                                // Priority 2: Symbols with cached positions (from POSITION_CACHE)
                                 for entry in POSITION_CACHE.iter() {
                                     let symbol = entry.key().clone();
                                     if !priority.contains(&symbol) {
@@ -890,7 +742,6 @@ impl Connection {
                                     }
                                 }
                                 
-                                // Priority 3: All other symbols
                                 let remaining: Vec<String> = symbols_clone.iter()
                                     .filter(|s| !priority.contains(s) && !cached.contains(s))
                                     .cloned()
@@ -918,7 +769,6 @@ impl Connection {
                             let symbol_timeout = Duration::from_secs(3);
                             let validation_start = Instant::now();
 
-                            // Helper function to validate a batch of symbols
                             let validate_symbols_batch = {
                                 let venue = venue_clone.clone();
                                 let timeout = symbol_timeout;
@@ -930,13 +780,11 @@ impl Connection {
                                         let symbol_clone = symbol.clone();
                                         
                                         tokio::spawn(async move {
-                                            // Validate position
                                             let position_result = tokio::time::timeout(
                                                 timeout,
                                                 venue.get_position(&symbol_clone)
                                             ).await;
                                             
-                                            // Validate orders
                                             let orders_result = tokio::time::timeout(
                                                 timeout,
                                                 venue.get_open_orders(&symbol_clone)
@@ -948,7 +796,6 @@ impl Connection {
                                 }
                             };
 
-                            // Priority 1: Validate active positions/orders immediately (blocking)
                             let mut validated_count = 0;
                             if !priority_symbols.is_empty() {
                                 info!(
@@ -961,7 +808,6 @@ impl Connection {
                                 validated_count += Self::process_validation_results(priority_results, &venue_clone).await;
                             }
 
-                            // Priority 2: Validate cached symbols (blocking, but fast)
                             if !cached_symbols.is_empty() {
                                 info!(
                                     cached_count,
@@ -973,7 +819,6 @@ impl Connection {
                                 validated_count += Self::process_validation_results(cached_results, &venue_clone).await;
                             }
 
-                            // Priority 3: Validate remaining symbols in background (non-blocking)
                             if !remaining_symbols.is_empty() {
                                 info!(
                                     remaining_count,
@@ -995,11 +840,9 @@ impl Connection {
                                 });
                             }
 
-                            // Validate balance (USDT/USDC) - with timeout
                             let balance_timeout = Duration::from_secs(5);
-                            const MAX_BALANCE_VALIDATION_TIME: Duration = Duration::from_secs(10); // Max 10 seconds for balance validation
+                            const MAX_BALANCE_VALIDATION_TIME: Duration = Duration::from_secs(10);
                             for asset in &["USDT", "USDC"] {
-                                // Check overall timeout
                                 if validation_start.elapsed() > MAX_BALANCE_VALIDATION_TIME {
                                     warn!(
                                         asset = %asset,
@@ -1010,7 +853,6 @@ impl Connection {
                                 
                                 match tokio::time::timeout(balance_timeout, venue_clone.available_balance(asset)).await {
                                     Ok(Ok(rest_balance)) => {
-                                        // Compare with WebSocket cache
                                         if let Some(ws_balance) = BALANCE_CACHE.get(*asset) {
                                             let balance_diff = (rest_balance - *ws_balance.value()).abs();
 
@@ -1024,7 +866,6 @@ impl Connection {
                                                 );
                                             }
                                         } else if !rest_balance.is_zero() {
-                                            // REST API shows balance but WebSocket cache doesn't
                                             warn!(
                                                 asset = %asset,
                                                 rest_balance = %rest_balance,
@@ -1033,7 +874,6 @@ impl Connection {
                                         }
                                     }
                                     Ok(Err(e)) => {
-                                        // Failed to fetch balance - log but don't fail
                                         debug!(
                                             asset = %asset,
                                             error = %e,
@@ -1041,7 +881,6 @@ impl Connection {
                                         );
                                     }
                                     Err(_) => {
-                                        // Timeout - log warning
                                         warn!(
                                             asset = %asset,
                                             timeout_secs = balance_timeout.as_secs(),
@@ -1085,19 +924,17 @@ impl Connection {
                             Ok(event) => {
                                 if first_event_after_reconnect {
                                     first_event_after_reconnect = false;
-                                    // Can send heartbeat if needed
                                 }
 
-                                // Convert UserEvent to OrderUpdate/PositionUpdate/BalanceUpdate
                                 match event {
                                     UserEvent::OrderFill {
                                         symbol,
                                         order_id,
                                         side,
-                                        qty: last_filled_qty, // Last executed qty (incremental, this fill only)
+                                        qty: last_filled_qty,
                                         cumulative_filled_qty,
                                         order_qty,
-                                        price: last_fill_price, // Last executed price (this fill only)
+                                        price: last_fill_price,
                                         is_maker,
                                         order_status,
                                         commission: _,
@@ -1111,7 +948,6 @@ impl Connection {
                                             "EXPIRED_IN_MATCH" => OrderStatus::ExpiredInMatch,
                                             "REJECTED" => OrderStatus::Rejected,
                                             unknown => {
-                                                // Unknown status - log warning and treat as rejected
                                                 tracing::warn!(
                                                     order_status = unknown,
                                                     "CONNECTION: Unknown order status received, treating as Rejected"
@@ -1124,7 +960,7 @@ impl Connection {
                                         let remaining_qty = if total_order_qty.0 >= cumulative_filled_qty.0 {
                                             Qty(total_order_qty.0 - cumulative_filled_qty.0)
                                         } else {
-                                            Qty(Decimal::ZERO) // Should not happen, but safety check
+                                            Qty(Decimal::ZERO)
                                         };
 
                                         let now = Instant::now();
@@ -1139,28 +975,23 @@ impl Connection {
                                                 }
                                             });
 
-                                            // Add this fill to weighted sum: price * qty
                                             history.weighted_price_sum += last_fill_price.0 * last_filled_qty.0;
                                             history.total_filled_qty = cumulative_filled_qty;
-                                            history.last_update = now; // Update timestamp
+                                            history.last_update = now;
 
-                                            // Track maker/taker status for commission calculation
                                             history.total_fill_count += 1;
                                             if is_maker {
                                                 history.maker_fill_count += 1;
                                             }
 
-                                            // Calculate average: weighted_sum / total_qty
                                             let avg_price = if !cumulative_filled_qty.0.is_zero() {
                                                 Px(history.weighted_price_sum / cumulative_filled_qty.0)
                                             } else {
-                                                last_fill_price // Fallback if qty is zero (should not happen)
+                                                last_fill_price
                                             };
 
-                                            // If all fills are maker, use maker commission; otherwise use taker commission
                                             let all_maker = history.maker_fill_count == history.total_fill_count;
 
-                                            // Publish OrderFillHistoryUpdate event for STORAGE module
                                             use crate::event_bus::{FillHistoryAction, FillHistoryData, OrderFillHistoryUpdate};
                                             let fill_history_update = OrderFillHistoryUpdate {
                                                 order_id: order_id.clone(),
@@ -1181,30 +1012,24 @@ impl Connection {
                                             (avg_price, all_maker)
                                         };
 
-                                        // Update open orders cache from WebSocket
-                                        // Update OPEN_ORDERS_CACHE based on order status
                             let mut order_entry = OPEN_ORDERS_CACHE.entry(symbol.clone()).or_insert_with(Vec::new);
 
-                                        // Find existing order in cache
                                         let existing_order_idx = order_entry.iter().position(|o| o.order_id == order_id);
 
                                         match status {
                                             OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::ExpiredInMatch | OrderStatus::Rejected => {
-                                                // Order is closed - remove from cache
                                                 if let Some(idx) = existing_order_idx {
                                                     order_entry.remove(idx);
                                                 }
-                                                // If no more open orders for this symbol, remove symbol entry
                                                 if order_entry.is_empty() {
                                                     OPEN_ORDERS_CACHE.remove(&symbol);
                                                 }
                                             }
                                             OrderStatus::New | OrderStatus::PartiallyFilled => {
-                                                // Order is still open - update or add to cache
                                                 let venue_order = VenueOrder {
                                                     order_id: order_id.clone(),
                                                     side,
-                                                    price: last_fill_price, // Use last fill price (or could use order price if available)
+                                                    price: last_fill_price,
                                                     qty: total_order_qty,
                                                 };
                                                 if let Some(idx) = existing_order_idx {
@@ -1215,7 +1040,6 @@ impl Connection {
                                             }
                                         }
 
-                                        // Clean up fill history when order is fully filled, canceled, or expired
                                         if matches!(
                                             status,
                                             OrderStatus::Filled
@@ -1225,7 +1049,6 @@ impl Connection {
                                         ) {
                                             order_fill_history.remove(&order_id);
 
-                                            // Publish OrderFillHistoryUpdate event (Remove) for STORAGE module
                                             use crate::event_bus::{FillHistoryAction, OrderFillHistoryUpdate};
                                             let fill_history_update = OrderFillHistoryUpdate {
                                                 order_id: order_id.clone(),
@@ -1239,10 +1062,6 @@ impl Connection {
                                             }
                                         }
 
-                                        // ✅ NEW: Extract rejection reason if order is rejected
-                                        // Note: Binance WebSocket events don't include rejection reason in ORDER_TRADE_UPDATE
-                                        // Rejection reason is only available via REST API query
-                                        // For now, we use order_status string as rejection reason if rejected
                                         let rejection_reason = if status == OrderStatus::Rejected {
                                             Some(format!("Order rejected: {}", order_status))
                                         } else {
@@ -1253,15 +1072,13 @@ impl Connection {
                                             symbol: symbol.clone(),
                                             order_id,
                                             side,
-                                            last_fill_price, // Last executed price (this fill only)
-                                            average_fill_price, // Weighted average of all fills
-                                            qty: total_order_qty, // Total order quantity (original order size)
-                                            filled_qty: cumulative_filled_qty, // Cumulative filled qty (total filled so far)
-                                            remaining_qty, // Remaining qty = order_qty - cumulative_filled_qty
+                                            last_fill_price,
+                                            average_fill_price,
+                                            qty: total_order_qty,
+                                            filled_qty: cumulative_filled_qty,
+                                            remaining_qty,
                                             status,
-                                            rejection_reason, // Extract from order_status if rejected
-                                            // True if all fills were maker orders, false if any fill was taker
-                                            // Used for commission calculation: if all maker, use maker commission; otherwise taker
+                                            rejection_reason,
                                             is_maker: Some(is_all_maker),
                                             timestamp: Instant::now(),
                                         };
@@ -1281,20 +1098,18 @@ impl Connection {
                                             const BASE_DELAY_MS: u64 = 200;
 
                                             for attempt in 0..MAX_RETRIES {
-                                                // Exponential backoff: 200ms, 400ms, 600ms, 800ms, 1000ms
                                                 let delay_ms = BASE_DELAY_MS * (attempt + 1) as u64;
                                                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
                                                 if let Ok(position) = venue_clone.get_position(&symbol_clone).await {
-                                                    // Position successfully fetched, send update event
                                                     let position_update = PositionUpdate {
                                                         symbol: symbol_clone,
                                                         qty: position.qty,
                                                         entry_price: position.entry,
                                                         leverage: position.leverage,
-                                                        unrealized_pnl: None, // Can be calculated from mark price
+                                                        unrealized_pnl: None,
                                                         is_open: !position.qty.0.is_zero(),
-                                                        liq_px: position.liq_px, // ✅ NEW: Include liquidation price
+                                                        liq_px: position.liq_px,
                                                         timestamp: Instant::now(),
                                                     };
                                                     if let Err(e) = event_bus_pos.position_update_tx.send(position_update) {
@@ -1303,11 +1118,9 @@ impl Connection {
                                                             "CONNECTION: Failed to send PositionUpdate event (no subscribers or channel closed)"
                                                         );
                                                     }
-                                                    // Successfully fetched and sent, break retry loop
                                                     break;
                                                 }
 
-                                                // If this was the last attempt, log warning
                                                 if attempt == MAX_RETRIES - 1 {
                                                     warn!(
                                                         symbol = %symbol_clone,
@@ -1323,37 +1136,30 @@ impl Connection {
                                         order_id,
                                         client_order_id: _,
                                     } => {
-                                        // Update open orders cache when order is canceled
-                                        // Remove canceled order from OPEN_ORDERS_CACHE
                                         if let Some(mut orders) = OPEN_ORDERS_CACHE.get_mut(&symbol) {
                                             orders.retain(|o| o.order_id != order_id);
-                                            // If no more open orders for this symbol, remove symbol entry
                                             if orders.is_empty() {
-                                                drop(orders); // Release lock before remove
+                                                drop(orders);
                                                 OPEN_ORDERS_CACHE.remove(&symbol);
                                             }
                                         }
                                     }
                                     UserEvent::AccountUpdate { positions, balances } => {
                                         for pos in &positions {
-                                            // Convert AccountPosition to Position for cache
                                             let position = Position {
                                                 symbol: pos.symbol.clone(),
                                                 qty: Qty(pos.position_amt),
                                                 entry: Px(pos.entry_price),
                                                 leverage: pos.leverage,
-                                                liq_px: None, // ACCOUNT_UPDATE doesn't include liquidation price
+                                                liq_px: None,
                                             };
                                             POSITION_CACHE.insert(pos.symbol.clone(), position);
                                         }
 
-                                        // Cache balances from WebSocket
-                                        // Update BALANCE_CACHE from ACCOUNT_UPDATE event
                                         for bal in &balances {
                                             BALANCE_CACHE.insert(bal.asset.clone(), bal.available_balance);
                                         }
 
-                                        // Position updates (publish events)
                                         for pos in positions {
                                             let position_update = PositionUpdate {
                                                 symbol: pos.symbol,
@@ -1362,7 +1168,7 @@ impl Connection {
                                                 leverage: pos.leverage,
                                                 unrealized_pnl: pos.unrealized_pnl,
                                                 is_open: !pos.position_amt.is_zero(),
-                                                liq_px: None, // ✅ NEW: ACCOUNT_UPDATE doesn't include liquidation price
+                                                liq_px: None,
                                                 timestamp: Instant::now(),
                                             };
                                             if let Err(e) = event_bus.position_update_tx.send(position_update) {
@@ -1373,7 +1179,6 @@ impl Connection {
                                             }
                                         }
 
-                                        // Balance updates (USDT/USDC)
                                         let mut usdt_balance = Decimal::ZERO;
                                         let mut usdc_balance = Decimal::ZERO;
                                         for bal in balances {
@@ -1399,7 +1204,6 @@ impl Connection {
                                         }
                                     }
                                     UserEvent::Heartbeat => {
-                                        // Heartbeat can trigger sync if needed
                                         info!("CONNECTION: user data stream heartbeat");
                                     }
                                 }
@@ -1433,17 +1237,13 @@ impl Connection {
         for result in results {
             match result {
                 Ok((symbol, position_result, orders_result)) => {
-                    // Process position validation
                     match position_result {
                         Ok(Ok(rest_position)) => {
-                            // Compare with WebSocket cache
                             if let Some(ws_position) = POSITION_CACHE.get(&symbol) {
                                 let ws_pos = ws_position.value();
                                 let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
                                 let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
                                 
-                                // ✅ CRITICAL: Safe unwrap - constant strings are valid decimals
-                                // But use unwrap_or for extra safety to prevent panic
                                 let significant_qty_diff = Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO);
                                 let significant_entry_diff = Decimal::from_str("0.01").unwrap_or(Decimal::ZERO);
                                 let significant_mismatch = qty_diff > significant_qty_diff
@@ -1473,11 +1273,9 @@ impl Connection {
                             validated_count += 1;
                         }
                         Ok(Err(_)) | Err(_) => {
-                            // Failed or timeout - skip silently for parallel execution
                         }
                     }
                     
-                    // Process orders validation
                     match orders_result {
                         Ok(Ok(rest_orders)) => {
                             let rest_orders_vec: Vec<_> = rest_orders.iter().map(|o| {
@@ -1512,12 +1310,10 @@ impl Connection {
                             OPEN_ORDERS_CACHE.insert(symbol.clone(), rest_orders_vec);
                         }
                         Ok(Err(_)) | Err(_) => {
-                            // Failed or timeout - skip silently
                         }
                     }
                 }
                 Err(_) => {
-                    // Task join error - skip
                 }
             }
         }
@@ -1529,7 +1325,6 @@ impl Connection {
     /// Returns order ID on success
     /// Performs validation before sending: rules, min_notional, balance
     pub async fn send_order(&self, command: OrderCommand) -> Result<String> {
-        // Rate limit check
         {
             let mut limiter = self.rate_limiter.lock().await;
             limiter.check_order_rate().await;
@@ -1541,8 +1336,6 @@ impl Connection {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_else(|_| {
-                    // System time is before UNIX epoch (should never happen, but handle gracefully)
-                    // Use current timestamp as fallback (0 would cause issues)
                     warn!("System time is before UNIX epoch, using fallback timestamp");
                     Duration::from_secs(0)
                 })
@@ -1551,8 +1344,6 @@ impl Connection {
 
         match command {
             OrderCommand::Open { symbol, side, price, qty, tif } => {
-                // Pre-order validation (exchange-level: rules, min_notional, balance)
-                // Position/order state validation is handled by ORDERING module
                 self.validate_order_before_send(&symbol, price, qty, side, true).await?;
 
                 let (order_id, _) = self.venue.place_limit_with_client_id(
@@ -1566,8 +1357,6 @@ impl Connection {
                 Ok(order_id)
             }
             OrderCommand::Close { symbol, side, price, qty, tif } => {
-                // Pre-order validation (exchange-level: rules, min_notional, balance)
-                // Position/order state validation is handled by ORDERING module
                 self.validate_order_before_send(&symbol, price, qty, side, false).await?;
 
                 let (order_id, _) = self.venue.place_limit_with_client_id(
@@ -1593,13 +1382,11 @@ impl Connection {
         price: Px,
         qty: Qty,
         _side: Side,
-        _is_open_order: bool, // true for Open orders, false for Close orders
+        _is_open_order: bool,
     ) -> Result<()> {
-        // 1. Fetch and validate symbol rules (early check)
         let rules = self.venue.rules_for(symbol).await
         .map_err(|e| anyhow!("Failed to fetch symbol rules for {}: {}", symbol, e))?;
 
-        // 2. Validate and format order params (includes min_notional check)
         let (_, _, price_quantized, qty_quantized) = BinanceFutures::validate_and_format_order_params(
         price,
         qty,
@@ -1607,10 +1394,8 @@ impl Connection {
         symbol,
         )?;
 
-        // 3. Calculate notional value
         let notional = price_quantized * qty_quantized;
 
-        // 4. Check min_notional (early validation, before API call)
         if !rules.min_notional.is_zero() && notional < rules.min_notional {
         return Err(anyhow!(
             "Order notional below minimum: {} < {} for symbol {}",
@@ -1620,21 +1405,6 @@ impl Connection {
         ));
         }
 
-        // 5. Balance check is done in ORDERING module (before calling send_order)
-        // ORDERING module handles balance reservation atomically with state check
-        // This prevents race conditions and ensures balance is available when order is placed
-        // 
-        // IMPORTANT: Do NOT check Binance API balance here because:
-        // 1. Binance API balance (BALANCE_CACHE) may be stale (updated via WebSocket with delay)
-        // 2. Internal balance reservation (shared_state.balance_store) is the source of truth
-        // 3. ORDERING module already validated balance before calling send_order
-        // 4. Checking Binance API balance here creates false negatives (balance appears 0 when it's actually available)
-        //
-        // If Binance API rejects order due to insufficient balance, it will return an error
-        // which will be handled by ORDERING module's retry logic
-        //
-        // Note: Balance check for both open and close orders is handled by ORDERING module
-        // This validation function only checks exchange-level constraints (min_notional, precision, etc.)
 
         Ok(())
     }
@@ -1643,7 +1413,6 @@ impl Connection {
     /// NOTE: Balance should come from WebSocket stream (AccountUpdate event)
     /// This is only used as fallback on startup
     pub async fn fetch_balance(&self, asset: &str) -> Result<Decimal> {
-        // Rate limit check
         {
             let mut limiter = self.rate_limiter.lock().await;
             limiter.check_balance_rate().await;
@@ -1656,12 +1425,10 @@ impl Connection {
     /// WebSocket-first approach: tries PRICE_CACHE (from WebSocket), falls back to REST API only if cache is empty
     /// REST API fallback should be rare - only on startup before WebSocket data arrives
     pub async fn get_current_prices(&self, symbol: &str) -> Result<(Px, Px)> {
-        // Try WebSocket cache first (faster, more efficient, reduces REST API rate limit usage)
         if let Some(price_update) = PRICE_CACHE.get(symbol) {
             return Ok((price_update.bid, price_update.ask));
         }
 
-        // Fallback to REST API only if cache is empty (e.g., on startup before WebSocket data arrives)
         warn!(
             symbol = %symbol,
             "PRICE_CACHE empty, falling back to REST API (should be rare - WebSocket should populate cache)"
@@ -1709,7 +1476,6 @@ impl Connection {
     }
 
     pub async fn cancel_order(&self, order_id: &str, symbol: &str) -> Result<()> {
-        // Rate limit check
         {
             let mut limiter = self.rate_limiter.lock().await;
             limiter.check_order_rate().await;
@@ -1725,8 +1491,6 @@ impl Connection {
     let shutdown_flag = self.shutdown_flag.clone();
 
     tokio::spawn(async move {
-        // ✅ Reduced from 1 hour to 15 minutes for faster rule updates
-        // Cache is also invalidated immediately on precision/MIN_NOTIONAL errors
         const REFRESH_INTERVAL_MINUTES: u64 = 15;
         const REFRESH_INTERVAL_SECS: u64 = REFRESH_INTERVAL_MINUTES * 60;
 
@@ -1736,10 +1500,8 @@ impl Connection {
         );
 
         loop {
-        // Wait for refresh interval or shutdown
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(REFRESH_INTERVAL_SECS)) => {
-                // Refresh interval elapsed - refresh all cached rules
                 let symbols_to_refresh: Vec<String> = FUT_RULES.iter().map(|entry| entry.key().clone()).collect();
 
                 if symbols_to_refresh.is_empty() {
@@ -1753,8 +1515,6 @@ impl Connection {
                     symbols_to_refresh.len()
                 );
 
-                // Refresh each symbol by removing from cache
-                // Next access will fetch fresh rules from exchange
                 for sym in &symbols_to_refresh {
                     FUT_RULES.remove(sym);
                 }
@@ -1765,7 +1525,6 @@ impl Connection {
                 );
             }
             _ = async {
-                // Wait for shutdown flag
                 loop {
                     if shutdown_flag.load(AtomicOrdering::Relaxed) {
                         break;
@@ -1792,23 +1551,13 @@ impl Connection {
     let quote_asset_upper = self.cfg.quote_asset.to_uppercase();
     let allow_usdt = self.cfg.allow_usdt_quote;
 
-    // ✅ CRITICAL: Check balance availability before including quote assets
-    // If balance is zero or insufficient, exclude that quote asset from discovery
-    // This prevents discovering symbols we cannot trade with
-    // 
-    // IMPORTANT: Use min_usd_per_order (not min_quote_balance_usd) for balance check
-    // - min_usd_per_order: Minimum margin required (e.g., 10 USD)
-    // - min_quote_balance_usd: Safety threshold for order placement (e.g., 120 USD)
-    // - User can trade with minimum margin (10 USD), leverage will increase notional
-    // - Balance check only needs to ensure minimum margin is available
     let min_required_balance = Decimal::from_str(
         &self.cfg.min_usd_per_order.to_string()
-    ).unwrap_or(Decimal::from(10)); // Default to 10 USD if conversion fails
+    ).unwrap_or(Decimal::from(10));
     
     let mut usdt_balance = Decimal::ZERO;
     let mut usdc_balance = Decimal::ZERO;
     
-    // Fetch balances to check availability
     match self.fetch_balance("USDT").await {
         Ok(bal) => usdt_balance = bal,
         Err(e) => {
@@ -1832,10 +1581,8 @@ impl Connection {
     let has_usdt_balance = usdt_balance >= min_required_balance;
     let has_usdc_balance = usdc_balance >= min_required_balance;
     
-    // Determine which quote assets to include based on balance availability
     let mut allowed_quotes = Vec::new();
     
-    // Include primary quote asset only if balance is available
     if quote_asset_upper == "USDT" {
         if has_usdt_balance {
             allowed_quotes.push("USDT".to_string());
@@ -1859,11 +1606,9 @@ impl Connection {
             );
         }
     } else {
-        // Unknown quote asset - include it anyway (let other filters handle it)
         allowed_quotes.push(quote_asset_upper.clone());
     }
     
-    // Include additional quote assets only if balance is available and allowed
     if allow_usdt && quote_asset_upper != "USDT" && has_usdt_balance {
         allowed_quotes.push("USDT".to_string());
     } else if allow_usdt && quote_asset_upper != "USDT" && !has_usdt_balance {
@@ -1906,20 +1651,15 @@ impl Connection {
         "CONNECTION: Discovering symbols with quote asset filter (balance-aware, using min_usd_per_order for check)"
     );
 
-    // Fetch all symbol metadata
     let all_symbols = self.venue.symbol_metadata().await?;
 
-    // Filter symbols
     let discovered: Vec<String> = all_symbols
         .into_iter()
         .filter(|meta| {
-            // Filter by quote asset
             let quote_match = allowed_quotes.contains(&meta.quote_asset.to_uppercase());
 
-            // Filter by status (must be TRADING)
             let status_match = meta.status.as_deref() == Some("TRADING");
 
-            // Filter by contract type (must be PERPETUAL)
             let contract_match = meta.contract_type.as_deref() == Some("PERPETUAL");
 
             let matches = quote_match && status_match && contract_match;
@@ -1987,7 +1727,6 @@ impl Connection {
             .send()
             .await?;
 
-        // Check HTTP status
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -1996,7 +1735,6 @@ impl Connection {
 
         let ticker: Ticker24h = resp.json().await?;
 
-        // Parse with proper error handling
         let price_change_percent = ticker.price_change_percent.parse::<f64>()
             .map_err(|e| anyhow!("Invalid priceChangePercent for {}: {} ({})", symbol, ticker.price_change_percent, e))?;
         let volume = ticker.volume.parse::<f64>()
@@ -2008,7 +1746,6 @@ impl Connection {
         let low_price = ticker.low_price.parse::<f64>()
             .map_err(|e| anyhow!("Invalid lowPrice for {}: {} ({})", symbol, ticker.low_price, e))?;
 
-        // Validate data
         if quote_volume <= 0.0 {
             return Err(anyhow!("Invalid quote volume for {}: {}", symbol, quote_volume));
         }
@@ -2029,7 +1766,6 @@ impl Connection {
 
     /// Discover all symbols and rank them by opportunity score
     pub async fn discover_and_rank_symbols(&self) -> Result<Vec<ScoredSymbol>> {
-        // 1. Tüm symbol'leri keşfet (quote asset filtrelemeli)
         let all_symbols = self.discover_symbols().await?;
 
         info!(
@@ -2038,9 +1774,6 @@ impl Connection {
             all_symbols.len()
         );
 
-        // 2. Her symbol için 24h stats çek (batch processing - rate limit koruması)
-        // Binance rate limit: 1200 requests/minute (weight 1 per request)
-        // Batch size: 50 symbols at a time to avoid rate limiting
         const BATCH_SIZE: usize = 50;
         let mut all_stats_results: Vec<Result<SymbolStats24h, anyhow::Error>> = Vec::new();
 
@@ -2048,7 +1781,6 @@ impl Connection {
             let mut stats_futures = Vec::new();
             for symbol in batch {
                 let symbol_clone = symbol.clone();
-                // We need to access self.venue and self.cfg, which are Arc types
                 let venue = self.venue.clone();
                 let futures_base = self.cfg.binance.futures_base.clone();
                 stats_futures.push(async move {
@@ -2086,7 +1818,6 @@ impl Connection {
                     }
                 };
 
-                // Check HTTP status
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -2102,7 +1833,6 @@ impl Connection {
                     }
                 };
 
-                // Parse with proper error handling
                 let price_change_percent = ticker.price_change_percent.parse::<f64>()
                     .map_err(|e| anyhow!("Invalid priceChangePercent for {}: {} ({})", symbol_clone, ticker.price_change_percent, e))?;
                 let volume = ticker.volume.parse::<f64>()
@@ -2114,7 +1844,6 @@ impl Connection {
                 let low_price = ticker.low_price.parse::<f64>()
                     .map_err(|e| anyhow!("Invalid lowPrice for {}: {} ({})", symbol_clone, ticker.low_price, e))?;
 
-                // Validate data
                 if quote_volume <= 0.0 {
                     tracing::debug!(symbol = %symbol_clone, quote_volume, "Invalid quote volume (<= 0)");
                     return Err(anyhow!("Invalid quote volume for {}: {}", symbol_clone, quote_volume));
@@ -2136,13 +1865,9 @@ impl Connection {
                 });
             }
 
-            // Process this batch
             let batch_results: Vec<Result<SymbolStats24h, anyhow::Error>> = future::join_all(stats_futures).await;
             all_stats_results.extend(batch_results);
 
-            // Rate limit koruması: batch'ler arasında kısa bir bekleme
-            // 50 request / batch, 1200 request / minute = ~2.4 batch / second
-            // Güvenli tarafta kalmak için batch'ler arasında 500ms bekle
             if batch.len() == BATCH_SIZE && all_stats_results.len() < all_symbols.len() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
@@ -2150,7 +1875,6 @@ impl Connection {
 
         let stats_results = all_stats_results;
 
-        // 3. Skorlama
         let mut scored_symbols = Vec::new();
         let mut error_count = 0;
         for (symbol, stats_result) in all_symbols.iter().zip(stats_results.iter()) {
@@ -2170,7 +1894,6 @@ impl Connection {
                 }
                 Err(e) => {
                     error_count += 1;
-                    // Log only first few errors to avoid spam
                     if error_count <= 5 {
                         tracing::debug!(symbol = %symbol, error = %e, "Failed to fetch/parse 24h stats");
                     }
@@ -2187,7 +1910,6 @@ impl Connection {
             );
         }
 
-        // 4. En yüksek skordan düşüğe sırala
         scored_symbols.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(scored_symbols)
@@ -2203,19 +1925,12 @@ impl Connection {
             "Restarting market data streams with new symbol list"
         );
 
-        // ✅ CRITICAL: Set leverage for new symbols before starting streams
-        // Problem: New symbols added via dynamic symbol rotation don't have leverage set
-        // This causes "Leverage 50 is not valid" errors when placing orders
-        // Solution: Set leverage for all new symbols (same logic as startup)
         let desired_leverage = self.cfg.leverage.unwrap_or(self.cfg.exec.default_leverage);
         let use_isolated_margin = self.cfg.risk.use_isolated_margin;
 
         for symbol in &new_symbols {
-            // ✅ CRITICAL: Clamp leverage to symbol's max leverage (if available)
-            // Use centralized clamping function to avoid code duplication
             let leverage = self.get_clamped_leverage(symbol, desired_leverage).await;
 
-            // Set margin type (isolated or cross)
             if let Err(e) = self.venue.set_margin_type(symbol, use_isolated_margin).await {
                 warn!(
                     error = %e,
@@ -2225,18 +1940,9 @@ impl Connection {
                 );
             }
 
-            // Set leverage (only if position is closed or doesn't exist)
-            // ✅ CRITICAL: Leverage mismatch with open position will cause order placement failures
-            // Problem: New symbol rotation may add symbols with existing positions that have different leverage
-            // Solution: Error if leverage mismatch detected (same as startup logic)
             if let Ok(position) = self.venue.get_position(symbol).await {
                 if !position.qty.0.is_zero() {
-                    // Position is OPEN - leverage cannot be changed
-                    // Use clamped leverage for comparison
                     if position.leverage != leverage {
-                        // ✅ CRITICAL: Leverage mismatch with open position is a critical error
-                        // This will cause order placement to fail with "Leverage X is not valid" error
-                        // Cannot auto-fix while position is open - must close position first
                         error!(
                             symbol = %symbol,
                             current_leverage = position.leverage,
@@ -2244,9 +1950,6 @@ impl Connection {
                             clamped_leverage = leverage,
                             "CONNECTION: CRITICAL - Leverage mismatch detected for new symbol (position is open, cannot change). Order placement will fail!"
                         );
-                        // Note: We don't return error here to allow other symbols to be processed
-                        // But this is logged as ERROR to make it visible
-                        // ORDERING module should handle this by closing position or rejecting orders
                     } else {
                         info!(
                             symbol = %symbol,
@@ -2255,9 +1958,6 @@ impl Connection {
                         );
                     }
                 } else {
-                    // Position is CLOSED - safe to set leverage
-                    // ✅ CRITICAL: Re-fetch symbol rules to get max leverage (may have changed or not been fetched yet)
-                    // Use config default_leverage as safe fallback instead of hardcoded 50
                     let safe_leverage_fallback = self.cfg.exec.default_leverage;
                     
                     let final_leverage = match self.venue.rules_for(symbol).await {
@@ -2292,7 +1992,6 @@ impl Connection {
                                         "CONNECTION: Leverage set to lower value than clamped (step-down mechanism)"
                                     );
                                 }
-                                // Verify the fix worked
                                 if let Ok(updated_position) = self.venue.get_position(symbol).await {
                                     if updated_position.leverage == actual_leverage {
                                         info!(
@@ -2320,7 +2019,6 @@ impl Connection {
                                     final_leverage = final_leverage,
                                     "CONNECTION: Failed to auto-fix leverage mismatch for new symbol (all leverage values failed)"
                                 );
-                                // Note: We don't return error here to allow other symbols to be processed
                             }
                         }
                     } else {
@@ -2332,8 +2030,6 @@ impl Connection {
                     }
                 }
             } else {
-                // No position exists - safe to set leverage
-                // Leverage is already clamped above, so use it directly
                 match self.venue.set_leverage(symbol, leverage).await {
                     Ok(actual_leverage) => {
                         if actual_leverage != leverage {
@@ -2358,19 +2054,12 @@ impl Connection {
                             leverage,
                             "CONNECTION: CRITICAL - Failed to set leverage for new symbol (all leverage values failed). Order placement will fail!"
                         );
-                        // Note: We don't return error here to allow other symbols to be processed
-                        // But this is logged as ERROR to make it visible
                     }
                 }
             }
         }
 
-        // Note: WebSocket streams are managed by tokio::spawn tasks
-        // They will automatically reconnect if they fail
-        // For a proper restart, we would need to track and close existing streams
-        // For now, we'll just start new streams (old ones will eventually timeout)
         
-        // Start new market data streams
         self.start_market_data_stream(new_symbols).await?;
 
         Ok(())
@@ -2381,40 +2070,36 @@ impl Connection {
 fn calculate_opportunity_score(stats: &SymbolStats24h, cfg: &AppCfg) -> f64 {
     let ds_cfg = &cfg.dynamic_symbol_selection;
 
-    // 1. Volatilite skoru (en önemli)
     let volatility_abs = stats.price_change_percent.abs();
     
-    // Minimum volatilite kontrolü
     if volatility_abs < ds_cfg.min_volatility_pct {
-        return 0.0; // Çok düşük volatilite = işlem yapma
+        return 0.0;
     }
 
     let volatility_score = if volatility_abs < 3.0 {
-        1.0 // Orta volatilite
+        1.0
     } else if volatility_abs < 6.0 {
-        2.0 // İyi volatilite
+        2.0
     } else if volatility_abs < 10.0 {
-        3.0 // Harika volatilite
+        3.0
     } else {
-        2.5 // Çok yüksek = riskli, biraz cezalandır
+        2.5
     };
 
-    // 2. Volume skoru (likidite için)
     if stats.quote_volume < ds_cfg.min_quote_volume {
-        return 0.0; // Çok düşük volume = slippage riski
+        return 0.0;
     }
 
     let volume_score = if stats.quote_volume < 10_000_000.0 {
-        0.5 // Düşük volume
+        0.5
     } else if stats.quote_volume < 50_000_000.0 {
-        1.0 // Normal volume
+        1.0
     } else {
-        1.5 // Yüksek volume = iyi likidite
+        1.5
     };
 
-    // 3. İşlem sayısı skoru (aktivite için)
     if stats.trades < ds_cfg.min_trades_24h {
-        return 0.0; // Çok az işlem
+        return 0.0;
     }
 
     let trades_score = if stats.trades < 10000 {
@@ -2423,29 +2108,23 @@ fn calculate_opportunity_score(stats: &SymbolStats24h, cfg: &AppCfg) -> f64 {
         1.0
     };
 
-    // 4. Spread tahmini (24h high-low range - bu gerçek spread değil, sadece volatilite göstergesi)
-    // Not: Gerçek spread (bid-ask) için @bookTicker stream'inden alınmalı
-    // Burada 24h high-low range'i kullanıyoruz, bu da volatilite göstergesi olarak işlev görür
     let price_mid = (stats.high_price + stats.low_price) / 2.0;
     let range_pct = if price_mid > 0.0 {
         ((stats.high_price - stats.low_price) / price_mid) * 100.0
     } else {
-        100.0 // Hata durumu
+        100.0
     };
 
-    // Range çok genişse (aşırı volatilite) cezalandır, dar ise (stabil) ödüllendir
-    // Ancak çok dar range (düşük volatilite) zaten min_volatility_pct ile filtreleniyor
     let spread_score = if range_pct > 20.0 {
-        0.5 // Çok geniş range = aşırı volatilite, riskli
+        0.5
     } else if range_pct > 10.0 {
-        0.8 // Geniş range = yüksek volatilite
+        0.8
     } else if range_pct > 5.0 {
-        1.0 // Normal range
+        1.0
     } else {
-        0.9 // Dar range = düşük volatilite (ama zaten min_volatility_pct geçti)
+        0.9
     };
 
-    // TOPLAM SKOR (ağırlıklı)
     let total_score = (volatility_score * ds_cfg.volatility_weight)
         + (volume_score * ds_cfg.volume_weight)
         + (trades_score * ds_cfg.trades_weight)

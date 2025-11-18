@@ -1,8 +1,3 @@
-// TRENDING: Trend analysis, generates TradeSignal
-// Only does trend analysis, never places orders
-// Subscribes to MarketTick events, publishes TradeSignal events
-// No balance/margin/position size calculations - ORDERING handles that
-
 use crate::config::AppCfg;
 use crate::event_bus::{EventBus, MarketTick, TradeSignal};
 use crate::types::{LastSignal, PositionDirection, PricePoint, Px, Side, SymbolState, TrendSignal};
@@ -20,10 +15,10 @@ use tracing::{debug, error, info, warn};
 /// Market regime for adaptive strategy
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MarketRegime {
-    Trending,   // Strong directional movement - use trend-following
-    Ranging,    // Sideways movement - use mean-reversion (not implemented yet)
-    Volatile,   // High volatility - reduce position size
-    Unknown,    // Not enough data
+    Trending,
+    Ranging,
+    Volatile,
+    Unknown,
 }
 
 struct TrendScores {
@@ -46,6 +41,25 @@ pub struct Trending {
 }
 
 impl Trending {
+    fn new_symbol_state(symbol: String) -> SymbolState {
+        SymbolState {
+            symbol: symbol.clone(),
+            prices: VecDeque::new(),
+            last_signal_time: None,
+            last_position_close_time: None,
+            last_position_direction: None,
+            tick_counter: 0,
+            ema_9: None,
+            ema_21: None,
+            ema_55: None,
+            ema_55_history: VecDeque::new(),
+            rsi_avg_gain: None,
+            rsi_avg_loss: None,
+            rsi_period_count: 0,
+            last_analysis_time: None,
+        }
+    }
+
     /// Create a new Trending module instance.
     ///
     /// The Trending module analyzes market data and generates trade signals. It does not place
@@ -119,7 +133,6 @@ impl Trending {
         let last_signals = self.last_signals.clone();
         let symbol_states = self.symbol_states.clone();
         
-        // Spawn task for MarketTick events (signal generation)
         let event_bus_tick = event_bus.clone();
         let shutdown_flag_tick = shutdown_flag.clone();
         let cfg_tick = cfg.clone();
@@ -177,22 +190,7 @@ impl Trending {
                             
                             let mut states = symbol_states_pos.lock().await;
                             let state = states.entry(update.symbol.clone()).or_insert_with(|| {
-                                SymbolState {
-                                    symbol: update.symbol.clone(),
-                                    prices: VecDeque::new(),
-                                    last_signal_time: None,
-                                    last_position_close_time: None,
-                                    last_position_direction: None,
-                                    tick_counter: 0,
-                                    ema_9: None,
-                                    ema_21: None,
-                                    ema_55: None,
-                                    ema_55_history: VecDeque::new(),
-                                    rsi_avg_gain: None,
-                                    rsi_avg_loss: None,
-                                    rsi_period_count: 0,
-                                    last_analysis_time: None,
-                                }
+                                Self::new_symbol_state(update.symbol.clone())
                             });
                             
                             state.last_position_close_time = Some(Instant::now());
@@ -209,13 +207,11 @@ impl Trending {
             ).await;
         });
         
-        // Spawn cleanup task for symbol_states to prevent memory leak
-        // Cleanup symbols that haven't received ticks in the last hour
         let symbol_states_cleanup = symbol_states.clone();
         let shutdown_flag_cleanup = shutdown_flag.clone();
         tokio::spawn(async move {
-            const CLEANUP_INTERVAL_SECS: u64 = 3600; // Cleanup every hour
-            const MAX_AGE_SECS: u64 = 3600; // Remove symbols not seen in last hour
+            const CLEANUP_INTERVAL_SECS: u64 = 3600;
+            const MAX_AGE_SECS: u64 = 3600;
             
             loop {
                 tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
@@ -228,10 +224,7 @@ impl Trending {
                 let mut states = symbol_states_cleanup.lock().await;
                 let initial_count = states.len();
                 
-                // Remove symbols that haven't received ticks in the last hour
-                // Use last price timestamp from prices VecDeque, or fallback to last_signal_time/last_position_close_time
                 states.retain(|symbol, state| {
-                    // Get last activity timestamp from price history (most recent price point)
                     let last_activity = state.prices
                         .back()
                         .map(|p| p.timestamp)
@@ -241,7 +234,6 @@ impl Trending {
                     if let Some(last_ts) = last_activity {
                         let age = now.duration_since(last_ts);
                         if age.as_secs() > MAX_AGE_SECS {
-                            // Symbol hasn't been active in the last hour - remove to prevent memory leak
                             debug!(
                                 symbol = %symbol,
                                 age_secs = age.as_secs(),
@@ -249,17 +241,16 @@ impl Trending {
                                 "TRENDING: Cleaning up stale symbol state (no ticks in {} hours)",
                                 age.as_secs() / 3600
                             );
-                            false // Remove
+                            false
                         } else {
-                            true // Keep (recent activity)
+                            true
                         }
                     } else {
-                        // No activity timestamp at all - remove empty state
                         debug!(
                             symbol = %symbol,
                             "TRENDING: Cleaning up empty symbol state (no activity recorded)"
                         );
-                        false // Remove
+                        false
                     }
                 });
                 
@@ -393,7 +384,6 @@ impl Trending {
     fn calculate_rsi_from_state(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> Option<f64> {
         const RSI_PERIOD: usize = 14;
         
-        // Need at least RSI_PERIOD updates before RSI is reliable
         if state.rsi_period_count < RSI_PERIOD {
             return None;
         }
@@ -402,7 +392,7 @@ impl Trending {
         let avg_loss = state.rsi_avg_loss?;
         
         if avg_loss.is_zero() {
-            return Some(100.0); // All gains, no losses
+            return Some(100.0);
         }
         
         let min_avg_loss = utils::f64_to_decimal(cfg.rsi_min_avg_loss, Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO));
@@ -473,9 +463,6 @@ impl Trending {
         Some(sum / Decimal::from(true_ranges.len()))
     }
 
-    /// Detect market regime (simplified - ATR-based only)
-    /// Note: Removed simplified ADX calculation as it was inaccurate
-    /// Using only ATR for volatility-based regime detection
     fn detect_market_regime(state: &SymbolState, cfg: &crate::config::TrendingCfg) -> MarketRegime {
         let atr_period = cfg.atr_period;
         let low_volatility_threshold = cfg.low_volatility_threshold;
@@ -483,7 +470,6 @@ impl Trending {
 
         let prices = &state.prices;
         
-        // Calculate ATR for volatility
         let atr = Self::calculate_atr(prices, atr_period);
         let atr_pct = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
             if !current_price.price.is_zero() {
@@ -495,14 +481,12 @@ impl Trending {
             None
         };
 
-        // Determine regime based on ATR only (simplified approach)
         if let Some(atr_pct_val) = atr_pct {
             if atr_pct_val < low_volatility_threshold {
                 MarketRegime::Ranging
             } else if atr_pct_val > high_volatility_threshold {
                 MarketRegime::Volatile
             } else {
-                // Medium volatility - assume trending (default for trend-following strategy)
                 MarketRegime::Trending
             }
         } else {
@@ -633,16 +617,15 @@ impl Trending {
         
         let current_price = prices.back()?.price;
         
-        let (mut scores, short_term_aligned, mid_term_aligned, slope_strong, ema_fast, ema_mid, ema_slow) = match Self::calculate_ema_scores(state, current_price, cfg) {
+        let (scores, short_term_aligned, mid_term_aligned, slope_strong, ema_fast, ema_mid, ema_slow) = match Self::calculate_ema_scores(state, current_price, cfg) {
             Some(s) => s,
             None => return None,
         };
         
         let mut score_long = scores.score_long;
         let mut score_short = scores.score_short;
-        let mut trend_strength = scores.trend_strength;
+        let trend_strength = scores.trend_strength;
         
-        // 2. RSI momentum confirmation (weight: 1.0) with adaptive thresholds
         let rsi = match Self::calculate_rsi_from_state(state, cfg) {
             Some(rsi_val) => rsi_val,
             None => {
@@ -659,13 +642,12 @@ impl Trending {
             }
         };
         
-        // Adaptive RSI thresholds based on volatility (from config)
         let atr = Self::calculate_atr(prices, cfg.atr_period);
         let volatility_multiplier = if let (Some(atr_val), Some(current_price)) = (atr, prices.back()) {
             if !current_price.price.is_zero() {
                 let atr_pct = (atr_val / current_price.price).to_f64().unwrap_or(0.01);
-                let base_volatility = cfg.base_volatility; // From config
-                (atr_pct / base_volatility).max(0.5).min(2.0) // Clamp between 0.5x and 2x
+                let base_volatility = cfg.base_volatility;
+                (atr_pct / base_volatility).max(0.5).min(2.0)
             } else {
                 1.0
             }
@@ -673,14 +655,9 @@ impl Trending {
             1.0
         };
         
-        // ✅ SMART OPTIMIZATION: Keep original RSI range for trending markets
-        // Backtest: DOGE (54.5% win rate) and BTC (50% win rate) worked well with original range
-        // Only narrow RSI range for ranging/volatile markets (done in regime-based filtering)
-        let rsi_lower = base_rsi_lower - (10.0 * volatility_multiplier); // 45-55 range (original)
-        let rsi_upper = base_rsi_upper - (5.0 * (1.0 - volatility_multiplier)); // 65-70 range (original)
+        let rsi_lower = base_rsi_lower - (10.0 * volatility_multiplier);
+        let rsi_upper = base_rsi_upper - (5.0 * (1.0 - volatility_multiplier));
         
-        // Short signals: RSI < upper_short (bearish momentum, oversold region)
-        // Use config value instead of hardcoded 40.0
         let rsi_upper_short = base_rsi_upper_short;
         
         let rsi_bullish = rsi > rsi_lower && rsi < rsi_upper;
@@ -700,21 +677,13 @@ impl Trending {
             MarketRegime::Unknown => base_min_score * cfg.regime_multiplier_unknown,
         };
         
-        // ✅ OPTIMIZED: Stricter volume confirmation based on backtest results
-        // Backtest analysis: DOGE (54.5% win rate) had strong volume confirmation
-        // ETH (25% win rate) and SOL (33% win rate) had weak volume confirmation
-        // Solution: Higher volume threshold and make it mandatory for medium-volatility coins
-        // ✅ HFT MODE: In HFT mode, volume is optional if require_volume_confirmation is false
         let (current_volume, avg_volume) = if cfg.hft_mode && !cfg.require_volume_confirmation {
-            // HFT mode with optional volume - try to get volume but don't fail if missing
             let current_vol = prices.back()
                 .and_then(|p| p.volume);
             let avg_vol = Self::calculate_avg_volume(prices, VOLUME_PERIOD);
             
-            // If volume data is available, use it; otherwise use None (volume confirmation will be skipped)
             (current_vol, avg_vol)
         } else {
-            // Normal mode - volume is required
             let current_volume = match prices.back() {
                 Some(price_point) => match price_point.volume {
                     Some(vol) => vol,
@@ -739,7 +708,6 @@ impl Trending {
             let avg_volume = match Self::calculate_avg_volume(prices, VOLUME_PERIOD) {
                 Some(avg) => avg,
                 None => {
-                    // Count how many price points have volume data
                     let volume_count = prices.iter().filter(|p| p.volume.is_some()).count();
                     warn!(
                         symbol = %state.symbol,
@@ -757,17 +725,6 @@ impl Trending {
             (Some(current_volume), Some(avg_volume))
         };
         
-        // ✅ UNIVERSAL PATTERN: Trend + Volume combination = higher win rate across ALL coins
-        // Backtest analysis:
-        // - DOGE/BTC (good): Strong trend alignment + Volume = 50%+ win rate
-        // - ETH/SOL (bad): Weak trend alignment + No volume = 25-33% win rate
-        // Solution: Require strong trend alignment OR volume confirmation
-        // This filters out weak signals that fail in ETH/SOL while preserving good signals in DOGE/BTC
-        
-        // Calculate trend strength (0.0 - 1.0)
-        // Strong trend = at least 2 of 3 EMA conditions met (short + mid = 0.7, or short + slope = 0.7, etc.)
-        // This allows signals when trend is clearly established (not just perfect alignment)
-        // ✅ Get trend threshold from config instead of hardcoded values
         let trend_threshold = if cfg.hft_mode {
             cfg.trend_threshold_hft
         } else {
@@ -775,10 +732,6 @@ impl Trending {
         };
         let is_strong_trend = trend_strength >= trend_threshold;
         
-        // ✅ CRITICAL FIX: No volume data available (volume=None in MarketTick)
-        // Since volume data is not available from WebSocket, we bypass volume confirmation
-        // for strong trends. This allows signals to be generated even without volume data.
-        // Calculate volume_confirms AFTER is_strong_trend is defined
         let volume_confirms = if let (Some(current_vol), Some(avg_vol)) = (current_volume, avg_volume) {
             let volume_multiplier = if cfg.hft_mode {
                 utils::f64_to_decimal(cfg.volume_multiplier_hft, Decimal::from_str("1.1").unwrap_or(Decimal::from(110) / Decimal::from(100)))
@@ -787,40 +740,27 @@ impl Trending {
             };
             let volume_surge = current_vol > avg_vol * volume_multiplier;
             
-            // Volume trend (recent > longer average)
             let volume_trend = match Self::calculate_avg_volume(prices, 5) {
                 Some(recent_avg_volume) => recent_avg_volume > avg_vol,
                 None => false,
             };
             
-            // In HFT mode, only volume_surge is required; volume_trend is optional
             if cfg.hft_mode {
                 volume_surge
             } else {
                 volume_surge && volume_trend
             }
         } else {
-            // ✅ CRITICAL FIX: No volume data available (volume=None in MarketTick)
-            // Since volume data is not available from WebSocket, we bypass volume confirmation
-            // for strong trends. This allows signals to be generated even without volume data.
             if cfg.hft_mode && !cfg.require_volume_confirmation {
-                // HFT mode without volume requirement - treat as confirmed
                 true
             } else if is_strong_trend {
-                // Strong trend can compensate for missing volume data
                 true
             } else {
-                // Weak trend without volume - require volume confirmation
                 false
             }
         };
         
-        // Universal rule: Strong trend OR volume confirmation required
-        // Weak trend without volume = reject (prevents ETH/SOL false signals)
-        // Strong trend with/without volume = allow (preserves DOGE/BTC good signals)
-        // Volume with weak trend = allow but with higher threshold (preserves some good signals)
         if !is_strong_trend && !volume_confirms {
-            // Weak trend + no volume = reject signal (prevents false signals in ETH/SOL)
             debug!(
                 symbol = %state.symbol,
                 trend_strength,
@@ -831,26 +771,17 @@ impl Trending {
             return None;
         }
         
-        // Apply volume bonus (if present)
         if volume_confirms {
             score_long += 1.0;
             score_short += 1.0;
         }
         
-        // 4. Generate signal based on weighted score (with adaptive threshold)
-        // ✅ PRODUCTION: Original adaptive threshold
-        // Backtest: Original 10% increase worked well
-        // Solution: Return to proven 10% increase for weak trends
         let final_min_score = if is_strong_trend {
-            min_score // Strong trend: use normal threshold (works for DOGE/BTC)
+            min_score
         } else {
-            // Weak trend but has volume: require higher score (from config)
-            // This filters out marginal signals that fail in ETH/SOL
             min_score * cfg.weak_trend_score_multiplier
         };
         
-        // ✅ DEBUG: Always log score analysis for troubleshooting (even if scores are 0)
-        // This helps identify why signals are not being generated
         debug!(
             symbol = %state.symbol,
             score_long,
@@ -877,7 +808,7 @@ impl Trending {
         } else if score_short >= final_min_score {
             Some(TrendSignal::Short)
         } else {
-            None // Score too low
+            None
         }
     }
     
@@ -967,7 +898,6 @@ impl Trending {
         (Some(cfg.stop_loss_pct), Some(cfg.take_profit_pct))
     }
 
-    /// Simple algorithm: Spread check → Cooldown check → Trend analysis → Signal
     async fn process_market_tick(
         tick: &MarketTick,
         cfg: &Arc<AppCfg>,
@@ -986,43 +916,24 @@ impl Trending {
             return Ok(());
         }
         
-        // 3. Trend analysis
         let mid_price = crate::utils::calculate_mid_price(tick.bid, tick.ask);
         let spread_timestamp = now;
         
         let trend_signal = {
             let mut states = symbol_states.lock().await;
-            let state = states.entry(tick.symbol.clone()).or_insert_with(|| SymbolState {
-                                    symbol: tick.symbol.clone(),
-                                    prices: VecDeque::new(),
-                                    last_signal_time: None,
-                                    last_position_close_time: None,
-                                    last_position_direction: None,
-                                    tick_counter: 0,
-                                    ema_9: None,
-                                    ema_21: None,
-                                    ema_55: None,
-                                    ema_55_history: VecDeque::new(),
-                                    rsi_avg_gain: None,
-                                    rsi_avg_loss: None,
-                                    rsi_period_count: 0,
-                                    last_analysis_time: None,
+            let state = states.entry(tick.symbol.clone()).or_insert_with(|| {
+                Self::new_symbol_state(tick.symbol.clone())
             });
             
-            // ✅ FIX: Throttling to prevent channel lag (from config)
-            // Problem: Too many trend analyses causing channel lag (10,000+ warnings)
-            // Solution: Limit analysis frequency based on config (default: 10 per second = 100ms)
             let min_analysis_interval_ms = cfg.trending.min_analysis_interval_ms;
             
             if let Some(last_analysis) = state.last_analysis_time {
                 let elapsed_ms = now.duration_since(last_analysis).as_millis() as u64;
                 if elapsed_ms < min_analysis_interval_ms {
-                    // Skip - too frequent, prevent channel lag
                     return Ok(());
                 }
             }
             
-            // Update last analysis time
             state.last_analysis_time = Some(now);
             
             state.prices.push_back(PricePoint {
@@ -1031,22 +942,20 @@ impl Trending {
                 volume: tick.volume,
             });
             
-            const MAX_HISTORY: usize = 100; // Keep last 100 prices (EMA_SLOW=55 + buffer)
+            const MAX_HISTORY: usize = 100;
             while state.prices.len() > MAX_HISTORY {
                 state.prices.pop_front();
             }
             
-            // Incremental EMA/RSI update (O(1) performance)
             Self::update_indicators(state, mid_price);
             
             Self::analyze_trend(state, &cfg.trending)
         };
         
-        // 4. Generate signal if trend detected
         let side = match trend_signal {
             Some(TrendSignal::Long) => Side::Buy,
             Some(TrendSignal::Short) => Side::Sell,
-            None => return Ok(()), // No trend, skip
+            None => return Ok(()),
         };
         
         let entry_price = Px(mid_price);
@@ -1058,7 +967,6 @@ impl Trending {
             symbol_states,
         ).await;
         
-        // 6. Send signal
         let signal = TradeSignal {
             symbol: tick.symbol.clone(),
             side,
@@ -1073,7 +981,6 @@ impl Trending {
         if let Err(e) = event_bus.trade_signal_tx.send(signal.clone()) {
             error!(error = ?e, symbol = %tick.symbol, "TRENDING: Failed to send TradeSignal");
         } else {
-            // Update last signal timestamp
             {
                 let mut last_signals_map = last_signals.lock().await;
                 last_signals_map.insert(tick.symbol.clone(), LastSignal {
@@ -1094,4 +1001,3 @@ impl Trending {
         Ok(())
     }
 }
-

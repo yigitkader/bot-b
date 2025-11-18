@@ -1,8 +1,3 @@
-// FOLLOW_ORDERS: Position tracking, TP/SL control
-// Tracks open positions and sends CloseRequest when TP/SL is triggered
-// Listens to PositionUpdate and MarketTick events
-// Publishes CloseRequest events
-
 use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
@@ -85,16 +80,14 @@ impl FollowOrders {
         let shutdown_flag_signal = shutdown_flag.clone();
         tokio::spawn(async move {
             let trade_signal_rx = event_bus_signal.subscribe_trade_signal();
-            let tp_sl_signals_clone = tp_sl_signals.clone();
-            let positions_signal_clone = positions_signal.clone();
             crate::event_loop::run_event_loop_async(
                 trade_signal_rx,
                 shutdown_flag_signal,
                 "FOLLOW_ORDERS",
                 "TradeSignal",
                 move |signal| {
-                    let tp_sl_signals = tp_sl_signals_clone.clone();
-                    let positions_signal = positions_signal_clone.clone();
+                    let tp_sl_signals = tp_sl_signals.clone();
+                    let positions_signal = positions_signal.clone();
                     async move {
                         Self::handle_trade_signal(&signal, &tp_sl_signals, &positions_signal).await;
                     }
@@ -203,7 +196,6 @@ impl FollowOrders {
         tp_sl_from_signals: &Arc<RwLock<HashMap<String, (Option<f64>, Option<f64>)>>>,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
     ) {
-        // Store TP/SL info for future position opens
         {
             let mut tp_sl_guard = tp_sl_from_signals.write().await;
             tp_sl_guard.insert(
@@ -212,12 +204,9 @@ impl FollowOrders {
             );
         }
         
-        // CRITICAL: If position is already open, update TP/SL immediately
-        // This handles the race condition where PositionUpdate arrives before TradeSignal
         {
             let mut positions_guard = positions.write().await;
             if let Some(position) = positions_guard.get_mut(&signal.symbol) {
-                // Position already exists, update TP/SL
                 position.stop_loss_pct = signal.stop_loss_pct;
                 position.take_profit_pct = signal.take_profit_pct;
                 
@@ -253,18 +242,12 @@ impl FollowOrders {
                 tp_sl_guard.get(&update.symbol)
                     .cloned()
                     .unwrap_or((
-                        Some(cfg.stop_loss_pct),    // Default from config
-                        Some(cfg.take_profit_pct)   // Default from config
+                        Some(cfg.stop_loss_pct),
+                        Some(cfg.take_profit_pct)
                     ))
             };
             
-            // Determine position direction from qty sign and ensure qty is positive
-            let direction = PositionDirection::from_qty_sign(update.qty.0);
-            let qty_abs = if update.qty.0.is_sign_negative() {
-                Qty(-update.qty.0) // Make positive
-            } else {
-                update.qty
-            };
+            let (direction, qty_abs) = PositionDirection::direction_and_abs_qty(update.qty);
             
             let opened_at = Instant::now();
             
@@ -277,13 +260,12 @@ impl FollowOrders {
                 stop_loss_pct,
                 take_profit_pct,
                 opened_at,
-                is_maker: None, // Will be updated from OrderUpdate when order is filled
-                close_requested: false, // Initialize to false - will be set when CloseRequest is sent
-                liquidation_price: update.liq_px, // ✅ NEW: Store liquidation price for risk monitoring
-                trailing_stop_placed: false, // ✅ NEW: Initialize trailing stop flag
+                is_maker: None,
+                close_requested: false,
+                liquidation_price: update.liq_px,
+                trailing_stop_placed: false,
             });
             
-            // Initialize position state for smart closing logic
             {
                 let mut states_guard = position_states.write().await;
                 states_guard.insert(update.symbol.clone(), PositionState::new(opened_at));
@@ -299,16 +281,13 @@ impl FollowOrders {
                 "FOLLOW_ORDERS: Position tracked with TP/SL and smart closing state"
             );
         } else {
-            // Position closed
             positions_guard.remove(&update.symbol);
             
-            // Clean up TP/SL info for this symbol
             {
                 let mut tp_sl_guard = tp_sl_from_signals.write().await;
                 tp_sl_guard.remove(&update.symbol);
             }
             
-            // Clean up position state
             {
                 let mut states_guard = position_states.write().await;
                 states_guard.remove(&update.symbol);
@@ -393,16 +372,18 @@ impl FollowOrders {
         let exit_commission_pct = utils::get_commission_rate(false, cfg.risk.maker_commission_pct, cfg.risk.taker_commission_pct);
         let total_commission_pct = entry_commission_pct + exit_commission_pct;
         let net_pnl_pct = gross_pnl_pct - total_commission_pct;
-        let net_pnl_pct_f64 = net_pnl_pct.to_f64().unwrap_or(0.0);
+        let net_pnl_pct_f64 = utils::decimal_to_f64(net_pnl_pct);
         
-        let position_qty_f64 = position.qty.0.to_f64().unwrap_or(0.0);
-        let entry_price_f64 = position.entry_price.0.to_f64().unwrap_or(0.0);
-        let current_price_f64 = current_price_val.to_f64().unwrap_or(0.0);
+        let position_qty_f64 = utils::decimal_to_f64(position.qty.0);
+        let entry_price_f64 = utils::decimal_to_f64(position.entry_price.0);
+        let current_price_f64 = utils::decimal_to_f64(current_price_val);
         
-        let price_diff = match position.direction {
-            PositionDirection::Long => current_price_f64 - entry_price_f64,
-            PositionDirection::Short => entry_price_f64 - current_price_f64,
-        };
+        let price_diff_decimal = utils::calculate_price_change(
+            position.entry_price.0,
+            current_price_val,
+            position.direction,
+        );
+        let price_diff = utils::decimal_to_f64(price_diff_decimal * position.entry_price.0);
         let entry_notional = utils::f64_to_decimal(entry_price_f64, Decimal::ZERO) * position.qty.0;
         let exit_notional = utils::f64_to_decimal(current_price_f64, Decimal::ZERO) * position.qty.0;
         let total_commission = utils::calculate_total_commission(
@@ -414,7 +395,7 @@ impl FollowOrders {
         );
         
         let gross_pnl_usd = price_diff * position_qty_f64;
-        let net_pnl_usd = gross_pnl_usd - total_commission.to_f64().unwrap_or(0.0);
+        let net_pnl_usd = gross_pnl_usd - utils::decimal_to_f64(total_commission);
         
         Ok(PositionPnL {
             price_change_pct_f64,
@@ -491,21 +472,6 @@ impl FollowOrders {
 
     /// Check TP/SL for a market tick
     /// If TP or SL is triggered, send CloseRequest
-    /// 
-    /// ✅ NEW: Smart closing logic with 11 different closing conditions
-    /// - First checks smart closing conditions (from position_manager)
-    /// - Then falls back to traditional TP/SL checks
-    /// 
-    /// ✅ CRITICAL: Race condition prevention
-    /// - Check close_requested flag BEFORE calculating PnL
-    /// - Remove position and set flag BEFORE sending CloseRequest
-    /// - Only send CloseRequest if position was successfully removed
-    /// This prevents duplicate CloseRequest events when multiple ticks arrive simultaneously
-    /// 
-    /// Performance & Responsibility:
-    /// - If position doesn't exist: Return immediately (no expensive calculations)
-    /// - If position exists: Check smart closing + TP/SL and send CloseRequest if triggered
-    /// - This ensures FOLLOW_ORDERS only processes ticks when position is tracked
     async fn check_tp_sl(
         tick: &MarketTick,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
@@ -583,7 +549,7 @@ impl FollowOrders {
                 PositionDirection::Long => {
                     if liquidation_price.0 > Decimal::ZERO {
                         let distance = ((current_price_val - liquidation_price.0) / liquidation_price.0) * Decimal::from(100);
-                        distance.to_f64().unwrap_or(0.0)
+                        utils::decimal_to_f64(distance)
                     } else {
                         0.0
                     }
@@ -591,7 +557,7 @@ impl FollowOrders {
                 PositionDirection::Short => {
                     if current_price_val > Decimal::ZERO {
                         let distance = ((liquidation_price.0 - current_price_val) / current_price_val) * Decimal::from(100);
-                        distance.to_f64().unwrap_or(0.0)
+                        utils::decimal_to_f64(distance)
                     } else {
                         0.0
                     }
@@ -640,20 +606,16 @@ impl FollowOrders {
         
         if let Some(tp_pct) = position.take_profit_pct {
             if pnl.net_pnl_pct_f64 >= tp_pct {
-                // TP threshold reached - check if trailing stop should be placed
                 if cfg.trending.use_trailing_stop && !position.trailing_stop_placed {
-                    // Calculate TP price (activation price for trailing stop)
                     let tp_price = match position.direction {
                         PositionDirection::Long => {
                             position.entry_price.0 * (Decimal::ONE + utils::f64_to_decimal_pct(tp_pct))
                         }
                         PositionDirection::Short => {
-                            // Short: TP = entry * (1 - tp_pct / 100)
                             position.entry_price.0 * (Decimal::ONE - utils::f64_to_decimal_pct(tp_pct))
                         }
                     };
                     
-                    // Place trailing stop order
                     match connection.place_trailing_stop_order(
                         &position.symbol,
                         Px(tp_price),
@@ -669,15 +631,11 @@ impl FollowOrders {
                                 "FOLLOW_ORDERS: Trailing stop placed at TP threshold - position will be managed by trailing stop"
                             );
                             
-                            // Mark as placed
                             let mut positions_guard = positions.write().await;
                             if let Some(pos) = positions_guard.get_mut(&tick.symbol) {
                                 pos.trailing_stop_placed = true;
                             }
                             
-                            // ✅ CRITICAL: Do NOT send CloseRequest when trailing stop is placed
-                            // Trailing stop will manage the position closure automatically
-                            // Return early to prevent immediate CloseRequest
                             return Ok(());
                         }
                         Err(e) => {
@@ -686,7 +644,6 @@ impl FollowOrders {
                                 symbol = %position.symbol,
                                 "FOLLOW_ORDERS: Failed to place trailing stop order, falling back to immediate close"
                             );
-                            // Fall through to normal TP close if trailing stop placement fails
                         }
                     }
                 }
@@ -712,12 +669,12 @@ impl FollowOrders {
                     symbol = %tick.symbol,
                     net_pnl_pct = pnl.net_pnl_pct_f64,
                     gross_pnl_pct = pnl.gross_pnl_pct_f64,
-                    entry_commission_pct = pnl.entry_commission_pct.to_f64().unwrap_or(0.0),
-                    exit_commission_pct = pnl.exit_commission_pct.to_f64().unwrap_or(0.0),
-                    total_commission_pct = pnl.total_commission_pct.to_f64().unwrap_or(0.0),
+                    entry_commission_pct = utils::decimal_to_f64(pnl.entry_commission_pct),
+                    exit_commission_pct = utils::decimal_to_f64(pnl.exit_commission_pct),
+                    total_commission_pct = utils::decimal_to_f64(pnl.total_commission_pct),
                     tp_pct,
                     leverage = position.leverage,
-                    price_change_pct = pnl.price_change_pct.to_f64().unwrap_or(0.0),
+                    price_change_pct = utils::decimal_to_f64(pnl.price_change_pct),
                     "FOLLOW_ORDERS: Take profit triggered (net PnL), CloseRequest sent"
                 );
                 return Ok(());
@@ -747,12 +704,12 @@ impl FollowOrders {
                     symbol = %tick.symbol,
                     net_pnl_pct = pnl.net_pnl_pct_f64,
                     gross_pnl_pct = pnl.gross_pnl_pct_f64,
-                    entry_commission_pct = pnl.entry_commission_pct.to_f64().unwrap_or(0.0),
-                    exit_commission_pct = pnl.exit_commission_pct.to_f64().unwrap_or(0.0),
-                    total_commission_pct = pnl.total_commission_pct.to_f64().unwrap_or(0.0),
+                    entry_commission_pct = utils::decimal_to_f64(pnl.entry_commission_pct),
+                    exit_commission_pct = utils::decimal_to_f64(pnl.exit_commission_pct),
+                    total_commission_pct = utils::decimal_to_f64(pnl.total_commission_pct),
                     sl_pct,
                     leverage = position.leverage,
-                    price_change_pct = pnl.price_change_pct.to_f64().unwrap_or(0.0),
+                    price_change_pct = utils::decimal_to_f64(pnl.price_change_pct),
                     "FOLLOW_ORDERS: Stop loss triggered (net PnL), CloseRequest sent"
                 );
                 return Ok(());
@@ -762,4 +719,3 @@ impl FollowOrders {
         Ok(())
     }
 }
-
