@@ -38,10 +38,18 @@ fn load_historical_ticks_from_csv(
             continue;
         }
         
+        // Parse real data from CSV - fail if data is invalid (no mock/dummy data)
         let price = Decimal::from_str(parts[1].trim()).ok()?;
+        // Volume is optional in CSV, but if present must be valid real data
         let volume = parts.get(2)
-            .and_then(|v| Decimal::from_str(v.trim()).ok())
-            .unwrap_or(Decimal::from(1000));
+            .and_then(|v| Decimal::from_str(v.trim()).ok());
+        
+        // If volume is provided, it must be valid (>= 0)
+        if let Some(vol) = volume {
+            if vol < Decimal::ZERO {
+                return None; // Invalid volume data - skip this line
+            }
+        }
         
         let spread = price * Decimal::from_str("0.0001").unwrap();
         let bid = price - spread / Decimal::from(2);
@@ -195,16 +203,17 @@ async fn run_backtest(
         // Check if we have an open position
         if let Some((signal, entry_price, entry_tick)) = open_position {
             let current_price = (tick.bid.0 + tick.ask.0) / Decimal::from(2);
+            // Calculate price change from real market data - fail if conversion fails
             let price_change_pct = match signal {
                 TrendSignal::Long => {
                     ((current_price - entry_price) / entry_price * Decimal::from(100))
                         .to_f64()
-                        .unwrap_or(0.0)
+                        .expect("Failed to convert price change percentage to f64 for Long signal")
                 }
                 TrendSignal::Short => {
                     ((entry_price - current_price) / entry_price * Decimal::from(100))
                         .to_f64()
-                        .unwrap_or(0.0)
+                        .expect("Failed to convert price change percentage to f64 for Short signal")
                 }
             };
             
@@ -242,9 +251,15 @@ async fn run_backtest(
                     TrendSignal::Short => "SHORT",
                 };
                 let result_str = if pnl > Decimal::ZERO { "✅ WIN" } else { "❌ LOSS" };
+                // Convert real trade data to f64 for display - fail if conversion fails
+                let entry_price_f64 = entry_price.to_f64()
+                    .expect("Failed to convert entry price to f64 for display");
+                let current_price_f64 = current_price.to_f64()
+                    .expect("Failed to convert current price to f64 for display");
+                let pnl_f64 = pnl.to_f64()
+                    .expect("Failed to convert PnL to f64 for display");
                 println!("  {} {} trade closed: entry=${:.2}, exit=${:.2}, pnl=${:.2}, duration={} ticks", 
-                    result_str, signal_str, entry_price.to_f64().unwrap_or(0.0), 
-                    current_price.to_f64().unwrap_or(0.0), pnl.to_f64().unwrap_or(0.0), duration);
+                    result_str, signal_str, entry_price_f64, current_price_f64, pnl_f64, duration);
                 
                 open_position = None;
             }
@@ -264,7 +279,10 @@ async fn run_backtest(
                         TrendSignal::Long => "LONG",
                         TrendSignal::Short => "SHORT",
                     };
-                    println!("  📊 Signal generated at tick {}: {} @ ${:.2}", tick_index, signal_str, entry_price.to_f64().unwrap_or(0.0));
+                    // Convert real entry price to f64 for display - fail if conversion fails
+                    let entry_price_f64 = entry_price.to_f64()
+                        .expect("Failed to convert entry price to f64 for display");
+                    println!("  📊 Signal generated at tick {}: {} @ ${:.2}", tick_index, signal_str, entry_price_f64);
                     open_position = Some((signal, entry_price, tick_index));
                 }
             }
@@ -302,17 +320,19 @@ async fn run_backtest(
     
     // Sharpe Ratio: (Average Return - Risk Free Rate) / StdDev of Returns
     // Risk-free rate assumed to be 0 for simplicity
+    // Calculate Sharpe ratio from real trade PnL data - fail if conversion fails
     let sharpe_ratio = if trade_pnls.len() >= 2 {
-        let avg_return: f64 = trade_pnls.iter()
-            .map(|pnl| pnl.to_f64().unwrap_or(0.0))
-            .sum::<f64>() / trade_pnls.len() as f64;
+        // Convert all PnL values to f64 - fail if any conversion fails
+        let returns: Vec<f64> = trade_pnls.iter()
+            .map(|pnl| pnl.to_f64()
+                .expect("Failed to convert trade PnL to f64 for Sharpe ratio calculation"))
+            .collect();
         
-        let variance: f64 = trade_pnls.iter()
-            .map(|pnl| {
-                let ret = pnl.to_f64().unwrap_or(0.0);
-                (ret - avg_return).powi(2)
-            })
-            .sum::<f64>() / trade_pnls.len() as f64;
+        let avg_return: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
+        
+        let variance: f64 = returns.iter()
+            .map(|ret| (ret - avg_return).powi(2))
+            .sum::<f64>() / returns.len() as f64;
         
         let std_dev = variance.sqrt();
         if std_dev > 0.0 {
@@ -324,17 +344,22 @@ async fn run_backtest(
         0.0
     };
     
-    // Max Drawdown: Maximum peak-to-trough decline
+    // Max Drawdown: Maximum peak-to-trough decline (from real cumulative PnL data)
     let max_drawdown = if cumulative_pnl.len() >= 2 {
-        let mut max_dd = 0.0;
-        let mut peak = cumulative_pnl[0].to_f64().unwrap_or(0.0);
+        // Convert cumulative PnL to f64 for drawdown calculation - fail if conversion fails
+        let cumulative_pnl_f64: Vec<f64> = cumulative_pnl.iter()
+            .map(|pnl| pnl.to_f64()
+                .expect("Failed to convert cumulative PnL to f64 for drawdown calculation"))
+            .collect();
         
-        for pnl in &cumulative_pnl {
-            let pnl_f64 = pnl.to_f64().unwrap_or(0.0);
-            if pnl_f64 > peak {
-                peak = pnl_f64;
+        let mut max_dd = 0.0;
+        let mut peak = cumulative_pnl_f64[0];
+        
+        for pnl_f64 in &cumulative_pnl_f64 {
+            if *pnl_f64 > peak {
+                peak = *pnl_f64;
             }
-            let drawdown = peak - pnl_f64;
+            let drawdown = peak - *pnl_f64;
             if drawdown > max_dd {
                 max_dd = drawdown;
             }
@@ -344,9 +369,11 @@ async fn run_backtest(
         0.0
     };
     
-    // Profit Factor: Total Gains / Total Losses
+    // Profit Factor: Total Gains / Total Losses (from real trade data)
     let profit_factor = if total_losses > Decimal::ZERO {
-        (total_gains / total_losses).to_f64().unwrap_or(0.0)
+        (total_gains / total_losses)
+            .to_f64()
+            .expect("Failed to convert profit factor to f64")
     } else if total_gains > Decimal::ZERO {
         f64::INFINITY // All winning trades
     } else {
@@ -508,9 +535,10 @@ async fn run_point_in_time_backtest(
                 let signal_price = (signal_tick.bid.0 + signal_tick.ask.0) / Decimal::from(2);
                 let validation_price = (validation_tick.bid.0 + validation_tick.ask.0) / Decimal::from(2);
                 
+                // Calculate price change from real market data - fail if conversion fails
                 let price_change_pct = ((validation_price - signal_price) / signal_price * Decimal::from(100))
                     .to_f64()
-                    .unwrap_or(0.0);
+                    .expect("Failed to convert price change percentage to f64");
                 
                 price_changes.push(price_change_pct);
                 
@@ -549,11 +577,16 @@ async fn run_point_in_time_backtest(
                     TrendSignal::Short => "SHORT",
                 };
                 let result_str = if is_correct { "✅" } else { "❌" };
+                // Convert real prices to f64 for display - fail if conversion fails
+                let signal_price_f64 = signal_price.to_f64()
+                    .expect("Failed to convert signal price to f64 for display");
+                let validation_price_f64 = validation_price.to_f64()
+                    .expect("Failed to convert validation price to f64 for display");
                 println!("  {} Signal at tick {}: {} @ ${:.2} → {} min later @ ${:.2} ({:+.2}%)", 
                     result_str, i, signal_str, 
-                    signal_price.to_f64().unwrap_or(0.0),
+                    signal_price_f64,
                     validation_minutes,
-                    validation_price.to_f64().unwrap_or(0.0),
+                    validation_price_f64,
                     price_change_pct);
             }
         }
@@ -667,12 +700,37 @@ async fn fetch_binance_klines(
         }
         
         // Binance kline format: [Open time, Open, High, Low, Close, Volume, ...]
-        let open_time_ms = kline[0].as_i64().unwrap_or(0);
-        let open_price = Decimal::from_str(kline[1].as_str().unwrap_or("0"))?;
-        let high_price = Decimal::from_str(kline[2].as_str().unwrap_or("0"))?;
-        let low_price = Decimal::from_str(kline[3].as_str().unwrap_or("0"))?;
-        let close_price = Decimal::from_str(kline[4].as_str().unwrap_or("0"))?;
-        let volume = Decimal::from_str(kline[5].as_str().unwrap_or("0"))?;
+        // Parse real Binance kline data - fail if data is invalid (no mock/dummy data)
+        let open_time_ms = kline[0].as_i64()
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse open_time from Binance kline"))?;
+        let open_price = Decimal::from_str(
+            kline[1].as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get open price string from Binance kline"))?
+        )?;
+        let high_price = Decimal::from_str(
+            kline[2].as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get high price string from Binance kline"))?
+        )?;
+        let low_price = Decimal::from_str(
+            kline[3].as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get low price string from Binance kline"))?
+        )?;
+        let close_price = Decimal::from_str(
+            kline[4].as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get close price string from Binance kline"))?
+        )?;
+        let volume = Decimal::from_str(
+            kline[5].as_str()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get volume string from Binance kline"))?
+        )?;
+        
+        // Validate real market data
+        if close_price <= Decimal::ZERO {
+            return Err(anyhow::anyhow!("Invalid close price from Binance: {} (must be > 0)", close_price));
+        }
+        if volume < Decimal::ZERO {
+            return Err(anyhow::anyhow!("Invalid volume from Binance: {} (must be >= 0)", volume));
+        }
         
         // Use close price as mid price, calculate bid/ask with small spread
         let mid_price = close_price;
@@ -821,7 +879,10 @@ async fn test_strategy_with_multiple_binance_symbols() {
         println!("Winning Trades: {}", results.winning_trades);
         println!("Losing Trades: {}", results.losing_trades);
         println!("Total Trades: {}", results.winning_trades + results.losing_trades);
-        println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
+        // Convert real PnL to f64 for display - fail if conversion fails
+        let total_pnl_f64 = results.total_pnl.to_f64()
+            .expect("Failed to convert total PnL to f64 for display");
+        println!("Total PnL: ${:.2}", total_pnl_f64);
         println!("Win Rate: {:.2}%", results.win_rate * 100.0);
         println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
         println!("Max Drawdown: ${:.2}", results.max_drawdown);
@@ -841,7 +902,10 @@ async fn test_strategy_with_multiple_binance_symbols() {
     println!("Total Winning Trades: {}", total_winning_trades);
     println!("Total Losing Trades: {}", total_losing_trades);
     println!("Total Trades: {}", total_winning_trades + total_losing_trades);
-    println!("Total PnL (All Symbols): ${:.2}", total_pnl.to_f64().unwrap_or(0.0));
+    // Convert real total PnL to f64 for display - fail if conversion fails
+    let total_pnl_f64 = total_pnl.to_f64()
+        .expect("Failed to convert total PnL to f64 for display");
+    println!("Total PnL (All Symbols): ${:.2}", total_pnl_f64);
     
     if total_winning_trades + total_losing_trades > 0 {
         let aggregate_win_rate = (total_winning_trades as f64) / ((total_winning_trades + total_losing_trades) as f64) * 100.0;
@@ -851,10 +915,13 @@ async fn test_strategy_with_multiple_binance_symbols() {
     // Print per-symbol summary
     println!("\n=== Per-Symbol Summary ===");
     for (symbol, results) in &symbol_results {
+        // Convert real PnL to f64 for display - fail if conversion fails
+        let total_pnl_f64 = results.total_pnl.to_f64()
+            .expect("Failed to convert total PnL to f64 for display");
         println!("{}: {} trades, ${:.2} PnL, {:.1}% win rate", 
             symbol,
             results.winning_trades + results.losing_trades,
-            results.total_pnl.to_f64().unwrap_or(0.0),
+            total_pnl_f64,
             results.win_rate * 100.0
         );
     }
@@ -942,7 +1009,10 @@ async fn test_strategy_with_binance_data() {
     println!("Winning Trades: {}", results.winning_trades);
     println!("Losing Trades: {}", results.losing_trades);
     println!("Total Trades: {}", results.winning_trades + results.losing_trades);
-    println!("Total PnL: ${:.2}", results.total_pnl.to_f64().unwrap_or(0.0));
+    // Convert real PnL to f64 for display - fail if conversion fails
+    let total_pnl_f64 = results.total_pnl.to_f64()
+        .expect("Failed to convert total PnL to f64 for display");
+    println!("Total PnL: ${:.2}", total_pnl_f64);
     println!("Win Rate: {:.2}%", results.win_rate * 100.0);
     println!("Sharpe Ratio: {:.2}", results.sharpe_ratio);
     println!("Max Drawdown: ${:.2}", results.max_drawdown);
@@ -1222,21 +1292,31 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
         bid: real_bid.clone(),
         ask: real_ask.clone(),
         mark_price: Some(app::types::Px(real_mark_price)),
-        volume: Some(Decimal::from(1000)), // Realistic volume
+        // Volume from real market data - if not available, use None (no mock data)
+        volume: None, // Volume will be from real market tick if available
         timestamp: Instant::now(),
     };
     
     // Publish REAL event
     let _ = event_bus.market_tick_tx.send(real_tick.clone());
+    // Convert real prices to f64 for display - fail if conversion fails
+    let real_bid_f64 = real_bid.0.to_f64()
+        .expect("Failed to convert real bid to f64 for display");
+    let real_ask_f64 = real_ask.0.to_f64()
+        .expect("Failed to convert real ask to f64 for display");
     println!("   ✅ Published REAL MarketTick event: bid=${:.2}, ask=${:.2}", 
-        real_bid.0.to_f64().unwrap_or(0.0), real_ask.0.to_f64().unwrap_or(0.0));
+        real_bid_f64, real_ask_f64);
     
     // Try to receive the event (with timeout)
     match tokio::time::timeout(Duration::from_millis(100), market_tick_rx.recv()).await {
         Ok(Ok(received_tick)) => {
+            // Convert received tick prices to f64 for display - fail if conversion fails
+            let received_bid_f64 = received_tick.bid.0.to_f64()
+                .expect("Failed to convert received bid to f64 for display");
+            let received_ask_f64 = received_tick.ask.0.to_f64()
+                .expect("Failed to convert received ask to f64 for display");
             println!("   ✅ Received MarketTick event: bid=${:.2}, ask=${:.2}", 
-                received_tick.bid.0.to_f64().unwrap_or(0.0), 
-                received_tick.ask.0.to_f64().unwrap_or(0.0));
+                received_bid_f64, received_ask_f64);
         }
         Ok(Err(_)) => {
             println!("   ⚠️  Event channel closed");
@@ -1275,15 +1355,23 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
     
     // Test: Get current prices (uses rate limiter with weight 5)
     if let Ok((bid, ask)) = connection.get_current_prices("BTCUSDT").await {
+        // Convert real prices to f64 for display - fail if conversion fails
+        let bid_f64 = bid.0.to_f64()
+            .expect("Failed to convert bid to f64 for display");
+        let ask_f64 = ask.0.to_f64()
+            .expect("Failed to convert ask to f64 for display");
         println!("   ✅ get_current_prices: bid=${:.2}, ask=${:.2}", 
-            bid.0.to_f64().unwrap_or(0.0), ask.0.to_f64().unwrap_or(0.0));
+            bid_f64, ask_f64);
     } else {
         println!("   ⚠️  get_current_prices failed (may need API keys)");
     }
     
     // Test: Fetch balance (uses rate limiter with weight 5)
     if let Ok(balance) = connection.fetch_balance("USDT").await {
-        println!("   ✅ fetch_balance: ${:.2} USDT", balance.to_f64().unwrap_or(0.0));
+        // Convert real balance to f64 for display - fail if conversion fails
+        let balance_f64 = balance.to_f64()
+            .expect("Failed to convert balance to f64 for display");
+        println!("   ✅ fetch_balance: ${:.2} USDT", balance_f64);
     } else {
         println!("   ⚠️  fetch_balance failed (may need API keys)");
     }
@@ -1357,7 +1445,10 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
                     app::types::TrendSignal::Long => "LONG",
                     app::types::TrendSignal::Short => "SHORT",
                 };
-                println!("   📊 Signal generated: {} @ ${:.2}", signal_str, mid_price.to_f64().unwrap_or(0.0));
+                // Convert real mid price to f64 for display - fail if conversion fails
+                let mid_price_f64 = mid_price.to_f64()
+                    .expect("Failed to convert mid price to f64 for display");
+                println!("   📊 Signal generated: {} @ ${:.2}", signal_str, mid_price_f64);
             }
         }
         
@@ -1410,10 +1501,14 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
         trailing_stop_placed: false,
     };
     
+    // Convert real prices to f64 for display - fail if conversion fails
+    let real_entry_price_f64 = real_entry_price.to_f64()
+        .expect("Failed to convert entry price to f64 for display");
+    let real_mark_price_f64 = real_mark_price_decimal.to_f64()
+        .expect("Failed to convert mark price to f64 for display");
     println!("   ✅ Position tracking validated with real prices:");
     println!("      Entry: ${:.2}, Current: ${:.2}", 
-        real_entry_price.to_f64().unwrap_or(0.0), 
-        real_mark_price_decimal.to_f64().unwrap_or(0.0));
+        real_entry_price_f64, real_mark_price_f64);
     println!("   ℹ️  PnL calculation tested through integration (private method)");
     
     println!("   ✅ FollowOrders module test PASSED");
@@ -1443,7 +1538,9 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
                     }
                     match resp.json::<PremiumIndex>().await {
                         Ok(data) => {
-                            let rate = data.last_funding_rate.parse::<f64>().unwrap_or(0.0);
+                            // Parse real funding rate from Binance - fail if invalid
+                            let rate = data.last_funding_rate.parse::<f64>()
+                                .expect(&format!("Failed to parse funding rate from Binance: {}", data.last_funding_rate));
                             println!("   ✅ Real funding rate: {:.6} ({:.4}%)", rate, rate * 100.0);
                             (Some(rate), Some(data.next_funding_time))
                         }
@@ -1476,7 +1573,11 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
         }
     };
     let real_mark_price = (real_bid.0 + real_ask.0) / Decimal::from(2);
-    let position_size_notional = (real_mark_price * Decimal::from(1)).to_f64().unwrap_or(50000.0); // 1 BTC position
+    // Calculate position size from real market data - fail if conversion fails
+    let position_qty = Decimal::from(1); // 1 BTC position
+    let position_size_notional = (real_mark_price * position_qty)
+        .to_f64()
+        .expect("Failed to convert real position size to f64 for funding cost calculation");
     
     // Test funding cost application using FollowOrders method
     use app::follow_orders::FundingState;
@@ -1487,7 +1588,9 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
             let mut tracking = funding_tracking.write().await;
             let funding_cost = funding_rate * position_size_notional;
             tracking.insert("BTCUSDT".to_string(), FundingState {
-                total_funding_cost: Decimal::from_f64_retain(funding_cost).unwrap_or(Decimal::ZERO),
+                // Calculate funding cost from real data - fail if conversion fails
+                total_funding_cost: Decimal::from_f64_retain(funding_cost)
+                    .expect(&format!("Failed to convert funding cost to Decimal: {}", funding_cost)),
                 last_applied_funding_time: Some(next_funding_time),
             });
         }
@@ -1495,8 +1598,11 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
         // Check if funding was applied
         let tracking = funding_tracking.read().await;
         if let Some(state) = tracking.get("BTCUSDT") {
+            // Convert real funding cost to f64 for display - fail if conversion fails
+            let funding_cost_f64 = state.total_funding_cost.to_f64()
+                .expect("Failed to convert funding cost to f64 for display");
             println!("   ✅ Funding cost applied with REAL rate: ${:.2} total", 
-                state.total_funding_cost.to_f64().unwrap_or(0.0));
+                funding_cost_f64);
             println!("      Funding rate: {:.6} ({:.4}%)", funding_rate, funding_rate * 100.0);
             println!("      Position size: ${:.2}", position_size_notional);
             println!("      Next funding time: {}", next_funding_time);
@@ -1525,13 +1631,20 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
     };
     
     let real_mark_price = (real_bid.0 + real_ask.0) / Decimal::from(2);
-    let real_entry_price = real_mark_price * Decimal::from_str("0.98").unwrap(); // 2% below current (realistic entry)
+    let real_entry_price = real_mark_price * Decimal::from_str("0.98")
+        .expect("Failed to parse entry price multiplier");
     let position_qty = Decimal::from(1); // 1 BTC
-    let position_size_notional = (real_mark_price * position_qty).to_f64().unwrap_or(0.0);
     
-    // Calculate REAL PnL from actual market data
+    // Calculate position size from real market data - fail if conversion fails
+    let position_size_notional = (real_mark_price * position_qty)
+        .to_f64()
+        .expect("Failed to convert real position size to f64 for PnL calculation");
+    
+    // Calculate REAL PnL from actual market data - fail if conversion fails
     let price_diff = real_mark_price - real_entry_price;
-    let real_pnl_usd = (price_diff * position_qty).to_f64().unwrap_or(0.0);
+    let real_pnl_usd = (price_diff * position_qty)
+        .to_f64()
+        .expect("Failed to convert real PnL to f64");
     let pnl_pct = if position_size_notional > 0.0 {
         (real_pnl_usd / position_size_notional) * 100.0
     } else {
@@ -1540,8 +1653,10 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
     
     println!("   ✅ Testing with REAL position data:");
     println!("      Entry: ${:.2}, Mark: ${:.2}", 
-        real_entry_price.to_f64().unwrap_or(0.0),
-        real_mark_price.to_f64().unwrap_or(0.0));
+        real_entry_price.to_f64()
+            .expect("Failed to convert entry price to f64 for display"),
+        real_mark_price.to_f64()
+            .expect("Failed to convert mark price to f64 for display"));
     println!("      Position size: ${:.2}", position_size_notional);
     println!("      PnL: ${:.2} ({:.2}%)", real_pnl_usd, pnl_pct);
     
@@ -1592,10 +1707,29 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
                         match resp.json::<DepthResponse>().await {
                             Ok(depth) => {
                                 if let (Some(bid_str), Some(ask_str)) = (depth.bids.first(), depth.asks.first()) {
-                                    let bid_price = Decimal::from_str(&bid_str.0).unwrap_or(Decimal::from(50000));
-                                    let ask_price = Decimal::from_str(&ask_str.0).unwrap_or(Decimal::from(50010));
-                                    let _bid_qty = Decimal::from_str(&bid_str.1).unwrap_or(Decimal::from(1));
-                                    let _ask_qty = Decimal::from_str(&ask_str.1).unwrap_or(Decimal::from(1));
+                                    // Parse real order book data from Binance - fail if invalid
+                                    let bid_price = Decimal::from_str(&bid_str.0)
+                                        .expect(&format!("Failed to parse bid price from Binance order book: {}", bid_str.0));
+                                    let ask_price = Decimal::from_str(&ask_str.0)
+                                        .expect(&format!("Failed to parse ask price from Binance order book: {}", ask_str.0));
+                                    
+                                    // Validate real market data
+                                    if bid_price <= Decimal::ZERO || ask_price <= Decimal::ZERO {
+                                        panic!("Invalid order book prices from Binance: bid={}, ask={}", bid_price, ask_price);
+                                    }
+                                    if ask_price <= bid_price {
+                                        panic!("Invalid order book spread from Binance: bid={} >= ask={}", bid_price, ask_price);
+                                    }
+                                    // Parse real order book quantities - fail if invalid
+                                    let _bid_qty = Decimal::from_str(&bid_str.1)
+                                        .expect(&format!("Failed to parse bid quantity from Binance order book: {}", bid_str.1));
+                                    let _ask_qty = Decimal::from_str(&ask_str.1)
+                                        .expect(&format!("Failed to parse ask quantity from Binance order book: {}", ask_str.1));
+                                    
+                                    // Validate quantities are non-negative
+                                    if _bid_qty < Decimal::ZERO || _ask_qty < Decimal::ZERO {
+                                        panic!("Invalid order book quantities from Binance: bid_qty={}, ask_qty={}", _bid_qty, _ask_qty);
+                                    }
                                     (app::types::Px(bid_price), app::types::Px(ask_price))
                                 } else {
                                     println!("   ⚠️  No depth data, skipping QMEL test");
@@ -1635,7 +1769,10 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
     };
     
     println!("   ✅ Real order book fetched: bid=${:.2}, ask=${:.2}", 
-        real_bid.0.to_f64().unwrap_or(0.0), real_ask.0.to_f64().unwrap_or(0.0));
+        real_bid.0.to_f64()
+            .expect("Failed to convert bid to f64 for display"), 
+        real_ask.0.to_f64()
+            .expect("Failed to convert ask to f64 for display"));
     
     // Fetch real funding rate from Binance (if available)
     let real_funding_rate = {
@@ -1718,12 +1855,21 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
         trailing_stop_placed: false,
     };
     
+    // Convert real prices to f64 for display - fail if conversion fails
+    let real_entry_price_f64 = real_entry_price.to_f64()
+        .expect("Failed to convert entry price to f64 for display");
+    let real_mark_price_f64 = real_mark_price_decimal.to_f64()
+        .expect("Failed to convert mark price to f64 for display");
+    let real_bid_f64 = real_bid.0.to_f64()
+        .expect("Failed to convert bid to f64 for display");
+    let real_ask_f64 = real_ask.0.to_f64()
+        .expect("Failed to convert ask to f64 for display");
     println!("   ✅ Testing with REAL prices:");
     println!("      Entry: ${:.2}, Mark: ${:.2}, Bid: ${:.2}, Ask: ${:.2}",
-        real_entry_price.to_f64().unwrap_or(0.0),
-        real_mark_price_decimal.to_f64().unwrap_or(0.0),
-        real_bid.0.to_f64().unwrap_or(0.0),
-        real_ask.0.to_f64().unwrap_or(0.0));
+        real_entry_price_f64,
+        real_mark_price_f64,
+        real_bid_f64,
+        real_ask_f64);
     
     let (should_close, reason) = should_close_position_smart(
         &test_position_info,

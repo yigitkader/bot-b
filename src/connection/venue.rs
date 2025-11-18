@@ -1789,6 +1789,22 @@ impl Venue for BinanceFutures {
                                 body
                             ));
                         }
+                        // Check for Post Only rejection (-5022) - this is expected and retryable
+                        let is_post_only_rejection = body.contains("-5022") || body.contains("could not be executed as maker");
+                        if is_post_only_rejection {
+                            if attempt < MAX_RETRIES {
+                                let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
+                                // Post Only rejection is expected - log at debug level to reduce noise
+                                tracing::debug!(%sym, %status, attempt = attempt + 1, backoff_ms = backoff.as_millis(), "Post Only order rejected (cannot execute as maker), retrying with exponential backoff");
+                                tokio::time::sleep(backoff).await;
+                                last_error = Some(anyhow!("binance api error: {} - {} (Post Only rejection, retrying)", status, body));
+                                continue;
+                            } else {
+                                // After max retries, log as warning (not error) since this is expected behavior
+                                tracing::warn!(%sym, %status, %body, attempt, "Post Only order rejected after max retries (order cannot execute as maker)");
+                                return Err(anyhow!("binance api error: {} - {} (Post Only rejection after {} retries)", status, body, MAX_RETRIES));
+                            }
+                        }
                         if is_transient_error(status.as_u16(), &body) && attempt < MAX_RETRIES {
                             let backoff = crate::utils::exponential_backoff(attempt, INITIAL_BACKOFF_MS, 3);
                             tracing::warn!(%status, %body, attempt = attempt + 1, backoff_ms = backoff.as_millis(), "transient error, retrying with exponential backoff (unique clientOrderId)");

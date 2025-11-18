@@ -1585,8 +1585,13 @@ impl Ordering {
             }),
             timestamp: Instant::now(),
         };
-        if let Err(e) = event_bus.ordering_state_update_tx.send(update) {
-            warn!(error = ?e, "ORDERING: Failed to publish OrderingStateUpdate event (no subscribers)");
+        // OrderingStateUpdate event is optional - ignore send errors if no subscribers
+        // This event may be used by future monitoring/debugging tools
+        // Broadcast channel's send() will only fail if there are no receivers, which is expected
+        if let Err(_) = event_bus.ordering_state_update_tx.send(update) {
+            // No subscribers - this is expected and not an error
+            // Only log at trace level to avoid log noise
+            tracing::trace!("ORDERING: OrderingStateUpdate event not consumed (no subscribers)");
         }
     }
     async fn handle_order_update(

@@ -67,6 +67,9 @@ impl EventBus {
     pub fn subscribe_balance_update(&self) -> broadcast::Receiver<BalanceUpdate> {
         self.balance_update_tx.subscribe()
     }
+    pub fn subscribe_ordering_state_update(&self) -> broadcast::Receiver<OrderingStateUpdate> {
+        self.ordering_state_update_tx.subscribe()
+    }
     pub fn health_stats(&self) -> EventBusHealth {
         EventBusHealth {
             market_tick_receivers: self.market_tick_tx.receiver_count(),
