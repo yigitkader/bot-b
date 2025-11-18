@@ -19,7 +19,7 @@ pub fn analyze_orders(
     bid: Px,
     ask: Px,
     position_size_notional: f64,
-    cfg: &AppCfg,
+    _cfg: &AppCfg,
     max_order_age_ms: u64,
 ) -> Vec<String> {
     let mut orders_to_cancel = Vec::new();
@@ -148,7 +148,7 @@ pub fn should_sync_orders(
 pub fn calculate_fill_rate_from_history(
     filled_orders: usize,
     total_orders: usize,
-    time_window_sec: u64,
+    _time_window_sec: u64,
 ) -> f64 {
     if total_orders == 0 {
         return 0.5;

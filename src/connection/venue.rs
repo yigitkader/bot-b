@@ -198,12 +198,12 @@ struct OrderBookTop {
     asks: Vec<(String, String)>,
 }
 #[derive(Deserialize)]
-struct FutPlacedOrder {
+pub(crate) struct FutPlacedOrder {
 #[serde(rename = "orderId")]
-    order_id: u64,
+    pub(crate) order_id: u64,
 #[serde(rename = "clientOrderId")]
 #[allow(dead_code)]
-    client_order_id: Option<String>,
+    pub(crate) client_order_id: Option<String>,
 }
 #[derive(Deserialize)]
 struct FutOpenOrder {

@@ -168,7 +168,7 @@ pub struct BinanceCfg {
     #[serde(default = "default_hedge_mode")]
     pub hedge_mode: bool,
 }
-impl Default for BinanceCfg {
+impl ::std::default::Default for BinanceCfg {
     fn default() -> Self {
         Self {
             api_key: "test_api_key".to_string(),
@@ -229,7 +229,7 @@ pub struct AppCfg {
     #[serde(default)]
     pub internal: InternalCfg,
 }
-impl Default for AppCfg {
+impl ::std::default::Default for AppCfg {
     fn default() -> Self {
         Self {
             symbol: None,

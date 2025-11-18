@@ -2,10 +2,9 @@ use crate::config::AppCfg;
 use crate::connection::Connection;
 use crate::event_bus::{CloseRequest, CloseReason, EventBus, MarketTick, PositionUpdate, TradeSignal};
 use crate::position_manager::{PositionState, should_close_position_smart};
-use crate::types::{PositionDirection, PositionInfo, Px, Qty};
+use crate::types::{PositionDirection, PositionInfo, Px};
 use crate::utils;
 use anyhow::{anyhow, Result};
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -372,7 +371,7 @@ impl FollowOrders {
     }
     async fn send_close_request_and_remove_position(
         tick: &MarketTick,
-        position: &PositionInfo,
+        _position: &PositionInfo,
         reason: CloseReason,
         positions: &Arc<RwLock<HashMap<String, PositionInfo>>>,
         position_states: &Arc<RwLock<HashMap<String, PositionState>>>,

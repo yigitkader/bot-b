@@ -35,7 +35,8 @@ impl Balance {
                 "BALANCE: failed to fetch initial balance after retries, will wait for WebSocket updates"
             );
         }
-        let balance_store = self.shared_state.balance_store.clone();
+        let shared_state = &*self.shared_state;
+        let balance_store = shared_state.balance_store.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let event_bus = self.event_bus.clone();
         tokio::spawn(async move {
@@ -102,19 +103,21 @@ impl Balance {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Failed to fetch balance after {} attempts", MAX_RETRIES)))
     }
     async fn fetch_and_update_balance(&self) -> Result<()> {
-        let usdt_balance = self.connection.fetch_balance("USDT").await?;
-        let usdc_balance = self.connection.fetch_balance("USDC").await?;
+        let connection = &*self.connection;
+        let usdt_balance = connection.fetch_balance("USDT").await?;
+        let usdc_balance = connection.fetch_balance("USDC").await?;
         let timestamp = Instant::now();
         let balance_update = BalanceUpdate {
             usdt: usdt_balance,
             usdc: usdc_balance,
             timestamp,
         };
-        let receiver_count = self.event_bus.balance_update_tx.receiver_count();
+        let event_bus = &*self.event_bus;
+        let receiver_count = event_bus.balance_update_tx.receiver_count();
         if receiver_count == 0 {
             debug!("BALANCE: No BalanceUpdate subscribers, skipping event");
         } else {
-            if let Err(e) = self.event_bus.balance_update_tx.send(balance_update) {
+            if let Err(e) = event_bus.balance_update_tx.send(balance_update) {
                 warn!(
                     error = ?e,
                     receiver_count,
@@ -123,7 +126,8 @@ impl Balance {
             }
         }
         {
-            let mut store = self.shared_state.balance_store.write().await;
+            let shared_state = &*self.shared_state;
+            let mut store = shared_state.balance_store.write().await;
             if store.last_updated <= timestamp {
                 store.usdt = usdt_balance;
                 store.usdc = usdc_balance;

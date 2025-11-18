@@ -6,6 +6,8 @@ pub use crate::types::{
     PositionUpdate, TradeSignal,
 };
 use tokio::sync::{broadcast, mpsc};
+use std::cmp;
+#[derive(Clone)]
 pub struct EventBus {
     pub market_tick_tx: broadcast::Sender<MarketTick>,
     pub trade_signal_tx: broadcast::Sender<TradeSignal>,
@@ -19,12 +21,12 @@ pub struct EventBus {
 }
 impl EventBus {
     pub fn new_with_config(cfg: &crate::config::EventBusCfg) -> Self {
-        let market_tick_buffer = cfg.market_tick_buffer.max(1);
-        let trade_signal_buffer = cfg.trade_signal_buffer.max(1);
-        let close_request_buffer = cfg.close_request_buffer.max(1);
-        let order_update_buffer = cfg.order_update_buffer.max(1);
-        let position_update_buffer = cfg.position_update_buffer.max(1);
-        let balance_update_buffer = cfg.balance_update_buffer.max(1);
+        let market_tick_buffer = cmp::max(cfg.market_tick_buffer, 1);
+        let trade_signal_buffer = cmp::max(cfg.trade_signal_buffer, 1);
+        let close_request_buffer = cmp::max(cfg.close_request_buffer, 1);
+        let order_update_buffer = cmp::max(cfg.order_update_buffer, 1);
+        let position_update_buffer = cmp::max(cfg.position_update_buffer, 1);
+        let balance_update_buffer = cmp::max(cfg.balance_update_buffer, 1);
         let (market_tick_tx, _) = broadcast::channel(market_tick_buffer);
         let (trade_signal_tx, _) = broadcast::channel(trade_signal_buffer);
         let (close_request_tx, _) = broadcast::channel(close_request_buffer);

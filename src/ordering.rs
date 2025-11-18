@@ -434,7 +434,6 @@ impl Ordering {
                                         epsilon_qty,
                                         EPSILON_PRICE_PCT,
                                     );
-                                    use rust_decimal::prelude::ToPrimitive;
                                     let qty_diff = (internal_pos.qty.0 - exchange_pos.qty.0).abs();
                                     let entry_diff = (internal_pos.entry_price.0 - exchange_pos.entry.0).abs();
                                     let price_diff_pct = if internal_pos.entry_price.0 > Decimal::ZERO {
@@ -1489,7 +1488,6 @@ impl Ordering {
         epsilon_qty: Decimal,
         epsilon_price_pct: f64,
     ) -> bool {
-        use rust_decimal::prelude::ToPrimitive;
         let qty_diff = (update_qty - existing_qty).abs();
         let price_diff_abs = (update_price - existing_price).abs();
         let price_diff_pct = if existing_price > Decimal::ZERO {
@@ -1531,7 +1529,7 @@ impl Ordering {
         state.last_position_update_timestamp = Some(timestamp);
     }
     fn publish_state_and_drop(
-        mut state_guard: tokio::sync::MutexGuard<'_, OrderingState>,
+        state_guard: tokio::sync::MutexGuard<'_, OrderingState>,
         event_bus: &Arc<EventBus>,
     ) {
         let state_to_publish = state_guard.clone();
@@ -1615,7 +1613,6 @@ impl Ordering {
                                 let existing_entry_price = existing_pos.entry_price.0;
                                 let epsilon_qty = Decimal::new(1, 6);
                                 const EPSILON_PRICE_PCT: f64 = 0.001;
-                                use rust_decimal::prelude::ToPrimitive;
                                 let qty_diff = (qty_abs.0 - qty_abs_existing).abs();
                                 let price_diff_abs = (update.average_fill_price.0 - existing_entry_price).abs();
                                 let price_diff_pct = if existing_entry_price > Decimal::ZERO {
@@ -1784,7 +1781,6 @@ impl Ordering {
                     EPSILON_PRICE_PCT,
                 );
                 let should_skip = !should_update;
-                use rust_decimal::prelude::ToPrimitive;
                 let qty_diff = (qty_abs_update - qty_abs_existing).abs();
                 let price_diff_abs = (update.entry_price.0 - existing_entry_price).abs();
                 let price_diff_pct = if existing_entry_price > Decimal::ZERO {

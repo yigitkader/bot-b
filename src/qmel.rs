@@ -478,7 +478,7 @@ impl DirectionModel {
             state.funding_rate.unwrap_or(0.0),
         ]
     }
-    pub fn update(&mut self, state: &MarketState, actual_direction: f64, learning_rate: f64) {
+    pub fn update(&mut self, state: &MarketState, actual_direction: f64, _learning_rate: f64) {
         if !actual_direction.is_finite() || actual_direction < 0.0 || actual_direction > 1.0 {
             warn!("Invalid actual_direction: {}, skipping update", actual_direction);
             return;

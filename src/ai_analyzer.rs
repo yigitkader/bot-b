@@ -1,6 +1,5 @@
 
 use crate::event_bus::EventBus;
-use crate::types::*;
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -373,9 +372,8 @@ impl AiAnalyzer {
                             update.usdt.to_f64().unwrap_or(0.0),
                             update.usdc.to_f64().unwrap_or(0.0),
                         );
-                        if let Some((prev_usdt, prev_usdc)) = last_balance {
+                        if let Some((prev_usdt, _prev_usdc)) = last_balance {
                             let usdt_change = (current_balance.0 - prev_usdt).abs();
-                            let usdc_change = (current_balance.1 - prev_usdc).abs();
                             if usdt_change > 100.0 || usdt_change > prev_usdt * 0.1 {
                                 let mut history = anomaly_history.lock().await;
                                 let report = AnomalyReport {
