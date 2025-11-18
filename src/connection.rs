@@ -551,15 +551,18 @@ impl Connection {
         let api_key = self.cfg.binance.api_key.clone();
         let futures_base = self.cfg.binance.futures_base.clone();
         let reconnect_delay = Duration::from_millis(self.cfg.websocket.reconnect_delay_ms);
+        let ping_interval_ms = self.cfg.websocket.ping_interval_ms;
+        let reconnect_delay_ms = self.cfg.websocket.reconnect_delay_ms;
         let kind = UserStreamKind::Futures;
         let event_bus = self.event_bus.clone();
         let shutdown_flag = self.shutdown_flag.clone();
         let venue = self.venue.clone();
         let order_fill_history = self.order_fill_history.clone();
         let shared_state_for_validation = self.shared_state.clone();
+        let cfg_for_validation = self.cfg.clone();
         info!(
-        reconnect_delay_ms = self.cfg.websocket.reconnect_delay_ms,
-        ping_interval_ms = self.cfg.websocket.ping_interval_ms,
+        reconnect_delay_ms,
+        ping_interval_ms,
         ?kind,
         "CONNECTION: launching user data stream task"
         );
@@ -575,11 +578,13 @@ impl Connection {
                     let venue_for_validation = venue.clone();
                     let symbols_for_validation = symbols.clone();
                     let shared_state_for_validation_clone = shared_state_for_validation.clone();
+                    let cfg_for_validation_clone = cfg_for_validation.clone();
                     stream.set_on_reconnect(move || {
                         info!("CONNECTION: WebSocket reconnected - Binance will automatically send state updates via ACCOUNT_UPDATE and ORDER_TRADE_UPDATE events");
                         let venue_clone = venue_for_validation.clone();
                         let symbols_clone = symbols_for_validation.clone();
                         let shared_state_for_validation = shared_state_for_validation_clone.clone();
+                        let cfg_clone = cfg_for_validation_clone.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_secs(2)).await;
                             info!(
@@ -659,7 +664,7 @@ impl Connection {
                                 );
                                 let priority_tasks = validate_symbols_batch(priority_symbols);
                                 let priority_results = future::join_all(priority_tasks).await;
-                                validated_count += Self::process_validation_results(priority_results, &venue_clone).await;
+                                validated_count += Self::process_validation_results(priority_results, &venue_clone, &cfg_clone).await;
                             }
                             if !cached_symbols.is_empty() {
                                 info!(
@@ -669,7 +674,7 @@ impl Connection {
                                 );
                                 let cached_tasks = validate_symbols_batch(cached_symbols);
                                 let cached_results = future::join_all(cached_tasks).await;
-                                validated_count += Self::process_validation_results(cached_results, &venue_clone).await;
+                                validated_count += Self::process_validation_results(cached_results, &venue_clone, &cfg_clone).await;
                             }
                             if !remaining_symbols.is_empty() {
                                 info!(
@@ -677,11 +682,12 @@ impl Connection {
                                     "CONNECTION: Starting background validation for {} remaining symbols (non-blocking)",
                                     remaining_count
                                 );
+                                let cfg_bg = cfg_clone.clone();
                                 let venue_bg = venue_clone.clone();
                                 tokio::spawn(async move {
                                     let remaining_tasks = validate_symbols_batch(remaining_symbols);
                                     let remaining_results = future::join_all(remaining_tasks).await;
-                                    let bg_validated = Self::process_validation_results(remaining_results, &venue_bg).await;
+                                    let bg_validated = Self::process_validation_results(remaining_results, &venue_bg, &cfg_bg).await;
                                     info!(
                                         validated_count = bg_validated,
                                         total_remaining = remaining_count,
@@ -1047,6 +1053,7 @@ impl Connection {
     async fn process_validation_results(
         results: Vec<Result<(String, Result<Result<Position, anyhow::Error>, tokio::time::error::Elapsed>, Result<Result<Vec<VenueOrder>, anyhow::Error>, tokio::time::error::Elapsed>), tokio::task::JoinError>>,
         _venue: &Arc<BinanceFutures>,
+        cfg: &AppCfg,
     ) -> usize {
         let mut validated_count = 0;
         for result in results {
@@ -1058,8 +1065,14 @@ impl Connection {
                                 let ws_pos = ws_position.value();
                                 let qty_diff = (rest_position.qty.0 - ws_pos.qty.0).abs();
                                 let entry_diff = (rest_position.entry.0 - ws_pos.entry.0).abs();
-                                let significant_qty_diff = Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO);
-                                let significant_entry_diff = Decimal::from_str("0.01").unwrap_or(Decimal::ZERO);
+                                // Thresholds for position mismatch detection (configurable via price_tick/qty_step)
+                                // Using config values ensures these thresholds match exchange precision
+                                let qty_threshold = Decimal::from_str(&cfg.qty_step.to_string())
+                                    .unwrap_or_else(|_| Decimal::from_str("0.0001").unwrap_or(Decimal::ZERO));
+                                let price_threshold = Decimal::from_str(&cfg.price_tick.to_string())
+                                    .unwrap_or_else(|_| Decimal::from_str("0.01").unwrap_or(Decimal::ZERO));
+                                let significant_qty_diff = qty_threshold;
+                                let significant_entry_diff = price_threshold;
                                 let significant_mismatch = qty_diff > significant_qty_diff
                                     || entry_diff > significant_entry_diff;
                                 POSITION_CACHE.insert(symbol.clone(), rest_position.clone());
@@ -1281,9 +1294,13 @@ impl Connection {
     pub async fn discover_symbols(&self) -> Result<Vec<String>> {
     let quote_asset_upper = self.cfg.quote_asset.to_uppercase();
     let allow_usdt = self.cfg.allow_usdt_quote;
+    // Use config value, fallback to min_margin_usd if parsing fails
     let min_required_balance = Decimal::from_str(
         &self.cfg.min_usd_per_order.to_string()
-    ).unwrap_or(Decimal::from(10));
+    ).unwrap_or_else(|_| {
+        Decimal::from_str(&self.cfg.min_margin_usd.to_string())
+            .unwrap_or_else(|_| Decimal::from(10)) // Last resort fallback
+    });
     let mut usdt_balance = Decimal::ZERO;
     let mut usdc_balance = Decimal::ZERO;
     match self.fetch_balance("USDT").await {

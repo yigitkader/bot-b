@@ -220,7 +220,10 @@ pub fn calculate_dust_threshold(min_notional: Decimal, current_price: Decimal) -
     if !current_price.is_zero() {
         min_notional / current_price
     } else {
-        let assumed_min_price = Decimal::new(1, 2);
+        // Fallback: assume minimum price of $0.01 (1 cent) for dust calculation
+        // This is only used when current_price is zero (shouldn't happen in production)
+        // In production, current_price should always come from real market data
+        let assumed_min_price = Decimal::new(1, 2); // 0.01
         min_notional / assumed_min_price
     }
 }

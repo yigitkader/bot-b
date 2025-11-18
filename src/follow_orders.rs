@@ -386,6 +386,52 @@ impl FollowOrders {
             total_commission_pct,
         })
     }
+    
+    /// Apply funding cost if needed (8-hour interval)
+    /// Funding is charged every 8 hours in futures markets
+    pub(crate) async fn apply_funding_cost_if_needed(
+        funding_tracking: &Arc<RwLock<HashMap<String, FundingState>>>,
+        symbol: &str,
+        funding_rate: Option<f64>,
+        next_funding_time: Option<u64>,
+        position_size_notional: f64,
+    ) {
+        if let (Some(funding_rate), Some(next_funding_ts)) = (funding_rate, next_funding_time) {
+            const FUNDING_INTERVAL_MS: u64 = 8 * 3600 * 1000; // 8 hours
+            let this_funding_ts = next_funding_ts.saturating_sub(FUNDING_INTERVAL_MS);
+            
+            let mut tracking = funding_tracking.write().await;
+            let state = tracking.entry(symbol.to_string()).or_insert_with(|| FundingState {
+                total_funding_cost: Decimal::ZERO,
+                last_applied_funding_time: None,
+            });
+            
+            let should_apply = if let Some(last_applied) = state.last_applied_funding_time {
+                this_funding_ts > last_applied
+            } else {
+                true
+            };
+            
+            if should_apply && position_size_notional > 0.0 {
+                let funding_cost = funding_rate * position_size_notional;
+                state.total_funding_cost += Decimal::from_f64_retain(funding_cost)
+                    .unwrap_or(Decimal::ZERO);
+                state.last_applied_funding_time = Some(this_funding_ts);
+                
+                info!(
+                    symbol = %symbol,
+                    funding_rate,
+                    this_funding_ts,
+                    next_funding_ts,
+                    position_size_notional,
+                    funding_cost,
+                    total_funding_cost = %state.total_funding_cost,
+                    "FOLLOW_ORDERS: Funding cost applied (8-hour interval)"
+                );
+            }
+        }
+    }
+    
     async fn send_close_request_and_remove_position(
         tick: &MarketTick,
         _position: &PositionInfo,

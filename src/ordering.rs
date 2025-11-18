@@ -8,6 +8,7 @@ use crate::utils;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -753,13 +754,18 @@ impl Ordering {
         let taker_commission_rate = utils::get_commission_rate(false, cfg.risk.maker_commission_pct, cfg.risk.taker_commission_pct);
         let total_commission_rate = taker_commission_rate * Decimal::from(2);
         let calculated_commission_buffer = estimated_notional * total_commission_rate;
-        let min_commission_buffer = utils::f64_to_decimal(cfg.risk.min_commission_buffer_usd, Decimal::from(1) / Decimal::from(2));
+        // Use config value, fallback to 0.5 USD if parsing fails
+        let min_commission_buffer = utils::f64_to_decimal(
+            cfg.risk.min_commission_buffer_usd, 
+            Decimal::from_str("0.5").unwrap_or(Decimal::ZERO)
+        );
         let commission_buffer = calculated_commission_buffer.max(min_commission_buffer);
         let estimated_margin_for_safety = utils::f64_to_decimal(cfg.max_usd_per_order, max_margin)
             .max(min_margin)
             .min(max_margin);
         let safety_margin = (estimated_margin_for_safety * Decimal::from(5) / Decimal::from(100))
-            .max(Decimal::from(1));
+            // Ensure minimum order size is at least 1 (using config qty_step if available)
+            .max(Decimal::from_str(&cfg.qty_step.to_string()).unwrap_or_else(|_| Decimal::from(1)));
         let total_buffer = commission_buffer + safety_margin;
         let usable_balance = available_balance.saturating_sub(total_buffer);
         let margin_usd = match cfg.margin_strategy.as_str() {
@@ -903,7 +909,11 @@ impl Ordering {
         } else {
             &cfg.quote_asset
         };
-        let min_margin = utils::f64_to_decimal(cfg.min_margin_usd, Decimal::from(10));
+        // Use config value, fallback to 10 USD if parsing fails
+        let min_margin = utils::f64_to_decimal(
+            cfg.min_margin_usd, 
+            Decimal::from_str("10").unwrap_or(Decimal::from(10))
+        );
         let balance_store = shared_state.balance_store.read().await;
         let usdt_balance = balance_store.usdt;
         let usdc_balance = balance_store.usdc;
@@ -977,7 +987,11 @@ impl Ordering {
         Self::validate_trade_signal(signal, shared_state).await?;
         let now = Instant::now();
         let (available_balance, selected_quote_asset) = Self::select_balance_for_trade(signal, cfg, shared_state).await?;
-        let min_margin = utils::f64_to_decimal(cfg.min_margin_usd, Decimal::from(10));
+        // Use config value, fallback to 10 USD if parsing fails
+        let min_margin = utils::f64_to_decimal(
+            cfg.min_margin_usd, 
+            Decimal::from_str("10").unwrap_or(Decimal::from(10))
+        );
         if available_balance < min_margin {
             debug!(
                 symbol = %signal.symbol,
