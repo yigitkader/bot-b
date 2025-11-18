@@ -36,6 +36,7 @@ pub enum LogEvent {
         order_id: String,
         reason: String,
         fill_rate: f64,
+        cancellation_duration_ms: Option<u64>, // Time from order creation to cancellation
     },
     #[serde(rename = "position_updated")]
     PositionUpdated {
@@ -152,7 +153,7 @@ impl JsonLogger {
         };
         self.send_event(event);
     }
-    pub fn log_order_canceled(&self, symbol: &str, order_id: &str, reason: &str, fill_rate: f64, event_timestamp: Option<Instant>) {
+    pub fn log_order_canceled(&self, symbol: &str, order_id: &str, reason: &str, fill_rate: f64, event_timestamp: Option<Instant>, cancellation_duration_ms: Option<u64>) {
         let timestamp_ms = event_timestamp
             .map(|ts| Self::instant_to_timestamp_ms(ts))
             .unwrap_or_else(|| Self::timestamp_ms());
@@ -162,6 +163,7 @@ impl JsonLogger {
             order_id: order_id.to_string(),
             reason: reason.to_string(),
             fill_rate,
+            cancellation_duration_ms,
         };
         self.send_event(event);
     }
@@ -269,6 +271,9 @@ impl Logging {
         let event_bus_order = event_bus.clone();
         let shutdown_flag_order = shutdown_flag.clone();
         tokio::spawn(async move {
+            use std::collections::HashMap;
+            use tokio::sync::RwLock;
+            let order_creation_times_local: Arc<RwLock<HashMap<String, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
             let mut order_update_rx = event_bus_order.subscribe_order_update();
             info!("LOGGING: Started, listening to OrderUpdate events");
             loop {
@@ -278,7 +283,20 @@ impl Logging {
                             break;
                         }
                         match update.status {
+                            crate::event_bus::OrderStatus::New => {
+                                // Track order creation time
+                                let mut times = order_creation_times_local.write().await;
+                                times.insert(update.order_id.clone(), update.timestamp);
+                                info!(
+                                    symbol = %update.symbol,
+                                    order_id = %update.order_id,
+                                    "LOGGING: Order created (New status)"
+                                );
+                            }
                             crate::event_bus::OrderStatus::Filled => {
+                                // Clean up order creation time tracking
+                                let mut times = order_creation_times_local.write().await;
+                                times.remove(&update.order_id);
                                 json_logger_order.log_order_filled(
                                     &update.symbol,
                                     &update.order_id,
@@ -292,31 +310,106 @@ impl Logging {
                                 );
                             }
                             crate::event_bus::OrderStatus::Canceled => {
+                                // Calculate cancellation duration
+                                let times = order_creation_times_local.read().await;
+                                let order_creation_time = times.get(&update.order_id);
+                                let cancellation_duration_ms = order_creation_time
+                                    .map(|creation_time| {
+                                        update.timestamp.duration_since(*creation_time).as_millis() as u64
+                                    });
+                                drop(times);
+                                let mut times = order_creation_times_local.write().await;
+                                times.remove(&update.order_id);
+                                
+                                // Log order cancellation with cancellation duration
                                 json_logger_order.log_order_canceled(
                                     &update.symbol,
                                     &update.order_id,
                                     "Order canceled",
                                     1.0,
                                     Some(update.timestamp),
+                                    cancellation_duration_ms,
                                 );
+                                
+                                // Log to console with visibility
+                                if let Some(duration_ms) = cancellation_duration_ms {
+                                    if duration_ms < 5000 {
+                                        warn!(
+                                            symbol = %update.symbol,
+                                            order_id = %update.order_id,
+                                            cancellation_duration_ms = duration_ms,
+                                            "LOGGING: ⚠️ Order canceled quickly after placement ({}ms) - check ORDERING logs for details",
+                                            duration_ms
+                                        );
+                                    } else {
+                                        info!(
+                                            symbol = %update.symbol,
+                                            order_id = %update.order_id,
+                                            cancellation_duration_ms = duration_ms,
+                                            "LOGGING: Order canceled (was open for {}ms)",
+                                            duration_ms
+                                        );
+                                    }
+                                } else {
+                                    info!(
+                                        symbol = %update.symbol,
+                                        order_id = %update.order_id,
+                                        "LOGGING: Order canceled (creation time not tracked)"
+                                    );
+                                }
                             }
                             crate::event_bus::OrderStatus::Expired | crate::event_bus::OrderStatus::ExpiredInMatch => {
+                                // Calculate expiration duration
+                                let times = order_creation_times_local.read().await;
+                                let order_creation_time = times.get(&update.order_id);
+                                let expiration_duration_ms = order_creation_time
+                                    .map(|creation_time| {
+                                        update.timestamp.duration_since(*creation_time).as_millis() as u64
+                                    });
+                                drop(times);
+                                let mut times = order_creation_times_local.write().await;
+                                times.remove(&update.order_id);
+                                
                                 json_logger_order.log_order_canceled(
                                     &update.symbol,
                                     &update.order_id,
                                     "Order expired",
                                     1.0,
                                     Some(update.timestamp),
+                                    expiration_duration_ms,
                                 );
                             }
                             crate::event_bus::OrderStatus::Rejected => {
+                                // Calculate rejection duration
+                                let times = order_creation_times_local.read().await;
+                                let order_creation_time = times.get(&update.order_id);
+                                let rejection_duration_ms = order_creation_time
+                                    .map(|creation_time| {
+                                        update.timestamp.duration_since(*creation_time).as_millis() as u64
+                                    });
+                                drop(times);
+                                let mut times = order_creation_times_local.write().await;
+                                times.remove(&update.order_id);
+                                
                                 json_logger_order.log_order_canceled(
                                     &update.symbol,
                                     &update.order_id,
                                     "Order rejected",
                                     1.0,
                                     Some(update.timestamp),
+                                    rejection_duration_ms,
                                 );
+                                
+                                if let Some(duration_ms) = rejection_duration_ms {
+                                    warn!(
+                                        symbol = %update.symbol,
+                                        order_id = %update.order_id,
+                                        rejection_duration_ms = duration_ms,
+                                        rejection_reason = ?update.rejection_reason,
+                                        "LOGGING: Order rejected ({}ms after placement)",
+                                        duration_ms
+                                    );
+                                }
                             }
                             _ => {
                                 info!(

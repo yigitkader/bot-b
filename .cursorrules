@@ -1,0 +1,125 @@
+# Cursor AI Rules for Trading Bot Project
+
+## 🎯 Project Context
+This is a Rust-based trading bot for Binance Futures with event-driven architecture.
+
+## 📋 Code Standards
+
+### 1. NO Mock/Dummy Data in Production Code
+- ❌ NEVER use hardcoded test values (e.g., `50000`, `100.0`) in `src/` files
+- ✅ ALWAYS use real API data or config values
+- ✅ Test files (`tests/`) can use mock data, but prefer real API data
+- ✅ Fallback values MUST come from config, not hardcoded
+
+### 2. Config-Driven Parameters
+- ✅ ALL parameters MUST come from `config.yaml` via `AppCfg`
+- ✅ Provide default values for all config fields
+- ✅ NEVER hardcode business logic values
+- ✅ Use `#[serde(default = "default_function")]` for defaults
+
+### 3. Error Handling
+- ❌ NEVER use `unwrap()` in production code (only in tests)
+- ✅ ALWAYS use `Result<T>` pattern
+- ✅ Use `anyhow::Error` with context
+- ✅ Handle Mutex/RwLock poisoning gracefully
+- ✅ Use `unwrap_or_else()` for safe fallbacks
+
+### 4. Lifetime & Ownership
+- ❌ NEVER use `&self` inside `tokio::spawn` closures
+- ✅ ALWAYS clone required values before `tokio::spawn`
+- ✅ Use `Arc<T>` for shared ownership
+- ✅ Clone config before moving into async tasks
+
+### 5. Thread Safety
+- ✅ Use `Arc<T>` for shared state
+- ✅ Use `RwLock` for read-heavy, `Mutex` for write-heavy
+- ✅ Handle poisoning with `match` or `unwrap_or_else`
+- ✅ Use atomic operations when appropriate
+
+### 6. Event Bus Pattern
+- ✅ Subscribe to events via `event_bus.subscribe_*()`
+- ✅ Publish events via `event_bus.*_tx.send()`
+- ✅ Use broadcast channels for multi-subscriber events
+- ✅ Include timestamps in all events
+
+### 7. Rate Limiting
+- ✅ ALWAYS use `crate::utils::rate_limit_guard(weight).await` before API calls
+- ✅ Use correct weight values (see Binance API docs)
+- ✅ Never bypass rate limiting
+
+### 8. Type Safety
+- ✅ Use type aliases: `Px`, `Qty`, `Side`
+- ✅ Prefer `Decimal` over `f64` for financial calculations
+- ✅ Use `Option<T>` for optional values
+- ✅ Use `Result<T>` for fallible operations
+
+### 9. Documentation
+- ✅ Add doc comments for all public functions
+- ✅ Document complex logic with inline comments
+- ✅ Update `ARCHITECTURE.md` when adding modules
+- ✅ Update `MODULE_DOCUMENTATION.md` when changing modules
+
+### 10. Testing
+- ✅ Write unit tests for each module
+- ✅ Use real API data in integration tests (no mocks)
+- ✅ Test error cases, not just happy paths
+- ✅ Run `cargo test` before committing
+
+## 🔍 Code Review Checklist
+
+Before making changes, check:
+1. ✅ No mock/dummy data in production code
+2. ✅ All parameters from config
+3. ✅ Proper error handling (no unwrap)
+4. ✅ Lifetime safety (no &self in tokio::spawn)
+5. ✅ Thread safety (Arc, Mutex, RwLock)
+6. ✅ Rate limiting on API calls
+7. ✅ Type safety (Decimal, Option, Result)
+8. ✅ Documentation updated
+9. ✅ Tests pass
+
+## 🚨 Red Flags (Fix Immediately)
+
+- `unwrap()` in production code
+- Hardcoded values instead of config
+- Mock data in `src/` files
+- `&self` in `tokio::spawn`
+- Race conditions
+- Memory leaks
+- Panic risks
+
+## 📚 Architecture
+
+- **Event-Driven**: Modules communicate via EventBus
+- **Modular**: Each module has single responsibility
+- **Config-Driven**: All parameters from config.yaml
+- **Thread-Safe**: Arc + Mutex/RwLock pattern
+- **No Mock Data**: Real API data in production
+
+## 🔄 Module Dependencies
+
+See `ARCHITECTURE.md` for complete dependency graph.
+
+## 📝 Naming Conventions
+
+- Structs: `PascalCase` (e.g., `MarketTick`)
+- Functions: `snake_case` (e.g., `calculate_pnl`)
+- Constants: `UPPER_SNAKE_CASE` (e.g., `MAX_POSITION_DURATION_SEC`)
+- Modules: `snake_case` (e.g., `follow_orders`)
+
+## 🧪 Testing Strategy
+
+1. Unit tests in each module (`#[cfg(test)]`)
+2. Integration tests in `tests/backtest.rs` (real API data)
+3. Compile tests in `tests/compile_test.rs`
+
+## 🚀 Adding New Modules
+
+1. Create file in `src/`
+2. Add to `src/lib.rs`
+3. Add to `src/main.rs` imports
+4. Subscribe to EventBus events
+5. Update config if needed
+6. Add tests
+7. Update documentation
+

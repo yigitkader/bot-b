@@ -35,8 +35,27 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all("logs")?;
     let _log_file = std::fs::File::create("logs/console.log")?;
     drop(_log_file);
+    // Filter out noisy external library logs (hyper, reqwest, rustls)
+    // Only show app logs at debug level, external libs at warn or higher
+    use std::str::FromStr;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+        .unwrap_or_else(|_| {
+            let mut filter = tracing_subscriber::EnvFilter::new("debug");
+            // Suppress noisy external library logs
+            if let Ok(d) = tracing_subscriber::filter::Directive::from_str("hyper=warn") {
+                filter = filter.add_directive(d);
+            }
+            if let Ok(d) = tracing_subscriber::filter::Directive::from_str("reqwest=warn") {
+                filter = filter.add_directive(d);
+            }
+            if let Ok(d) = tracing_subscriber::filter::Directive::from_str("rustls=warn") {
+                filter = filter.add_directive(d);
+            }
+            if let Ok(d) = tracing_subscriber::filter::Directive::from_str("hyper_util=warn") {
+                filter = filter.add_directive(d);
+            }
+            filter
+        });
     let file_appender = tracing_appender::rolling::never("logs", "console.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     use tracing_subscriber::layer::SubscriberExt;

@@ -65,69 +65,56 @@ impl Connection {
     }
     pub async fn get_clamped_leverage(&self, symbol: &str, desired_leverage: u32) -> u32 {
         let safe_leverage_fallback = self.cfg.exec.default_leverage;
-        match self.venue.rules_for(symbol).await {
+        // First, try to get coin's max leverage from Binance
+        let coin_max_leverage = match self.venue.rules_for(symbol).await {
             Ok(rules) => {
                 if let Some(symbol_max_lev) = rules.max_leverage {
-                    let clamped = desired_leverage.min(symbol_max_lev);
-                    if clamped < desired_leverage {
-                        debug!(
-                            symbol = %symbol,
-                            desired_leverage,
-                            coin_max_leverage = symbol_max_lev,
-                            final_leverage = clamped,
-                            "CONNECTION: Leverage clamped to coin's max leverage"
-                        );
-                    }
-                    clamped
+                    Some(symbol_max_lev)
                 } else {
-                    if let Some(coin_max_lev) = self.venue.fetch_max_leverage(symbol).await {
-                        let clamped = desired_leverage.min(coin_max_lev);
-                        if clamped < desired_leverage {
-                            debug!(
-                                symbol = %symbol,
-                                desired_leverage,
-                                coin_max_leverage = coin_max_lev,
-                                final_leverage = clamped,
-                                "CONNECTION: Leverage clamped to coin's max leverage (fetched directly)"
-                            );
-                        }
-                        clamped
-                    } else {
-                        let clamped = desired_leverage.min(safe_leverage_fallback);
-                        warn!(
-                            symbol = %symbol,
-                            desired_leverage,
-                            safe_fallback = safe_leverage_fallback,
-                            final_leverage = clamped,
-                            "CONNECTION: Coin's max leverage unavailable, using safe fallback ({}x) - this should be rare",
-                            safe_leverage_fallback
-                        );
-                        clamped
-                    }
+                    // Fallback: try to fetch directly
+                    self.venue.fetch_max_leverage(symbol).await
                 }
             }
-            Err(e) => {
-                if let Some(coin_max_lev) = self.venue.fetch_max_leverage(symbol).await {
-                    let clamped = desired_leverage.min(coin_max_lev);
-                    debug!(
-                        symbol = %symbol,
-                        desired_leverage,
-                        coin_max_leverage = coin_max_lev,
-                        final_leverage = clamped,
-                        "CONNECTION: Leverage clamped to coin's max leverage (fetched after rules_for failed)"
-                    );
-                    clamped
-                } else {
-                    warn!(
-                        error = %e,
-                        symbol = %symbol,
-                        safe_fallback = safe_leverage_fallback,
-                        "CONNECTION: Failed to fetch coin info, using safe fallback ({}x) as last resort",
-                        safe_leverage_fallback
-                    );
-                    desired_leverage.min(safe_leverage_fallback)
-                }
+            Err(_) => {
+                // If rules_for fails, try to fetch directly
+                self.venue.fetch_max_leverage(symbol).await
             }
+        };
+        
+        // Use coin's max leverage if available (this is the primary source)
+        // desired_leverage is only used as a fallback if coin's max leverage is unavailable
+        if let Some(coin_max_lev) = coin_max_leverage {
+            // Use coin's max leverage directly from Binance
+            // If desired_leverage is lower, respect it for safety (user may want lower leverage)
+            let final_leverage = if desired_leverage < coin_max_lev {
+                desired_leverage
+            } else {
+                coin_max_lev
+            };
+            debug!(
+                symbol = %symbol,
+                desired_leverage,
+                coin_max_leverage = coin_max_lev,
+                final_leverage,
+                "CONNECTION: Using coin's max leverage ({}x) from Binance. Final leverage: {}x (desired: {}x)",
+                coin_max_lev,
+                final_leverage,
+                desired_leverage
+            );
+            final_leverage
+        } else {
+            // Coin's max leverage unavailable, use desired_leverage or safe fallback
+            let final_leverage = desired_leverage.min(safe_leverage_fallback);
+            warn!(
+                symbol = %symbol,
+                desired_leverage,
+                safe_fallback = safe_leverage_fallback,
+                final_leverage,
+                "CONNECTION: Coin's max leverage unavailable, using desired leverage ({}) or safe fallback ({}x) - this should be rare",
+                desired_leverage,
+                safe_leverage_fallback
+            );
+            final_leverage
         }
     }
     pub async fn start(&self, symbols: Vec<String>) -> Result<()> {
@@ -1396,7 +1383,8 @@ impl Connection {
             let contract_match = meta.contract_type.as_deref() == Some("PERPETUAL");
             let matches = quote_match && status_match && contract_match;
             if !matches {
-                tracing::debug!(
+                // Only log at trace level - too verbose during discovery (1800+ symbols)
+                tracing::trace!(
                     symbol = %meta.symbol,
                     quote_asset = %meta.quote_asset,
                     status = ?meta.status,
@@ -1404,7 +1392,7 @@ impl Connection {
                     quote_match,
                     status_match,
                     contract_match,
-                    "symbol filtered out during discovery"
+                    "Symbol filtered out during discovery"
                 );
             }
             matches

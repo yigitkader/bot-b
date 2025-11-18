@@ -1330,6 +1330,7 @@ impl Ordering {
             }
         }
         {
+            let order_creation_time = Instant::now();
             let mut state_guard = shared_state.ordering_state.lock().await;
             if state_guard.open_order.is_none() && state_guard.open_position.is_none() {
                 state_guard.open_order = Some(OpenOrder {
@@ -1338,7 +1339,9 @@ impl Ordering {
                     side: signal.side,
                     qty: calculated_size,
                 });
-                state_guard.last_order_update_timestamp = Some(Instant::now());
+                // Track order creation time to detect quick cancellations
+                state_guard.order_creation_times.insert(order_id.clone(), order_creation_time);
+                state_guard.last_order_update_timestamp = Some(order_creation_time);
                 Self::publish_state_and_drop(state_guard, event_bus);
                 {
                     let mut state_guard = shared_state.ordering_state.lock().await;
@@ -1612,6 +1615,8 @@ impl Ordering {
                 match update.status {
                     crate::event_bus::OrderStatus::Filled => {
                         state_guard.order_timeouts.remove(&update.order_id);
+                        // Clean up order creation time tracking
+                        state_guard.order_creation_times.remove(&update.order_id);
                         if let Some(ref existing_pos) = state_guard.open_position {
                             if existing_pos.symbol == update.symbol {
                                 let position_is_newer = Self::is_timestamp_older(
@@ -1700,27 +1705,61 @@ impl Ordering {
                     }
                     crate::event_bus::OrderStatus::Canceled => {
                         state_guard.order_timeouts.remove(&update.order_id);
+                        // Check if this was a quick cancellation (order created and canceled within short time)
+                        let order_creation_time = state_guard.order_creation_times.remove(&update.order_id);
+                        let cancellation_duration = order_creation_time
+                            .map(|creation_time| update.timestamp.duration_since(creation_time))
+                            .unwrap_or_else(|| Duration::from_secs(0));
+                        const QUICK_CANCEL_THRESHOLD_SECS: u64 = 5; // 5 seconds
+                        let is_quick_cancel = cancellation_duration.as_secs() < QUICK_CANCEL_THRESHOLD_SECS;
+                        
+                        if is_quick_cancel {
+                            warn!(
+                                symbol = %update.symbol,
+                                order_id = %update.order_id,
+                                cancellation_duration_ms = cancellation_duration.as_millis(),
+                                cancellation_duration_secs = cancellation_duration.as_secs_f64(),
+                                "ORDERING: ⚠️ Order canceled quickly after placement ({}ms) - this may indicate market conditions changed or order was immediately rejected",
+                                cancellation_duration.as_millis()
+                            );
+                        } else {
+                            info!(
+                                symbol = %update.symbol,
+                                order_id = %update.order_id,
+                                cancellation_duration_ms = cancellation_duration.as_millis(),
+                                cancellation_duration_secs = cancellation_duration.as_secs_f64(),
+                                "ORDERING: Order canceled (was open for {}ms)",
+                                cancellation_duration.as_millis()
+                            );
+                        }
                         Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
                         Self::publish_state_and_drop(state_guard, event_bus);
-                        info!(
-                            symbol = %update.symbol,
-                            order_id = %update.order_id,
-                            "ORDERING: Order canceled"
-                        );
                     }
                     crate::event_bus::OrderStatus::Expired
                     | crate::event_bus::OrderStatus::ExpiredInMatch => {
                         state_guard.order_timeouts.remove(&update.order_id);
+                        // Check if this was a quick expiration
+                        let order_creation_time = state_guard.order_creation_times.remove(&update.order_id);
+                        let expiration_duration = order_creation_time
+                            .map(|creation_time| update.timestamp.duration_since(creation_time))
+                            .unwrap_or_else(|| Duration::from_secs(0));
                         Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
                         info!(
                             symbol = %update.symbol,
                             order_id = %update.order_id,
                             status = ?update.status,
-                            "ORDERING: Order expired"
+                            expiration_duration_ms = expiration_duration.as_millis(),
+                            "ORDERING: Order expired (was open for {}ms)",
+                            expiration_duration.as_millis()
                         );
                     }
                     crate::event_bus::OrderStatus::Rejected => {
                         state_guard.order_timeouts.remove(&update.order_id);
+                        // Check if this was a quick rejection (order created and rejected immediately)
+                        let order_creation_time = state_guard.order_creation_times.remove(&update.order_id);
+                        let rejection_duration = order_creation_time
+                            .map(|creation_time| update.timestamp.duration_since(creation_time))
+                            .unwrap_or_else(|| Duration::from_secs(0));
                         Self::clear_order_with_timestamp(&mut state_guard, update.timestamp);
                         let rejection_reason = update.rejection_reason.as_deref();
                         let should_open_circuit = state_guard.circuit_breaker.record_rejection(rejection_reason);
@@ -1729,6 +1768,8 @@ impl Ordering {
                                 symbol = %update.symbol,
                                 order_id = %update.order_id,
                                 reject_count = state_guard.circuit_breaker.reject_count,
+                                rejection_duration_ms = rejection_duration.as_millis(),
+                                rejection_reason = ?rejection_reason,
                                 "ORDERING: CRITICAL - Circuit breaker OPENED after {} consecutive rejections. Order placement will be blocked for 1 minute to prevent Binance ban.",
                                 state_guard.circuit_breaker.reject_count
                             );
@@ -1736,9 +1777,12 @@ impl Ordering {
                         warn!(
                             symbol = %update.symbol,
                             order_id = %update.order_id,
-                                reject_count = state_guard.circuit_breaker.reject_count,
-                                "ORDERING: Order rejected ({} consecutive rejections, circuit breaker will open at 5)",
-                                state_guard.circuit_breaker.reject_count
+                            reject_count = state_guard.circuit_breaker.reject_count,
+                            rejection_duration_ms = rejection_duration.as_millis(),
+                            rejection_reason = ?rejection_reason,
+                            "ORDERING: Order rejected ({} consecutive rejections, circuit breaker will open at 5) - order was rejected {}ms after placement",
+                            state_guard.circuit_breaker.reject_count,
+                            rejection_duration.as_millis()
                         );
                         }
                     }

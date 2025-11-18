@@ -632,7 +632,16 @@ impl Trending {
         } else {
             min_score * cfg.weak_trend_score_multiplier
         };
-        debug!(
+        let signal = if score_long >= final_min_score {
+            Some(TrendSignal::Long)
+        } else if score_short >= final_min_score {
+            Some(TrendSignal::Short)
+        } else {
+            None
+        };
+        // Only log score analysis at trace level - too verbose for normal operation (346+ per run)
+        // Signal generation will be logged at info level separately
+        tracing::trace!(
             symbol = %state.symbol,
             score_long,
             score_short,
@@ -650,15 +659,10 @@ impl Trending {
             slope_strong,
             rsi_bullish,
             rsi_bearish,
-            "TRENDING: Score analysis (signal will be generated if score >= threshold)"
+            signal = ?signal,
+            "TRENDING: Score analysis completed"
         );
-        if score_long >= final_min_score {
-            Some(TrendSignal::Long)
-        } else if score_short >= final_min_score {
-            Some(TrendSignal::Short)
-        } else {
-            None
-        }
+        signal
     }
     fn check_spread(tick: &MarketTick, cfg: &Arc<AppCfg>) -> Result<Option<f64>> {
         let spread_bps_f64 = crate::utils::calculate_spread_bps(tick.bid, tick.ask);
@@ -687,26 +691,15 @@ impl Trending {
         if let Some(last_signal) = last_signals_map.get(&tick.symbol) {
             let elapsed = now.duration_since(last_signal.timestamp);
             if elapsed < Duration::from_secs(cooldown_seconds) {
-                let remaining_secs = cooldown_seconds - elapsed.as_secs();
-                let cooldown_threshold = (cooldown_seconds * 4) / 5;
-                if elapsed.as_secs() >= cooldown_threshold {
-                    debug!(
-                        symbol = %tick.symbol,
-                        elapsed_secs = elapsed.as_secs(),
-                        remaining_secs = remaining_secs,
-                        cooldown_secs = cooldown_seconds,
-                        last_signal_side = ?last_signal.side,
-                        "TRENDING: Cooldown check failed - {} seconds elapsed, {} seconds remaining",
-                        elapsed.as_secs(),
-                        remaining_secs
-                    );
-                }
+                // Cooldown check failed - only log at trace level to reduce log noise
+                // This happens frequently and is expected behavior
                 tracing::trace!(
                     symbol = %tick.symbol,
                     elapsed_secs = elapsed.as_secs(),
+                    remaining_secs = cooldown_seconds - elapsed.as_secs(),
                     cooldown_secs = cooldown_seconds,
                     last_signal_side = ?last_signal.side,
-                    "TRENDING: Cooldown check failed (trace)"
+                    "TRENDING: Cooldown check failed"
                 );
                 return Ok(false);
             }

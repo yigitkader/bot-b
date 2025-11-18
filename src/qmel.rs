@@ -609,25 +609,28 @@ impl AutoRiskGovernor {
         target_tick_usd: f64,
         volatility_1s: f64,
         daily_drawdown_pct: f64,
+        coin_max_leverage: f64,
     ) -> f64 {
+        // Use coin's max leverage from Binance instead of config value
+        let effective_max_leverage = coin_max_leverage.min(self.max_leverage);
         let leverage_by_stop = if mmr > 0.0 {
             (self.alpha * stop_distance_pct) / mmr
         } else {
-            self.max_leverage.min(20.0)
+            effective_max_leverage.min(20.0)
         };
         let leverage_by_vol = if volatility_1s > 1e-8 {
             (self.beta * target_tick_usd) / volatility_1s
         } else {
-            self.max_leverage.min(20.0)
+            effective_max_leverage.min(20.0)
         };
         let drawdown_factor = if daily_drawdown_pct > 0.0 {
             (1.0 - daily_drawdown_pct * 0.3).max(0.3)
         } else {
             1.0
         };
-        let base_leverage = leverage_by_stop.min(leverage_by_vol).min(self.max_leverage).min(20.0);
+        let base_leverage = leverage_by_stop.min(leverage_by_vol).min(effective_max_leverage).min(20.0);
         let final_leverage = base_leverage * drawdown_factor;
-        final_leverage.max(1.0).min(20.0).min(self.max_leverage)
+        final_leverage.max(1.0).min(20.0).min(effective_max_leverage)
     }
 }
 pub struct ExecutionOptimizer {
@@ -829,4 +832,42 @@ impl RegimeClassifier {
         state.cancel_trade_ratio > self.cancel_trade_threshold * 2.0
             || (state.volatility_1s > state.volatility_5s * 3.0 && state.volatility_1s > 0.1)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Unit tests that only test algorithm logic without mock data
+    // All tests with real market data should be in tests/ directory
+
+    #[test]
+    fn test_feature_extractor_new() {
+        let extractor = FeatureExtractor::new();
+        assert_eq!(extractor.vol_1s_ewma, 0.0);
+        assert_eq!(extractor.vol_5s_ewma, 0.0);
+        assert!(extractor.last_price.is_none());
+        assert!(extractor.price_history_1s.is_empty());
+    }
+
+    #[test]
+    fn test_get_cancel_trade_ratio() {
+        let mut extractor = FeatureExtractor::new();
+        // Initially should be 0
+        let ratio = extractor.get_cancel_trade_ratio();
+        assert_eq!(ratio, 0.0);
+        
+        // Record some trades and cancels
+        extractor.record_trade();
+        extractor.record_trade();
+        extractor.record_cancel();
+        
+        let ratio = extractor.get_cancel_trade_ratio();
+        // Should be 0.5 (1 cancel / 2 trades)
+        assert!((ratio - 0.5).abs() < 0.01);
+    }
+
+    // Note: Tests that require real market data (OrderBook, prices, etc.)
+    // should be in tests/ directory using real Binance API data.
+    // These unit tests only verify algorithm logic without mock data.
 }

@@ -324,6 +324,8 @@ pub struct OrderingState {
     pub reserved_margin: Decimal,
     pub circuit_breaker: CircuitBreakerState,
     pub order_timeouts: std::collections::HashMap<String, Instant>,
+    // Track order creation times to detect quick cancellations
+    pub order_creation_times: std::collections::HashMap<String, Instant>,
 }
 #[derive(Clone, Debug)]
 pub struct CircuitBreakerState {
@@ -347,6 +349,7 @@ impl OrderingState {
                 rejection_reasons: std::collections::HashMap::new(),
             },
             order_timeouts: std::collections::HashMap::new(),
+            order_creation_times: std::collections::HashMap::new(),
         }
     }
 }
