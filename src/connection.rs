@@ -35,7 +35,14 @@ impl Connection {
             .user_agent("bot-b/0.1")
             .build()
             .expect("failed to build reqwest client");
-        Self { config, http }
+        // Rate limiter: Binance Futures API limiti ~1200 requests/minute
+        // Güvenli limit: 20 requests/second = 1200/minute
+        let rate_limiter = Arc::new(tokio::sync::Semaphore::new(20));
+        Self {
+            config,
+            http,
+            rate_limiter,
+        }
     }
 
     pub fn quote_asset(&self) -> &str {
@@ -667,6 +674,11 @@ impl Connection {
         path: &str,
         params: Vec<(String, String)>,
     ) -> Result<reqwest::Response> {
+        // Rate limit kontrolü
+        let _permit = self.rate_limiter.acquire().await.map_err(|_| {
+            anyhow!("rate limiter closed")
+        })?;
+        
         let query = self.sign_params(params)?;
         let url = format!("{}{}?{}", self.config.base_url, path, query);
         let response = self
@@ -676,6 +688,11 @@ impl Connection {
             .send()
             .await?
             .error_for_status()?;
+        
+        // Permit'i bırak (rate limit için)
+        drop(_permit);
+        tokio::time::sleep(Duration::from_millis(50)).await; // ~20 req/s için
+        
         Ok(response)
     }
 
@@ -684,6 +701,11 @@ impl Connection {
         path: &str,
         params: Vec<(String, String)>,
     ) -> Result<reqwest::Response> {
+        // Rate limit kontrolü
+        let _permit = self.rate_limiter.acquire().await.map_err(|_| {
+            anyhow!("rate limiter closed")
+        })?;
+        
         let body = self.sign_params(params)?;
         let url = format!("{}{}", self.config.base_url, path);
         let response = self
@@ -695,6 +717,11 @@ impl Connection {
             .send()
             .await?
             .error_for_status()?;
+        
+        // Permit'i bırak (rate limit için)
+        drop(_permit);
+        tokio::time::sleep(Duration::from_millis(50)).await; // ~20 req/s için
+        
         Ok(response)
     }
 

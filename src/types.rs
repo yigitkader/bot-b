@@ -198,6 +198,7 @@ pub struct BotConfig {
 pub struct Connection {
     pub(crate) config: crate::BotConfig,
     pub(crate) http: Client,
+    pub(crate) rate_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug)]
@@ -433,6 +434,7 @@ pub struct LoggingChannels {
     pub order_update_rx: BReceiver<OrderUpdate>,
     pub position_update_rx: BReceiver<PositionUpdate>,
     pub balance_rx: BReceiver<BalanceSnapshot>,
+    pub signal_rx: MReceiver<TradeSignal>,
 }
 
 #[derive(Clone)]

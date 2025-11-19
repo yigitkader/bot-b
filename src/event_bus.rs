@@ -68,6 +68,7 @@ impl EventBus {
             order_update_rx: self.order_update_tx.subscribe(),
             position_update_rx: self.position_update_tx.subscribe(),
             balance_rx: self.balance_tx.subscribe(),
+            signal_rx: Self::take_receiver(&self.signal_rx, "TradeSignal"),
         }
     }
 
