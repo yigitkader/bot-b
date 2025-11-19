@@ -10,7 +10,9 @@ use log::{info, warn};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::Sha256;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::{
     sync::RwLock,
     time::{interval, sleep, Duration},
@@ -48,6 +50,29 @@ impl Connection {
         &self.config.quote_asset
     }
 
+    pub async fn fetch_snapshot(&self) -> Result<MarketTick> {
+        let premium = self.fetch_premium_index().await?;
+        let (symbol, price, funding_rate, ts) = premium.into_parts()?;
+        let obi = self.fetch_depth_obi().await?;
+        let (liq_long, liq_short) = self
+            .fetch_liquidation_clusters()
+            .await
+            .unwrap_or((None, None));
+
+        Ok(MarketTick {
+            symbol,
+            price,
+            bid: price,
+            ask: price,
+            volume: 0.0,
+            ts,
+            obi,
+            funding_rate,
+            liq_long_cluster: liq_long,
+            liq_short_cluster: liq_short,
+        })
+    }
+
     pub async fn run_market_ws(self: Arc<Self>, ch: ConnectionChannels) -> Result<()> {
         let depth_state = Arc::new(RwLock::new(DepthState::new(20)));
         let liq_state = Arc::new(RwLock::new(LiqState::default()));
@@ -55,12 +80,14 @@ impl Connection {
         loop {
             let mark_stream = self.clone();
             let depth_stream = self.clone();
-            let liq_stream = self.clone();
+            let liq_stream_conn = self.clone();
+            let liq_oi_conn = self.clone();
             let ch_mark = ch.clone();
             let depth_for_mark = depth_state.clone();
             let depth_for_depth = depth_state.clone();
             let liq_for_mark = liq_state.clone();
-            let liq_for_task = liq_state.clone();
+            let liq_for_stream = liq_state.clone();
+            let liq_for_oi = liq_state.clone();
 
             let mark_task = tokio::spawn(async move {
                 mark_stream
@@ -71,13 +98,18 @@ impl Connection {
                 tokio::spawn(
                     async move { depth_stream.consume_depth_stream(depth_for_depth).await },
                 );
-            let liq_task = tokio::spawn(async move {
-                if let Err(err) = liq_stream.run_liq_oi_pollers(liq_for_task).await {
-                    warn!("CONNECTION: liq/OI poller exited: {err:?}");
+            let liq_stream_task = tokio::spawn(async move {
+                if let Err(err) = liq_stream_conn.run_liq_stream(liq_for_stream).await {
+                    warn!("CONNECTION: liq stream exited: {err:?}");
+                }
+            });
+            let liq_oi_task = tokio::spawn(async move {
+                if let Err(err) = liq_oi_conn.run_open_interest_poller(liq_for_oi).await {
+                    warn!("CONNECTION: open interest poller exited: {err:?}");
                 }
             });
 
-            let _ = tokio::join!(mark_task, depth_task, liq_task);
+            let _ = tokio::join!(mark_task, depth_task, liq_stream_task, liq_oi_task);
             warn!("CONNECTION: market streams stopped. Reconnecting soon...");
             sleep(Duration::from_secs(2)).await;
         }
@@ -335,19 +367,103 @@ impl Connection {
         }
     }
 
-    async fn run_liq_oi_pollers(self: Arc<Self>, liq_state: Arc<RwLock<LiqState>>) -> Result<()> {
+    async fn run_liq_stream(self: Arc<Self>, liq_state: Arc<RwLock<LiqState>>) -> Result<()> {
+        let stream_symbol = self.config.symbol.to_lowercase();
+        let ws_url = format!(
+            "{}/ws/{}@forceOrder",
+            self.config.ws_base_url.trim_end_matches('/'),
+            stream_symbol
+        );
+
+        loop {
+            match connect_async(&ws_url).await {
+                Ok((ws_stream, _)) => {
+                    info!("CONNECTION: liquidation stream connected ({ws_url})");
+                    let (_, mut read) = ws_stream.split();
+                    while let Some(msg) = read.next().await {
+                        match msg {
+                            Ok(Message::Text(txt)) => {
+                                self.handle_force_order_message(&txt, &liq_state).await?;
+                            }
+                            Ok(Message::Binary(bin)) => {
+                                if let Ok(txt) = String::from_utf8(bin) {
+                                    self.handle_force_order_message(&txt, &liq_state).await?;
+                                }
+                            }
+                            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
+                            }
+                            Ok(Message::Close(frame)) => {
+                                warn!("CONNECTION: liq stream closed: {:?}", frame);
+                                break;
+                            }
+                            Err(err) => {
+                                warn!("CONNECTION: liq stream error: {err}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => warn!("CONNECTION: liq stream connect error: {err:?}"),
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn handle_force_order_message(
+        &self,
+        payload: &str,
+        liq_state: &Arc<RwLock<LiqState>>,
+    ) -> Result<()> {
+        if let Ok(wrapper) = serde_json::from_str::<ForceOrderStreamWrapper>(payload) {
+            self.ingest_force_order(wrapper.data.order, liq_state)
+                .await?;
+        } else if let Ok(event) = serde_json::from_str::<ForceOrderStreamEvent>(payload) {
+            self.ingest_force_order(event.order, liq_state).await?;
+        }
+        Ok(())
+    }
+
+    async fn ingest_force_order(
+        &self,
+        order: ForceOrderStreamOrder,
+        liq_state: &Arc<RwLock<LiqState>>,
+    ) -> Result<()> {
+        if order.symbol != self.config.symbol {
+            return Ok(());
+        }
+        let qty = order
+            .last_filled
+            .as_deref()
+            .or_else(|| order.executed_qty.as_deref())
+            .or_else(|| order.orig_qty.as_deref())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let price = order
+            .avg_price
+            .as_deref()
+            .or_else(|| order.price.as_deref())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let notional = qty * price;
+        if notional <= 0.0 {
+            return Ok(());
+        }
+        liq_state.write().await.record(&order.side, notional);
+        Ok(())
+    }
+
+    async fn run_open_interest_poller(
+        self: Arc<Self>,
+        liq_state: Arc<RwLock<LiqState>>,
+    ) -> Result<()> {
         let mut ticker = interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
-            match self.fetch_liquidation_clusters().await {
-                Ok((long, short)) => {
-                    liq_state.write().await.update(long, short);
-                }
-                Err(err) => warn!("CONNECTION: liq snapshot fetch failed: {err:?}"),
+            match self.fetch_open_interest().await {
+                Ok(value) => liq_state.write().await.set_open_interest(value),
+                Err(err) => warn!("CONNECTION: open interest fetch failed: {err:?}"),
             }
         }
-        #[allow(unreachable_code)]
-        Ok(())
     }
 
     async fn create_listen_key(&self) -> Result<String> {
@@ -451,21 +567,21 @@ impl Connection {
     }
 
     async fn fetch_liquidation_clusters(&self) -> Result<(Option<f64>, Option<f64>)> {
-        let url = format!("{}/fapi/v1/liquidationOrders", self.config.base_url);
-        let response = self
-            .http
-            .get(&url)
-            .query(&[("symbol", self.config.symbol.as_str()), ("limit", "100")])
-            .send()
+        let params = vec![
+            ("symbol".to_string(), self.config.symbol.clone()),
+            ("limit".to_string(), "100".to_string()),
+            ("autoCloseType".to_string(), "LIQUIDATION".to_string()),
+        ];
+        let records = self
+            .signed_get("/fapi/v1/forceOrders", params)
             .await?
-            .error_for_status()?
-            .json::<Vec<LiquidationOrder>>()
+            .json::<Vec<ForceOrderRecord>>()
             .await?;
 
         let mut long_total = 0.0;
         let mut short_total = 0.0;
 
-        for order in response {
+        for order in records {
             let qty = order
                 .executed_qty
                 .as_deref()
@@ -487,20 +603,11 @@ impl Connection {
         }
 
         let oi = self.fetch_open_interest().await.unwrap_or(0.0);
-        let normalize = |value: f64| if oi > 0.0 { value / oi } else { value };
-
-        let long_cluster = if long_total > 0.0 {
-            Some(normalize(long_total))
-        } else {
-            None
-        };
-        let short_cluster = if short_total > 0.0 {
-            Some(normalize(short_total))
-        } else {
-            None
-        };
-
-        Ok((long_cluster, short_cluster))
+        if oi <= 0.0 {
+            return Ok((None, None));
+        }
+        let normalize = |value: f64| if value > 0.0 { Some(value / oi) } else { None };
+        Ok((normalize(long_total), normalize(short_total)))
     }
 
     async fn fetch_open_interest(&self) -> Result<f64> {
@@ -518,6 +625,49 @@ impl Connection {
         resp.open_interest
             .parse::<f64>()
             .context("failed to parse open interest")
+    }
+
+    async fn fetch_depth_obi(&self) -> Result<Option<f64>> {
+        let url = format!("{}/fapi/v1/depth", self.config.base_url);
+        let snapshot = self
+            .http
+            .get(&url)
+            .query(&[("symbol", self.config.symbol.as_str()), ("limit", "20")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DepthSnapshot>()
+            .await?;
+
+        let bid_sum: f64 = snapshot
+            .bids
+            .iter()
+            .filter_map(|lvl| lvl[1].parse::<f64>().ok())
+            .sum();
+        let ask_sum: f64 = snapshot
+            .asks
+            .iter()
+            .filter_map(|lvl| lvl[1].parse::<f64>().ok())
+            .sum();
+        if bid_sum > 0.0 && ask_sum > 0.0 {
+            Ok(Some(bid_sum / ask_sum))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn fetch_premium_index(&self) -> Result<PremiumIndex> {
+        let url = format!("{}/fapi/v1/premiumIndex", self.config.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("symbol", self.config.symbol.as_str())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<PremiumIndex>()
+            .await?;
+        Ok(resp)
     }
 
     async fn signed_get(
@@ -600,7 +750,7 @@ struct DepthEvent {
 }
 
 #[derive(Debug, Deserialize)]
-struct LiquidationOrder {
+struct ForceOrderRecord {
     #[serde(rename = "side")]
     side: String,
     #[serde(rename = "avgPrice")]
@@ -614,9 +764,78 @@ struct LiquidationOrder {
 }
 
 #[derive(Debug, Deserialize)]
+struct ForceOrderStreamWrapper {
+    data: ForceOrderStreamEvent,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceOrderStreamEvent {
+    #[serde(rename = "o")]
+    order: ForceOrderStreamOrder,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceOrderStreamOrder {
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "S")]
+    side: String,
+    #[serde(rename = "p")]
+    price: Option<String>,
+    #[serde(rename = "ap")]
+    avg_price: Option<String>,
+    #[serde(rename = "q")]
+    orig_qty: Option<String>,
+    #[serde(rename = "l")]
+    last_filled: Option<String>,
+    #[serde(rename = "z")]
+    executed_qty: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenInterestResponse {
     #[serde(rename = "openInterest")]
     open_interest: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepthSnapshot {
+    bids: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PremiumIndex {
+    #[serde(rename = "symbol")]
+    symbol: String,
+    #[serde(rename = "markPrice")]
+    mark_price_str: String,
+    #[serde(rename = "lastFundingRate")]
+    last_funding_rate: Option<String>,
+    #[serde(rename = "time")]
+    event_time_ms: u64,
+}
+
+impl PremiumIndex {
+    fn mark_price(&self) -> Result<f64> {
+        self.mark_price_str
+            .parse::<f64>()
+            .context("failed to parse mark price")
+    }
+
+    fn funding_rate(&self) -> Option<f64> {
+        self.last_funding_rate
+            .as_ref()
+            .and_then(|v| v.parse::<f64>().ok())
+    }
+
+    fn into_parts(self) -> Result<(String, f64, Option<f64>, DateTime<Utc>)> {
+        let price = self.mark_price()?;
+        let funding = self.funding_rate();
+        let ts = DateTime::<Utc>::from_timestamp_millis(self.event_time_ms as i64)
+            .unwrap_or_else(|| Utc::now());
+        Ok((self.symbol, price, funding, ts))
+    }
 }
 
 struct DepthState {
@@ -672,20 +891,77 @@ impl DepthState {
     }
 }
 
+const LIQ_WINDOW_SECS: u64 = 30;
+
 #[derive(Default)]
 struct LiqState {
-    liq_long: Option<f64>,
-    liq_short: Option<f64>,
+    entries: VecDeque<LiqEntry>,
+    long_sum: f64,
+    short_sum: f64,
+    open_interest: f64,
+}
+
+struct LiqEntry {
+    ts: Instant,
+    ratio: f64,
+    is_long_cluster: bool,
 }
 
 impl LiqState {
-    fn update(&mut self, long: Option<f64>, short: Option<f64>) {
-        self.liq_long = long;
-        self.liq_short = short;
+    fn record(&mut self, side: &str, notional: f64) {
+        if self.open_interest <= f64::EPSILON || notional <= 0.0 {
+            return;
+        }
+        let ratio = notional / self.open_interest;
+        let now = Instant::now();
+        let is_long_cluster = side.eq_ignore_ascii_case("SELL");
+        self.entries.push_back(LiqEntry {
+            ts: now,
+            ratio,
+            is_long_cluster,
+        });
+        if is_long_cluster {
+            self.long_sum += ratio;
+        } else {
+            self.short_sum += ratio;
+        }
+        self.prune(now);
+    }
+
+    fn set_open_interest(&mut self, value: f64) {
+        if value > 0.0 {
+            self.open_interest = value;
+        }
     }
 
     fn snapshot(&self) -> (Option<f64>, Option<f64>) {
-        (self.liq_long, self.liq_short)
+        (
+            if self.long_sum > 0.0 {
+                Some(self.long_sum)
+            } else {
+                None
+            },
+            if self.short_sum > 0.0 {
+                Some(self.short_sum)
+            } else {
+                None
+            },
+        )
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(entry) = self.entries.front() {
+            if now.duration_since(entry.ts) > StdDuration::from_secs(LIQ_WINDOW_SECS) {
+                let entry = self.entries.pop_front().unwrap();
+                if entry.is_long_cluster {
+                    self.long_sum = (self.long_sum - entry.ratio).max(0.0);
+                } else {
+                    self.short_sum = (self.short_sum - entry.ratio).max(0.0);
+                }
+            } else {
+                break;
+            }
+        }
     }
 }
 

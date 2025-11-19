@@ -1,23 +1,12 @@
-mod balance;
-mod config;
-mod connection;
-mod event_bus;
-mod follow_orders;
-mod logging;
-mod ordering;
-mod state;
-mod trending;
-mod types;
-
-use crate::config::BotConfig;
-use crate::connection::Connection;
-use crate::event_bus::EventBus;
-use crate::state::SharedState;
 use anyhow::Result;
 use futures::future::join_all;
 use log::{error, info};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use trading_bot::{
+    balance, config::BotConfig, connection::Connection, event_bus::EventBus, follow_orders,
+    logging, ordering, state::SharedState, trending,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {

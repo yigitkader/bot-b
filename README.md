@@ -1,54 +1,5 @@
-trading-bot/
-├── Cargo.toml
-├── config.yaml
-└── crates/
-├── bot_core/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-├── strategy/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-├── risk/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-├── exec/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-├── data/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-│   └── src/binance_ws.rs
-├── monitor/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-├── backtest/
-│   ├── Cargo.toml
-│   └── src/lib.rs
-└── app/
-├── Cargo.toml
-└── src/main.rs
+cargo test backtest_replays_real_binance_ticks
 
+FORCE_RECORD=1 cargo test backtest_replays_real_binance_ticks
 
-
-
-
-
-
-
-RUST_LOG=info ./target/debug/app --config ./config.yaml
-
-Yapılan işlemler:
-
-RUST_LOG=info → Log seviyesini info olarak ayarlar.
-
-./target/debug/app → Derlenmiş uygulamayı çalıştırır.
-
---config ./config.yaml → Uygulamanın ayarlarını (symbol, strategy, risk vs.) config.yaml dosyasından yükler.
-
-
-
-# Tüm testleri çalıştır
-cargo test --lib
-cargo test --test compile_test
-cargo test --test backtest -- --ignored --nocapture
-cargo test --test trending_success_test -- --ignored --nocapture
+FORCE_RECORD=1 RECORD_SAMPLES=30 cargo test backtest_replays_real_binance_ticks

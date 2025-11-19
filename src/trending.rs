@@ -126,7 +126,7 @@ impl Atr {
     }
 }
 
-struct TrendEngine {
+pub struct TrendEngine {
     ema_fast: Ema,
     ema_slow: Ema,
     rsi: Rsi,
@@ -134,11 +134,11 @@ struct TrendEngine {
     tick_count: usize,
     last_atr: Option<f64>,
     last_signal_ts: Option<DateTime<Utc>>,
-    params: TrendParams,
+    pub params: TrendParams,
 }
 
 impl TrendEngine {
-    fn new(params: TrendParams) -> Self {
+    pub fn new(params: TrendParams) -> Self {
         Self {
             ema_fast: Ema::new(params.ema_fast_period),
             ema_slow: Ema::new(params.ema_slow_period),
@@ -155,14 +155,14 @@ impl TrendEngine {
         self.tick_count >= self.params.warmup_min_ticks
     }
 
-    fn can_emit_signal(&self, now: DateTime<Utc>) -> bool {
+    pub fn can_emit_signal(&self, now: DateTime<Utc>) -> bool {
         match self.last_signal_ts {
             None => true,
             Some(last) => (now - last).num_seconds() >= self.params.signal_cooldown_secs,
         }
     }
 
-    fn on_tick(&mut self, tick: &MarketTick) -> Option<Side> {
+    pub fn on_tick(&mut self, tick: &MarketTick) -> Option<Side> {
         self.tick_count += 1;
         let price = tick.price;
 
@@ -357,7 +357,7 @@ impl TrendEngine {
         }
     }
 
-    fn mark_signal_emitted(&mut self, ts: DateTime<Utc>) {
+    pub fn mark_signal_emitted(&mut self, ts: DateTime<Utc>) {
         self.last_signal_ts = Some(ts);
     }
 }
@@ -408,3 +408,4 @@ pub async fn run_trending(mut ch: TrendingChannels, params: TrendParams) {
         }
     }
 }
+
