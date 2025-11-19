@@ -44,3 +44,11 @@ RUST_LOG=info → Log seviyesini info olarak ayarlar.
 ./target/debug/app → Derlenmiş uygulamayı çalıştırır.
 
 --config ./config.yaml → Uygulamanın ayarlarını (symbol, strategy, risk vs.) config.yaml dosyasından yükler.
+
+
+
+# Tüm testleri çalıştır
+cargo test --lib
+cargo test --test compile_test
+cargo test --test backtest -- --ignored --nocapture
+cargo test --test trending_success_test -- --ignored --nocapture

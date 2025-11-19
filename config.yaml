@@ -36,7 +36,7 @@ min_quote_balance_usd: 20.0  # Minimum quote asset balance threshold (USD) - leg
 # ============================================================================
 # Trading Parameters
 # ============================================================================
-leverage: 100  # Leverage for futures (100x max for HFT strategy - will be clamped to symbol max if lower)
+leverage: 125  # Leverage for futures (fallback if symbol doesn't have max leverage - coin's max leverage (100x, 125x, etc.) will be used when available)
 
 # Price/quantity precision (for quantization)
 # Can be auto-fetched from exchangeInfo, but kept here for determinism
@@ -58,8 +58,8 @@ qty_step: 0.001
 #   * Total costs: ~0.10%
 # - Minimum TP%: SL% (0.08%) + costs (0.10%) = 0.18%
 # - Recommended TP%: 0.2% (safety margin for profitability)
-take_profit_pct: 0.2    # Take profit percentage (0.2% for HFT - ensures profitability after all costs)
-stop_loss_pct: 0.08     # Stop loss percentage (0.08% for HFT - tighter than traditional)
+take_profit_pct: 0.35   # Take profit percentage (increased to 0.35% to ensure more trades meet 0.50 USDT/USDC profit target)
+stop_loss_pct: 0.12     # Stop loss percentage (increased to 0.12% - slightly looser to reduce premature stops, better risk/reward)
 
 # ============================================================================
 # Trend Analysis (for TRENDING module)
@@ -67,9 +67,19 @@ stop_loss_pct: 0.08     # Stop loss percentage (0.08% for HFT - tighter than tra
 trending:
   min_spread_bps: 0.01  # Minimum spread to generate signal (bps) - Binance major pairs (BTC/ETH) have spreads ~0.01-0.03 bps
   max_spread_bps: 200.0 # Maximum spread to generate signal (bps)
-  signal_cooldown_seconds: 5  # Cooldown between signals for same symbol (reduced for high-frequency trading)
+  signal_cooldown_seconds: 12  # Cooldown between signals (balanced: 12s to reduce frequency while still allowing quality signals)
   hft_mode: true  # High-frequency trading mode: allows signals without volume confirmation
-  require_volume_confirmation: false  # Require volume confirmation for trend signals (false = optional in HFT mode)
+  require_volume_confirmation: false  # Volume confirmation optional (false = allow signals with strong trends even without volume)
+  base_min_score: 6.5  # Balanced: 6.5 for quality signals without being too restrictive
+  trend_threshold_hft: 0.5  # Balanced: 0.5 for moderate trend strength (allows more signals while maintaining quality)
+  trend_threshold_normal: 0.6  # Balanced: 0.6 for moderate trend strength
+  weak_trend_score_multiplier: 1.15  # Balanced: 1.15 (between 1.1 and 1.2) for weak trends
+  regime_multiplier_trending: 0.9  # Decreased from 0.95 to 0.9 (more signals in trending markets - more reliable)
+  regime_multiplier_ranging: 1.15  # Balanced: 1.15 (between 1.1 and 1.2) for ranging markets
+  rsi_lower_long: 40.0  # Decreased from 55.0 to 40.0 (earlier long entry - improve long win rate)
+  rsi_upper_long: 65.0  # Decreased from 70.0 to 65.0 (earlier long exit - improve long win rate)
+  atr_sl_multiplier: 2.0  # Optimized: 2.0x ATR for stop loss
+  atr_tp_multiplier: 4.0  # Optimized: 4.0x ATR for take profit
 
 # ============================================================================
 # Binance API Configuration
@@ -85,9 +95,9 @@ binance:
 # Risk Management
 # ============================================================================
 risk:
-  max_leverage: 100  # Maximum leverage limit (100x for HFT strategy)
+  max_leverage: 200  # Maximum leverage limit (informational only - validation removed, coin's max leverage from exchange will be used)
   use_isolated_margin: true  # Use isolated margin (required for high leverage)
-  max_position_notional_usd: 10000.0  # Maximum position notional (USD) - must be >= max_margin_usd (100) * leverage (100) = 10000
+  max_position_notional_usd: 30000.0  # Maximum position notional (USD) - must be >= max_margin_usd (100) * leverage (100) = 10000
   maker_commission_pct: 0.02  # Maker commission rate (percentage, e.g., 0.02 for 0.02%)
   taker_commission_pct: 0.04  # Taker commission rate (percentage, e.g., 0.04 for 0.04%)
 
@@ -105,12 +115,30 @@ websocket:
 exec:
   tif: "post_only"  # Time in force: "gtc" | "ioc" | "post_only"
   default_leverage: 20  # Default leverage (fallback if not set per symbol)
+  
+  # HFT Strategy: Fast open/close for maximum trade frequency
+  # Target: $0.50 profit per trade, 100+ trades per day
+  min_profit_usd: 0.50              # Minimum profit target per trade ($0.50)
+  max_position_duration_sec: 60.0   # Maximum position duration (60s for HFT - was 300s)
+  max_loss_duration_sec: 30.0       # Maximum loss duration before force close (30s for HFT - was 120s)
+  
+  # Time-weighted profit thresholds (aggressive for HFT)
+  # Lower values = close positions earlier with smaller profits
+  time_weighted_threshold_early: 0.3    # Close if profit >= $0.15 within 10 seconds (was 0.6 = $0.30)
+  time_weighted_threshold_normal: 0.5   # Close if profit >= $0.25 within 20 seconds (was 1.0 = $0.50)
+  time_weighted_threshold_mid: 0.3      # Close if profit >= $0.15 within 60 seconds (was 0.4 = $0.20)
+  time_weighted_threshold_late: 0.2     # Close if profit >= $0.10 after 60 seconds (unchanged)
+  
+  # Trailing stop and loss protection
+  trailing_stop_threshold_ratio: 0.5    # Trailing stop at 50% of peak profit
+  max_loss_threshold_ratio: 2.0         # Force close if loss > 2x min_profit ($1.00)
+  stop_loss_threshold_ratio: 0.8        # Stop loss at 80% of min_profit ($0.40)
 
 # ============================================================================
 # Event Bus Configuration
 # ============================================================================
 event_bus:
-  market_tick_buffer: 10000     # Buffer for MarketTick events (high frequency) - increased to handle channel lagging
+  market_tick_buffer: 50000     # Buffer for MarketTick events (high frequency) - increased to handle channel lagging (was 10000, now 50000 to prevent message loss)
   trade_signal_buffer: 1000    # Buffer for TradeSignal events
   close_request_buffer: 1000   # Buffer for CloseRequest events
   order_update_buffer: 1000    # Buffer for OrderUpdate events

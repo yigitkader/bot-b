@@ -60,7 +60,7 @@ fn load_historical_ticks_from_csv(
             bid: Px(bid),
             ask: Px(ask),
             mark_price: Some(Px(price)),
-            volume: Some(volume),
+            volume, // volume is already Option<Decimal>
             timestamp: Instant::now() + Duration::from_secs(line_num as u64),
         });
     }
@@ -726,10 +726,10 @@ async fn fetch_binance_klines(
         
         // Validate real market data
         if close_price <= Decimal::ZERO {
-            return Err(anyhow::anyhow!("Invalid close price from Binance: {} (must be > 0)", close_price));
+            return Err(anyhow::anyhow!("Invalid close price from Binance: {} (must be > 0)", close_price).into());
         }
         if volume < Decimal::ZERO {
-            return Err(anyhow::anyhow!("Invalid volume from Binance: {} (must be >= 0)", volume));
+            return Err(anyhow::anyhow!("Invalid volume from Binance: {} (must be >= 0)", volume).into());
         }
         
         // Use close price as mid price, calculate bid/ask with small spread
@@ -783,7 +783,6 @@ async fn fetch_binance_klines(
 #[tokio::test]
 #[ignore] // Ignore by default - requires internet connection
 async fn test_strategy_with_multiple_binance_symbols() {
-    use chrono::TimeZone;
     
     // ✅ CRITICAL: Test multiple symbols with different price levels and volatility
     // This ensures strategy works across different market conditions
@@ -941,7 +940,6 @@ async fn test_strategy_with_multiple_binance_symbols() {
 #[tokio::test]
 #[ignore] // Ignore by default - requires internet connection
 async fn test_strategy_with_binance_data() {
-    use chrono::TimeZone;
     
     // Test parameters
     let symbol = "BTCUSDT";
@@ -1047,7 +1045,6 @@ async fn test_strategy_with_binance_data() {
 #[tokio::test]
 #[ignore] // Ignore by default - requires internet connection
 async fn test_point_in_time_backtest() {
-    use chrono::TimeZone;
     
     // Test parameters
     let symbol = "BTCUSDT";
@@ -1259,7 +1256,7 @@ async fn test_comprehensive_integration() -> Result<(), Box<dyn std::error::Erro
     
     // Test event bus subscriptions
     let mut market_tick_rx = event_bus.subscribe_market_tick();
-    let mut trade_signal_rx = event_bus.subscribe_trade_signal();
+    let _trade_signal_rx = event_bus.subscribe_trade_signal();
     println!("   ✅ Event bus subscriptions created");
     
     // Test with REAL market data - get current prices first
