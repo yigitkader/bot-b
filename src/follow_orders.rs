@@ -1,4 +1,4 @@
-use crate::event_bus::FollowChannels;
+use crate::types::FollowChannels;
 use crate::types::{CloseRequest, MarketTick, PositionUpdate, Side};
 use chrono::Utc;
 use log::info;

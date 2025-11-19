@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use std::fs;
 use std::str::FromStr;
+use crate::types::{FileConfig, TrendParams};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
     pub api_key: String,
@@ -150,79 +150,7 @@ impl BotConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TrendParams {
-    pub ema_fast_period: usize,
-    pub ema_slow_period: usize,
-    pub rsi_period: usize,
-    pub atr_period: usize,
-    pub leverage: f64,
-    pub position_size_quote: f64,
-    pub rsi_long_min: f64,
-    pub rsi_short_max: f64,
-    pub atr_rising_factor: f64,
-    pub obi_long_min: f64,
-    pub obi_short_max: f64,
-    pub funding_max_for_long: f64,
-    pub funding_min_for_short: f64,
-    pub long_min_score: usize,
-    pub short_min_score: usize,
-    pub signal_cooldown_secs: i64,
-    pub warmup_min_ticks: usize,
-}
 
-// fallback for warmup default referencing EMA slow period
-#[derive(Debug, Default, Deserialize)]
-struct FileConfig {
-    #[serde(default)]
-    symbols: Vec<String>,
-    #[serde(default)]
-    quote_asset: Option<String>,
-    #[serde(default)]
-    leverage: Option<f64>,
-    #[serde(default)]
-    take_profit_pct: Option<f64>,
-    #[serde(default)]
-    stop_loss_pct: Option<f64>,
-    #[serde(default)]
-    max_usd_per_order: Option<f64>,
-    #[serde(default)]
-    trending: Option<FileTrending>,
-    #[serde(default)]
-    binance: Option<FileBinance>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct FileBinance {
-    #[serde(default)]
-    futures_base: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    secret_key: Option<String>,
-    #[serde(default)]
-    recv_window_ms: Option<u64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct FileTrending {
-    #[serde(default)]
-    rsi_lower_long: Option<f64>,
-    #[serde(default)]
-    rsi_upper_long: Option<f64>,
-    #[serde(default)]
-    signal_cooldown_seconds: Option<i64>,
-    #[serde(default)]
-    ema_fast_period: Option<usize>,
-    #[serde(default)]
-    ema_slow_period: Option<usize>,
-    #[serde(default)]
-    rsi_period: Option<usize>,
-    #[serde(default)]
-    atr_period: Option<usize>,
-    #[serde(default)]
-    warmup_min_ticks: Option<usize>,
-}
 
 impl FileConfig {
     fn load(path: &str) -> Option<Self> {

@@ -1,19 +1,15 @@
 use crate::types::{
-    BalanceSnapshot, CloseRequest, MarketTick, OrderUpdate, PositionUpdate, TradeSignal,
+    BalanceChannels, BalanceSnapshot, CloseRequest, ConnectionChannels, EventBus,
+    FollowChannels, LoggingChannels, MarketTick, OrderingChannels, OrderUpdate, PositionUpdate,
+    TradeSignal, TrendingChannels,
 };
 use std::sync::Mutex;
 use tokio::sync::{broadcast, mpsc};
 
-pub struct EventBus {
-    market_tx: broadcast::Sender<MarketTick>,
-    order_update_tx: broadcast::Sender<OrderUpdate>,
-    position_update_tx: broadcast::Sender<PositionUpdate>,
-    balance_tx: broadcast::Sender<BalanceSnapshot>,
-    signal_tx: mpsc::Sender<TradeSignal>,
-    signal_rx: Mutex<Option<mpsc::Receiver<TradeSignal>>>,
-    close_tx: mpsc::Sender<CloseRequest>,
-    close_rx: Mutex<Option<mpsc::Receiver<CloseRequest>>>,
-}
+use tokio::sync::broadcast::{Receiver as BReceiver, Sender as BSender};
+use tokio::sync::mpsc::{Receiver as MReceiver, Sender as MSender};
+
+
 
 impl EventBus {
     pub fn new(buffer: usize) -> Self {
@@ -90,45 +86,4 @@ impl EventBus {
             .take()
             .unwrap_or_else(|| panic!("{name} receiver already taken"))
     }
-}
-
-use tokio::sync::broadcast::{Receiver as BReceiver, Sender as BSender};
-use tokio::sync::mpsc::{Receiver as MReceiver, Sender as MSender};
-
-pub struct TrendingChannels {
-    pub market_rx: BReceiver<MarketTick>,
-    pub signal_tx: MSender<TradeSignal>,
-}
-
-pub struct OrderingChannels {
-    pub signal_rx: MReceiver<TradeSignal>,
-    pub close_rx: MReceiver<CloseRequest>,
-    pub order_update_rx: BReceiver<OrderUpdate>,
-    pub position_update_rx: BReceiver<PositionUpdate>,
-}
-
-pub struct FollowChannels {
-    pub market_rx: BReceiver<MarketTick>,
-    pub position_update_rx: BReceiver<PositionUpdate>,
-    pub close_tx: MSender<CloseRequest>,
-}
-
-#[derive(Clone)]
-pub struct BalanceChannels {
-    pub balance_tx: BSender<BalanceSnapshot>,
-}
-
-pub struct LoggingChannels {
-    pub market_rx: BReceiver<MarketTick>,
-    pub order_update_rx: BReceiver<OrderUpdate>,
-    pub position_update_rx: BReceiver<PositionUpdate>,
-    pub balance_rx: BReceiver<BalanceSnapshot>,
-}
-
-#[derive(Clone)]
-pub struct ConnectionChannels {
-    pub market_tx: BSender<MarketTick>,
-    pub order_update_tx: BSender<OrderUpdate>,
-    pub position_update_tx: BSender<PositionUpdate>,
-    pub balance_tx: BSender<BalanceSnapshot>,
 }

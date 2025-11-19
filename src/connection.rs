@@ -1,6 +1,12 @@
 use crate::config::BotConfig;
-use crate::event_bus::ConnectionChannels;
-use crate::types::{BalanceSnapshot, MarketTick, OrderStatus, OrderUpdate, PositionUpdate, Side};
+use crate::types::ConnectionChannels;
+use crate::types::{
+    AccountBalance, AccountPayload, AccountPosition, AccountUpdate, BalanceSnapshot, Connection,
+    DepthEvent, DepthSnapshot, ForceOrderRecord, ForceOrderStreamEvent, ForceOrderStreamOrder,
+    ForceOrderStreamWrapper, FuturesBalance, LiqEntry, LiqState, ListenKeyResponse,
+    MarkPriceEvent, MarketTick, NewOrderRequest, OpenInterestResponse, OrderPayload, OrderStatus,
+    OrderTradeUpdate, OrderUpdate, PositionUpdate, PremiumIndex, Side,
+};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -21,20 +27,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone)]
-pub struct Connection {
-    config: BotConfig,
-    http: Client,
-}
 
-#[derive(Debug)]
-pub struct NewOrderRequest {
-    pub symbol: String,
-    pub side: Side,
-    pub quantity: f64,
-    pub reduce_only: bool,
-    pub client_order_id: Option<String>,
-}
 
 impl Connection {
     pub fn new(config: BotConfig) -> Self {
@@ -45,7 +38,6 @@ impl Connection {
         Self { config, http }
     }
 
-    #[allow(dead_code)]
     pub fn quote_asset(&self) -> &str {
         &self.config.quote_asset
     }
@@ -729,92 +721,6 @@ impl Connection {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct MarkPriceEvent {
-    #[serde(rename = "s")]
-    symbol: String,
-    #[serde(rename = "p")]
-    mark_price: String,
-    #[serde(rename = "r")]
-    funding_rate: Option<String>,
-    #[serde(rename = "E")]
-    event_time: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DepthEvent {
-    #[serde(rename = "b")]
-    bids: Vec<[String; 2]>,
-    #[serde(rename = "a")]
-    asks: Vec<[String; 2]>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ForceOrderRecord {
-    #[serde(rename = "side")]
-    side: String,
-    #[serde(rename = "avgPrice")]
-    avg_price: Option<String>,
-    #[serde(rename = "price")]
-    price: Option<String>,
-    #[serde(rename = "executedQty")]
-    executed_qty: Option<String>,
-    #[serde(rename = "origQty")]
-    orig_qty: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ForceOrderStreamWrapper {
-    data: ForceOrderStreamEvent,
-}
-
-#[derive(Debug, Deserialize)]
-struct ForceOrderStreamEvent {
-    #[serde(rename = "o")]
-    order: ForceOrderStreamOrder,
-}
-
-#[derive(Debug, Deserialize)]
-struct ForceOrderStreamOrder {
-    #[serde(rename = "s")]
-    symbol: String,
-    #[serde(rename = "S")]
-    side: String,
-    #[serde(rename = "p")]
-    price: Option<String>,
-    #[serde(rename = "ap")]
-    avg_price: Option<String>,
-    #[serde(rename = "q")]
-    orig_qty: Option<String>,
-    #[serde(rename = "l")]
-    last_filled: Option<String>,
-    #[serde(rename = "z")]
-    executed_qty: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenInterestResponse {
-    #[serde(rename = "openInterest")]
-    open_interest: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DepthSnapshot {
-    bids: Vec<[String; 2]>,
-    asks: Vec<[String; 2]>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PremiumIndex {
-    #[serde(rename = "symbol")]
-    symbol: String,
-    #[serde(rename = "markPrice")]
-    mark_price_str: String,
-    #[serde(rename = "lastFundingRate")]
-    last_funding_rate: Option<String>,
-    #[serde(rename = "time")]
-    event_time_ms: u64,
-}
 
 impl PremiumIndex {
     fn mark_price(&self) -> Result<f64> {
@@ -893,19 +799,7 @@ impl DepthState {
 
 const LIQ_WINDOW_SECS: u64 = 30;
 
-#[derive(Default)]
-struct LiqState {
-    entries: VecDeque<LiqEntry>,
-    long_sum: f64,
-    short_sum: f64,
-    open_interest: f64,
-}
 
-struct LiqEntry {
-    ts: Instant,
-    ratio: f64,
-    is_long_cluster: bool,
-}
 
 impl LiqState {
     fn record(&mut self, side: &str, notional: f64) {
@@ -965,40 +859,6 @@ impl LiqState {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ListenKeyResponse {
-    #[serde(rename = "listenKey")]
-    listen_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct FuturesBalance {
-    #[serde(rename = "asset")]
-    asset: String,
-    #[serde(rename = "availableBalance")]
-    available_balance: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OrderTradeUpdate {
-    #[serde(rename = "o")]
-    order: OrderPayload,
-}
-
-#[derive(Debug, Deserialize)]
-struct OrderPayload {
-    #[serde(rename = "s")]
-    symbol: String,
-    #[serde(rename = "S")]
-    side: String,
-    #[serde(rename = "X")]
-    status: String,
-    #[serde(rename = "z")]
-    filled_qty: String,
-    #[serde(rename = "E")]
-    event_time: u64,
-}
-
 impl OrderTradeUpdate {
     fn into_order_update(self) -> OrderUpdate {
         let side = if self.order.side == "BUY" {
@@ -1027,28 +887,6 @@ impl OrderTradeUpdate {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct AccountUpdate {
-    #[serde(rename = "a")]
-    account: AccountPayload,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountPayload {
-    #[serde(rename = "B")]
-    balances: Vec<AccountBalance>,
-    #[serde(rename = "P")]
-    positions: Vec<AccountPosition>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountBalance {
-    #[serde(rename = "a")]
-    asset: String,
-    #[serde(rename = "wb")]
-    wallet_balance: String,
-}
-
 impl AccountBalance {
     fn to_balance_snapshot(&self) -> Option<BalanceSnapshot> {
         let free = self.wallet_balance.parse().ok()?;
@@ -1060,17 +898,6 @@ impl AccountBalance {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct AccountPosition {
-    #[serde(rename = "s")]
-    symbol: String,
-    #[serde(rename = "pa")]
-    position_amount: String,
-    #[serde(rename = "ep")]
-    entry_price: String,
-    #[serde(rename = "cr")]
-    unrealized_pnl: String,
-}
 
 impl AccountPosition {
     fn to_position_update(&self) -> Option<PositionUpdate> {

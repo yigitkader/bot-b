@@ -1,29 +1,9 @@
-use crate::types::{BalanceSnapshot, OrderUpdate, PositionUpdate};
+use crate::types::{
+    BalanceSnapshot, BalanceStore, OrderState, OrderUpdate, PositionState, PositionUpdate,
+    SharedState,
+};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Default, Clone)]
-pub struct BalanceStore {
-    pub usdt: f64,
-    pub usdc: f64,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct OrderState {
-    pub has_open_order: bool,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct PositionState {
-    pub has_open_position: bool,
-    pub last_position: Option<PositionUpdate>,
-}
-
-#[derive(Clone)]
-pub struct SharedState {
-    pub balance: Arc<Mutex<BalanceStore>>,
-    pub order_state: Arc<Mutex<OrderState>>,
-    pub position_state: Arc<Mutex<PositionState>>,
-}
 
 impl SharedState {
     pub fn new() -> Self {

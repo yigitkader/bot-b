@@ -3,7 +3,7 @@ use std::{env, fs, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use log::{info, warn};
 use tokio::time::{sleep, timeout};
-use trading_bot::{config::BotConfig, connection::Connection, event_bus::EventBus};
+use trading_bot::{config::BotConfig, Connection, EventBus};
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -1,6 +1,4 @@
-use crate::connection::{Connection, NewOrderRequest};
-use crate::event_bus::OrderingChannels;
-use crate::state::SharedState;
+use crate::types::{Connection, NewOrderRequest, OrderingChannels, SharedState};
 use crate::types::{CloseRequest, Side, TradeSignal};
 use log::{info, warn};
 use std::sync::Arc;

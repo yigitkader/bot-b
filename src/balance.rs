@@ -1,6 +1,4 @@
-use crate::connection::Connection;
-use crate::event_bus::BalanceChannels;
-use crate::state::SharedState;
+use crate::types::{BalanceChannels, Connection, SharedState};
 use log::error;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};

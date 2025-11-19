@@ -9,8 +9,10 @@ pub mod state;
 pub mod trending;
 pub mod types;
 
-pub use config::{BotConfig, TrendParams};
-pub use connection::Connection;
-pub use event_bus::EventBus;
-pub use state::SharedState;
-pub use trending::TrendEngine;
+pub use config::BotConfig;
+pub use trending::{generate_signals, run_backtest, run_trending};
+pub use types::{
+    AlgoConfig, BacktestResult, BalanceChannels, Connection, ConnectionChannels, EventBus,
+    FollowChannels, FuturesClient, LoggingChannels, NewOrderRequest, OrderingChannels,
+    PositionSide, SharedState, Signal, SignalSide, TrendParams, TrendingChannels,
+};

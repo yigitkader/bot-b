@@ -4,9 +4,9 @@ use log::{error, info};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use trading_bot::{
-    balance, config::BotConfig, connection::Connection, event_bus::EventBus, follow_orders,
-    logging, ordering, state::SharedState, trending,
+    balance, config::BotConfig, follow_orders, logging, ordering, trending,
 };
+use trading_bot::{Connection, EventBus, SharedState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -83,9 +83,10 @@ async fn main() -> Result<()> {
 
     {
         let ch = trending_ch;
+        let symbol = config.symbol.clone();
         let trend_params = config.trend_params();
         tasks.push(tokio::spawn(async move {
-            trending::run_trending(ch, trend_params).await;
+            trending::run_trending(ch, symbol, trend_params).await;
         }));
     }
 

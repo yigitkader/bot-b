@@ -1,4 +1,4 @@
-use crate::event_bus::LoggingChannels;
+use crate::types::LoggingChannels;
 use log::info;
 use tokio::sync::broadcast;
 
