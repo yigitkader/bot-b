@@ -348,9 +348,9 @@ fn generate_signal(
         short_score += 1;
     }
 
-    let side = if long_score >= 4 && long_score > short_score {
+    let side = if long_score >= cfg.long_min_score && long_score > short_score {
         SignalSide::Long
-    } else if short_score >= 4 && short_score > long_score {
+    } else if short_score >= cfg.short_min_score && short_score > long_score {
         SignalSide::Short
     } else {
         SignalSide::Flat
@@ -667,6 +667,8 @@ pub async fn run_trending(
         funding_extreme_neg: params.funding_min_for_short.min(-0.0001),
         lsr_crowded_long: params.obi_long_min.max(1.3),
         lsr_crowded_short: params.obi_short_max.min(0.8),
+        long_min_score: params.long_min_score,
+        short_min_score: params.short_min_score,
         fee_bps_round_trip: 8.0, // Default fee
         max_holding_bars: 48,   // Default max holding
     };

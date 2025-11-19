@@ -608,6 +608,8 @@ pub struct AlgoConfig {
     pub funding_extreme_neg: f64,  // aşırı short seviye (örn: -0.01)
     pub lsr_crowded_long: f64,     // longShortRatio > X => crowded long
     pub lsr_crowded_short: f64,    // longShortRatio < X => crowded short
+    pub long_min_score: usize,     // LONG sinyal için minimum score (örn: 4)
+    pub short_min_score: usize,    // SHORT sinyal için minimum score (örn: 4)
 
     // Risk & maliyet
     pub fee_bps_round_trip: f64,   // round-trip toplam taker fee bps (örn: 8 = 0.08%)
