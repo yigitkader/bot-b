@@ -592,6 +592,7 @@ pub struct BacktestResult {
     pub win_rate: f64,
     pub total_pnl_pct: f64,
     pub avg_pnl_pct: f64,
+    pub avg_r: f64, // Average Risk/Reward ratio (average win / average loss)
 }
 
 // =======================

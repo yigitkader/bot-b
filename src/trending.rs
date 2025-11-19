@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -512,12 +512,16 @@ pub fn run_backtest_on_series(
     let mut win_trades = 0usize;
     let mut loss_trades = 0usize;
     let mut total_pnl_pct = 0.0;
+    let mut total_win_pnl = 0.0;
+    let mut total_loss_pnl = 0.0;
 
     for t in &trades {
         if t.win {
             win_trades += 1;
+            total_win_pnl += t.pnl_pct.abs();
         } else {
             loss_trades += 1;
+            total_loss_pnl += t.pnl_pct.abs();
         }
         total_pnl_pct += t.pnl_pct;
     }
@@ -534,6 +538,23 @@ pub fn run_backtest_on_series(
         total_pnl_pct / total_trades as f64
     };
 
+    // Average R (Risk/Reward): average win / average loss
+    let avg_r = if loss_trades > 0 && win_trades > 0 {
+        let avg_win = total_win_pnl / win_trades as f64;
+        let avg_loss = total_loss_pnl / loss_trades as f64;
+        if avg_loss > 0.0 {
+            avg_win / avg_loss
+        } else {
+            0.0
+        }
+    } else if loss_trades == 0 && win_trades > 0 {
+        // Sadece kazançlar var, R = infinity (çok büyük sayı)
+        f64::INFINITY
+    } else {
+        // Sadece kayıplar var veya hiç trade yok
+        0.0
+    };
+
     BacktestResult {
         trades,
         total_trades,
@@ -542,6 +563,7 @@ pub fn run_backtest_on_series(
         win_rate,
         total_pnl_pct,
         avg_pnl_pct,
+        avg_r,
     }
 }
 
@@ -569,6 +591,48 @@ pub async fn run_backtest(
 
     let contexts = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
     Ok(run_backtest_on_series(&candles, &contexts, cfg))
+}
+
+// =======================
+//  CSV Export
+// =======================
+
+/// Backtest sonuçlarını CSV formatında export eder
+/// Plan.md'de belirtildiği gibi her trade satırı CSV'ye yazılır
+pub fn export_backtest_to_csv(result: &BacktestResult, file_path: &str) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(file_path)
+        .context(format!("Failed to create CSV file: {}", file_path))?;
+
+    // CSV header
+    writeln!(
+        file,
+        "entry_time,exit_time,side,entry_price,exit_price,pnl_pct,win"
+    )?;
+
+    // CSV rows
+    for trade in &result.trades {
+        let side_str = match trade.side {
+            PositionSide::Long => "LONG",
+            PositionSide::Short => "SHORT",
+            PositionSide::Flat => "FLAT",
+        };
+        writeln!(
+            file,
+            "{},{},{},{:.8},{:.8},{:.6},{}",
+            trade.entry_time.format("%Y-%m-%d %H:%M:%S"),
+            trade.exit_time.format("%Y-%m-%d %H:%M:%S"),
+            side_str,
+            trade.entry_price,
+            trade.exit_price,
+            trade.pnl_pct * 100.0, // Yüzde olarak
+            if trade.win { "WIN" } else { "LOSS" }
+        )?;
+    }
+
+    Ok(())
 }
 
 // =======================

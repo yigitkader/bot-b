@@ -1,4 +1,5 @@
-use trading_bot::trending::{run_backtest, AlgoConfig};
+use trading_bot::trending::{run_backtest, export_backtest_to_csv};
+use trading_bot::{AlgoConfig, PositionSide};
 
 /// Runs backtest using real Binance data (klines, funding, OI, long/short ratio)
 #[tokio::test]
@@ -37,14 +38,19 @@ async fn backtest_with_real_binance_data() {
     println!("Win rate       : {:.2}%", res.win_rate * 100.0);
     println!("Total PnL      : {:.4}%", res.total_pnl_pct * 100.0);
     println!("Avg PnL/trade  : {:.4}%", res.avg_pnl_pct * 100.0);
+    if res.avg_r.is_infinite() {
+        println!("Avg R (R/R)    : ∞ (only wins)");
+    } else {
+        println!("Avg R (R/R)    : {:.4}", res.avg_r);
+    }
 
     if !res.trades.is_empty() {
         println!("\n===== TRADE DETAILS =====");
         for (idx, trade) in res.trades.iter().enumerate() {
             let side_str = match trade.side {
-                trading_bot::trending::PositionSide::Long => "LONG",
-                trading_bot::trending::PositionSide::Short => "SHORT",
-                trading_bot::trending::PositionSide::Flat => "FLAT",
+                PositionSide::Long => "LONG",
+                PositionSide::Short => "SHORT",
+                PositionSide::Flat => "FLAT",
             };
             let win_str = if trade.win { "✅ WIN" } else { "❌ LOSS" };
             println!(
@@ -61,8 +67,8 @@ async fn backtest_with_real_binance_data() {
         }
 
         // Summary by side
-        let long_trades: Vec<_> = res.trades.iter().filter(|t| matches!(t.side, trading_bot::trending::PositionSide::Long)).collect();
-        let short_trades: Vec<_> = res.trades.iter().filter(|t| matches!(t.side, trading_bot::trending::PositionSide::Short)).collect();
+        let long_trades: Vec<_> = res.trades.iter().filter(|t| matches!(t.side, PositionSide::Long)).collect();
+        let short_trades: Vec<_> = res.trades.iter().filter(|t| matches!(t.side, PositionSide::Short)).collect();
 
         if !long_trades.is_empty() {
             let long_pnl: f64 = long_trades.iter().map(|t| t.pnl_pct).sum();
@@ -83,6 +89,14 @@ async fn backtest_with_real_binance_data() {
                 (short_wins as f64 / short_trades.len() as f64) * 100.0,
                 short_wins, short_trades.len());
         }
+    }
+
+    // CSV export test
+    let csv_path = "tests/data/backtest_result.csv";
+    if let Err(e) = export_backtest_to_csv(&res, csv_path) {
+        eprintln!("Warning: Failed to export CSV: {e:?}");
+    } else {
+        println!("\n✅ Backtest results exported to: {}", csv_path);
     }
 
     // Assertions
