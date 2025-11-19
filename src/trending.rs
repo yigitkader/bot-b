@@ -210,17 +210,27 @@ where
 //  Sinyal Context Hesabı
 // =======================
 
+/// Gerçek API verisi kullanarak signal context'leri oluşturur
+/// 
+/// # Önemli: Dummy/Mock Data Yok
+/// Bu fonksiyon kesinlikle gerçek API verisi kullanır. Eğer veri bulunamazsa,
+/// o candle için context oluşturulmaz (skip edilir). Hiçbir fallback değer kullanılmaz.
+/// 
+/// # Returns
+/// Eşleşen candle'ları ve context'leri birlikte döndürür. Eğer bir candle için
+/// gerçek API verisi yoksa, o candle skip edilir ve sonuçta yer almaz.
 pub fn build_signal_contexts(
     candles: &[Candle],
     funding: &[FundingRate],
     oi_hist: &[OpenInterestPoint],
     lsr_hist: &[LongShortRatioPoint],
-) -> Vec<SignalContext> {
+) -> (Vec<Candle>, Vec<SignalContext>) {
     let mut ema_fast = ExponentialMovingAverage::new(21).unwrap();
     let mut ema_slow = ExponentialMovingAverage::new(55).unwrap();
     let mut rsi = RelativeStrengthIndex::new(14).unwrap();
     let mut atr = AverageTrueRange::new(14).unwrap();
 
+    let mut matched_candles = Vec::with_capacity(candles.len());
     let mut contexts = Vec::with_capacity(candles.len());
 
     for c in candles {
@@ -238,21 +248,29 @@ pub fn build_signal_contexts(
         let r = rsi.next(&di);
         let atr_v = atr.next(&di);
 
-        let funding_rate = nearest_value_by_time(&c.close_time, funding, |fr| {
+        // Gerçek API verisi kullanılmalı - fallback değerler yok
+        // Eğer veri bulunamazsa, bu candle için context oluşturulmaz (skip edilir)
+        let Some(funding_rate) = nearest_value_by_time(&c.close_time, funding, |fr| {
             ts_ms_to_utc(fr.funding_time)
         })
-        .map(|fr| fr.funding_rate.parse().unwrap_or(0.0))
-        .unwrap_or(0.0);
+        .and_then(|fr| fr.funding_rate.parse().ok()) else {
+            // Veri yoksa bu candle'ı skip et - dummy data kullanma
+            continue;
+        };
 
-        let open_interest = nearest_value_by_time(&c.close_time, oi_hist, |p| p.timestamp)
-            .map(|p| p.open_interest)
-            .unwrap_or(0.0);
+        let Some(open_interest) = nearest_value_by_time(&c.close_time, oi_hist, |p| p.timestamp)
+            .map(|p| p.open_interest) else {
+            // Veri yoksa bu candle'ı skip et - dummy data kullanma
+            continue;
+        };
 
-        let long_short_ratio =
-            nearest_value_by_time(&c.close_time, lsr_hist, |p| p.timestamp)
-                .map(|p| p.long_short_ratio)
-                .unwrap_or(1.0);
+        let Some(long_short_ratio) = nearest_value_by_time(&c.close_time, lsr_hist, |p| p.timestamp)
+            .map(|p| p.long_short_ratio) else {
+            // Veri yoksa bu candle'ı skip et - dummy data kullanma
+            continue;
+        };
 
+        matched_candles.push(c.clone());
         contexts.push(SignalContext {
             ema_fast: ema_f,
             ema_slow: ema_s,
@@ -264,7 +282,7 @@ pub fn build_signal_contexts(
         });
     }
 
-    contexts
+    (matched_candles, contexts)
 }
 
 // =======================
@@ -594,8 +612,8 @@ pub async fn run_backtest(
         .fetch_top_long_short_ratio(symbol, futures_period, kline_limit)
         .await?;
 
-    let contexts = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
-    Ok(run_backtest_on_series(&candles, &contexts, cfg))
+    let (matched_candles, contexts) = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
+    Ok(run_backtest_on_series(&matched_candles, &contexts, cfg))
 }
 
 // =======================
@@ -782,15 +800,16 @@ async fn generate_latest_signal(
     let oi_hist = client.fetch_open_interest_hist(symbol, futures_period, kline_limit).await?;
     let lsr_hist = client.fetch_top_long_short_ratio(symbol, futures_period, kline_limit).await?;
 
-    // Signal context'leri oluştur
-    let contexts = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
+    // Signal context'leri oluştur (sadece gerçek API verisi olan candle'lar)
+    let (matched_candles, contexts) = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
 
     if contexts.len() < params.warmup_min_ticks {
         // Henüz yeterli veri yok
         return Ok(None);
     }
 
-    // En son sinyali üret
+    // En son eşleşen candle ve context'i kullan
+    let latest_matched_candle = &matched_candles[matched_candles.len() - 1];
     let latest_ctx = &contexts[contexts.len() - 1];
     let prev_ctx = if contexts.len() > 1 {
         Some(&contexts[contexts.len() - 2])
@@ -798,7 +817,7 @@ async fn generate_latest_signal(
         None
     };
 
-    let signal = generate_signal(latest_candle, latest_ctx, prev_ctx, cfg);
+    let signal = generate_signal(latest_matched_candle, latest_ctx, prev_ctx, cfg);
 
     // Eğer sinyal Flat değilse, TradeSignal'e dönüştür
     match signal.side {
