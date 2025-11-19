@@ -7,6 +7,10 @@ edition = "2021"
 name = "recorder"
 path = "tests/helpers/recorder.rs"
 
+[[bin]]
+name = "backtest"
+path = "src/bin/backtest.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

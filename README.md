@@ -1,5 +1,5 @@
-cargo test backtest_replays_real_binance_ticks
+# Default ayarlarla (BTCUSDT, 5m, son 24 saat)
+cargo run --bin backtest
 
-FORCE_RECORD=1 cargo test backtest_replays_real_binance_ticks
-
-FORCE_RECORD=1 RECORD_SAMPLES=30 cargo test backtest_replays_real_binance_ticks
+# Environment variable'larla özelleştirme
+SYMBOL=ETHUSDT INTERVAL=15m PERIOD=15m LIMIT=96 cargo run --bin backtest

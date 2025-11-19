@@ -348,9 +348,14 @@ fn generate_signal(
         short_score += 1;
     }
 
-    let side = if long_score >= cfg.long_min_score && long_score > short_score {
+    // Kullanıcının "en iyi sistem" tanımına göre: minimum 4 score gerekli
+    // Ancak config'den de alabilir (varsayılan 4)
+    let long_min = cfg.long_min_score.max(4);
+    let short_min = cfg.short_min_score.max(4);
+    
+    let side = if long_score >= long_min && long_score > short_score {
         SignalSide::Long
-    } else if short_score >= cfg.short_min_score && short_score > long_score {
+    } else if short_score >= short_min && short_score > long_score {
         SignalSide::Short
     } else {
         SignalSide::Flat
