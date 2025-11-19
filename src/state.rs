@@ -80,4 +80,11 @@ impl SharedState {
             state.last_position = Some(update.clone());
         }
     }
+
+    pub fn current_position(&self) -> Option<PositionUpdate> {
+        self.position_state
+            .lock()
+            .ok()
+            .and_then(|state| state.last_position.clone())
+    }
 }

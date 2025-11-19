@@ -1,24 +1,37 @@
 use crate::config::BotConfig;
 use crate::event_bus::ConnectionChannels;
 use crate::types::{BalanceSnapshot, MarketTick, OrderStatus, OrderUpdate, PositionUpdate, Side};
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
+use hex;
+use hmac::{Hmac, Mac};
 use log::{info, warn};
 use reqwest::Client;
 use serde::Deserialize;
+use sha2::Sha256;
 use std::sync::Arc;
 use tokio::{
     sync::RwLock,
-    time::{sleep, Duration},
+    time::{interval, sleep, Duration},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct Connection {
     config: BotConfig,
     http: Client,
+}
+
+#[derive(Debug)]
+pub struct NewOrderRequest {
+    pub symbol: String,
+    pub side: Side,
+    pub quantity: f64,
+    pub reduce_only: bool,
+    pub client_order_id: Option<String>,
 }
 
 impl Connection {
@@ -30,31 +43,41 @@ impl Connection {
         Self { config, http }
     }
 
+    #[allow(dead_code)]
     pub fn quote_asset(&self) -> &str {
         &self.config.quote_asset
     }
 
     pub async fn run_market_ws(self: Arc<Self>, ch: ConnectionChannels) -> Result<()> {
         let depth_state = Arc::new(RwLock::new(DepthState::new(20)));
+        let liq_state = Arc::new(RwLock::new(LiqState::default()));
 
         loop {
             let mark_stream = self.clone();
             let depth_stream = self.clone();
+            let liq_stream = self.clone();
             let ch_mark = ch.clone();
             let depth_for_mark = depth_state.clone();
             let depth_for_depth = depth_state.clone();
+            let liq_for_mark = liq_state.clone();
+            let liq_for_task = liq_state.clone();
 
             let mark_task = tokio::spawn(async move {
                 mark_stream
-                    .consume_mark_price_stream(ch_mark, depth_for_mark)
+                    .consume_mark_price_stream(ch_mark, depth_for_mark, liq_for_mark)
                     .await
             });
             let depth_task =
                 tokio::spawn(
                     async move { depth_stream.consume_depth_stream(depth_for_depth).await },
                 );
+            let liq_task = tokio::spawn(async move {
+                if let Err(err) = liq_stream.run_liq_oi_pollers(liq_for_task).await {
+                    warn!("CONNECTION: liq/OI poller exited: {err:?}");
+                }
+            });
 
-            let _ = tokio::join!(mark_task, depth_task);
+            let _ = tokio::join!(mark_task, depth_task, liq_task);
             warn!("CONNECTION: market streams stopped. Reconnecting soon...");
             sleep(Duration::from_secs(2)).await;
         }
@@ -128,24 +151,78 @@ impl Connection {
         }
     }
 
-    pub async fn send_order(&self, description: String) -> Result<()> {
-        info!("CONNECTION: send_order -> {}", description);
+    pub async fn send_order(&self, order: NewOrderRequest) -> Result<()> {
+        self.ensure_credentials()?;
+
+        let NewOrderRequest {
+            symbol,
+            side,
+            quantity,
+            reduce_only,
+            client_order_id,
+        } = order;
+
+        if quantity <= 0.0 {
+            return Err(anyhow!("order quantity must be positive"));
+        }
+
+        let side = match side {
+            Side::Long => "BUY",
+            Side::Short => "SELL",
+        };
+
+        let mut params = vec![
+            ("symbol".to_string(), symbol),
+            ("side".to_string(), side.to_string()),
+            ("type".to_string(), "MARKET".to_string()),
+            ("quantity".to_string(), format!("{:.6}", quantity)),
+        ];
+
+        if reduce_only {
+            params.push(("reduceOnly".into(), "true".into()));
+        }
+        if let Some(id) = client_order_id {
+            params.push(("newClientOrderId".into(), id));
+        }
+
+        self.signed_post("/fapi/v1/order", params).await?;
+        info!("CONNECTION: order sent (reduce_only={})", reduce_only);
         Ok(())
     }
 
     pub async fn fetch_balance(&self) -> Result<Vec<BalanceSnapshot>> {
-        let snapshot = BalanceSnapshot {
-            asset: "USDT".into(),
-            free: 1_000.0,
-            ts: Utc::now(),
-        };
-        Ok(vec![snapshot])
+        self.ensure_credentials()?;
+
+        let response = self
+            .signed_get("/fapi/v2/balance", Vec::<(String, String)>::new())
+            .await?
+            .json::<Vec<FuturesBalance>>()
+            .await
+            .context("failed to parse balance response")?;
+
+        let snapshots = response
+            .into_iter()
+            .filter_map(|record| {
+                record
+                    .available_balance
+                    .parse::<f64>()
+                    .ok()
+                    .map(|free| BalanceSnapshot {
+                        asset: record.asset,
+                        free,
+                        ts: Utc::now(),
+                    })
+            })
+            .collect();
+
+        Ok(snapshots)
     }
 
     async fn consume_mark_price_stream(
         self: Arc<Self>,
         ch: ConnectionChannels,
         depth_state: Arc<RwLock<DepthState>>,
+        liq_state: Arc<RwLock<LiqState>>,
     ) -> Result<()> {
         let mut retry_delay = Duration::from_secs(1);
         loop {
@@ -160,6 +237,9 @@ impl Connection {
                             Ok(Message::Text(txt)) => {
                                 if let Some(mut tick) = self.parse_mark_price(&txt) {
                                     tick.obi = (depth_state.read().await).obi();
+                                    let (liq_long, liq_short) = (liq_state.read().await).snapshot();
+                                    tick.liq_long_cluster = liq_long;
+                                    tick.liq_short_cluster = liq_short;
                                     if ch.market_tx.send(tick).is_err() {
                                         warn!("CONNECTION: market_tx receiver dropped");
                                         break;
@@ -170,6 +250,10 @@ impl Connection {
                                 if let Ok(txt) = String::from_utf8(bin) {
                                     if let Some(mut tick) = self.parse_mark_price(&txt) {
                                         tick.obi = (depth_state.read().await).obi();
+                                        let (liq_long, liq_short) =
+                                            (liq_state.read().await).snapshot();
+                                        tick.liq_long_cluster = liq_long;
+                                        tick.liq_short_cluster = liq_short;
                                         if ch.market_tx.send(tick).is_err() {
                                             warn!("CONNECTION: market_tx receiver dropped");
                                             break;
@@ -249,6 +333,21 @@ impl Connection {
             sleep(retry_delay).await;
             retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
         }
+    }
+
+    async fn run_liq_oi_pollers(self: Arc<Self>, liq_state: Arc<RwLock<LiqState>>) -> Result<()> {
+        let mut ticker = interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            match self.fetch_liquidation_clusters().await {
+                Ok((long, short)) => {
+                    liq_state.write().await.update(long, short);
+                }
+                Err(err) => warn!("CONNECTION: liq snapshot fetch failed: {err:?}"),
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
     async fn create_listen_key(&self) -> Result<String> {
@@ -350,6 +449,134 @@ impl Connection {
             liq_short_cluster: None,
         })
     }
+
+    async fn fetch_liquidation_clusters(&self) -> Result<(Option<f64>, Option<f64>)> {
+        let url = format!("{}/fapi/v1/liquidationOrders", self.config.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("symbol", self.config.symbol.as_str()), ("limit", "100")])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<LiquidationOrder>>()
+            .await?;
+
+        let mut long_total = 0.0;
+        let mut short_total = 0.0;
+
+        for order in response {
+            let qty = order
+                .executed_qty
+                .as_deref()
+                .or_else(|| order.orig_qty.as_deref())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let price = order
+                .avg_price
+                .as_deref()
+                .or_else(|| order.price.as_deref())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let notional = qty * price;
+            match order.side.as_str() {
+                "SELL" => long_total += notional,
+                "BUY" => short_total += notional,
+                _ => {}
+            }
+        }
+
+        let oi = self.fetch_open_interest().await.unwrap_or(0.0);
+        let normalize = |value: f64| if oi > 0.0 { value / oi } else { value };
+
+        let long_cluster = if long_total > 0.0 {
+            Some(normalize(long_total))
+        } else {
+            None
+        };
+        let short_cluster = if short_total > 0.0 {
+            Some(normalize(short_total))
+        } else {
+            None
+        };
+
+        Ok((long_cluster, short_cluster))
+    }
+
+    async fn fetch_open_interest(&self) -> Result<f64> {
+        let url = format!("{}/fapi/v1/openInterest", self.config.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("symbol", self.config.symbol.as_str())])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OpenInterestResponse>()
+            .await?;
+
+        resp.open_interest
+            .parse::<f64>()
+            .context("failed to parse open interest")
+    }
+
+    async fn signed_get(
+        &self,
+        path: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<reqwest::Response> {
+        let query = self.sign_params(params)?;
+        let url = format!("{}{}?{}", self.config.base_url, path, query);
+        let response = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.config.api_key)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response)
+    }
+
+    async fn signed_post(
+        &self,
+        path: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<reqwest::Response> {
+        let body = self.sign_params(params)?;
+        let url = format!("{}{}", self.config.base_url, path);
+        let response = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.config.api_key)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response)
+    }
+
+    fn sign_params(&self, mut params: Vec<(String, String)>) -> Result<String> {
+        let timestamp = Utc::now().timestamp_millis();
+        params.push(("timestamp".into(), timestamp.to_string()));
+        if self.config.recv_window_ms > 0 {
+            params.push(("recvWindow".into(), self.config.recv_window_ms.to_string()));
+        }
+        let query = serde_urlencoded::to_string(&params)?;
+        let mut mac = HmacSha256::new_from_slice(self.config.api_secret.as_bytes())
+            .map_err(|err| anyhow!("failed to init signer: {err}"))?;
+        mac.update(query.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+        Ok(format!("{query}&signature={signature}"))
+    }
+
+    fn ensure_credentials(&self) -> Result<()> {
+        if self.config.api_key.is_empty() || self.config.api_secret.is_empty() {
+            Err(anyhow!("Binance API key/secret required"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +597,26 @@ struct DepthEvent {
     bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
     asks: Vec<[String; 2]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiquidationOrder {
+    #[serde(rename = "side")]
+    side: String,
+    #[serde(rename = "avgPrice")]
+    avg_price: Option<String>,
+    #[serde(rename = "price")]
+    price: Option<String>,
+    #[serde(rename = "executedQty")]
+    executed_qty: Option<String>,
+    #[serde(rename = "origQty")]
+    orig_qty: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenInterestResponse {
+    #[serde(rename = "openInterest")]
+    open_interest: String,
 }
 
 struct DepthState {
@@ -425,10 +672,35 @@ impl DepthState {
     }
 }
 
+#[derive(Default)]
+struct LiqState {
+    liq_long: Option<f64>,
+    liq_short: Option<f64>,
+}
+
+impl LiqState {
+    fn update(&mut self, long: Option<f64>, short: Option<f64>) {
+        self.liq_long = long;
+        self.liq_short = short;
+    }
+
+    fn snapshot(&self) -> (Option<f64>, Option<f64>) {
+        (self.liq_long, self.liq_short)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ListenKeyResponse {
     #[serde(rename = "listenKey")]
     listen_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FuturesBalance {
+    #[serde(rename = "asset")]
+    asset: String,
+    #[serde(rename = "availableBalance")]
+    available_balance: String,
 }
 
 #[derive(Debug, Deserialize)]

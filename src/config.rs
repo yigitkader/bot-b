@@ -14,7 +14,11 @@ pub struct BotConfig {
     pub leverage: f64,
     pub tp_percent: f64,
     pub sl_percent: f64,
-    pub max_position_usdt: f64,
+    pub position_size_quote: f64,
+    pub ema_fast_period: usize,
+    pub ema_slow_period: usize,
+    pub rsi_period: usize,
+    pub atr_period: usize,
     pub rsi_long_min: f64,
     pub rsi_short_max: f64,
     pub atr_rising_factor: f64,
@@ -26,6 +30,7 @@ pub struct BotConfig {
     pub short_min_score: usize,
     pub signal_cooldown_secs: i64,
     pub warmup_min_ticks: usize,
+    pub recv_window_ms: u64,
 }
 
 impl BotConfig {
@@ -33,6 +38,31 @@ impl BotConfig {
         let file_cfg = FileConfig::load("config.yaml").unwrap_or_default();
         let binance_cfg = file_cfg.binance.as_ref();
         let trending_cfg = file_cfg.trending.as_ref();
+        let ema_fast_period = numeric_setting(
+            "BOT_EMA_FAST_PERIOD",
+            trending_cfg.and_then(|t| t.ema_fast_period),
+            21usize,
+        );
+        let ema_slow_period = numeric_setting(
+            "BOT_EMA_SLOW_PERIOD",
+            trending_cfg.and_then(|t| t.ema_slow_period),
+            55usize,
+        );
+        let rsi_period = numeric_setting(
+            "BOT_RSI_PERIOD",
+            trending_cfg.and_then(|t| t.rsi_period),
+            14usize,
+        );
+        let atr_period = numeric_setting(
+            "BOT_ATR_PERIOD",
+            trending_cfg.and_then(|t| t.atr_period),
+            14usize,
+        );
+        let warmup_min_ticks = numeric_setting(
+            "BOT_WARMUP_MIN_TICKS",
+            trending_cfg.and_then(|t| t.warmup_min_ticks),
+            ema_slow_period + 10,
+        );
 
         Self {
             api_key: string_setting(
@@ -56,7 +86,16 @@ impl BotConfig {
             leverage: numeric_setting("BOT_LEVERAGE", file_cfg.leverage, 10.0),
             tp_percent: numeric_setting("BOT_TP_PERCENT", file_cfg.take_profit_pct, 1.0),
             sl_percent: numeric_setting("BOT_SL_PERCENT", file_cfg.stop_loss_pct, 0.5),
-            max_position_usdt: numeric_setting("BOT_MAX_POSITION_USDT", None, 50.0),
+            position_size_quote: numeric_setting_with_alias(
+                "BOT_POSITION_SIZE_QUOTE",
+                Some("BOT_MAX_POSITION_USDT"),
+                file_cfg.max_usd_per_order,
+                50.0,
+            ),
+            ema_fast_period,
+            ema_slow_period,
+            rsi_period,
+            atr_period,
             rsi_long_min: numeric_setting(
                 "BOT_RSI_LONG_MIN",
                 trending_cfg.and_then(|t| t.rsi_lower_long),
@@ -79,12 +118,23 @@ impl BotConfig {
                 trending_cfg.and_then(|t| t.signal_cooldown_seconds),
                 30i64,
             ),
-            warmup_min_ticks: Self::env_or("BOT_WARMUP_MIN_TICKS", EMA_SLOW_PERIOD + 10),
+            warmup_min_ticks,
+            recv_window_ms: numeric_setting(
+                "BINANCE_RECV_WINDOW_MS",
+                binance_cfg.and_then(|b| b.recv_window_ms),
+                5000u64,
+            ),
         }
     }
 
     pub fn trend_params(&self) -> TrendParams {
         TrendParams {
+            ema_fast_period: self.ema_fast_period,
+            ema_slow_period: self.ema_slow_period,
+            rsi_period: self.rsi_period,
+            atr_period: self.atr_period,
+            leverage: self.leverage,
+            position_size_quote: self.position_size_quote,
             rsi_long_min: self.rsi_long_min,
             rsi_short_max: self.rsi_short_max,
             atr_rising_factor: self.atr_rising_factor,
@@ -98,20 +148,16 @@ impl BotConfig {
             warmup_min_ticks: self.warmup_min_ticks,
         }
     }
-
-    fn env_or<T>(key: &str, default: T) -> T
-    where
-        T: FromStr,
-    {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse::<T>().ok())
-            .unwrap_or(default)
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TrendParams {
+    pub ema_fast_period: usize,
+    pub ema_slow_period: usize,
+    pub rsi_period: usize,
+    pub atr_period: usize,
+    pub leverage: f64,
+    pub position_size_quote: f64,
     pub rsi_long_min: f64,
     pub rsi_short_max: f64,
     pub atr_rising_factor: f64,
@@ -126,8 +172,6 @@ pub struct TrendParams {
 }
 
 // fallback for warmup default referencing EMA slow period
-const EMA_SLOW_PERIOD: usize = 55;
-
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
@@ -140,6 +184,8 @@ struct FileConfig {
     take_profit_pct: Option<f64>,
     #[serde(default)]
     stop_loss_pct: Option<f64>,
+    #[serde(default)]
+    max_usd_per_order: Option<f64>,
     #[serde(default)]
     trending: Option<FileTrending>,
     #[serde(default)]
@@ -154,6 +200,8 @@ struct FileBinance {
     api_key: Option<String>,
     #[serde(default)]
     secret_key: Option<String>,
+    #[serde(default)]
+    recv_window_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -164,6 +212,16 @@ struct FileTrending {
     rsi_upper_long: Option<f64>,
     #[serde(default)]
     signal_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    ema_fast_period: Option<usize>,
+    #[serde(default)]
+    ema_slow_period: Option<usize>,
+    #[serde(default)]
+    rsi_period: Option<usize>,
+    #[serde(default)]
+    atr_period: Option<usize>,
+    #[serde(default)]
+    warmup_min_ticks: Option<usize>,
 }
 
 impl FileConfig {
@@ -191,4 +249,27 @@ where
         .and_then(|v| v.parse::<T>().ok())
         .or(file_value)
         .unwrap_or(default)
+}
+
+fn numeric_setting_with_alias<T>(
+    primary_env: &str,
+    alias_env: Option<&str>,
+    file_value: Option<T>,
+    default: T,
+) -> T
+where
+    T: FromStr + Copy,
+{
+    if let Some(val) = std::env::var(primary_env)
+        .ok()
+        .and_then(|v| v.parse::<T>().ok())
+    {
+        return val;
+    }
+    if let Some(alias) = alias_env {
+        if let Some(val) = std::env::var(alias).ok().and_then(|v| v.parse::<T>().ok()) {
+            return val;
+        }
+    }
+    file_value.unwrap_or(default)
 }

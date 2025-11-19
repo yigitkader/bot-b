@@ -1,7 +1,7 @@
-use crate::connection::Connection;
+use crate::connection::{Connection, NewOrderRequest};
 use crate::event_bus::OrderingChannels;
 use crate::state::SharedState;
-use crate::types::{CloseRequest, TradeSignal};
+use crate::types::{CloseRequest, Side, TradeSignal};
 use log::{info, warn};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -21,7 +21,7 @@ pub async fn run_ordering(
                 handle_signal(signal, &state, order_lock.clone(), connection.clone()).await;
             },
             Some(request) = ch.close_rx.recv() => {
-                handle_close_request(request, order_lock.clone(), connection.clone()).await;
+                handle_close_request(request, &state, order_lock.clone(), connection.clone()).await;
             },
             res = order_update_rx.recv() => match res {
                 Ok(update) => state.apply_order_update(&update),
@@ -53,12 +53,25 @@ async fn handle_signal(
 
     let _guard = lock.lock().await;
     state.set_open_order(true);
-    let quote_asset = connection.quote_asset();
-    let description = format!(
-        "OPEN {:?} {} size {:.2} {}",
-        signal.side, signal.symbol, signal.size_usdt, quote_asset
-    );
-    if let Err(err) = connection.send_order(description).await {
+    let qty = (signal.size_usdt / signal.entry_price).abs();
+    if qty <= 0.0 {
+        warn!(
+            "ORDERING: invalid quantity computed from signal {} (size={}, price={})",
+            signal.id, signal.size_usdt, signal.entry_price
+        );
+        state.set_open_order(false);
+        return;
+    }
+
+    let order = NewOrderRequest {
+        symbol: signal.symbol.clone(),
+        side: signal.side,
+        quantity: qty,
+        reduce_only: false,
+        client_order_id: Some(signal.id.to_string()),
+    };
+
+    if let Err(err) = connection.send_order(order).await {
         warn!("ORDERING: send_order failed: {err:?}");
         state.set_open_order(false);
     } else {
@@ -68,15 +81,41 @@ async fn handle_signal(
 
 async fn handle_close_request(
     request: CloseRequest,
+    state: &SharedState,
     lock: Arc<Mutex<()>>,
     connection: Arc<Connection>,
 ) {
     let _guard = lock.lock().await;
-    let description = format!(
-        "CLOSE position {} reason {}",
-        request.position_id, request.reason
-    );
-    if let Err(err) = connection.send_order(description).await {
+
+    let position = match state
+        .current_position()
+        .filter(|pos| pos.position_id == request.position_id && pos.size > 0.0)
+    {
+        Some(pos) => pos,
+        None => {
+            warn!(
+                "ORDERING: no active position found for close request {}",
+                request.position_id
+            );
+            return;
+        }
+    };
+
+    let side = if position.side == Side::Long {
+        Side::Short
+    } else {
+        Side::Long
+    };
+
+    let order = NewOrderRequest {
+        symbol: position.symbol.clone(),
+        side,
+        quantity: position.size,
+        reduce_only: true,
+        client_order_id: Some(format!("close-{}", request.position_id)),
+    };
+
+    if let Err(err) = connection.send_order(order).await {
         warn!("ORDERING: close send_order failed: {err:?}");
     } else {
         info!("ORDERING: close order submitted {}", request.position_id);

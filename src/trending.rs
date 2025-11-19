@@ -5,11 +5,6 @@ use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use uuid::Uuid;
 
-const EMA_FAST_PERIOD: usize = 21;
-const EMA_SLOW_PERIOD: usize = 55;
-const RSI_PERIOD: usize = 14;
-const ATR_PERIOD: usize = 14;
-
 struct Ema {
     k: f64,
     value: Option<f64>,
@@ -145,10 +140,10 @@ struct TrendEngine {
 impl TrendEngine {
     fn new(params: TrendParams) -> Self {
         Self {
-            ema_fast: Ema::new(EMA_FAST_PERIOD),
-            ema_slow: Ema::new(EMA_SLOW_PERIOD),
-            rsi: Rsi::new(RSI_PERIOD),
-            atr: Atr::new(ATR_PERIOD),
+            ema_fast: Ema::new(params.ema_fast_period),
+            ema_slow: Ema::new(params.ema_slow_period),
+            rsi: Rsi::new(params.rsi_period),
+            atr: Atr::new(params.atr_period),
             tick_count: 0,
             last_atr: None,
             last_signal_ts: None,
@@ -389,8 +384,8 @@ pub async fn run_trending(mut ch: TrendingChannels, params: TrendParams) {
                         symbol: tick.symbol.clone(),
                         side,
                         entry_price: tick.price,
-                        leverage: 10.0,  // TODO: config'ten al
-                        size_usdt: 10.0, // TODO: balance'a göre hesapla
+                        leverage: engine.params.leverage,
+                        size_usdt: engine.params.position_size_quote,
                         ts: now,
                     };
 
