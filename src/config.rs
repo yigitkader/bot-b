@@ -31,6 +31,11 @@ pub struct BotConfig {
     pub signal_cooldown_secs: i64,
     pub warmup_min_ticks: usize,
     pub recv_window_ms: u64,
+    // Liquidation cluster thresholds (normalized ratio: liquidation_notional / open_interest)
+    // Typical values: 0.0001 (0.01%) to 0.01 (1%) of OI
+    // Higher values indicate more significant liquidation pressure
+    pub liq_long_cluster_min: Option<f64>,
+    pub liq_short_cluster_min: Option<f64>,
 }
 
 impl BotConfig {
@@ -124,6 +129,35 @@ impl BotConfig {
                 binance_cfg.and_then(|b| b.recv_window_ms),
                 5000u64,
             ),
+            use_isolated_margin: bool_setting(
+                "BOT_USE_ISOLATED_MARGIN",
+                file_cfg.risk.as_ref().and_then(|r| r.use_isolated_margin),
+                false,
+            ),
+            min_margin_usd: numeric_setting(
+                "BOT_MIN_MARGIN_USD",
+                file_cfg.min_margin_usd,
+                10.0,
+            ),
+            max_position_notional_usd: numeric_setting(
+                "BOT_MAX_POSITION_NOTIONAL_USD",
+                file_cfg.risk.as_ref().and_then(|r| r.max_position_notional_usd),
+                30000.0,
+            ),
+            min_quote_balance_usd: numeric_setting(
+                "BOT_MIN_QUOTE_BALANCE_USD",
+                file_cfg.min_quote_balance_usd,
+                20.0,
+            ),
+            // Liquidation cluster thresholds (ratio: liquidation_notional / open_interest)
+            // Default: None (no filtering). Typical values: 0.0001 (0.01%) to 0.01 (1%)
+            // Example: 0.001 means liquidations must be >= 0.1% of OI to be considered significant
+            liq_long_cluster_min: std::env::var("BOT_LIQ_LONG_CLUSTER_MIN")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok()),
+            liq_short_cluster_min: std::env::var("BOT_LIQ_SHORT_CLUSTER_MIN")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok()),
         }
     }
 
@@ -197,6 +231,21 @@ where
     if let Some(alias) = alias_env {
         if let Some(val) = std::env::var(alias).ok().and_then(|v| v.parse::<T>().ok()) {
             return val;
+        }
+    }
+    file_value.unwrap_or(default)
+}
+
+fn bool_setting(env_key: &str, file_value: Option<bool>, default: bool) -> bool {
+    if let Ok(val) = std::env::var(env_key) {
+        if let Ok(parsed) = val.parse::<bool>() {
+            return parsed;
+        }
+        // Also support "true"/"false" strings
+        match val.to_lowercase().as_str() {
+            "true" | "1" | "yes" => return true,
+            "false" | "0" | "no" => return false,
+            _ => {}
         }
     }
     file_value.unwrap_or(default)

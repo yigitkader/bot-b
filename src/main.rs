@@ -17,6 +17,13 @@ async fn main() -> Result<()> {
 
     let shared_state = SharedState::new();
     let connection = Arc::new(Connection::new(config.clone()));
+
+    // Initialize trading settings (margin mode and leverage) at startup
+    if let Err(err) = connection.initialize_trading_settings().await {
+        error!("Failed to initialize trading settings: {err:?}");
+        return Err(err);
+    }
+
     let bus = EventBus::new(2048);
 
     let trending_ch = bus.trending_channels();
@@ -60,8 +67,11 @@ async fn main() -> Result<()> {
 
     {
         let ch = follow_ch;
+        // Round-trip commission: 2x taker fee (entry + exit)
+        // Default: 0.08% (2x 0.04% taker fee)
+        let commission_pct = 0.08;
         tasks.push(tokio::spawn(async move {
-            follow_orders::run_follow_orders(ch, config.tp_percent, config.sl_percent).await;
+            follow_orders::run_follow_orders(ch, config.tp_percent, config.sl_percent, commission_pct).await;
         }));
     }
 

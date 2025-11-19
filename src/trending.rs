@@ -232,6 +232,12 @@ pub fn build_signal_contexts(
 
     let mut matched_candles = Vec::with_capacity(candles.len());
     let mut contexts = Vec::with_capacity(candles.len());
+    
+    // Last known values - bu veriler periyodik olarak güncellenir, bu yüzden
+    // son bilinen değerleri kullanarak eksik verileri dolduruyoruz
+    let mut last_funding: Option<f64> = None;
+    let mut last_oi: Option<f64> = None;
+    let mut last_lsr: Option<f64> = None;
 
     for c in candles {
         let di = DataItem::builder()
@@ -248,27 +254,52 @@ pub fn build_signal_contexts(
         let r = rsi.next(&di);
         let atr_v = atr.next(&di);
 
-        // Gerçek API verisi kullanılmalı - fallback değerler yok
-        // Eğer veri bulunamazsa, bu candle için context oluşturulmaz (skip edilir)
-        let Some(funding_rate) = nearest_value_by_time(&c.close_time, funding, |fr| {
+        // Funding rate: Önce bu candle için en yakın funding'i bul
+        // Eğer bulunursa kullan ve last_funding'i güncelle
+        // Eğer bulunamazsa, son bilinen funding rate'i kullan
+        let funding_rate = nearest_value_by_time(&c.close_time, funding, |fr| {
             ts_ms_to_utc(fr.funding_time)
         })
-        .and_then(|fr| fr.funding_rate.parse().ok()) else {
-            // Veri yoksa bu candle'ı skip et - dummy data kullanma
+        .and_then(|fr| fr.funding_rate.parse().ok())
+        .or_else(|| last_funding);
+        
+        // Eğer funding rate bulunamadıysa (ne direct match ne de last known), skip et
+        let Some(funding_rate) = funding_rate else {
             continue;
         };
+        
+        // Funding rate bulundu, last_funding'i güncelle
+        last_funding = Some(funding_rate);
 
-        let Some(open_interest) = nearest_value_by_time(&c.close_time, oi_hist, |p| p.timestamp)
-            .map(|p| p.open_interest) else {
-            // Veri yoksa bu candle'ı skip et - dummy data kullanma
+        // Open Interest: Önce bu candle için en yakın OI'yi bul
+        // Eğer bulunursa kullan ve last_oi'yi güncelle
+        // Eğer bulunamazsa, son bilinen OI değerini kullan
+        let open_interest = nearest_value_by_time(&c.close_time, oi_hist, |p| p.timestamp)
+            .map(|p| p.open_interest)
+            .or(last_oi);
+        
+        // Eğer OI bulunamadıysa (ne direct match ne de last known), skip et
+        let Some(open_interest) = open_interest else {
             continue;
         };
+        
+        // OI bulundu, last_oi'yi güncelle
+        last_oi = Some(open_interest);
 
-        let Some(long_short_ratio) = nearest_value_by_time(&c.close_time, lsr_hist, |p| p.timestamp)
-            .map(|p| p.long_short_ratio) else {
-            // Veri yoksa bu candle'ı skip et - dummy data kullanma
+        // Long/Short Ratio: Önce bu candle için en yakın LSR'yi bul
+        // Eğer bulunursa kullan ve last_lsr'yi güncelle
+        // Eğer bulunamazsa, son bilinen LSR değerini kullan
+        let long_short_ratio = nearest_value_by_time(&c.close_time, lsr_hist, |p| p.timestamp)
+            .map(|p| p.long_short_ratio)
+            .or(last_lsr);
+        
+        // Eğer LSR bulunamadıysa (ne direct match ne de last known), skip et
+        let Some(long_short_ratio) = long_short_ratio else {
             continue;
         };
+        
+        // LSR bulundu, last_lsr'yi güncelle
+        last_lsr = Some(long_short_ratio);
 
         matched_candles.push(c.clone());
         contexts.push(SignalContext {
@@ -371,7 +402,36 @@ fn generate_signal(
     let long_min = cfg.long_min_score.max(4);
     let short_min = cfg.short_min_score.max(4);
     
-    let side = if long_score >= long_min && long_score > short_score {
+    // Determine signal side with tie-break mechanism
+    let side = if long_score >= long_min && short_score >= short_min {
+        // Both scores meet minimum threshold
+        if long_score > short_score {
+            SignalSide::Long
+        } else if short_score > long_score {
+            SignalSide::Short
+        } else {
+            // Tie-break: use trend direction as primary factor
+            match trend {
+                TrendDirection::Up => SignalSide::Long,
+                TrendDirection::Down => SignalSide::Short,
+                TrendDirection::Flat => {
+                    // Secondary tie-break: use RSI
+                    if ctx.rsi >= cfg.rsi_trend_long_min {
+                        SignalSide::Long
+                    } else if ctx.rsi <= cfg.rsi_trend_short_max {
+                        SignalSide::Short
+                    } else {
+                        // Tertiary tie-break: use funding rate
+                        if ctx.funding_rate <= cfg.funding_extreme_pos {
+                            SignalSide::Long
+                        } else {
+                            SignalSide::Short
+                        }
+                    }
+                }
+            }
+        }
+    } else if long_score >= long_min && long_score > short_score {
         SignalSide::Long
     } else if short_score >= short_min && short_score > long_score {
         SignalSide::Short
@@ -668,12 +728,21 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, Duration as TokioDuration};
 use uuid::Uuid;
 
+/// Her side için ayrı cooldown tracking (trend reversal'ları kaçırmamak için)
+/// LONG ve SHORT sinyalleri birbirini bloklamaz
+struct LastSignalState {
+    last_long_time: Option<chrono::DateTime<Utc>>,
+    last_short_time: Option<chrono::DateTime<Utc>>,
+}
+
 /// Production için trending modülü - MarketTick eventlerini dinler ve TradeSignal üretir
 /// 
 /// Bu fonksiyon:
 /// 1. Periyodik olarak kline verilerini çeker (örn: her 5 dakikada bir)
 /// 2. Funding, OI, Long/Short ratio verilerini çeker
 /// 3. Sinyal üretir
+/// 4. TradeSignal eventlerini event bus'a gönderir
+
 /// 4. TradeSignal eventlerini event bus'a gönderir
 pub async fn run_trending(
     mut ch: TrendingChannels,
@@ -700,11 +769,16 @@ pub async fn run_trending(
     let futures_period = "5m";
     let kline_limit = (params.warmup_min_ticks + 10) as u32; // Warmup için yeterli veri
 
-    let mut last_signal_time: Option<chrono::DateTime<Utc>> = None;
+    let mut signal_state = LastSignalState {
+        last_long_time: None,
+        last_short_time: None,
+    };
     let mut last_candle_time: Option<chrono::DateTime<Utc>> = None;
 
-    // Her 5 dakikada bir sinyal kontrolü yap
-    let mut ticker = interval(TokioDuration::from_secs(60)); // Her 1 dakikada kontrol et (yeni candle için)
+    // 5 dakikalık kline için 5 dakikada bir kontrol et (API rate limit tasarrufu)
+    // generate_latest_signal içinde duplicate candle kontrolü de var (ek güvenlik)
+    let kline_interval_secs = 5 * 60; // 5 minutes = 300 seconds
+    let mut ticker = interval(TokioDuration::from_secs(kline_interval_secs));
     
     info!("TRENDING: started for symbol {}", symbol);
 
@@ -732,7 +806,7 @@ pub async fn run_trending(
                     kline_limit,
                     &cfg,
                     &params,
-                    &mut last_signal_time,
+                    &mut signal_state,
                     &mut last_candle_time,
                 ).await {
                     Ok(Some(signal)) => {
@@ -761,7 +835,7 @@ async fn generate_latest_signal(
     kline_limit: u32,
     cfg: &AlgoConfig,
     params: &TrendParams,
-    last_signal_time: &mut Option<chrono::DateTime<Utc>>,
+    signal_state: &mut LastSignalState,
     last_candle_time: &mut Option<chrono::DateTime<Utc>>,
 ) -> Result<Option<TradeSignal>> {
     // Kline verilerini çek
@@ -777,23 +851,21 @@ async fn generate_latest_signal(
         return Ok(None);
     }
 
-    // Son candle'ın zamanını kontrol et
+    // Son candle'ın zamanını kontrol et (duplicate API call koruması)
+    // Interval 5 dakika olsa bile, clock drift veya API timing farklılıkları
+    // nedeniyle aynı candle tekrar gelebilir
     let latest_candle = &candles[candles.len() - 1];
     if let Some(last_time) = last_candle_time {
-        // Eğer aynı candle ise, yeni sinyal üretme
+        // Eğer aynı candle ise (close_time değişmemiş), yeni sinyal üretme
+        // Bu sayede gereksiz API çağrıları ve sinyal üretimi önlenir
         if latest_candle.close_time <= *last_time {
             return Ok(None);
         }
     }
     *last_candle_time = Some(latest_candle.close_time);
 
-    // Cooldown kontrolü
-    if let Some(last_time) = last_signal_time {
-        let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
-        if Utc::now() - *last_time < cooldown_duration {
-            return Ok(None);
-        }
-    }
+    // Cooldown kontrolü burada yapılmaz - signal side'ı bilinmeden yapılamaz
+    // Cooldown kontrolü signal üretildikten sonra, side'a göre yapılacak
 
     // Funding, OI, Long/Short ratio verilerini çek
     let funding = client.fetch_funding_rates(symbol, 100).await?;
@@ -828,7 +900,28 @@ async fn generate_latest_signal(
                 SignalSide::Flat => unreachable!(),
             };
 
-            *last_signal_time = Some(Utc::now());
+            // Side-specific cooldown kontrolü (trend reversal'ları kaçırmamak için)
+            let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
+            let now = Utc::now();
+            
+            match side {
+                Side::Long => {
+                    if let Some(last_time) = signal_state.last_long_time {
+                        if now - last_time < cooldown_duration {
+                            return Ok(None); // Long cooldown aktif
+                        }
+                    }
+                    signal_state.last_long_time = Some(now);
+                }
+                Side::Short => {
+                    if let Some(last_time) = signal_state.last_short_time {
+                        if now - last_time < cooldown_duration {
+                            return Ok(None); // Short cooldown aktif
+                        }
+                    }
+                    signal_state.last_short_time = Some(now);
+                }
+            }
 
             let trade_signal = TradeSignal {
                 id: Uuid::new_v4(),

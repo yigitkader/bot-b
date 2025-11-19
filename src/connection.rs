@@ -2,10 +2,11 @@ use crate::config::BotConfig;
 use crate::types::ConnectionChannels;
 use crate::types::{
     AccountBalance, AccountPayload, AccountPosition, AccountUpdate, BalanceSnapshot, Connection,
-    DepthEvent, DepthSnapshot, ForceOrderRecord, ForceOrderStreamEvent, ForceOrderStreamOrder,
-    ForceOrderStreamWrapper, FuturesBalance, LiqEntry, LiqState, ListenKeyResponse,
-    MarkPriceEvent, MarketTick, NewOrderRequest, OpenInterestResponse, OrderPayload, OrderStatus,
-    OrderTradeUpdate, OrderUpdate, PositionUpdate, PremiumIndex, Side,
+    DepthEvent, DepthSnapshot, ExchangeInfoResponse, Filter, ForceOrderRecord,
+    ForceOrderStreamEvent, ForceOrderStreamOrder, ForceOrderStreamWrapper, FuturesBalance,
+    LeverageBracketResponse, LiqEntry, LiqState, ListenKeyResponse, MarkPriceEvent, MarketTick,
+    NewOrderRequest, OpenInterestResponse, OrderPayload, OrderStatus, OrderTradeUpdate,
+    OrderUpdate, PositionRiskResponse, PositionUpdate, PremiumIndex, Side, SymbolInfo, SymbolPrecision,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -35,9 +36,10 @@ impl Connection {
             .user_agent("bot-b/0.1")
             .build()
             .expect("failed to build reqwest client");
-        // Rate limiter: Binance Futures API limiti ~1200 requests/minute
-        // Güvenli limit: 20 requests/second = 1200/minute
-        let rate_limiter = Arc::new(tokio::sync::Semaphore::new(20));
+        // Rate limiter: Binance Futures API
+        // - Order limiter: 10 orders/second
+        // - Weight limiter: 1200 weight/minute
+        let rate_limiter = Arc::new(crate::types::RateLimiter::new());
         Self {
             config,
             http,
@@ -47,6 +49,29 @@ impl Connection {
 
     pub fn quote_asset(&self) -> &str {
         &self.config.quote_asset
+    }
+
+    pub fn config(&self) -> &BotConfig {
+        &self.config
+    }
+
+    /// Initialize trading settings for the symbol (margin mode and leverage)
+    /// Should be called once at bot startup
+    pub async fn initialize_trading_settings(&self) -> Result<()> {
+        self.ensure_credentials()?;
+        let symbol = &self.config.symbol;
+
+        info!("CONNECTION: Initializing trading settings for {}", symbol);
+
+        // Set margin mode first
+        self.set_margin_mode(symbol, self.config.use_isolated_margin)
+            .await?;
+
+        // Then set leverage
+        self.set_leverage(symbol, self.config.leverage).await?;
+
+        info!("CONNECTION: Trading settings initialized successfully");
+        Ok(())
     }
 
     pub async fn fetch_snapshot(&self) -> Result<MarketTick> {
@@ -182,6 +207,37 @@ impl Connection {
         }
     }
 
+    /// Calculate limit price from best bid/ask with slippage tolerance
+    /// For BUY orders: uses best ask (or slightly above with tolerance)
+    /// For SELL orders: uses best bid (or slightly below with tolerance)
+    fn calculate_limit_price(
+        side: &Side,
+        best_bid: f64,
+        best_ask: f64,
+        tick_size: f64,
+        slippage_tolerance: f64,
+    ) -> f64 {
+        let slippage_tolerance = slippage_tolerance.max(0.0).min(0.01); // Clamp between 0% and 1%
+        
+        let price = match side {
+            Side::Long => {
+                // BUY: use best ask, add small slippage tolerance to improve fill probability
+                best_ask * (1.0 + slippage_tolerance)
+            }
+            Side::Short => {
+                // SELL: use best bid, subtract small slippage tolerance to improve fill probability
+                best_bid * (1.0 - slippage_tolerance)
+            }
+        };
+        
+        // Round to tick size
+        if tick_size > 0.0 {
+            (price / tick_size).round() * tick_size
+        } else {
+            price
+        }
+    }
+
     pub async fn send_order(&self, order: NewOrderRequest) -> Result<()> {
         self.ensure_credentials()?;
 
@@ -197,17 +253,83 @@ impl Connection {
             return Err(anyhow!("order quantity must be positive"));
         }
 
-        let side = match side {
+        // Set margin mode BEFORE setting leverage and sending order (CRITICAL for Binance Futures)
+        self.set_margin_mode(&symbol, self.config.use_isolated_margin)
+            .await?;
+
+        // Set leverage BEFORE sending order (CRITICAL for Binance Futures)
+        self.set_leverage(&symbol, self.config.leverage).await?;
+
+        // Fetch symbol info to format quantity correctly
+        let symbol_info = self.fetch_symbol_info(&symbol).await?;
+        let qty_rounded = Self::round_to_step_size(quantity, symbol_info.step_size);
+        let qty_formatted = Self::format_quantity(qty_rounded, symbol_info.step_size);
+
+        let side_str = match side {
             Side::Long => "BUY",
             Side::Short => "SELL",
         };
 
+        // Determine order type: MARKET for close orders, LIMIT for open orders
+        let order_type = if reduce_only {
+            "MARKET" // Close orders use market to ensure immediate execution
+        } else {
+            "LIMIT"  // Open orders use limit to avoid slippage
+        };
+
         let mut params = vec![
-            ("symbol".to_string(), symbol),
-            ("side".to_string(), side.to_string()),
-            ("type".to_string(), "MARKET".to_string()),
-            ("quantity".to_string(), format!("{:.6}", quantity)),
+            ("symbol".to_string(), symbol.clone()),
+            ("side".to_string(), side_str.to_string()),
+            ("type".to_string(), order_type.to_string()),
+            ("quantity".to_string(), qty_formatted),
         ];
+
+        // For LIMIT orders, calculate price from best bid/ask
+        if order_type == "LIMIT" {
+            // Fetch depth snapshot to get best bid/ask
+            match self.fetch_depth_snapshot().await {
+                Ok(depth) => {
+                    // Parse best bid and ask
+                    let best_bid = depth.bids
+                        .first()
+                        .and_then(|lvl| lvl[0].parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let best_ask = depth.asks
+                        .first()
+                        .and_then(|lvl| lvl[0].parse::<f64>().ok())
+                        .unwrap_or(0.0);
+
+                    if best_bid > 0.0 && best_ask > 0.0 {
+                        // Calculate limit price with 0.1% slippage tolerance (default)
+                        let slippage_tolerance = 0.001; // 0.1%
+                        let limit_price = Self::calculate_limit_price(
+                            &side,
+                            best_bid,
+                            best_ask,
+                            symbol_info.tick_size,
+                            slippage_tolerance,
+                        );
+
+                        // Format price with appropriate precision (using tick_size)
+                        let price_formatted = if symbol_info.tick_size > 0.0 {
+                            Self::format_quantity(limit_price, symbol_info.tick_size)
+                        } else {
+                            format!("{:.8}", limit_price)
+                        };
+                        params.push(("price".to_string(), price_formatted));
+                        params.push(("timeInForce".to_string(), "GTC".to_string())); // Good Till Cancel
+                    } else {
+                        warn!("CONNECTION: invalid bid/ask prices, falling back to market order");
+                        params[2] = ("type".to_string(), "MARKET".to_string());
+                    }
+                }
+                Err(err) => {
+                    warn!("CONNECTION: failed to fetch depth snapshot for limit price: {err:?}, falling back to market order");
+                    // Fallback to market order if depth fetch fails
+                    params[2] = ("type".to_string(), "MARKET".to_string());
+                }
+            }
+        }
 
         if reduce_only {
             params.push(("reduceOnly".into(), "true".into()));
@@ -217,8 +339,180 @@ impl Connection {
         }
 
         self.signed_post("/fapi/v1/order", params).await?;
-        info!("CONNECTION: order sent (reduce_only={})", reduce_only);
+        info!("CONNECTION: order sent (type={}, reduce_only={})", order_type, reduce_only);
         Ok(())
+    }
+
+    /// Fetch maximum leverage for a symbol from Binance
+    /// GET /fapi/v1/leverageBracket
+    pub async fn fetch_max_leverage(&self, symbol: &str) -> Result<f64> {
+        let params = vec![("symbol".to_string(), symbol.to_string())];
+        let response = self
+            .signed_get("/fapi/v1/leverageBracket", params)
+            .await?
+            .json::<Vec<LeverageBracketResponse>>()
+            .await
+            .context("failed to parse leverage bracket response")?;
+
+        // When symbol parameter is provided, response contains only that symbol's brackets
+        // Find the symbol's bracket and get the maximum initial leverage
+        let bracket_response = response
+            .into_iter()
+            .find(|bracket| bracket.symbol == symbol)
+            .ok_or_else(|| anyhow!("leverage bracket not found for symbol: {}", symbol))?;
+
+        let max_leverage = bracket_response
+            .brackets
+            .iter()
+            .map(|b| b.initial_leverage as f64)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .ok_or_else(|| anyhow!("no leverage brackets found for symbol: {}", symbol))?;
+
+        Ok(max_leverage)
+    }
+
+    /// Set margin mode (ISOLATED or CROSSED) for a symbol
+    /// POST /fapi/v1/marginType
+    pub async fn set_margin_mode(&self, symbol: &str, isolated: bool) -> Result<()> {
+        self.ensure_credentials()?;
+
+        let margin_type = if isolated { "ISOLATED" } else { "CROSSED" };
+        let params = vec![
+            ("symbol".to_string(), symbol.to_string()),
+            ("marginType".to_string(), margin_type.to_string()),
+        ];
+
+        self.signed_post("/fapi/v1/marginType", params).await?;
+        info!(
+            "CONNECTION: margin mode set to {} for {}",
+            margin_type, symbol
+        );
+        Ok(())
+    }
+
+    /// Set leverage for a symbol (required before placing orders on Binance Futures)
+    /// POST /fapi/v1/leverage
+    /// Automatically validates against maximum leverage from Binance
+    pub async fn set_leverage(&self, symbol: &str, leverage: f64) -> Result<()> {
+        self.ensure_credentials()?;
+
+        if leverage <= 0.0 {
+            return Err(anyhow!("leverage must be positive"));
+        }
+
+        // Fetch maximum leverage from Binance for this symbol
+        let max_leverage = self.fetch_max_leverage(symbol).await?;
+
+        if leverage > max_leverage {
+            return Err(anyhow!(
+                "leverage {}x exceeds maximum {}x for symbol {}",
+                leverage,
+                max_leverage,
+                symbol
+            ));
+        }
+
+        let params = vec![
+            ("symbol".to_string(), symbol.to_string()),
+            ("leverage".to_string(), leverage.to_string()),
+        ];
+
+        self.signed_post("/fapi/v1/leverage", params).await?;
+        info!(
+            "CONNECTION: leverage set to {}x for {} (max: {}x)",
+            leverage, symbol, max_leverage
+        );
+        Ok(())
+    }
+
+    /// Fetch exchange info for a symbol (stepSize, minQuantity, etc.)
+    /// GET /fapi/v1/exchangeInfo
+    pub async fn fetch_symbol_info(&self, symbol: &str) -> Result<SymbolPrecision> {
+        let url = format!("{}/fapi/v1/exchangeInfo", self.config.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ExchangeInfoResponse>()
+            .await
+            .context("failed to parse exchange info response")?;
+
+        let symbol_info = response
+            .symbols
+            .into_iter()
+            .find(|s| s.symbol == symbol)
+            .ok_or_else(|| anyhow!("symbol not found in exchange info: {}", symbol))?;
+
+        let mut step_size = 0.001;
+        let mut min_quantity = 0.001;
+        let mut max_quantity = f64::MAX;
+        let mut tick_size = 0.01;
+        let mut min_price = 0.0;
+        let mut max_price = f64::MAX;
+
+        for filter in symbol_info.filters {
+            match filter.filter_type.as_str() {
+                "LOT_SIZE" => {
+                    if let (Some(ss), Some(mq), Some(mqx)) = (
+                        filter.data.get("stepSize").and_then(|v| v.as_str()),
+                        filter.data.get("minQty").and_then(|v| v.as_str()),
+                        filter.data.get("maxQty").and_then(|v| v.as_str()),
+                    ) {
+                        step_size = ss.parse().unwrap_or(0.001);
+                        min_quantity = mq.parse().unwrap_or(0.001);
+                        max_quantity = mqx.parse().unwrap_or(f64::MAX);
+                    }
+                }
+                "PRICE_FILTER" => {
+                    if let (Some(ts), Some(mp), Some(mxp)) = (
+                        filter.data.get("tickSize").and_then(|v| v.as_str()),
+                        filter.data.get("minPrice").and_then(|v| v.as_str()),
+                        filter.data.get("maxPrice").and_then(|v| v.as_str()),
+                    ) {
+                        tick_size = ts.parse().unwrap_or(0.01);
+                        min_price = mp.parse().unwrap_or(0.0);
+                        max_price = mxp.parse().unwrap_or(f64::MAX);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(SymbolPrecision {
+            step_size,
+            min_quantity,
+            max_quantity,
+            tick_size,
+            min_price,
+            max_price,
+        })
+    }
+
+    /// Round quantity to step size
+    pub fn round_to_step_size(quantity: f64, step_size: f64) -> f64 {
+        if step_size <= 0.0 {
+            return quantity;
+        }
+        (quantity / step_size).floor() * step_size
+    }
+
+    /// Format quantity with appropriate precision based on step size
+    pub fn format_quantity(quantity: f64, step_size: f64) -> String {
+        if step_size <= 0.0 {
+            return format!("{:.8}", quantity);
+        }
+        // Calculate decimal places from step size
+        // e.g., 0.001 -> 3 decimals, 0.01 -> 2 decimals, 1.0 -> 0 decimals
+        let step_str = format!("{:.10}", step_size);
+        let decimal_places = if let Some(dot_pos) = step_str.find('.') {
+            let after_dot = &step_str[dot_pos + 1..];
+            after_dot.trim_end_matches('0').len()
+        } else {
+            0
+        };
+        format!("{:.1$}", quantity, decimal_places.min(8))
     }
 
     pub async fn fetch_balance(&self) -> Result<Vec<BalanceSnapshot>> {
@@ -249,12 +543,60 @@ impl Connection {
         Ok(snapshots)
     }
 
+    /// Fetch current position for a symbol from Binance API
+    /// Returns None if no position exists or position is closed
+    pub async fn fetch_position(&self, symbol: &str) -> Result<Option<PositionUpdate>> {
+        self.ensure_credentials()?;
+
+        let mut params = Vec::new();
+        params.push(("symbol".to_string(), symbol.to_string()));
+
+        let response = self
+            .signed_get("/fapi/v2/positionRisk", params)
+            .await?
+            .json::<Vec<PositionRiskResponse>>()
+            .await
+            .context("failed to parse position risk response")?;
+
+        // Find position for the requested symbol
+        let position = response.into_iter().find(|p| p.symbol == symbol);
+
+        match position {
+            Some(pos) => {
+                let size = pos.position_amount.parse::<f64>().unwrap_or(0.0);
+                if size == 0.0 {
+                    return Ok(None);
+                }
+
+                let entry_price = pos.entry_price.parse::<f64>().unwrap_or(0.0);
+                let unrealized_pnl = pos.unrealized_profit.parse::<f64>().unwrap_or(0.0);
+                let leverage = pos.leverage.parse::<f64>().unwrap_or(0.0);
+                let side = if size >= 0.0 { Side::Long } else { Side::Short };
+
+                Ok(Some(PositionUpdate {
+                    position_id: Uuid::new_v4(), // API doesn't return position ID, generate new one
+                    symbol: pos.symbol,
+                    side,
+                    entry_price,
+                    size: size.abs(),
+                    leverage,
+                    unrealized_pnl,
+                    ts: Utc::now(),
+                    is_closed: false,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn consume_mark_price_stream(
         self: Arc<Self>,
         ch: ConnectionChannels,
         depth_state: Arc<RwLock<DepthState>>,
         liq_state: Arc<RwLock<LiqState>>,
     ) -> Result<()> {
+        use tokio::sync::broadcast;
+        
         let mut retry_delay = Duration::from_secs(1);
         loop {
             let url = self.mark_price_stream_url();
@@ -263,6 +605,8 @@ impl Connection {
                     info!("CONNECTION: mark price stream connected ({url})");
                     retry_delay = Duration::from_secs(1);
                     let (_, mut read) = ws_stream.split();
+                    // Create a receiver to monitor for lag
+                    let mut lag_monitor = ch.market_tx.subscribe();
                     while let Some(message) = read.next().await {
                         match message {
                             Ok(Message::Text(txt)) => {
@@ -271,9 +615,42 @@ impl Connection {
                                     let (liq_long, liq_short) = (liq_state.read().await).snapshot();
                                     tick.liq_long_cluster = liq_long;
                                     tick.liq_short_cluster = liq_short;
-                                    if ch.market_tx.send(tick).is_err() {
-                                        warn!("CONNECTION: market_tx receiver dropped");
-                                        break;
+                                    
+                                    // Check for lag by trying to receive (non-blocking)
+                                    // If we can receive, it means messages are being consumed
+                                    // If we get Lagged error, receivers are falling behind
+                                    match lag_monitor.try_recv() {
+                                        Ok(_) | Err(broadcast::error::TryRecvError::Empty) => {
+                                            // Normal operation - send the tick
+                                            if ch.market_tx.send(tick).is_err() {
+                                                warn!("CONNECTION: market_tx receiver dropped");
+                                                break;
+                                            }
+                                        }
+                                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                                            warn!("CONNECTION: Market tick lagged by {} messages", n);
+                                            // Fetch snapshot to recover from lag
+                                            if let Ok(snapshot) = self.fetch_snapshot().await {
+                                                let mut recovered_tick = snapshot;
+                                                recovered_tick.obi = (depth_state.read().await).obi();
+                                                let (liq_long, liq_short) = (liq_state.read().await).snapshot();
+                                                recovered_tick.liq_long_cluster = liq_long;
+                                                recovered_tick.liq_short_cluster = liq_short;
+                                                if ch.market_tx.send(recovered_tick).is_err() {
+                                                    warn!("CONNECTION: market_tx receiver dropped");
+                                                    break;
+                                                }
+                                            }
+                                            // Also send the current tick
+                                            if ch.market_tx.send(tick).is_err() {
+                                                warn!("CONNECTION: market_tx receiver dropped");
+                                                break;
+                                            }
+                                        }
+                                        Err(broadcast::error::TryRecvError::Closed) => {
+                                            warn!("CONNECTION: market_tx channel closed");
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -285,9 +662,40 @@ impl Connection {
                                             (liq_state.read().await).snapshot();
                                         tick.liq_long_cluster = liq_long;
                                         tick.liq_short_cluster = liq_short;
-                                        if ch.market_tx.send(tick).is_err() {
-                                            warn!("CONNECTION: market_tx receiver dropped");
-                                            break;
+                                        
+                                        // Check for lag by trying to receive (non-blocking)
+                                        match lag_monitor.try_recv() {
+                                            Ok(_) | Err(broadcast::error::TryRecvError::Empty) => {
+                                                // Normal operation - send the tick
+                                                if ch.market_tx.send(tick).is_err() {
+                                                    warn!("CONNECTION: market_tx receiver dropped");
+                                                    break;
+                                                }
+                                            }
+                                            Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                                                warn!("CONNECTION: Market tick lagged by {} messages", n);
+                                                // Fetch snapshot to recover from lag
+                                                if let Ok(snapshot) = self.fetch_snapshot().await {
+                                                    let mut recovered_tick = snapshot;
+                                                    recovered_tick.obi = (depth_state.read().await).obi();
+                                                    let (liq_long, liq_short) = (liq_state.read().await).snapshot();
+                                                    recovered_tick.liq_long_cluster = liq_long;
+                                                    recovered_tick.liq_short_cluster = liq_short;
+                                                    if ch.market_tx.send(recovered_tick).is_err() {
+                                                        warn!("CONNECTION: market_tx receiver dropped");
+                                                        break;
+                                                    }
+                                                }
+                                                // Also send the current tick
+                                                if ch.market_tx.send(tick).is_err() {
+                                                    warn!("CONNECTION: market_tx receiver dropped");
+                                                    break;
+                                                }
+                                            }
+                                            Err(broadcast::error::TryRecvError::Closed) => {
+                                                warn!("CONNECTION: market_tx channel closed");
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -322,6 +730,14 @@ impl Connection {
     ) -> Result<()> {
         let mut retry_delay = Duration::from_secs(1);
         loop {
+            // Fetch snapshot before reconnecting to restore state
+            if let Ok(snapshot) = self.fetch_depth_snapshot().await {
+                depth_state.write().await.reset_with_snapshot(snapshot);
+                info!("CONNECTION: depth state restored from snapshot");
+            } else {
+                warn!("CONNECTION: failed to fetch depth snapshot, continuing with empty state");
+            }
+
             let url = self.depth_stream_url();
             match connect_async(&url).await {
                 Ok((ws_stream, _)) => {
@@ -565,6 +981,17 @@ impl Connection {
         })
     }
 
+    /// Fetch liquidation clusters and normalize by Open Interest
+    /// 
+    /// Returns: (liq_long_cluster, liq_short_cluster) as normalized ratios
+    /// 
+    /// Normalization: liquidation_notional / open_interest
+    /// - Values are typically in range 0.0001 (0.01%) to 0.01 (1%) of OI
+    /// - Example: 0.001 means liquidations represent 0.1% of total open interest
+    /// - Higher values indicate more significant liquidation pressure
+    /// 
+    /// Note: OI is in notional value (e.g., 1.5B USD), liquidations are smaller (e.g., 500K USD)
+    /// This normalization allows comparison across different market sizes
     async fn fetch_liquidation_clusters(&self) -> Result<(Option<f64>, Option<f64>)> {
         let params = vec![
             ("symbol".to_string(), self.config.symbol.clone()),
@@ -595,8 +1022,8 @@ impl Connection {
                 .unwrap_or(0.0);
             let notional = qty * price;
             match order.side.as_str() {
-                "SELL" => long_total += notional,
-                "BUY" => short_total += notional,
+                "SELL" => long_total += notional,  // Long liquidations (forced sells)
+                "BUY" => short_total += notional,  // Short liquidations (forced buys)
                 _ => {}
             }
         }
@@ -605,6 +1032,9 @@ impl Connection {
         if oi <= 0.0 {
             return Ok((None, None));
         }
+        
+        // Normalize: ratio of liquidation notional to open interest
+        // This gives a scale-independent measure of liquidation pressure
         let normalize = |value: f64| if value > 0.0 { Some(value / oi) } else { None };
         Ok((normalize(long_total), normalize(short_total)))
     }
@@ -626,7 +1056,7 @@ impl Connection {
             .context("failed to parse open interest")
     }
 
-    async fn fetch_depth_obi(&self) -> Result<Option<f64>> {
+    async fn fetch_depth_snapshot(&self) -> Result<DepthSnapshot> {
         let url = format!("{}/fapi/v1/depth", self.config.base_url);
         let snapshot = self
             .http
@@ -637,6 +1067,11 @@ impl Connection {
             .error_for_status()?
             .json::<DepthSnapshot>()
             .await?;
+        Ok(snapshot)
+    }
+
+    async fn fetch_depth_obi(&self) -> Result<Option<f64>> {
+        let snapshot = self.fetch_depth_snapshot().await?;
 
         let bid_sum: f64 = snapshot
             .bids
@@ -669,15 +1104,37 @@ impl Connection {
         Ok(resp)
     }
 
+    /// Get weight for an endpoint (Binance Futures API weight system)
+    fn get_endpoint_weight(&self, path: &str) -> u32 {
+        match path {
+            "/fapi/v1/order" => 1, // Order placement
+            "/fapi/v1/marginType" => 1,
+            "/fapi/v1/leverage" => 1,
+            "/fapi/v1/leverageBracket" => 1,
+            "/fapi/v2/balance" => 5,
+            "/fapi/v2/positionRisk" => 5,
+            "/fapi/v1/forceOrders" => 20,
+            "/fapi/v1/exchangeInfo" => 1,
+            "/fapi/v1/depth" => 1,
+            "/fapi/v1/premiumIndex" => 1,
+            "/fapi/v1/openInterest" => 1,
+            _ => 1, // Default weight
+        }
+    }
+
+    /// Check if endpoint is an order endpoint (needs order rate limiting)
+    fn is_order_endpoint(&self, path: &str) -> bool {
+        matches!(path, "/fapi/v1/order" | "/fapi/v1/marginType" | "/fapi/v1/leverage")
+    }
+
     async fn signed_get(
         &self,
         path: &str,
         params: Vec<(String, String)>,
     ) -> Result<reqwest::Response> {
-        // Rate limit kontrolü
-        let _permit = self.rate_limiter.acquire().await.map_err(|_| {
-            anyhow!("rate limiter closed")
-        })?;
+        // Acquire weight permit
+        let weight = self.get_endpoint_weight(path);
+        self.rate_limiter.acquire_weight(weight).await?;
         
         let query = self.sign_params(params)?;
         let url = format!("{}{}?{}", self.config.base_url, path, query);
@@ -689,10 +1146,6 @@ impl Connection {
             .await?
             .error_for_status()?;
         
-        // Permit'i bırak (rate limit için)
-        drop(_permit);
-        tokio::time::sleep(Duration::from_millis(50)).await; // ~20 req/s için
-        
         Ok(response)
     }
 
@@ -701,10 +1154,14 @@ impl Connection {
         path: &str,
         params: Vec<(String, String)>,
     ) -> Result<reqwest::Response> {
-        // Rate limit kontrolü
-        let _permit = self.rate_limiter.acquire().await.map_err(|_| {
-            anyhow!("rate limiter closed")
-        })?;
+        // For order endpoints, use order limiter (10 orders/second)
+        if self.is_order_endpoint(path) {
+            let _order_permit = self.rate_limiter.acquire_order_permit().await?;
+        }
+        
+        // Acquire weight permit
+        let weight = self.get_endpoint_weight(path);
+        self.rate_limiter.acquire_weight(weight).await?;
         
         let body = self.sign_params(params)?;
         let url = format!("{}{}", self.config.base_url, path);
@@ -717,10 +1174,6 @@ impl Connection {
             .send()
             .await?
             .error_for_status()?;
-        
-        // Permit'i bırak (rate limit için)
-        drop(_permit);
-        tokio::time::sleep(Duration::from_millis(50)).await; // ~20 req/s için
         
         Ok(response)
     }
@@ -789,7 +1242,67 @@ impl DepthState {
     }
 
     fn update(&mut self, event: &DepthEvent) {
-        self.bids = event
+        // Merge bids: update or remove levels based on delta event
+        for [price_str, qty_str] in &event.bids {
+            let Ok(price) = price_str.parse::<f64>() else { continue };
+            let Ok(qty) = qty_str.parse::<f64>() else { continue };
+
+            if qty == 0.0 {
+                // Remove level when qty is 0 (Binance spec: "Bids and asks with quantity 0 mean the level should be removed")
+                self.bids.retain(|(p, _)| *p != price);
+            } else {
+                // Update existing level or insert new one
+                if let Some(level) = self.bids.iter_mut().find(|(p, _)| *p == price) {
+                    level.1 = qty;
+                } else {
+                    self.bids.push((price, qty));
+                }
+            }
+        }
+
+        // Sort bids descending (highest price first) and truncate
+        self.bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        self.bids.truncate(self.depth_limit);
+
+        // Merge asks: update or remove levels based on delta event
+        for [price_str, qty_str] in &event.asks {
+            let Ok(price) = price_str.parse::<f64>() else { continue };
+            let Ok(qty) = qty_str.parse::<f64>() else { continue };
+
+            if qty == 0.0 {
+                // Remove level when qty is 0 (Binance spec: "Bids and asks with quantity 0 mean the level should be removed")
+                self.asks.retain(|(p, _)| *p != price);
+            } else {
+                // Update existing level or insert new one
+                if let Some(level) = self.asks.iter_mut().find(|(p, _)| *p == price) {
+                    level.1 = qty;
+                } else {
+                    self.asks.push((price, qty));
+                }
+            }
+        }
+
+        // Sort asks ascending (lowest price first) and truncate
+        self.asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        self.asks.truncate(self.depth_limit);
+
+        // Recalculate OBI
+        let bid_sum: f64 = self.bids.iter().map(|(_, qty)| qty).sum();
+        let ask_sum: f64 = self.asks.iter().map(|(_, qty)| qty).sum();
+        if bid_sum > 0.0 && ask_sum > 0.0 {
+            self.obi = Some(bid_sum / ask_sum);
+        } else {
+            self.obi = None;
+        }
+    }
+
+    fn obi(&self) -> Option<f64> {
+        self.obi
+    }
+
+    /// Reset state with a depth snapshot
+    fn reset_with_snapshot(&mut self, snapshot: DepthSnapshot) {
+        self.bids = snapshot
             .bids
             .iter()
             .take(self.depth_limit)
@@ -799,7 +1312,7 @@ impl DepthState {
                 Some((price, qty))
             })
             .collect();
-        self.asks = event
+        self.asks = snapshot
             .asks
             .iter()
             .take(self.depth_limit)
@@ -818,10 +1331,6 @@ impl DepthState {
             self.obi = None;
         }
     }
-
-    fn obi(&self) -> Option<f64> {
-        self.obi
-    }
 }
 
 const LIQ_WINDOW_SECS: u64 = 30;
@@ -829,12 +1338,26 @@ const LIQ_WINDOW_SECS: u64 = 30;
 
 
 impl LiqState {
+    /// Record a liquidation event and normalize by Open Interest
+    /// 
+    /// Normalization: liquidation_notional / open_interest
+    /// - Values are typically very small (0.0001 to 0.01 range)
+    /// - Represents the ratio of liquidation volume to total open interest
+    /// - Accumulated over LIQ_WINDOW_SECS (30 seconds) to detect clusters
     fn record(&mut self, side: &str, notional: f64) {
         if self.open_interest <= f64::EPSILON || notional <= 0.0 {
             return;
         }
         let ratio = notional / self.open_interest;
         let now = Instant::now();
+        
+        // Prune old entries BEFORE adding the new one to avoid race conditions
+        // This ensures the newly added entry is never incorrectly pruned due to:
+        // - NTP clock adjustments
+        // - Instant wrapping
+        // - Time synchronization issues
+        self.prune(now);
+        
         let is_long_cluster = side.eq_ignore_ascii_case("SELL");
         self.entries.push_back(LiqEntry {
             ts: now,
@@ -846,7 +1369,6 @@ impl LiqState {
         } else {
             self.short_sum += ratio;
         }
-        self.prune(now);
     }
 
     fn set_open_interest(&mut self, value: f64) {
@@ -855,6 +1377,13 @@ impl LiqState {
         }
     }
 
+    /// Get current liquidation cluster sums (normalized ratios)
+    /// 
+    /// Returns: (liq_long_cluster, liq_short_cluster)
+    /// - Values are ratios: accumulated_liquidation_notional / open_interest
+    /// - Typical range: 0.0001 (0.01%) to 0.01 (1%) of OI
+    /// - To convert to percentage: value * 100.0
+    /// - To convert to basis points: value * 10000.0
     fn snapshot(&self) -> (Option<f64>, Option<f64>) {
         (
             if self.long_sum > 0.0 {
@@ -870,9 +1399,20 @@ impl LiqState {
         )
     }
 
+    /// Prune entries older than LIQ_WINDOW_SECS
+    /// 
+    /// Handles edge cases:
+    /// - Clock adjustments (NTP sync)
+    /// - Instant wrapping
+    /// - Entries with timestamps in the future (due to clock issues)
     fn prune(&mut self, now: Instant) {
         while let Some(entry) = self.entries.front() {
-            if now.duration_since(entry.ts) > StdDuration::from_secs(LIQ_WINDOW_SECS) {
+            // Use checked_duration_since to handle clock adjustments gracefully
+            // If entry.ts is in the future (due to clock sync), treat it as expired
+            let age = now.checked_duration_since(entry.ts)
+                .unwrap_or(StdDuration::from_secs(LIQ_WINDOW_SECS + 1));
+            
+            if age > StdDuration::from_secs(LIQ_WINDOW_SECS) {
                 let entry = self.entries.pop_front().unwrap();
                 if entry.is_long_cluster {
                     self.long_sum = (self.long_sum - entry.ratio).max(0.0);

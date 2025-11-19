@@ -6,6 +6,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
+use anyhow::Result;
 
 use tokio::sync::broadcast::{Receiver as BReceiver, Sender as BSender};
 use tokio::sync::mpsc::{Receiver as MReceiver, Sender as MSender};
@@ -125,9 +126,23 @@ pub(crate) struct FileConfig {
     #[serde(default)]
     pub max_usd_per_order: Option<f64>,
     #[serde(default)]
+    pub min_margin_usd: Option<f64>,
+    #[serde(default)]
+    pub min_quote_balance_usd: Option<f64>,
+    #[serde(default)]
     pub trending: Option<FileTrending>,
     #[serde(default)]
     pub binance: Option<FileBinance>,
+    #[serde(default)]
+    pub risk: Option<FileRisk>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct FileRisk {
+    #[serde(default)]
+    pub use_isolated_margin: Option<bool>,
+    #[serde(default)]
+    pub max_position_notional_usd: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -191,14 +206,96 @@ pub struct BotConfig {
     pub signal_cooldown_secs: i64,
     pub warmup_min_ticks: usize,
     pub recv_window_ms: u64,
+    pub use_isolated_margin: bool,
+    pub min_margin_usd: f64,
+    pub max_position_notional_usd: f64,
+    pub min_quote_balance_usd: f64,
 }
 
+
+/// Rate limiter for Binance Futures API
+/// - Order limiter: 10 orders/second
+/// - Weight limiter: 1200 weight/minute
+pub(crate) struct RateLimiter {
+    order_limiter: Arc<tokio::sync::Semaphore>,
+    weight_tracker: Arc<tokio::sync::RwLock<WeightTracker>>,
+}
+
+struct WeightTracker {
+    current_weight: u32,
+    window_start: std::time::Instant,
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        // Order limiter: 10 permits for 10 orders/second
+        let order_limiter = Arc::new(tokio::sync::Semaphore::new(10));
+        
+        let weight_tracker = Arc::new(tokio::sync::RwLock::new(WeightTracker {
+            current_weight: 0,
+            window_start: std::time::Instant::now(),
+        }));
+        
+        // Start weight reset task
+        let tracker_clone = weight_tracker.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let mut tracker = tracker_clone.write().await;
+                tracker.current_weight = 0;
+                tracker.window_start = std::time::Instant::now();
+            }
+        });
+        
+        Self {
+            order_limiter,
+            weight_tracker,
+        }
+    }
+    
+    /// Acquire permit for order (10 orders/second limit)
+    pub async fn acquire_order_permit(&self) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
+        use anyhow::anyhow;
+        // For orders: 10/sec means we need to space them out
+        // Acquire permit and wait 100ms between orders
+        let permit = self.order_limiter.acquire().await
+            .map_err(|_| anyhow!("order limiter closed"))?;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        Ok(permit)
+    }
+    
+    /// Acquire weight (1200 weight/minute limit)
+    pub async fn acquire_weight(&self, weight: u32) -> anyhow::Result<()> {
+        use anyhow::anyhow;
+        
+        loop {
+            // Check if we need to reset weight window
+            {
+                let mut tracker = self.weight_tracker.write().await;
+                if tracker.window_start.elapsed().as_secs() >= 60 {
+                    tracker.current_weight = 0;
+                    tracker.window_start = std::time::Instant::now();
+                }
+                
+                // Check if we have enough weight available
+                if tracker.current_weight + weight <= 1200 {
+                    tracker.current_weight += weight;
+                    return Ok(());
+                }
+            }
+            
+            // Wait a bit before retrying
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Connection {
     pub(crate) config: crate::BotConfig,
     pub(crate) http: Client,
-    pub(crate) rate_limiter: Arc<tokio::sync::Semaphore>,
+    pub(crate) rate_limiter: Arc<RateLimiter>,
 }
 
 #[derive(Debug)]
@@ -391,6 +488,90 @@ pub(crate) struct AccountPosition {
     pub unrealized_pnl: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct PositionRiskResponse {
+    #[serde(rename = "symbol")]
+    pub symbol: String,
+    #[serde(rename = "positionAmt")]
+    pub position_amount: String,
+    #[serde(rename = "entryPrice")]
+    pub entry_price: String,
+    #[serde(rename = "unRealizedProfit")]
+    pub unrealized_profit: String,
+    #[serde(rename = "leverage")]
+    pub leverage: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LeverageBracketResponse {
+    #[serde(rename = "symbol")]
+    pub symbol: String,
+    #[serde(rename = "brackets")]
+    pub brackets: Vec<LeverageBracket>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LeverageBracket {
+    #[serde(rename = "bracket")]
+    pub bracket: u8,
+    #[serde(rename = "initialLeverage")]
+    pub initial_leverage: u8,
+    #[serde(rename = "notionalCap")]
+    pub notional_cap: String,
+    #[serde(rename = "notionalFloor")]
+    pub notional_floor: String,
+    #[serde(rename = "maintMarginRatio")]
+    pub maint_margin_ratio: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ExchangeInfoResponse {
+    #[serde(rename = "symbols")]
+    pub symbols: Vec<SymbolInfo>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub(crate) struct SymbolInfo {
+    #[serde(rename = "symbol")]
+    pub symbol: String,
+    #[serde(rename = "filters")]
+    pub filters: Vec<Filter>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Filter {
+    pub filter_type: String,
+    pub data: serde_json::Value,
+}
+
+impl<'de> serde::Deserialize<'de> for Filter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let filter_type = value
+            .get("filterType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        Ok(Filter {
+            filter_type,
+            data: value,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolPrecision {
+    pub step_size: f64,
+    pub min_quantity: f64,
+    pub max_quantity: f64,
+    pub tick_size: f64,
+    pub min_price: f64,
+    pub max_price: f64,
+}
+
 pub struct EventBus {
     pub(crate) market_tx: broadcast::Sender<MarketTick>,
     pub(crate) order_update_tx: broadcast::Sender<OrderUpdate>,
@@ -452,11 +633,15 @@ pub struct ConnectionChannels {
 pub struct BalanceStore {
     pub usdt: f64,
     pub usdc: f64,
+    pub last_usdt_update: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_usdc_update: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct OrderState {
     pub has_open_order: bool,
+    pub last_order: Option<OrderUpdate>,
+    pub order_sent_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default, Clone)]
