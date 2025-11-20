@@ -1186,6 +1186,7 @@ fn generate_signal_enhanced(
     prev_ctx: Option<&SignalContext>,
     cfg: &AlgoConfig,
     candles: &[Candle],
+    contexts: &[SignalContext], // ✅ FIX: Contexts parametresi eklendi (volatility percentile için)
     current_index: usize,
     funding_arbitrage: Option<&FundingArbitrage>,
     mtf: Option<&MultiTimeframeAnalysis>,
@@ -1207,21 +1208,61 @@ fn generate_signal_enhanced(
         return base_signal;
     }
     
-    // === 1. VOLUME CONFIRMATION ===
-    // Düşük volume = zayıf signal (ama çok agresif olmamalı)
-    // Not: Volume ratio kontrolü opsiyonel - eğer volume çok düşükse uyar ama iptal etme
-    // TrendPlan.md'de önerilen: 1.5x minimum, ama bu çok agresif olabilir
-    // Optimize: Sadece çok düşük volume'leri filtrele (0.5x altı)
+    // === 1. VOLUME CONFIRMATION - ESNEK (TrendPlan.md Fix #1) ===
+    // ✅ FIX: Sadece EXTREME düşük volume'leri filtrele
+    // Kripto'da volume spike'lar çok normal, bu yüzden esnek olmalı
     if current_index >= 20 && candles.len() > current_index {
         let recent_candles = &candles[current_index.saturating_sub(19)..=current_index.min(candles.len() - 1)];
         let avg_volume_20: f64 = recent_candles.iter().map(|c| c.volume).sum::<f64>() / recent_candles.len() as f64;
         let volume_ratio = candle.volume / avg_volume_20.max(0.0001);
         
-        // Sadece çok düşük volume'leri filtrele (0.5x altı = çok zayıf)
-        // Config'deki min_volume_ratio kullanılmıyor çünkü çok agresif olabilir
-        // Farklı coinlerde volume pattern'leri farklı olabilir, bu yüzden esnek threshold kullanıyoruz
-        if volume_ratio < 0.5 {
-            // Çok düşük volume = zayıf signal, cancel et
+        // ✅ FIX: %30'dan az = gerçekten zayıf (0.5 çok agresif)
+        if volume_ratio < cfg.min_volume_ratio {
+            return Signal {
+                time: candle.close_time,
+                price: candle.close,
+                side: SignalSide::Flat,
+                ctx: ctx.clone(),
+            };
+        }
+        
+        // ✅ BONUS: Yüksek volume = güçlü signal (breakout potansiyeli)
+        // Bu bilgiyi signal scoring'de kullanabiliriz (gelecekte)
+    }
+    
+    // === 2. VOLATILITY FILTER - ADAPTIF (TrendPlan.md Fix #1) ===
+    // ✅ FIX: Volatility'yi market context'e göre değerlendir
+    // Sadece TOP 10% volatility'yi filtrele (percentile-based)
+    let atr_pct = ctx.atr / candle.close;
+    
+    // Volatility percentile hesapla (son 100 bar)
+    if current_index >= 100 && candles.len() > current_index {
+        let start_idx = current_index.saturating_sub(99);
+        let recent_atrs: Vec<f64> = candles[start_idx..=current_index]
+            .iter()
+            .zip(contexts[start_idx..=current_index].iter())
+            .map(|(c, ctx)| ctx.atr / c.close)
+            .collect();
+        
+        if !recent_atrs.is_empty() {
+            let mut sorted_atrs = recent_atrs.clone();
+            sorted_atrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let percentile_90_idx = (sorted_atrs.len() as f64 * 0.9) as usize;
+            let percentile_90 = sorted_atrs.get(percentile_90_idx).copied().unwrap_or(0.0);
+            
+            // ✅ Sadece TOP 10% volatility'yi filtrele
+            if atr_pct > percentile_90.max(cfg.max_volatility_pct / 100.0) {
+                return Signal {
+                    time: candle.close_time,
+                    price: candle.close,
+                    side: SignalSide::Flat,
+                    ctx: ctx.clone(),
+                };
+            }
+        }
+    } else {
+        // Fallback: Eğer yeterli data yoksa, config'deki threshold kullan
+        if atr_pct > cfg.max_volatility_pct / 100.0 {
             return Signal {
                 time: candle.close_time,
                 price: candle.close,
@@ -1231,35 +1272,37 @@ fn generate_signal_enhanced(
         }
     }
     
-    // === 2. VOLATILITY FILTER ===
-    // Çok volatile = risky (ama %2 çok düşük olabilir)
-    // Optimize: Sadece extreme volatility'leri filtrele (%3+)
-    let atr_pct = ctx.atr / candle.close;
-    if atr_pct > 0.03 { // %3+ volatility (daha esnek)
-        // Çok volatile = risky, cancel et
-        return Signal {
-            time: candle.close_time,
-            price: candle.close,
-            side: SignalSide::Flat,
-            ctx: ctx.clone(),
-        };
-    }
-    
-    // === 3. RECENT PRICE ACTION ===
-    // Parabolic move = reversal riski (ama %3 çok düşük olabilir)
-    // Optimize: Sadece extreme parabolic move'ları filtrele (%5+)
+    // === 3. PRICE ACTION - MOMENTUM CONFIRMATION (TrendPlan.md Fix #1) ===
+    // ✅ FIX: Parabolic move filtresini sadece EXTREME durumlar için kullan
+    // Ve direction'a göre akıllı karar ver
     if current_index >= 5 && candles.len() > current_index {
         let price_5bars_ago = candles[current_index - 5].close;
         let price_change_5bars = (candle.close - price_5bars_ago) / price_5bars_ago;
         
-        if price_change_5bars.abs() > 0.05 { // %5+ move (daha esnek)
-            // Parabolic move = reversal riski, cancel et
-            return Signal {
-                time: candle.close_time,
-                price: candle.close,
-                side: SignalSide::Flat,
-                ctx: ctx.clone(),
-            };
+        // ✅ FIX: %8+ move = gerçekten parabolic (5 çok agresif)
+        if price_change_5bars.abs() > cfg.max_price_change_5bars_pct / 100.0 {
+            // ✅ AKILLI: Eğer signal direction ile uyumsuzsa iptal et
+            match base_signal.side {
+                SignalSide::Long if price_change_5bars < -cfg.max_price_change_5bars_pct / 100.0 => {
+                    // Sharp dump sonrası long = knife catching
+                    return Signal {
+                        time: candle.close_time,
+                        price: candle.close,
+                        side: SignalSide::Flat,
+                        ctx: ctx.clone(),
+                    };
+                }
+                SignalSide::Short if price_change_5bars > cfg.max_price_change_5bars_pct / 100.0 => {
+                    // Sharp pump sonrası short = fading winners
+                    return Signal {
+                        time: candle.close_time,
+                        price: candle.close,
+                        side: SignalSide::Flat,
+                        ctx: ctx.clone(),
+                    };
+                }
+                _ => {} // Direction uyumlu, devam et
+            }
         }
     }
     
@@ -1298,38 +1341,67 @@ fn generate_signal_enhanced(
         }
     }
     
-    // === 5. FUNDING ARBITRAGE CHECK ===
-    // Pre-funding window'da extreme funding varsa, counter-trend pozisyon al
+    // === 5. FUNDING ARBITRAGE CHECK (TrendPlan.md Fix #3) ===
+    // ✅ YENİ: Funding Arbitrage Integration - AKTİFLEŞTİR!
     if let Some(fa) = funding_arbitrage {
-        if let Some(arb_signal) = fa.detect_funding_arbitrage(candle.close_time) {
-            match arb_signal {
-                FundingArbitrageSignal::PreFundingShort { .. } => {
-                    // Extreme positive funding → SHORT pozisyon (counter-trend)
-                    // Base signal'i override et
-                    return Signal {
-                        time: candle.close_time,
-                        price: candle.close,
-                        side: SignalSide::Short,
-                        ctx: ctx.clone(),
-                    };
-                }
-                FundingArbitrageSignal::PreFundingLong { .. } => {
-                    // Extreme negative funding → LONG pozisyon (counter-trend)
-                    return Signal {
-                        time: candle.close_time,
-                        price: candle.close,
-                        side: SignalSide::Long,
-                        ctx: ctx.clone(),
-                    };
+        // 1. Pre-funding window check
+        if fa.is_pre_funding_window(candle.close_time) {
+            if let Some(arb_signal) = fa.detect_funding_arbitrage(candle.close_time) {
+                match arb_signal {
+                    FundingArbitrageSignal::PreFundingShort { expected_pnl_bps, .. } => {
+                        // 🎯 KRITIK: Extreme positive funding → SHORT!
+                        // Long traders will pay funding → some will close → price drops
+                        
+                        // ✅ Minimum threshold: 5bps+ expected profit
+                        if expected_pnl_bps >= 5 {  // 0.05%+ profit
+                            // Override base signal
+                            return Signal {
+                                time: candle.close_time,
+                                price: candle.close,
+                                side: SignalSide::Short,
+                                ctx: ctx.clone(),
+                            };
+                        }
+                    }
+                    FundingArbitrageSignal::PreFundingLong { expected_pnl_bps, .. } => {
+                        if expected_pnl_bps >= 5 {  // 0.05%+ profit
+                            return Signal {
+                                time: candle.close_time,
+                                price: candle.close,
+                                side: SignalSide::Long,
+                                ctx: ctx.clone(),
+                            };
+                        }
+                    }
                 }
             }
         }
         
-        // Funding exhaustion check: Eğer funding sürekli artıyorsa, reversal yakın
+        // 2. Post-funding liquidation check
+        if let Some(post_funding) = fa.detect_post_funding_opportunity(candle.close_time) {
+            match post_funding {
+                PostFundingSignal::ExpectLongLiquidation => {
+                    // Long'lar funding ödedi → weak hands liquidate olabilir
+                    // ✅ Base signal SHORT ise, confidence artır
+                    if matches!(base_signal.side, SignalSide::Short) {
+                        // Keep signal, high confidence
+                        return base_signal;
+                    }
+                }
+                PostFundingSignal::ExpectShortLiquidation => {
+                    if matches!(base_signal.side, SignalSide::Long) {
+                        return base_signal;
+                    }
+                }
+            }
+        }
+        
+        // 3. Funding exhaustion check
         if let Some(exhaustion) = fa.detect_funding_exhaustion() {
             match (base_signal.side, exhaustion) {
                 (SignalSide::Long, FundingExhaustionSignal::ExtremePositive) => {
-                    // Long signal ama funding extreme positive → reversal riski
+                    // ⚠️ WARNING: Funding too high, reversal risk
+                    // Cancel long signal
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -1338,7 +1410,6 @@ fn generate_signal_enhanced(
                     };
                 }
                 (SignalSide::Short, FundingExhaustionSignal::ExtremeNegative) => {
-                    // Short signal ama funding extreme negative → reversal riski
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -1539,82 +1610,143 @@ fn generate_signal(
     let mut long_score = 0usize;
     let mut short_score = 0usize;
 
-    // LONG kuralları
-    // 1) Trend yukarı
+    // ✅ LONG kuralları - TrendPlan.md Fix #4: 0-10 points per side
+    // 1. TREND STRENGTH (0-2 points)
     if matches!(trend, TrendDirection::Up) {
         long_score += 1;
-    }
-    // 1.5) Price action confirmation: Price EMA fast'ın üstünde (trend ile uyumlu)
-    if price_action_bullish {
-        long_score += 1;
-    }
-    // 1.6) OPTIMIZATION: Trend strength - EMA fast ve slow arasındaki mesafe (opsiyonel bonus)
-    // Zayıf trend'lerde trade yapma (false signal riski) - ama çok sıkı olmamalı
-    if matches!(trend, TrendDirection::Up) {
+        
+        // ✅ Bonus: Strong trend
         let trend_strength = (ctx.ema_fast - ctx.ema_slow) / ctx.ema_slow;
-        if trend_strength > 0.0005 { // %0.05+ trend strength (daha esnek)
+        if trend_strength > 0.002 {  // %0.2+ separation
             long_score += 1;
         }
     }
-    // 2) Momentum yukarı
+    
+    // 2. MOMENTUM CONFLUENCE (0-2 points)
     if ctx.rsi >= cfg.rsi_trend_long_min {
         long_score += 1;
+        
+        // ✅ Bonus: RSI rising (momentum building)
+        if let Some(prev) = prev_ctx {
+            if ctx.rsi > prev.rsi {
+                long_score += 1;
+            }
+        }
     }
-    // 3) Funding aşırı pozitif değil (aşırı long kalabalığı istemiyoruz)
-    if ctx.funding_rate <= cfg.funding_extreme_pos {
+    
+    // 3. FUNDING EDGE (0-2 points)
+    // Negative/neutral funding = shorts paying longs = bullish
+    if ctx.funding_rate <= 0.0001 {  // <= 0.01%
         long_score += 1;
+        
+        // ✅ Bonus: Negative funding (shorts desperate)
+        if ctx.funding_rate < -0.0002 {  // < -0.02%
+            long_score += 1;
+        }
     }
-    // 4) Open interest artıyor (yeni pozisyon akışı var)
-    if oi_change_up {
+    
+    // 4. CROWD POSITIONING (0-2 points)
+    // We want to be CONTRARIAN to crowd
+    if ctx.long_short_ratio < 1.0 {  // More shorts than longs
         long_score += 1;
+        
+        // ✅ Bonus: Extreme short crowding
+        if ctx.long_short_ratio < 0.7 {  // 70% shorts
+            long_score += 1;
+        }
     }
-    // 5) Top trader'lar aşırı long değil (hatta biraz short baskısı olabilir)
-    if !crowded_long {
-        long_score += 1;
+    
+    // 5. OPEN INTEREST CONFIRMATION (0-2 points)
+    if let Some(prev) = prev_ctx {
+        if ctx.open_interest > prev.open_interest {
+            // OI rising = new money entering
+            long_score += 1;
+            
+            // ✅ Bonus: Significant OI increase
+            let oi_change = (ctx.open_interest - prev.open_interest) / prev.open_interest;
+            if oi_change > 0.02 {  // 2%+ OI increase
+                long_score += 1;
+            }
+        }
     }
     // 6) ATR volatility kontrolü: Yüksek volatility'de daha dikkatli ol
     // ATR rising factor ile birlikte kullanılabilir (gelecekte)
     // Şimdilik ATR hesaplanıyor ama signal generation'da kullanılmıyor
     // Not: ATR değeri ctx.atr'de mevcut, ancak şu an için signal scoring'de kullanılmıyor
 
-    // SHORT kuralları
-    // 1) Trend aşağı
+    // ✅ SHORT kuralları - TrendPlan.md Fix #4: 0-10 points per side
+    // 1. TREND STRENGTH (0-2 points)
     if matches!(trend, TrendDirection::Down) {
         short_score += 1;
-    }
-    // 1.5) Price action confirmation: Price EMA fast'ın altında (trend ile uyumlu)
-    if price_action_bearish {
-        short_score += 1;
-    }
-    // 1.6) OPTIMIZATION: Trend strength - EMA fast ve slow arasındaki mesafe (opsiyonel bonus)
-    // Zayıf trend'lerde trade yapma (false signal riski) - ama çok sıkı olmamalı
-    if matches!(trend, TrendDirection::Down) {
+        
+        // ✅ Bonus: Strong trend
         let trend_strength = (ctx.ema_slow - ctx.ema_fast) / ctx.ema_slow;
-        if trend_strength > 0.0005 { // %0.05+ trend strength (daha esnek)
+        if trend_strength > 0.002 {  // %0.2+ separation
             short_score += 1;
         }
     }
-    // 2) Momentum aşağı
+    
+    // 2. MOMENTUM CONFLUENCE (0-2 points)
     if ctx.rsi <= cfg.rsi_trend_short_max {
         short_score += 1;
+        
+        // ✅ Bonus: RSI falling (momentum building)
+        if let Some(prev) = prev_ctx {
+            if ctx.rsi < prev.rsi {
+                short_score += 1;
+            }
+        }
     }
-    // 3) Funding pozitif ve mümkünse aşırı (crowded long)
-    if ctx.funding_rate >= cfg.funding_extreme_pos {
+    
+    // 3. FUNDING EDGE (0-2 points)
+    // Positive funding = longs paying shorts = bearish
+    if ctx.funding_rate >= 0.0001 {  // >= 0.01%
         short_score += 1;
+        
+        // ✅ Bonus: Extreme positive funding (longs desperate)
+        if ctx.funding_rate > 0.0002 {  // > 0.02%
+            short_score += 1;
+        }
     }
-    // 4) Open interest artıyor (yeni pozisyon akışı var)
-    if oi_change_up {
+    
+    // 4. CROWD POSITIONING (0-2 points)
+    // We want to be CONTRARIAN to crowd
+    if ctx.long_short_ratio > 1.0 {  // More longs than shorts
         short_score += 1;
+        
+        // ✅ Bonus: Extreme long crowding
+        if ctx.long_short_ratio > 1.3 {  // 130% longs
+            short_score += 1;
+        }
     }
-    // 5) Top trader'lar aşırı long (crowded long → short fırsatı)
-    if crowded_long {
-        short_score += 1;
+    
+    // 5. OPEN INTEREST CONFIRMATION (0-2 points)
+    if let Some(prev) = prev_ctx {
+        if ctx.open_interest > prev.open_interest {
+            // OI rising = new money entering (can be bearish if shorts)
+            short_score += 1;
+            
+            // ✅ Bonus: Significant OI increase
+            let oi_change = (ctx.open_interest - prev.open_interest) / prev.open_interest;
+            if oi_change > 0.02 {  // 2%+ OI increase
+                short_score += 1;
+            }
+        }
     }
 
-    // Kullanıcının "en iyi sistem" tanımına göre: minimum 4 score gerekli
-    // Ancak config'den de alabilir (varsayılan 4)
-    let long_min = cfg.long_min_score.max(4);
-    let short_min = cfg.short_min_score.max(4);
+    // ✅ DECISION: Adaptive threshold (TrendPlan.md Fix #4)
+    // Total possible: 10 points per side
+    // FIX: Adaptive threshold mantığını düzelt - çok agresif olmamalı
+    let min_score = if long_score + short_score >= 8 {
+        // Strong market conditions → lower threshold
+        cfg.long_min_score.min(5).max(4) // Min 4, max 5
+    } else {
+        // Weak market conditions → higher threshold ama çok yüksek olmamalı
+        cfg.long_min_score.max(5).min(6) // Min 5, max 6
+    };
+    
+    let long_min = min_score;
+    let short_min = min_score;
     
     // Determine signal side with tie-break mechanism
     let side = if long_score >= long_min && short_score >= short_min {
@@ -1807,7 +1939,7 @@ pub fn run_backtest_on_series(
 
         // Enhanced signal generation with ALL REAL DATA
         let sig = generate_signal_enhanced(
-            c, ctx, prev_ctx, cfg, candles, i,
+            c, ctx, prev_ctx, cfg, candles, contexts, i,
             Some(&funding_arbitrage),
             None, // MTF - farklı timeframe'ler gerektirir, production'da kullanılır
             None, // OrderFlow - DepthSnapshot gerektirir, production'da kullanılır
@@ -2120,7 +2252,7 @@ pub fn run_backtest_on_series_v2(
 
         // Enhanced signal generation with ALL REAL DATA
         let sig = generate_signal_enhanced(
-            c, ctx, prev_ctx, cfg, candles, i,
+            c, ctx, prev_ctx, cfg, candles, contexts, i,
             Some(&funding_arbitrage),
             None, // MTF - farklı timeframe'ler gerektirir, production'da kullanılır
             None, // OrderFlow - DepthSnapshot gerektirir, production'da kullanılır
@@ -2150,9 +2282,10 @@ pub fn run_backtest_on_series_v2(
             if i + 1 < candles.len() {
                 let entry_candle = &candles[i + 1]; // Next candle
                 
-                // Dynamic slippage based on ATR
+                // ✅ GERÇEKÇI SLIPPAGE (TrendPlan.md Fix #2)
+                // ATR-based slippage, clamped to realistic range
                 let atr_pct = ctx.atr / c.close;
-                let volatility_multiplier = (atr_pct * 100.0).min(5.0).max(1.0);
+                let volatility_multiplier = (atr_pct * 100.0).clamp(1.0, 3.0); // 1x-3x (daha gerçekçi)
                 let dynamic_slippage_frac = base_slippage_frac * volatility_multiplier;
                 
                 match sig.side {
@@ -2183,26 +2316,46 @@ pub fn run_backtest_on_series_v2(
             PositionSide::Long => {
                 let holding_bars = i.saturating_sub(pos_entry_index);
                 
-                // Exit conditions:
-                // 1. Opposite signal
-                // 2. Max holding time
-                // 3. Stop loss hit (ATR-based)
-                // 4. Take profit hit (ATR-based) - OPTIMIZATION: Büyük kazananları koru
-                // Dynamic stop-loss based on ATR multiplier (coin-agnostic)
-                let atr_multiplier = cfg.atr_stop_loss_multiplier;
-                let stop_loss_price = pos_entry_price * (1.0 - atr_multiplier * ctx.atr / pos_entry_price);
+                // ✅ ADAPTIVE STOP LOSS (TrendPlan.md Fix #4)
+                // Market volatile ise → wider stop
+                // Market calm ise → tighter stop
+                let volatility_regime = if ctx.atr / c.close > 0.02 {
+                    1.5  // High volatility → 1.5x wider stop
+                } else {
+                    1.0  // Normal volatility
+                };
                 
-                // Dynamic take-profit based on ATR multiplier
-                let tp_multiplier = cfg.atr_take_profit_multiplier;
-                let take_profit_price = pos_entry_price * (1.0 + tp_multiplier * ctx.atr / pos_entry_price);
+                let dynamic_sl_multiplier = cfg.atr_stop_loss_multiplier * volatility_regime;
+                let stop_loss_price = pos_entry_price * (1.0 - dynamic_sl_multiplier * ctx.atr / pos_entry_price);
                 
-                // OPTIMIZATION: Minimum holding time - çok kısa trade'leri filtrele
+                // ✅ TRAILING STOP LOGIC (TrendPlan.md Fix #4)
+                let current_pnl_pct = (c.close - pos_entry_price) / pos_entry_price;
+                let mut final_stop_price = stop_loss_price;
+                
+                if current_pnl_pct > 0.01 {  // %1+ profit
+                    // ✅ Activate trailing stop at breakeven
+                    let trailing_stop = pos_entry_price * 0.999;  // -0.1% from entry
+                    final_stop_price = stop_loss_price.max(trailing_stop);
+                }
+                
+                // ✅ DYNAMIC TAKE PROFIT (TrendPlan.md Fix #4)
+                // Strong trend → let winners run longer
+                let trend_strength = (ctx.ema_fast - ctx.ema_slow).abs() / ctx.ema_slow;
+                let dynamic_tp_multiplier = if trend_strength > 0.003 {
+                    cfg.atr_take_profit_multiplier * 1.5  // 1.5x wider TP
+                } else {
+                    cfg.atr_take_profit_multiplier
+                };
+                
+                let take_profit_price = pos_entry_price * (1.0 + dynamic_tp_multiplier * ctx.atr / pos_entry_price);
+                
+                // Exit conditions
                 let min_holding_bars = cfg.min_holding_bars;
-                let should_close =
-                    matches!(sig.side, SignalSide::Short)
-                    || holding_bars >= cfg.max_holding_bars
-                    || (holding_bars >= min_holding_bars && next_c.low <= stop_loss_price) // Min holding sonrası stop-loss
-                    || (holding_bars >= min_holding_bars && next_c.high >= take_profit_price); // Min holding sonrası take-profit
+                let should_close = 
+                    matches!(sig.side, SignalSide::Short) ||  // Reversal signal
+                    holding_bars >= cfg.max_holding_bars ||   // Max time
+                    (holding_bars >= min_holding_bars && next_c.low <= final_stop_price) ||
+                    (holding_bars >= min_holding_bars && next_c.high >= take_profit_price);
 
                 if should_close {
                     let atr_pct = ctx.atr / c.close;
@@ -2230,21 +2383,43 @@ pub fn run_backtest_on_series_v2(
             PositionSide::Short => {
                 let holding_bars = i.saturating_sub(pos_entry_index);
                 
-                // Dynamic stop-loss based on ATR multiplier (coin-agnostic)
-                let atr_multiplier = cfg.atr_stop_loss_multiplier;
-                let stop_loss_price = pos_entry_price * (1.0 + atr_multiplier * ctx.atr / pos_entry_price);
+                // ✅ ADAPTIVE STOP LOSS (TrendPlan.md Fix #4)
+                let volatility_regime = if ctx.atr / c.close > 0.02 {
+                    1.5  // High volatility → 1.5x wider stop
+                } else {
+                    1.0  // Normal volatility
+                };
                 
-                // Dynamic take-profit based on ATR multiplier
-                let tp_multiplier = cfg.atr_take_profit_multiplier;
-                let take_profit_price = pos_entry_price * (1.0 - tp_multiplier * ctx.atr / pos_entry_price);
+                let dynamic_sl_multiplier = cfg.atr_stop_loss_multiplier * volatility_regime;
+                let stop_loss_price = pos_entry_price * (1.0 + dynamic_sl_multiplier * ctx.atr / pos_entry_price);
                 
-                // OPTIMIZATION: Minimum holding time - çok kısa trade'leri filtrele
+                // ✅ TRAILING STOP LOGIC (TrendPlan.md Fix #4)
+                let current_pnl_pct = (pos_entry_price - c.close) / pos_entry_price;
+                let mut final_stop_price = stop_loss_price;
+                
+                if current_pnl_pct > 0.01 {  // %1+ profit
+                    // ✅ Activate trailing stop at breakeven
+                    let trailing_stop = pos_entry_price * 1.001;  // +0.1% from entry
+                    final_stop_price = stop_loss_price.min(trailing_stop);
+                }
+                
+                // ✅ DYNAMIC TAKE PROFIT (TrendPlan.md Fix #4)
+                let trend_strength = (ctx.ema_slow - ctx.ema_fast).abs() / ctx.ema_slow;
+                let dynamic_tp_multiplier = if trend_strength > 0.003 {
+                    cfg.atr_take_profit_multiplier * 1.5  // 1.5x wider TP
+                } else {
+                    cfg.atr_take_profit_multiplier
+                };
+                
+                let take_profit_price = pos_entry_price * (1.0 - dynamic_tp_multiplier * ctx.atr / pos_entry_price);
+                
+                // Exit conditions
                 let min_holding_bars = cfg.min_holding_bars;
-                let should_close =
-                    matches!(sig.side, SignalSide::Long)
-                    || holding_bars >= cfg.max_holding_bars
-                    || (holding_bars >= min_holding_bars && next_c.high >= stop_loss_price) // Min holding sonrası stop-loss
-                    || (holding_bars >= min_holding_bars && next_c.low <= take_profit_price); // Min holding sonrası take-profit
+                let should_close = 
+                    matches!(sig.side, SignalSide::Long) ||  // Reversal signal
+                    holding_bars >= cfg.max_holding_bars ||   // Max time
+                    (holding_bars >= min_holding_bars && next_c.high >= final_stop_price) ||
+                    (holding_bars >= min_holding_bars && next_c.low <= take_profit_price);
 
                 if should_close {
                     let atr_pct = ctx.atr / c.close;

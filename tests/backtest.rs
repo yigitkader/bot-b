@@ -13,32 +13,39 @@ async fn backtest_with_real_binance_data() {
     let limit = 288;           // 288 * 5m = son 24 saat
 
     let cfg = AlgoConfig {
-        rsi_trend_long_min: 55.0,
-        rsi_trend_short_max: 45.0,
-        funding_extreme_pos: 0.0005,  // 0.05% (extreme long funding, ~219% APR annualized)
-        funding_extreme_neg: -0.0005, // -0.05% (extreme short funding, ~-219% APR annualized)
-        lsr_crowded_long: 1.3,        // longShortRatio > 1.3 => crowded long
-        lsr_crowded_short: 0.8,       // longShortRatio < 0.8 => crowded short
-        long_min_score: 4,             // Minimum 4 score gerekli
-        short_min_score: 4,            // Minimum 4 score gerekli
-        fee_bps_round_trip: 8.0,      // giriş+çıkış toplam 0.08% varsayalım
-        max_holding_bars: 48,          // max 48 bar (~4 saat @5m)
-        slippage_bps: 5.0,            // 0.05% slippage (realistic backtest)
-        // Signal Quality Filtering (TrendPlan.md önerileri)
-        min_volume_ratio: 1.5,        // Minimum volume ratio vs 20-bar average
-        max_volatility_pct: 2.0,      // Maximum ATR volatility % (2% = çok volatile)
-        max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
-        enable_signal_quality_filter: true, // Signal quality filtering aktif
-        // Stop Loss & Risk Management (coin-agnostic)
-        atr_stop_loss_multiplier: 3.0, // ATR multiplier for stop-loss (3.0 = 3x ATR)
-                                       // Recommended: 2.5-3.5 for most coins, adjust based on volatility
-        atr_take_profit_multiplier: 6.0, // ATR multiplier for take-profit (6.0 = 6x ATR)
-                                         // R:R ratio = 6:3 = 2.0x (iyi risk/reward)
-                                         // Büyük kazananları korumak için yeterince geniş
-                                         // Recommended: 5.0-7.0 for most coins
-        min_holding_bars: 3, // Minimum holding time (3 bars = 15 minutes @5m)
-                             // Çok kısa trade'leri filtrele (5-15 dakika çok riskli)
-                             // Recommended: 3-4 bars (15-20 minutes @5m)
+        // ✅ Signal Thresholds - ADAPTIVE (TrendPlan.md Fix #5)
+        rsi_trend_long_min: 52.0,   // 55 → 52 (daha esnek)
+        rsi_trend_short_max: 48.0,  // 45 → 48 (daha esnek)
+        
+        // ✅ Funding - AGGRESSIVE (TrendPlan.md Fix #5)
+        funding_extreme_pos: 0.0003,   // 0.05% → 0.03% (daha hassas)
+        funding_extreme_neg: -0.0003,  // -0.05% → -0.03%
+        
+        // ✅ LSR - CONTRARIAN (TrendPlan.md Fix #5)
+        lsr_crowded_long: 1.2,   // 1.3 → 1.2 (daha erken tespit)
+        lsr_crowded_short: 0.85, // 0.8 → 0.85
+        
+        // ✅ Scoring - BALANCED (TrendPlan.md Fix #5)
+        long_min_score: 5,   // 4 → 5 (daha seçici, adaptive threshold kullanıyor)
+        short_min_score: 5,
+        
+        // ✅ Fees - REALISTIC (TrendPlan.md Fix #5)
+        fee_bps_round_trip: 12.0,  // 8 → 12 (maker+taker)
+        
+        // ✅ Risk Management - WIDER (TrendPlan.md Fix #5)
+        atr_stop_loss_multiplier: 2.5,   // 3.0 → 2.5 (tighter stop)
+        atr_take_profit_multiplier: 7.0, // 6.0 → 7.0 (let winners run!)
+        
+        min_holding_bars: 2,  // 3 → 2 (daha hızlı entry/exit)
+        max_holding_bars: 60, // 48 → 60 (5 saat)
+        
+        // ✅ Signal Quality - RELAXED (TrendPlan.md Fix #5)
+        enable_signal_quality_filter: true,
+        min_volume_ratio: 0.3,  // 1.5 → 0.3 (çok daha esnek)
+        max_volatility_pct: 4.0, // 2.0 → 4.0 (kripto için normal)
+        max_price_change_5bars_pct: 10.0, // 3.0 → 10.0
+        
+        slippage_bps: 3.0,  // 5.0 → 3.0 (LIMIT orders ile düşük)
     };
 
     println!("\n");
