@@ -1,7 +1,6 @@
 use crate::types::LoggingChannels;
-use crate::types::TradeSignal;
 use log::info;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 pub async fn run_logging(ch: LoggingChannels) {
     let mut market_rx = ch.market_rx;
@@ -39,7 +38,8 @@ pub async fn run_logging(ch: LoggingChannels) {
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             Some(signal) = signal_rx.recv() => {
-                info!("LOG TradeSignal: {} {} @ {:.2} (size={:.2} USDT, leverage={}x)", 
+                info!(
+                    "LOG TradeSignal: {} {} @ {:.2} (size={:.2} USDT, leverage={}x, atr={:?})",
                     signal.symbol,
                     match signal.side {
                         crate::types::Side::Long => "LONG",
@@ -47,7 +47,8 @@ pub async fn run_logging(ch: LoggingChannels) {
                     },
                     signal.entry_price,
                     signal.size_usdt,
-                    signal.leverage
+                    signal.leverage,
+                    signal.atr_value
                 );
             }
         }

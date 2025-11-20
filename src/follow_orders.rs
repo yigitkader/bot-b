@@ -1,11 +1,12 @@
-use crate::types::FollowChannels;
 use crate::types::{CloseRequest, MarketTick, PositionUpdate, Side};
+use crate::types::{FollowChannels, PositionMeta, SharedState};
 use chrono::Utc;
 use log::{info, warn};
 use tokio::sync::broadcast;
 
 pub async fn run_follow_orders(
     ch: FollowChannels,
+    state: SharedState,
     tp_percent: f64,
     sl_percent: f64,
     commission_pct: f64,
@@ -24,6 +25,9 @@ pub async fn run_follow_orders(
         tokio::select! {
             res = position_update_rx.recv() => match res {
                 Ok(update) => {
+                    // Update equity with unrealized PnL
+                    state.update_equity(update.unrealized_pnl);
+                    
                     if update.is_closed {
                         current_position = None;
                     } else {
@@ -36,9 +40,11 @@ pub async fn run_follow_orders(
             res = market_rx.recv() => match res {
                 Ok(tick) => {
                     if let Some(position) = current_position.as_ref() {
+                        let position_meta = state.current_position_meta();
                         if let Some(req) = evaluate_position(
                             position,
                             &tick,
+                            position_meta,
                             tp_percent,
                             sl_percent,
                             commission_pct,
@@ -61,17 +67,13 @@ pub async fn run_follow_orders(
 fn evaluate_position(
     position: &PositionUpdate,
     tick: &MarketTick,
+    position_meta: Option<PositionMeta>,
     tp_percent: f64,
     sl_percent: f64,
     commission_pct: f64,
-    _atr_sl_multiplier: f64,
-    _atr_tp_multiplier: f64,
+    atr_sl_multiplier: f64,
+    atr_tp_multiplier: f64,
 ) -> Option<CloseRequest> {
-    // Note: ATR multipliers are available but not yet used
-    // To use ATR-based dynamic TP/SL, we need ATR value in MarketTick
-    // Currently using fixed percentage-based TP/SL
-    // Future enhancement: Calculate ATR from recent price movements or add to MarketTick
-    
     // CRITICAL: Validate position size first
     // Position size <= 0 means position is already closed or invalid (data corruption)
     // TP/SL calculation should not proceed with invalid position size
@@ -99,6 +101,63 @@ fn evaluate_position(
             position.leverage, position.position_id
         );
         return None;
+    }
+
+    if let Some(meta) = position_meta {
+        if let Some(atr_value) = meta.atr_at_entry {
+            if atr_value > 0.0 {
+                let (sl_hit, tp_hit, sl_price, tp_price) = match position.side {
+                    Side::Long => {
+                        let sl_price = position.entry_price - atr_sl_multiplier * atr_value;
+                        let tp_price = position.entry_price + atr_tp_multiplier * atr_value;
+                        (
+                            tick.price <= sl_price,
+                            tick.price >= tp_price,
+                            sl_price,
+                            tp_price,
+                        )
+                    }
+                    Side::Short => {
+                        let sl_price = position.entry_price + atr_sl_multiplier * atr_value;
+                        let tp_price = position.entry_price - atr_tp_multiplier * atr_value;
+                        (
+                            tick.price >= sl_price,
+                            tick.price <= tp_price,
+                            sl_price,
+                            tp_price,
+                        )
+                    }
+                };
+
+                if sl_hit {
+                    info!(
+                        "FOLLOW_ORDERS: ATR stop hit at {:.4} (entry {:.4}, atr {:.4})",
+                        sl_price, position.entry_price, atr_value
+                    );
+                    return Some(CloseRequest {
+                        position_id: position.position_id,
+                        reason: format!(
+                            "ATR SL hit ({:.4} vs entry {:.4})",
+                            sl_price, position.entry_price
+                        ),
+                        ts: Utc::now(),
+                    });
+                } else if tp_hit {
+                    info!(
+                        "FOLLOW_ORDERS: ATR take-profit hit at {:.4} (entry {:.4}, atr {:.4})",
+                        tp_price, position.entry_price, atr_value
+                    );
+                    return Some(CloseRequest {
+                        position_id: position.position_id,
+                        reason: format!(
+                            "ATR TP hit ({:.4} vs entry {:.4})",
+                            tp_price, position.entry_price
+                        ),
+                        ts: Utc::now(),
+                    });
+                }
+            }
+        }
     }
 
     // Calculate direction multiplier
@@ -132,7 +191,10 @@ fn evaluate_position(
         );
         Some(CloseRequest {
             position_id: position.position_id,
-            reason: format!("TP/SL net ROI: {:.2}% (ROI: {:.2}%, leverage: {:.1}x)", net_roi_pct, roi_pct, position.leverage),
+            reason: format!(
+                "TP/SL net ROI: {:.2}% (ROI: {:.2}%, leverage: {:.1}x)",
+                net_roi_pct, roi_pct, position.leverage
+            ),
             ts: Utc::now(),
         })
     } else {

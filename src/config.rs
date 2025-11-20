@@ -1,7 +1,7 @@
+use crate::types::{FileConfig, TrendParams};
 use serde::Deserialize;
 use std::fs;
 use std::str::FromStr;
-use crate::types::{FileConfig, TrendParams};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
@@ -22,8 +22,8 @@ pub struct BotConfig {
     pub rsi_long_min: f64,
     pub rsi_short_max: f64,
     pub atr_rising_factor: f64,
-    pub atr_sl_multiplier: f64,  // ATR multiplier for stop loss (dynamic SL = ATR * multiplier)
-    pub atr_tp_multiplier: f64,  // ATR multiplier for take profit (dynamic TP = ATR * multiplier)
+    pub atr_sl_multiplier: f64, // ATR multiplier for stop loss (dynamic SL = ATR * multiplier)
+    pub atr_tp_multiplier: f64, // ATR multiplier for take profit (dynamic TP = ATR * multiplier)
     pub obi_long_min: f64,
     pub obi_short_max: f64,
     pub funding_max_for_long: f64,
@@ -47,6 +47,7 @@ pub struct BotConfig {
     pub min_margin_usd: f64,
     pub max_position_notional_usd: f64,
     pub min_quote_balance_usd: f64,
+    pub max_slippage_bps: f64,
     // ✅ ADIM 2: Config.yaml parametreleri (TrendPlan.md)
     pub hft_mode: bool,
     pub base_min_score: f64,
@@ -163,14 +164,13 @@ impl BotConfig {
                 file_cfg.risk.as_ref().and_then(|r| r.use_isolated_margin),
                 false,
             ),
-            min_margin_usd: numeric_setting(
-                "BOT_MIN_MARGIN_USD",
-                file_cfg.min_margin_usd,
-                10.0,
-            ),
+            min_margin_usd: numeric_setting("BOT_MIN_MARGIN_USD", file_cfg.min_margin_usd, 10.0),
             max_position_notional_usd: numeric_setting(
                 "BOT_MAX_POSITION_NOTIONAL_USD",
-                file_cfg.risk.as_ref().and_then(|r| r.max_position_notional_usd),
+                file_cfg
+                    .risk
+                    .as_ref()
+                    .and_then(|r| r.max_position_notional_usd),
                 30000.0,
             ),
             min_quote_balance_usd: numeric_setting(
@@ -178,6 +178,7 @@ impl BotConfig {
                 file_cfg.min_quote_balance_usd,
                 20.0,
             ),
+            max_slippage_bps: numeric_setting("BOT_MAX_SLIPPAGE_BPS", None, 25.0),
             // Liquidation cluster thresholds (ratio: liquidation_notional / open_interest)
             // Default: None (no filtering). Typical values: 0.0001 (0.01%) to 0.01 (1%)
             // Example: 0.001 means liquidations must be >= 0.1% of OI to be considered significant
@@ -196,11 +197,7 @@ impl BotConfig {
                 30u64, // Default: 30 seconds
             ),
             // ✅ ADIM 2: Config.yaml parametreleri
-            hft_mode: bool_setting(
-                "BOT_HFT_MODE",
-                trending_cfg.and_then(|t| t.hft_mode),
-                false,
-            ),
+            hft_mode: bool_setting("BOT_HFT_MODE", trending_cfg.and_then(|t| t.hft_mode), false),
             base_min_score: numeric_setting(
                 "BOT_BASE_MIN_SCORE",
                 trending_cfg.and_then(|t| t.base_min_score),
@@ -254,7 +251,10 @@ impl BotConfig {
             process::exit(1);
         }
         if self.tp_percent > 100.0 {
-            eprintln!("WARNING: tp_percent is very high: {}%, this may be intentional", self.tp_percent);
+            eprintln!(
+                "WARNING: tp_percent is very high: {}%, this may be intentional",
+                self.tp_percent
+            );
         }
 
         // Stop loss validation
@@ -264,26 +264,40 @@ impl BotConfig {
             process::exit(1);
         }
         if self.sl_percent >= 100.0 {
-            eprintln!("ERROR: sl_percent >= 100% will cause instant liquidation, got: {}%", self.sl_percent);
+            eprintln!(
+                "ERROR: sl_percent >= 100% will cause instant liquidation, got: {}%",
+                self.sl_percent
+            );
             eprintln!("  Fix: Set BOT_SL_PERCENT to a reasonable value (e.g., 0.5-5.0%)");
             process::exit(1);
         }
 
         // Position size validation
         if self.position_size_quote <= 0.0 {
-            eprintln!("ERROR: position_size_quote must be > 0, got: {}", self.position_size_quote);
+            eprintln!(
+                "ERROR: position_size_quote must be > 0, got: {}",
+                self.position_size_quote
+            );
             eprintln!("  Fix: Set BOT_POSITION_SIZE_QUOTE to a positive value");
             process::exit(1);
         }
 
         // Period validation
         if self.ema_fast_period == 0 {
-            eprintln!("ERROR: ema_fast_period must be > 0, got: {}", self.ema_fast_period);
+            eprintln!(
+                "ERROR: ema_fast_period must be > 0, got: {}",
+                self.ema_fast_period
+            );
             process::exit(1);
         }
         if self.ema_slow_period <= self.ema_fast_period {
-            eprintln!("ERROR: ema_slow_period ({}) must be > ema_fast_period ({}), got: {} <= {}", 
-                     self.ema_slow_period, self.ema_fast_period, self.ema_slow_period, self.ema_fast_period);
+            eprintln!(
+                "ERROR: ema_slow_period ({}) must be > ema_fast_period ({}), got: {} <= {}",
+                self.ema_slow_period,
+                self.ema_fast_period,
+                self.ema_slow_period,
+                self.ema_fast_period
+            );
             eprintln!("  Fix: Set BOT_EMA_SLOW_PERIOD to a value greater than BOT_EMA_FAST_PERIOD");
             process::exit(1);
         }
@@ -298,11 +312,17 @@ impl BotConfig {
 
         // RSI bounds validation
         if self.rsi_long_min < 0.0 || self.rsi_long_min > 100.0 {
-            eprintln!("ERROR: rsi_long_min must be between 0-100, got: {}", self.rsi_long_min);
+            eprintln!(
+                "ERROR: rsi_long_min must be between 0-100, got: {}",
+                self.rsi_long_min
+            );
             process::exit(1);
         }
         if self.rsi_short_max < 0.0 || self.rsi_short_max > 100.0 {
-            eprintln!("ERROR: rsi_short_max must be between 0-100, got: {}", self.rsi_short_max);
+            eprintln!(
+                "ERROR: rsi_short_max must be between 0-100, got: {}",
+                self.rsi_short_max
+            );
             process::exit(1);
         }
         if self.rsi_long_min <= self.rsi_short_max {
@@ -312,11 +332,17 @@ impl BotConfig {
 
         // OBI validation
         if self.obi_long_min <= 0.0 {
-            eprintln!("ERROR: obi_long_min must be > 0, got: {}", self.obi_long_min);
+            eprintln!(
+                "ERROR: obi_long_min must be > 0, got: {}",
+                self.obi_long_min
+            );
             process::exit(1);
         }
         if self.obi_short_max <= 0.0 {
-            eprintln!("ERROR: obi_short_max must be > 0, got: {}", self.obi_short_max);
+            eprintln!(
+                "ERROR: obi_short_max must be > 0, got: {}",
+                self.obi_short_max
+            );
             process::exit(1);
         }
         if self.obi_short_max >= self.obi_long_min {
@@ -326,7 +352,10 @@ impl BotConfig {
 
         // Recv window validation (Binance: max 60000ms, recommended: 2000-3000ms)
         if self.recv_window_ms > 60000 {
-            eprintln!("ERROR: recv_window_ms exceeds Binance maximum (60000ms), got: {}ms", self.recv_window_ms);
+            eprintln!(
+                "ERROR: recv_window_ms exceeds Binance maximum (60000ms), got: {}ms",
+                self.recv_window_ms
+            );
             eprintln!("  Fix: Set BINANCE_RECV_WINDOW_MS to <= 60000");
             process::exit(1);
         }
@@ -336,13 +365,19 @@ impl BotConfig {
             eprintln!("  Recommendation: Use 2000-3000ms for security and reliability");
         }
         if self.recv_window_ms > 5000 {
-            eprintln!("WARNING: recv_window_ms is large ({}ms), increases replay attack risk", self.recv_window_ms);
+            eprintln!(
+                "WARNING: recv_window_ms is large ({}ms), increases replay attack risk",
+                self.recv_window_ms
+            );
             eprintln!("  Recommendation: Use 2000-3000ms for better security");
         }
 
         // Signal cooldown validation
         if self.signal_cooldown_secs < 0 {
-            eprintln!("ERROR: signal_cooldown_secs must be >= 0, got: {}", self.signal_cooldown_secs);
+            eprintln!(
+                "ERROR: signal_cooldown_secs must be >= 0, got: {}",
+                self.signal_cooldown_secs
+            );
             process::exit(1);
         }
 
@@ -356,26 +391,43 @@ impl BotConfig {
 
         // Margin and balance validation
         if self.min_margin_usd <= 0.0 {
-            eprintln!("ERROR: min_margin_usd must be > 0, got: {}", self.min_margin_usd);
+            eprintln!(
+                "ERROR: min_margin_usd must be > 0, got: {}",
+                self.min_margin_usd
+            );
             process::exit(1);
         }
         if self.min_quote_balance_usd <= 0.0 {
-            eprintln!("ERROR: min_quote_balance_usd must be > 0, got: {}", self.min_quote_balance_usd);
+            eprintln!(
+                "ERROR: min_quote_balance_usd must be > 0, got: {}",
+                self.min_quote_balance_usd
+            );
             process::exit(1);
         }
         if self.max_position_notional_usd <= 0.0 {
-            eprintln!("ERROR: max_position_notional_usd must be > 0, got: {}", self.max_position_notional_usd);
+            eprintln!(
+                "ERROR: max_position_notional_usd must be > 0, got: {}",
+                self.max_position_notional_usd
+            );
             process::exit(1);
         }
 
         // Liquidation window validation
         if self.liq_window_secs == 0 {
-            eprintln!("ERROR: liq_window_secs must be > 0, got: {}", self.liq_window_secs);
-            eprintln!("  Fix: Set BOT_LIQ_WINDOW_SECS to a positive value (recommended: 10-60 seconds)");
+            eprintln!(
+                "ERROR: liq_window_secs must be > 0, got: {}",
+                self.liq_window_secs
+            );
+            eprintln!(
+                "  Fix: Set BOT_LIQ_WINDOW_SECS to a positive value (recommended: 10-60 seconds)"
+            );
             process::exit(1);
         }
         if self.liq_window_secs < 5 {
-            eprintln!("WARNING: liq_window_secs is very low ({}s), may cause excessive pruning", self.liq_window_secs);
+            eprintln!(
+                "WARNING: liq_window_secs is very low ({}s), may cause excessive pruning",
+                self.liq_window_secs
+            );
             eprintln!("  Recommendation: Use at least 10 seconds for stable operation");
         }
         if self.liq_window_secs > 300 {
@@ -419,8 +471,6 @@ impl BotConfig {
         }
     }
 }
-
-
 
 impl FileConfig {
     pub fn load(path: &str) -> Option<Self> {

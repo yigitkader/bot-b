@@ -7,8 +7,10 @@ use dotenvy::dotenv;
 use std::fs::OpenOptions;
 use std::path::Path;
 use trading_bot::{
-    run_backtest, AlgoConfig, symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
+    run_backtest,
+    symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
     types::FileConfig,
+    AlgoConfig,
 };
 
 #[derive(Debug, serde::Serialize)]
@@ -34,11 +36,11 @@ async fn main() -> Result<()> {
 
     // Config dosyasından oku
     let file_cfg = FileConfig::load("config.yaml").unwrap_or_default();
-    
+
     // Symbol scanner config
     let allowed_quotes = vec!["USDT".to_string(), "USDC".to_string()];
     let scanner_config = SymbolSelectionConfig::from_file_config(&file_cfg, allowed_quotes);
-    
+
     // Environment variable'lardan veya default değerlerden al
     let interval = std::env::var("INTERVAL").unwrap_or_else(|_| "5m".to_string());
     let period = std::env::var("PERIOD").unwrap_or_else(|_| "5m".to_string());
@@ -46,30 +48,42 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "288".to_string())
         .parse()
         .unwrap_or(288); // 288 * 5m = son 24 saat
-    
+
     let max_symbols: usize = std::env::var("MAX_SYMBOLS")
         .unwrap_or_else(|_| "100".to_string())
         .parse()
         .unwrap_or(100);
-    
-    let output_file = std::env::var("OUTPUT_FILE")
-        .unwrap_or_else(|_| "backtest_results_multi.csv".to_string());
+
+    let output_file =
+        std::env::var("OUTPUT_FILE").unwrap_or_else(|_| "backtest_results_multi.csv".to_string());
 
     println!("===== MULTI-SYMBOL BACKTEST BAŞLIYOR =====");
     println!("Interval    : {}", interval);
     println!("Period      : {}", period);
-    println!("Limit       : {} (son {} saat @{})", limit, limit as f64 * 5.0 / 60.0, interval);
+    println!(
+        "Limit       : {} (son {} saat @{})",
+        limit,
+        limit as f64 * 5.0 / 60.0,
+        interval
+    );
     println!("Max symbols : {}", max_symbols);
     println!("Output file : {}", output_file);
-    println!("Başlangıç   : {}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Başlangıç   : {}",
+        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
     println!();
 
     // Symbol scanner oluştur ve symbol'leri keşfet
     let scanner = SymbolScanner::new(scanner_config);
     let all_symbols = scanner.discover_symbols().await?;
-    
-    println!("Discovered {} symbols, selecting top {}...", all_symbols.len(), max_symbols);
-    
+
+    println!(
+        "Discovered {} symbols, selecting top {}...",
+        all_symbols.len(),
+        max_symbols
+    );
+
     // Top N symbol'ü seç (scoring yaparak)
     let metrics = scanner.fetch_ticker_24hr(&all_symbols).await?;
     let scores = scanner.score_symbols(&metrics);
@@ -78,7 +92,7 @@ async fn main() -> Result<()> {
         .take(max_symbols)
         .map(|s| s.symbol)
         .collect();
-    
+
     println!("Selected {} symbols for backtest", selected_symbols.len());
     println!();
 
@@ -118,15 +132,25 @@ async fn main() -> Result<()> {
         .create(true)
         .append(true)
         .open(&output_file)?;
-    
+
     let mut wtr = Writer::from_writer(file);
-    
+
     // Header yaz (sadece yeni dosya ise)
     if !file_exists {
         wtr.write_record(&[
-            "symbol", "interval", "total_trades", "win_trades", "loss_trades",
-            "win_rate", "total_pnl_pct", "avg_pnl_pct", "avg_r",
-            "total_signals", "long_signals", "short_signals", "timestamp",
+            "symbol",
+            "interval",
+            "total_trades",
+            "win_trades",
+            "loss_trades",
+            "win_rate",
+            "total_pnl_pct",
+            "avg_pnl_pct",
+            "avg_r",
+            "total_signals",
+            "long_signals",
+            "short_signals",
+            "timestamp",
         ])?;
     }
 
@@ -146,7 +170,7 @@ async fn main() -> Result<()> {
         match run_backtest(symbol, &interval, &period, limit, &cfg).await {
             Ok(result) => {
                 success_count += 1;
-                
+
                 let row = BacktestRow {
                     symbol: symbol.clone(),
                     interval: interval.clone(),
@@ -168,7 +192,10 @@ async fn main() -> Result<()> {
 
                 println!(
                     "  ✅ {}: {} trades, {:.2}% win rate, {:.4}% total PnL",
-                    symbol, result.total_trades, result.win_rate * 100.0, result.total_pnl_pct * 100.0
+                    symbol,
+                    result.total_trades,
+                    result.win_rate * 100.0,
+                    result.total_pnl_pct * 100.0
                 );
             }
             Err(err) => {
@@ -189,8 +216,10 @@ async fn main() -> Result<()> {
     println!("Errors       : {}", error_count);
     println!("Total time   : {:?}", total_duration);
     println!("Output file  : {}", output_file);
-    println!("Bitiş        : {}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Bitiş        : {}",
+        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
 
     Ok(())
 }
-

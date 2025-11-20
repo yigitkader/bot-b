@@ -1,12 +1,13 @@
 use crate::config::BotConfig;
 use crate::types::ConnectionChannels;
 use crate::types::{
-    AccountBalance, AccountPayload, AccountPosition, AccountUpdate, BalanceSnapshot, Connection,
-    DepthEvent, DepthSnapshot, ExchangeInfoResponse, Filter, ForceOrderRecord,
+    AccountBalance, AccountPosition, AccountUpdate, BalanceSnapshot, Connection,
+    DepthEvent, DepthSnapshot, ExchangeInfoResponse, ForceOrderRecord,
     ForceOrderStreamEvent, ForceOrderStreamOrder, ForceOrderStreamWrapper, FuturesBalance,
     LeverageBracketResponse, LiqEntry, LiqState, ListenKeyResponse, MarkPriceEvent, MarketTick,
-    NewOrderRequest, OpenInterestEvent, OpenInterestResponse, OrderPayload, OrderStatus, OrderTradeUpdate,
-    OrderUpdate, PositionRiskResponse, PositionUpdate, PremiumIndex, Side, SymbolInfo, SymbolPrecision,
+    NewOrderRequest, OpenInterestEvent, OpenInterestResponse, OrderStatus,
+    OrderTradeUpdate, OrderUpdate, PositionRiskResponse, PositionUpdate, PremiumIndex, Side,
+    SymbolPrecision,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 use tokio::{
     sync::RwLock,
-    time::{interval, sleep, Duration},
+    time::{sleep, Duration},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
@@ -126,6 +127,8 @@ impl Connection {
             funding_rate,
             liq_long_cluster: liq_long,
             liq_short_cluster: liq_short,
+            bid_depth_usd: None,
+            ask_depth_usd: None,
         })
     }
 
@@ -195,7 +198,9 @@ impl Connection {
                                 match msg {
                                     Ok(Message::Text(txt)) => {
                                         // Check message size before processing (DOS protection)
-                                        if let Err(err) = Self::check_message_size(txt.len(), "user-data") {
+                                        if let Err(err) =
+                                            Self::check_message_size(txt.len(), "user-data")
+                                        {
                                             warn!("CONNECTION: {err:?}");
                                             break;
                                         }
@@ -207,7 +212,9 @@ impl Connection {
                                     }
                                     Ok(Message::Binary(bin)) => {
                                         // Check message size before processing (DOS protection)
-                                        if let Err(err) = Self::check_message_size(bin.len(), "user-data") {
+                                        if let Err(err) =
+                                            Self::check_message_size(bin.len(), "user-data")
+                                        {
                                             warn!("CONNECTION: {err:?}");
                                             break;
                                         }
@@ -250,21 +257,16 @@ impl Connection {
     }
 
     /// Calculate limit price from best bid/ask for aggressive fill strategy
-    /// 
+    ///
     /// # Strategy: Aggressive Fill (Immediate Execution)
     /// - LONG: Use best_ask (immediate fill from orderbook)
     /// - SHORT: Use best_bid (immediate fill from orderbook)
-    /// 
+    ///
     /// This ensures immediate execution at the best available price.
     /// Alternative strategies:
     /// - Post-Only/Maker: LONG = best_bid + 1 tick, SHORT = best_ask - 1 tick
     ///   (enters orderbook, maker fee advantage, but may not fill immediately)
-    fn calculate_limit_price(
-        side: &Side,
-        best_bid: f64,
-        best_ask: f64,
-        tick_size: f64,
-    ) -> f64 {
+    fn calculate_limit_price(side: &Side, best_bid: f64, best_ask: f64, tick_size: f64) -> f64 {
         let price = match side {
             Side::Long => {
                 // BUY: use best ask for immediate fill
@@ -277,7 +279,7 @@ impl Connection {
                 best_bid
             }
         };
-        
+
         // Round to tick size
         if tick_size > 0.0 {
             (price / tick_size).round() * tick_size
@@ -291,20 +293,22 @@ impl Connection {
     /// This is used to calculate quantity accurately before sending order
     pub async fn calculate_order_price(&self, symbol: &str, side: &Side) -> Result<f64> {
         let depth = self.fetch_depth_snapshot().await?;
-        
-        let best_bid = depth.bids
+
+        let best_bid = depth
+            .bids
             .first()
             .and_then(|lvl| lvl[0].parse::<f64>().ok())
             .ok_or_else(|| anyhow!("invalid best bid"))?;
-        
-        let best_ask = depth.asks
+
+        let best_ask = depth
+            .asks
             .first()
             .and_then(|lvl| lvl[0].parse::<f64>().ok())
             .ok_or_else(|| anyhow!("invalid best ask"))?;
 
         let symbol_info = self.fetch_symbol_info(symbol).await?;
         let price = Self::calculate_limit_price(side, best_bid, best_ask, symbol_info.tick_size);
-        
+
         Ok(price)
     }
 
@@ -344,7 +348,7 @@ impl Connection {
         let order_type = if reduce_only {
             "MARKET" // Close orders use market to ensure immediate execution
         } else {
-            "LIMIT"  // Open orders use limit to avoid slippage
+            "LIMIT" // Open orders use limit to avoid slippage
         };
 
         let mut params = vec![
@@ -360,11 +364,13 @@ impl Connection {
             match self.fetch_depth_snapshot().await {
                 Ok(depth) => {
                     // Parse best bid and ask
-                    let best_bid = depth.bids
+                    let best_bid = depth
+                        .bids
                         .first()
                         .and_then(|lvl| lvl[0].parse::<f64>().ok())
                         .unwrap_or(0.0);
-                    let best_ask = depth.asks
+                    let best_ask = depth
+                        .asks
                         .first()
                         .and_then(|lvl| lvl[0].parse::<f64>().ok())
                         .unwrap_or(0.0);
@@ -387,7 +393,8 @@ impl Connection {
                             format!("{:.8}", limit_price)
                         };
                         params.push(("price".to_string(), price_formatted));
-                        params.push(("timeInForce".to_string(), "GTC".to_string())); // Good Till Cancel
+                        params.push(("timeInForce".to_string(), "GTC".to_string()));
+                    // Good Till Cancel
                     } else {
                         warn!("CONNECTION: invalid bid/ask prices, falling back to market order");
                         params[2] = ("type".to_string(), "MARKET".to_string());
@@ -409,7 +416,10 @@ impl Connection {
         }
 
         self.signed_post("/fapi/v1/order", params).await?;
-        info!("CONNECTION: order sent (type={}, reduce_only={})", order_type, reduce_only);
+        info!(
+            "CONNECTION: order sent (type={}, reduce_only={})",
+            order_type, reduce_only
+        );
         Ok(())
     }
 
@@ -597,16 +607,16 @@ impl Connection {
 
         // Critical assets that must be parsed successfully (trading depends on these)
         let critical_assets: Vec<&str> = vec!["USDT", "USDC", &self.config.quote_asset];
-        
+
         let mut snapshots = Vec::new();
         let mut critical_parse_errors = Vec::new();
-        
+
         for record in response {
             let asset = &record.asset;
-            let is_critical = critical_assets.iter().any(|&critical| {
-                asset.eq_ignore_ascii_case(critical)
-            });
-            
+            let is_critical = critical_assets
+                .iter()
+                .any(|&critical| asset.eq_ignore_ascii_case(critical));
+
             match record.available_balance.parse::<f64>() {
                 Ok(free) => {
                     snapshots.push(BalanceSnapshot {
@@ -632,7 +642,7 @@ impl Connection {
                 }
             }
         }
-        
+
         // If any critical assets failed to parse, return error
         if !critical_parse_errors.is_empty() {
             let error_msg = format!(
@@ -641,18 +651,21 @@ impl Connection {
             );
             return Err(anyhow!(error_msg));
         }
-        
+
         // Verify critical assets are present in the response
         let snapshot_assets: Vec<&str> = snapshots.iter().map(|s| s.asset.as_str()).collect();
         for critical in &critical_assets {
-            if !snapshot_assets.iter().any(|&asset| asset.eq_ignore_ascii_case(critical)) {
+            if !snapshot_assets
+                .iter()
+                .any(|&asset| asset.eq_ignore_ascii_case(critical))
+            {
                 warn!(
                     "CONNECTION: critical asset {} not found in balance response (may have zero balance)",
                     critical
                 );
             }
         }
-        
+
         Ok(snapshots)
     }
 
@@ -709,7 +722,7 @@ impl Connection {
         liq_state: Arc<RwLock<LiqState>>,
     ) -> Result<()> {
         use tokio::sync::broadcast;
-        
+
         let mut retry_delay = Duration::from_secs(1);
         loop {
             let url = self.mark_price_stream_url();
@@ -724,7 +737,8 @@ impl Connection {
                         match message {
                             Ok(Message::Text(txt)) => {
                                 // Check message size before processing (DOS protection)
-                                if let Err(err) = Self::check_message_size(txt.len(), "mark-price") {
+                                if let Err(err) = Self::check_message_size(txt.len(), "mark-price")
+                                {
                                     warn!("CONNECTION: {err:?}");
                                     break;
                                 }
@@ -733,7 +747,8 @@ impl Connection {
                                     let (liq_long, liq_short) = (liq_state.read().await).snapshot();
                                     tick.liq_long_cluster = liq_long;
                                     tick.liq_short_cluster = liq_short;
-                                    
+                                    populate_tick_with_depth(&depth_state, &mut tick).await;
+
                                     // Check for lag by trying to receive (non-blocking)
                                     // If we can receive, it means messages are being consumed
                                     // If we get Lagged error, receivers are falling behind
@@ -746,14 +761,24 @@ impl Connection {
                                             }
                                         }
                                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                                            warn!("CONNECTION: Market tick lagged by {} messages", n);
+                                            warn!(
+                                                "CONNECTION: Market tick lagged by {} messages",
+                                                n
+                                            );
                                             // Fetch snapshot to recover from lag
                                             if let Ok(snapshot) = self.fetch_snapshot().await {
                                                 let mut recovered_tick = snapshot;
-                                                recovered_tick.obi = (depth_state.read().await).obi();
-                                                let (liq_long, liq_short) = (liq_state.read().await).snapshot();
+                                                recovered_tick.obi =
+                                                    (depth_state.read().await).obi();
+                                                let (liq_long, liq_short) =
+                                                    (liq_state.read().await).snapshot();
                                                 recovered_tick.liq_long_cluster = liq_long;
                                                 recovered_tick.liq_short_cluster = liq_short;
+                                                populate_tick_with_depth(
+                                                    &depth_state,
+                                                    &mut recovered_tick,
+                                                )
+                                                .await;
                                                 if ch.market_tx.send(recovered_tick).is_err() {
                                                     warn!("CONNECTION: market_tx receiver dropped");
                                                     break;
@@ -774,7 +799,8 @@ impl Connection {
                             }
                             Ok(Message::Binary(bin)) => {
                                 // Check message size before processing (DOS protection)
-                                if let Err(err) = Self::check_message_size(bin.len(), "mark-price") {
+                                if let Err(err) = Self::check_message_size(bin.len(), "mark-price")
+                                {
                                     warn!("CONNECTION: {err:?}");
                                     break;
                                 }
@@ -785,7 +811,8 @@ impl Connection {
                                             (liq_state.read().await).snapshot();
                                         tick.liq_long_cluster = liq_long;
                                         tick.liq_short_cluster = liq_short;
-                                        
+                                        populate_tick_with_depth(&depth_state, &mut tick).await;
+
                                         // Check for lag by trying to receive (non-blocking)
                                         match lag_monitor.try_recv() {
                                             Ok(_) | Err(broadcast::error::TryRecvError::Empty) => {
@@ -796,14 +823,24 @@ impl Connection {
                                                 }
                                             }
                                             Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                                                warn!("CONNECTION: Market tick lagged by {} messages", n);
+                                                warn!(
+                                                    "CONNECTION: Market tick lagged by {} messages",
+                                                    n
+                                                );
                                                 // Fetch snapshot to recover from lag
                                                 if let Ok(snapshot) = self.fetch_snapshot().await {
                                                     let mut recovered_tick = snapshot;
-                                                    recovered_tick.obi = (depth_state.read().await).obi();
-                                                    let (liq_long, liq_short) = (liq_state.read().await).snapshot();
+                                                    recovered_tick.obi =
+                                                        (depth_state.read().await).obi();
+                                                    let (liq_long, liq_short) =
+                                                        (liq_state.read().await).snapshot();
                                                     recovered_tick.liq_long_cluster = liq_long;
                                                     recovered_tick.liq_short_cluster = liq_short;
+                                                    populate_tick_with_depth(
+                                                        &depth_state,
+                                                        &mut recovered_tick,
+                                                    )
+                                                    .await;
                                                     if ch.market_tx.send(recovered_tick).is_err() {
                                                         warn!("CONNECTION: market_tx receiver dropped");
                                                         break;
@@ -933,24 +970,32 @@ impl Connection {
                         match msg {
                             Ok(Message::Text(txt)) => {
                                 // Check message size before processing (DOS protection)
-                                if let Err(err) = Self::check_message_size(txt.len(), "liquidation") {
+                                if let Err(err) = Self::check_message_size(txt.len(), "liquidation")
+                                {
                                     warn!("CONNECTION: {err:?}");
                                     break;
                                 }
-                                if let Err(err) = self.handle_force_order_message(&txt, &liq_state).await {
+                                if let Err(err) =
+                                    self.handle_force_order_message(&txt, &liq_state).await
+                                {
                                     warn!("CONNECTION: liquidation message handle error: {err:?}");
                                     // Don't break on handle error, continue processing
                                 }
                             }
                             Ok(Message::Binary(bin)) => {
                                 // Check message size before processing (DOS protection)
-                                if let Err(err) = Self::check_message_size(bin.len(), "liquidation") {
+                                if let Err(err) = Self::check_message_size(bin.len(), "liquidation")
+                                {
                                     warn!("CONNECTION: {err:?}");
                                     break;
                                 }
                                 if let Ok(txt) = String::from_utf8(bin) {
-                                    if let Err(err) = self.handle_force_order_message(&txt, &liq_state).await {
-                                        warn!("CONNECTION: liquidation message handle error: {err:?}");
+                                    if let Err(err) =
+                                        self.handle_force_order_message(&txt, &liq_state).await
+                                    {
+                                        warn!(
+                                            "CONNECTION: liquidation message handle error: {err:?}"
+                                        );
                                         // Don't break on handle error, continue processing
                                     }
                                 }
@@ -1035,7 +1080,9 @@ impl Connection {
                         match message {
                             Ok(Message::Text(txt)) => {
                                 // Check message size before processing (DOS protection)
-                                if let Err(err) = Self::check_message_size(txt.len(), "open-interest") {
+                                if let Err(err) =
+                                    Self::check_message_size(txt.len(), "open-interest")
+                                {
                                     warn!("CONNECTION: {err:?}");
                                     break;
                                 }
@@ -1049,14 +1096,19 @@ impl Connection {
                             }
                             Ok(Message::Binary(bin)) => {
                                 // Check message size before processing (DOS protection)
-                                if let Err(err) = Self::check_message_size(bin.len(), "open-interest") {
+                                if let Err(err) =
+                                    Self::check_message_size(bin.len(), "open-interest")
+                                {
                                     warn!("CONNECTION: {err:?}");
                                     break;
                                 }
                                 if let Ok(txt) = String::from_utf8(bin) {
-                                    if let Ok(event) = serde_json::from_str::<OpenInterestEvent>(&txt) {
+                                    if let Ok(event) =
+                                        serde_json::from_str::<OpenInterestEvent>(&txt)
+                                    {
                                         if event.symbol == self.config.symbol {
-                                            if let Ok(oi_value) = event.open_interest.parse::<f64>() {
+                                            if let Ok(oi_value) = event.open_interest.parse::<f64>()
+                                            {
                                                 liq_state.write().await.set_open_interest(oi_value);
                                             }
                                         }
@@ -1108,7 +1160,7 @@ impl Connection {
     }
 
     /// Keep-alive listen key to prevent expiration (key expires after 60 minutes)
-    /// 
+    ///
     /// Strategy:
     /// - Keep-alive every 25 minutes (safer than 30min - provides buffer for failures)
     /// - Retry logic with exponential backoff on failures
@@ -1121,17 +1173,17 @@ impl Connection {
         // This provides buffer if one keep-alive fails
         let keep_alive_interval_secs = 25 * 60; // 25 minutes
         let mut interval = tokio::time::interval(Duration::from_secs(keep_alive_interval_secs));
-        
+
         // Skip the first tick (interval starts immediately, we want to wait first)
         interval.tick().await;
-        
+
         loop {
             interval.tick().await;
-            
+
             // Retry logic: try up to 3 times with exponential backoff
             let mut retry_delay = Duration::from_secs(10);
             let mut success = false;
-            
+
             for attempt in 1..=3 {
                 match self
                     .http
@@ -1164,7 +1216,7 @@ impl Connection {
                     }
                 }
             }
-            
+
             if success {
                 // Keep-alive successful, continue to next interval
             }
@@ -1234,18 +1286,20 @@ impl Connection {
             funding_rate,
             liq_long_cluster: None,
             liq_short_cluster: None,
+            bid_depth_usd: None,
+            ask_depth_usd: None,
         })
     }
 
     /// Fetch liquidation clusters and normalize by Open Interest
-    /// 
+    ///
     /// Returns: (liq_long_cluster, liq_short_cluster) as normalized ratios
-    /// 
+    ///
     /// Normalization: liquidation_notional / open_interest
     /// - Values are typically in range 0.0001 (0.01%) to 0.01 (1%) of OI
     /// - Example: 0.001 means liquidations represent 0.1% of total open interest
     /// - Higher values indicate more significant liquidation pressure
-    /// 
+    ///
     /// Note: OI is in notional value (e.g., 1.5B USD), liquidations are smaller (e.g., 500K USD)
     /// This normalization allows comparison across different market sizes
     async fn fetch_liquidation_clusters(&self) -> Result<(Option<f64>, Option<f64>)> {
@@ -1278,8 +1332,8 @@ impl Connection {
                 .unwrap_or(0.0);
             let notional = qty * price;
             match order.side.as_str() {
-                "SELL" => long_total += notional,  // Long liquidations (forced sells)
-                "BUY" => short_total += notional,  // Short liquidations (forced buys)
+                "SELL" => long_total += notional, // Long liquidations (forced sells)
+                "BUY" => short_total += notional, // Short liquidations (forced buys)
                 _ => {}
             }
         }
@@ -1288,7 +1342,7 @@ impl Connection {
         if oi <= 0.0 {
             return Ok((None, None));
         }
-        
+
         // Normalize: ratio of liquidation notional to open interest
         // This gives a scale-independent measure of liquidation pressure
         let normalize = |value: f64| if value > 0.0 { Some(value / oi) } else { None };
@@ -1364,10 +1418,10 @@ impl Connection {
     /// Returns the offset in milliseconds (server_time - client_time)
     async fn fetch_server_time_offset(&self) -> Result<i64> {
         let url = format!("{}/fapi/v1/time", self.config.base_url);
-        
+
         // Record client time before request (to account for network latency)
         let client_time_before = Utc::now().timestamp_millis();
-        
+
         let resp = self
             .http
             .get(&url)
@@ -1376,16 +1430,16 @@ impl Connection {
             .error_for_status()?
             .json::<ServerTimeResponse>()
             .await?;
-        
+
         // Record client time after request
         let client_time_after = Utc::now().timestamp_millis();
-        
+
         // Use midpoint of request time to estimate actual server time at request moment
         let client_time_midpoint = (client_time_before + client_time_after) / 2;
-        
+
         // Calculate offset: positive means server is ahead
         let offset = resp.server_time - client_time_midpoint;
-        
+
         Ok(offset)
     }
 
@@ -1393,18 +1447,20 @@ impl Connection {
     /// Should be called periodically (e.g., every 5-10 minutes) to maintain accuracy
     /// Critical for recvWindow validation - Binance uses microsecond precision server time
     pub async fn sync_server_time(&self) -> Result<()> {
-        let offset = self.fetch_server_time_offset().await
+        let offset = self
+            .fetch_server_time_offset()
+            .await
             .context("Failed to fetch Binance server time")?;
-        
+
         let mut offset_guard = self.server_time_offset.write().await;
         *offset_guard = offset;
-        
+
         info!(
             "CONNECTION: Server time synced - offset: {}ms (server {} client)",
             offset,
             if offset >= 0 { "ahead of" } else { "behind" }
         );
-        
+
         Ok(())
     }
 
@@ -1415,11 +1471,12 @@ impl Connection {
         // Use blocking read since this is called from sync context
         // In async context, we'd need to make this async, but sign_params is sync
         // So we use try_read with fallback to Utc::now()
-        let offset = self.server_time_offset
+        let offset = self
+            .server_time_offset
             .try_read()
             .map(|guard| *guard)
             .unwrap_or(0);
-        
+
         let client_time = Utc::now().timestamp_millis();
         client_time + offset
     }
@@ -1439,13 +1496,16 @@ impl Connection {
             "/fapi/v1/premiumIndex" => 1,
             "/fapi/v1/openInterest" => 1,
             "/fapi/v1/time" => 1, // Server time endpoint
-            _ => 1, // Default weight
+            _ => 1,               // Default weight
         }
     }
 
     /// Check if endpoint is an order endpoint (needs order rate limiting)
     fn is_order_endpoint(&self, path: &str) -> bool {
-        matches!(path, "/fapi/v1/order" | "/fapi/v1/marginType" | "/fapi/v1/leverage")
+        matches!(
+            path,
+            "/fapi/v1/order" | "/fapi/v1/marginType" | "/fapi/v1/leverage"
+        )
     }
 
     async fn signed_get(
@@ -1457,7 +1517,7 @@ impl Connection {
         // Weight limiter uses internal tracking, so no explicit permit needed
         let weight = self.get_endpoint_weight(path);
         self.rate_limiter.acquire_weight(weight).await?;
-        
+
         // Execute request while rate limit is enforced
         // Note: Weight is already consumed, so we can proceed immediately
         let query = self.sign_params(params)?;
@@ -1469,7 +1529,7 @@ impl Connection {
             .send()
             .await?
             .error_for_status()?;
-        
+
         Ok(response)
     }
 
@@ -1487,15 +1547,15 @@ impl Connection {
         } else {
             None
         };
-        
+
         // Acquire weight permit (weight is consumed immediately, no permit to hold)
         let weight = self.get_endpoint_weight(path);
         self.rate_limiter.acquire_weight(weight).await?;
-        
+
         // Prepare request body and URL
         let body = self.sign_params(params)?;
         let url = format!("{}{}", self.config.base_url, path);
-        
+
         // Start HTTP request (permit is still held during request initiation)
         let response_future = self
             .http
@@ -1504,15 +1564,15 @@ impl Connection {
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
             .send();
-        
+
         // Drop permit immediately after starting the request
         // This allows other orders to proceed while we wait for the response
         // The rate limit is enforced at submission time, not during network I/O
         drop(_order_permit);
-        
+
         // Wait for response (permit is no longer held, improving throughput)
         let response = response_future.await?.error_for_status()?;
-        
+
         Ok(response)
     }
 
@@ -1542,6 +1602,17 @@ impl Connection {
     }
 }
 
+async fn populate_tick_with_depth(depth_state: &Arc<RwLock<DepthState>>, tick: &mut MarketTick) {
+    let depth = depth_state.read().await;
+    if let Some((price, _)) = depth.best_bid() {
+        tick.bid = price;
+    }
+    if let Some((price, _)) = depth.best_ask() {
+        tick.ask = price;
+    }
+    tick.bid_depth_usd = depth.depth_notional_usd(true, 10);
+    tick.ask_depth_usd = depth.depth_notional_usd(false, 10);
+}
 
 impl PremiumIndex {
     fn mark_price(&self) -> Result<f64> {
@@ -1585,8 +1656,12 @@ impl DepthState {
     fn update(&mut self, event: &DepthEvent) {
         // Merge bids: update or remove levels based on delta event
         for [price_str, qty_str] in &event.bids {
-            let Ok(price) = price_str.parse::<f64>() else { continue };
-            let Ok(qty) = qty_str.parse::<f64>() else { continue };
+            let Ok(price) = price_str.parse::<f64>() else {
+                continue;
+            };
+            let Ok(qty) = qty_str.parse::<f64>() else {
+                continue;
+            };
 
             if qty == 0.0 {
                 // Remove level when qty is 0 (Binance spec: "Bids and asks with quantity 0 mean the level should be removed")
@@ -1602,13 +1677,18 @@ impl DepthState {
         }
 
         // Sort bids descending (highest price first) and truncate
-        self.bids.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        self.bids
+            .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         self.bids.truncate(self.depth_limit);
 
         // Merge asks: update or remove levels based on delta event
         for [price_str, qty_str] in &event.asks {
-            let Ok(price) = price_str.parse::<f64>() else { continue };
-            let Ok(qty) = qty_str.parse::<f64>() else { continue };
+            let Ok(price) = price_str.parse::<f64>() else {
+                continue;
+            };
+            let Ok(qty) = qty_str.parse::<f64>() else {
+                continue;
+            };
 
             if qty == 0.0 {
                 // Remove level when qty is 0 (Binance spec: "Bids and asks with quantity 0 mean the level should be removed")
@@ -1624,7 +1704,8 @@ impl DepthState {
         }
 
         // Sort asks ascending (lowest price first) and truncate
-        self.asks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        self.asks
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         self.asks.truncate(self.depth_limit);
 
         // Recalculate OBI
@@ -1672,6 +1753,30 @@ impl DepthState {
             self.obi = None;
         }
     }
+
+    fn best_bid(&self) -> Option<(f64, f64)> {
+        self.bids.first().copied()
+    }
+
+    fn best_ask(&self) -> Option<(f64, f64)> {
+        self.asks.first().copied()
+    }
+
+    fn depth_notional_usd(&self, is_bid: bool, levels: usize) -> Option<f64> {
+        let book = if is_bid { &self.bids } else { &self.asks };
+        if book.is_empty() {
+            return None;
+        }
+        let mut total = 0.0;
+        for (price, qty) in book.iter().take(levels.max(1)) {
+            total += price * qty;
+        }
+        if total > 0.0 {
+            Some(total)
+        } else {
+            None
+        }
+    }
 }
 
 impl LiqState {
@@ -1687,7 +1792,7 @@ impl LiqState {
     }
 
     /// Record a liquidation event and normalize by Open Interest
-    /// 
+    ///
     /// Normalization: liquidation_notional / open_interest
     /// - Values are typically very small (0.0001 to 0.01 range)
     /// - Represents the ratio of liquidation volume to total open interest
@@ -1698,14 +1803,14 @@ impl LiqState {
         }
         let ratio = notional / self.open_interest;
         let now = Instant::now();
-        
+
         // Prune old entries BEFORE adding the new one to avoid race conditions
         // This ensures the newly added entry is never incorrectly pruned due to:
         // - NTP clock adjustments
         // - Instant wrapping
         // - Time synchronization issues
         self.prune(now);
-        
+
         let is_long_cluster = side.eq_ignore_ascii_case("SELL");
         self.entries.push_back(LiqEntry {
             ts: now,
@@ -1726,7 +1831,7 @@ impl LiqState {
     }
 
     /// Get current liquidation cluster sums (normalized ratios)
-    /// 
+    ///
     /// Returns: (liq_long_cluster, liq_short_cluster)
     /// - Values are ratios: accumulated_liquidation_notional / open_interest
     /// - Typical range: 0.0001 (0.01%) to 0.01 (1%) of OI
@@ -1748,7 +1853,7 @@ impl LiqState {
     }
 
     /// Prune entries older than the configured window
-    /// 
+    ///
     /// Handles edge cases:
     /// - Clock adjustments (NTP sync)
     /// - Instant wrapping
@@ -1757,9 +1862,10 @@ impl LiqState {
         while let Some(entry) = self.entries.front() {
             // Use checked_duration_since to handle clock adjustments gracefully
             // If entry.ts is in the future (due to clock sync), treat it as expired
-            let age = now.checked_duration_since(entry.ts)
+            let age = now
+                .checked_duration_since(entry.ts)
                 .unwrap_or(StdDuration::from_secs(self.window_secs + 1));
-            
+
             if age > StdDuration::from_secs(self.window_secs) {
                 let entry = self.entries.pop_front().unwrap();
                 if entry.is_long_cluster {
@@ -1812,7 +1918,6 @@ impl AccountBalance {
         })
     }
 }
-
 
 impl AccountPosition {
     fn to_position_update(&self, leverage: f64) -> Option<PositionUpdate> {

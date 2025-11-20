@@ -98,6 +98,9 @@ event_bus:
   position_update_buffer: 500
   # Balance updates: Very low frequency (30s interval), 100 buffer sufficient
   balance_update_buffer: 100
+  # Metrics cache update interval (seconds) - Funding/OI/LSR cache refresh rate
+  # Default: 300 (5 minutes) - balance between freshness and rate limit
+  metrics_cache_update_interval_secs: 300
 
 dynamic_symbol_selection:
   enabled: true
@@ -112,3 +115,8 @@ dynamic_symbol_selection:
   volume_weight: 1.0
   trades_weight: 0.5
   spread_weight: 1.0
+  
+  # Minimum balance (USDT/USDC) required to scan symbols for that quote asset
+  # If balance < min_balance_threshold, symbols with that quote will be excluded
+  # Default: 10.0 USD
+  min_balance_threshold: 10.0

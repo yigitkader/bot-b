@@ -1,6 +1,7 @@
+use crate::risk_manager::RiskManager;
+use crate::slippage::SlippageTracker;
+use crate::types::{CloseRequest, PositionMeta, Side, TradeSignal};
 use crate::types::{Connection, NewOrderRequest, OrderingChannels, SharedState};
-use crate::types::{CloseRequest, PositionUpdate, Side, TradeSignal};
-use crate::risk_manager::{RiskManager, RiskLimits};
 use log::{info, warn};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -10,11 +11,12 @@ pub async fn run_ordering(
     state: SharedState,
     connection: Arc<Connection>,
     risk_manager: Option<Arc<RiskManager>>, // ✅ ADIM 6: Risk manager desteği
+    slippage_tracker: Option<Arc<SlippageTracker>>,
 ) {
     let order_lock = Arc::new(Mutex::new(()));
     let mut order_update_rx = ch.order_update_rx;
     let mut position_update_rx = ch.position_update_rx;
-    
+
     // Timeout checker for orders that were sent but no update received
     let state_for_timeout = state.clone();
     let timeout_task = tokio::spawn(async move {
@@ -32,7 +34,15 @@ pub async fn run_ordering(
     loop {
         tokio::select! {
             Some(signal) = ch.signal_rx.recv() => {
-                handle_signal(signal, &state, order_lock.clone(), connection.clone(), risk_manager.as_deref()).await;
+                let tracker = slippage_tracker.clone();
+                handle_signal(
+                    signal,
+                    &state,
+                    order_lock.clone(),
+                    connection.clone(),
+                    risk_manager.as_deref(),
+                    tracker,
+                ).await;
             },
             Some(request) = ch.close_rx.recv() => {
                 handle_close_request(request, &state, order_lock.clone(), connection.clone()).await;
@@ -55,7 +65,7 @@ pub async fn run_ordering(
             }
         }
     }
-    
+
     timeout_task.abort();
 }
 
@@ -65,6 +75,7 @@ async fn handle_signal(
     lock: Arc<Mutex<()>>,
     connection: Arc<Connection>,
     risk_manager: Option<&RiskManager>, // ✅ ADIM 6: Risk manager desteği
+    slippage_tracker: Option<Arc<SlippageTracker>>,
 ) {
     if state.has_open_position() || state.has_open_order() {
         warn!(
@@ -77,7 +88,7 @@ async fn handle_signal(
     // Risk controls: Balance check
     let config = connection.config();
     let quote_balance = state.get_quote_balance();
-    
+
     if quote_balance < config.min_quote_balance_usd {
         warn!(
             "ORDERING: insufficient quote balance: {} < {} (min required), ignoring signal {}",
@@ -86,9 +97,51 @@ async fn handle_signal(
         return;
     }
 
+    // ✅ Drawdown check (if risk manager available)
+    if let Some(rm) = risk_manager {
+        let daily_dd = state.get_daily_drawdown_pct();
+        let weekly_dd = state.get_weekly_drawdown_pct();
+        let (allowed, reason) = rm.check_drawdown_limits(daily_dd, weekly_dd);
+        if !allowed {
+            warn!(
+                "ORDERING: drawdown limit breached, ignoring signal {}: {}",
+                signal.id, reason
+            );
+            return;
+        }
+    }
+
+    // ✅ ATR-based position sizing (if ATR and risk manager available)
+    let mut size_usdt = signal.size_usdt;
+    if let (Some(atr), Some(rm)) = (signal.atr_value, risk_manager) {
+        if atr > 0.0 {
+            let equity = state.get_equity();
+            // Use equity if available, otherwise fallback to balance
+            let base_equity = if equity > 0.0 { equity } else { quote_balance };
+            // Get ATR SL multiplier from config
+            let atr_sl_multiplier = config.atr_sl_multiplier;
+            let (calculated_size, _stop_distance) = rm.calculate_position_size(
+                base_equity,
+                atr,
+                signal.entry_price,
+                atr_sl_multiplier,
+            );
+            if calculated_size > 0.0 {
+                size_usdt = calculated_size;
+                info!(
+                    "ORDERING: ATR-based sizing: {:.2} USDT (equity: {:.2}, ATR: {:.4}, risk_pct: {:.2}%)",
+                    size_usdt,
+                    base_equity,
+                    atr,
+                    rm.limits().risk_per_trade_pct * 100.0
+                );
+            }
+        }
+    }
+
     // Risk controls: Minimum margin requirement check
     // Required margin = position_size / leverage
-    let required_margin = signal.size_usdt / signal.leverage;
+    let required_margin = size_usdt / signal.leverage;
     if required_margin < config.min_margin_usd {
         warn!(
             "ORDERING: required margin {} < {} (min required), ignoring signal {}",
@@ -99,13 +152,24 @@ async fn handle_signal(
 
     // Risk controls: Maximum position size check
     // Notional = position_size * leverage (total position value)
-    let notional = signal.size_usdt * signal.leverage;
+    let notional = size_usdt * signal.leverage;
     if notional > config.max_position_notional_usd {
         warn!(
             "ORDERING: position notional {} > {} (max allowed), ignoring signal {}",
             notional, config.max_position_notional_usd, signal.id
         );
         return;
+    }
+
+    if let Some(tracker) = slippage_tracker {
+        let estimated_bps = tracker.estimate_for_order(signal.side, notional).await;
+        if estimated_bps > config.max_slippage_bps {
+            warn!(
+                "ORDERING: estimated slippage {:.2} bps exceeds max {:.2} bps, ignoring signal {}",
+                estimated_bps, config.max_slippage_bps, signal.id
+            );
+            return;
+        }
     }
 
     // Risk controls: Balance sufficiency check
@@ -136,9 +200,12 @@ async fn handle_signal(
     // CRITICAL: Calculate quantity using actual order price, not signal.entry_price
     // The actual order price will be best_ask (LONG) or best_bid (SHORT) from depth snapshot
     // Using signal.entry_price would cause notional mismatch
-    
+
     // Fetch actual order price (same logic as send_order uses)
-    let order_price = match connection.calculate_order_price(&signal.symbol, &signal.side).await {
+    let order_price = match connection
+        .calculate_order_price(&signal.symbol, &signal.side)
+        .await
+    {
         Ok(price) => price,
         Err(err) => {
             warn!(
@@ -151,19 +218,21 @@ async fn handle_signal(
 
     // Calculate quantity with leverage included using actual order price
     // Notional = position_size * leverage (total position value)
-    let notional = signal.size_usdt * signal.leverage;
+    let notional = size_usdt * signal.leverage;
     let qty = (notional / order_price).abs();
-    
+
     // ✅ ADIM 6: Risk manager kontrolü (portföy bazlı limitler) - qty hesaplandıktan sonra
     if let Some(rm) = risk_manager {
-        let (allowed, reason) = rm.can_open_position(
-            &signal.symbol,
-            signal.side,
-            order_price, // Gerçek order price kullan
-            qty,
-            signal.leverage,
-        ).await;
-        
+        let (allowed, reason) = rm
+            .can_open_position(
+                &signal.symbol,
+                signal.side,
+                order_price, // Gerçek order price kullan
+                qty,
+                signal.leverage,
+            )
+            .await;
+
         if !allowed {
             warn!(
                 "ORDERING: risk manager blocked signal {}: {}",
@@ -173,7 +242,7 @@ async fn handle_signal(
             return;
         }
     }
-    
+
     if qty <= 0.0 {
         warn!(
             "ORDERING: invalid quantity computed from signal {} (size={}, leverage={}, order_price={})",
@@ -185,7 +254,7 @@ async fn handle_signal(
 
     // Round quantity to step size
     let mut qty = Connection::round_to_step_size(qty, symbol_info.step_size);
-    
+
     // Final check: verify rounded quantity with actual order price doesn't exceed notional limits
     let final_notional = qty * order_price;
     if final_notional > config.max_position_notional_usd {
@@ -196,7 +265,7 @@ async fn handle_signal(
         // Reduce quantity to stay within notional limit
         let max_qty = config.max_position_notional_usd / order_price;
         qty = Connection::round_to_step_size(max_qty, symbol_info.step_size);
-        
+
         if qty < symbol_info.min_quantity {
             warn!(
                 "ORDERING: reduced quantity {} below minimum {} for symbol {}, ignoring signal {}",
@@ -224,8 +293,13 @@ async fn handle_signal(
             qty, symbol_info.max_quantity, signal.symbol, signal.id
         );
         state.set_open_order(false);
+        state.clear_pending_position_meta();
         return;
     }
+
+    state.set_pending_position_meta(PositionMeta {
+        atr_at_entry: signal.atr_value,
+    });
 
     let order = NewOrderRequest {
         symbol: signal.symbol.clone(),
@@ -246,6 +320,7 @@ async fn handle_signal(
         state.set_open_order(false);
         // Clear timestamp since order was not actually sent
         state.clear_order_sent();
+        state.clear_pending_position_meta();
     } else {
         info!("ORDERING: open order submitted {}", signal.id);
         // Order successfully sent - state.has_open_order=true will remain until OrderUpdate event arrives
@@ -367,7 +442,10 @@ async fn handle_close_request(
     };
 
     if let Err(err) = connection.send_order(order).await {
-        warn!("ORDERING: close send_order failed for position {}: {err:?}", request.position_id);
+        warn!(
+            "ORDERING: close send_order failed for position {}: {err:?}",
+            request.position_id
+        );
     } else {
         info!(
             "ORDERING: close order submitted for position {} (size: {}, side: {:?})",

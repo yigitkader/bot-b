@@ -1,12 +1,12 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use uuid::Uuid;
-use anyhow::Result;
 
 use tokio::sync::broadcast::{Receiver as BReceiver, Sender as BSender};
 use tokio::sync::mpsc::{Receiver as MReceiver, Sender as MSender};
@@ -29,6 +29,8 @@ pub struct MarketTick {
     pub funding_rate: Option<f64>,
     pub liq_long_cluster: Option<f64>,
     pub liq_short_cluster: Option<f64>,
+    pub bid_depth_usd: Option<f64>,
+    pub ask_depth_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +42,7 @@ pub struct TradeSignal {
     pub leverage: f64,
     pub size_usdt: f64,
     pub ts: DateTime<Utc>,
+    pub atr_value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +101,13 @@ pub struct BalanceSnapshot {
     pub ts: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolRotationEvent {
+    pub new_symbols: Vec<String>,      // Symbols that were added
+    pub removed_symbols: Vec<String>, // Symbols that were removed
+    pub all_symbols: Vec<String>,     // Complete new symbol list after rotation
+    pub ts: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone)]
 pub struct TrendParams {
@@ -270,7 +280,6 @@ pub struct FileEventBus {
     pub metrics_cache_update_interval_secs: Option<u64>, // Metrics cache update interval (default: 300 = 5 minutes)
 }
 
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
     pub api_key: String,
@@ -305,7 +314,6 @@ pub struct BotConfig {
     pub min_quote_balance_usd: f64,
 }
 
-
 /// Rate limiter for Binance Futures API
 /// - Order limiter: 10 orders/second
 /// - Weight limiter: 1200 weight/minute
@@ -323,12 +331,12 @@ impl RateLimiter {
     pub fn new() -> Self {
         // Order limiter: 10 permits for 10 orders/second
         let order_limiter = Arc::new(tokio::sync::Semaphore::new(10));
-        
+
         let weight_tracker = Arc::new(tokio::sync::RwLock::new(WeightTracker {
             current_weight: 0,
             window_start: std::time::Instant::now(),
         }));
-        
+
         // Start weight reset task
         let tracker_clone = weight_tracker.clone();
         tokio::spawn(async move {
@@ -340,19 +348,19 @@ impl RateLimiter {
                 tracker.window_start = std::time::Instant::now();
             }
         });
-        
+
         Self {
             order_limiter,
             weight_tracker,
         }
     }
-    
+
     /// Acquire permit for order (10 orders/second limit)
-    /// 
+    ///
     /// CRITICAL: The permit MUST be held for the entire request duration to prevent rate limit bypass.
     /// The 100ms delay happens WHILE holding the permit (before returning it).
     /// Caller must keep the returned permit until the request completes.
-    /// 
+    ///
     /// Rate limit bypass prevention:
     /// - Sleep happens BEFORE returning permit (while permit is held)
     /// - Caller must hold permit during entire request
@@ -360,21 +368,24 @@ impl RateLimiter {
     pub async fn acquire_order_permit(&self) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
         use anyhow::anyhow;
         // Acquire permit first (this blocks if rate limit is exceeded)
-        let permit = self.order_limiter.acquire().await
+        let permit = self
+            .order_limiter
+            .acquire()
+            .await
             .map_err(|_| anyhow!("order limiter closed"))?;
-        
+
         // CRITICAL: Sleep while holding the permit to space out orders (10/sec = 100ms between)
         // This ensures the rate limit delay happens while the permit is held, preventing bypass
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
+
         // Return permit - caller must hold it for entire request duration
         Ok(permit)
     }
-    
+
     /// Acquire weight (1200 weight/minute limit)
     pub async fn acquire_weight(&self, weight: u32) -> anyhow::Result<()> {
         use anyhow::anyhow;
-        
+
         loop {
             // Check if we need to reset weight window
             {
@@ -383,14 +394,14 @@ impl RateLimiter {
                     tracker.current_weight = 0;
                     tracker.window_start = std::time::Instant::now();
                 }
-                
+
                 // Check if we have enough weight available
                 if tracker.current_weight + weight <= 1200 {
                     tracker.current_weight += weight;
                     return Ok(());
                 }
             }
-            
+
             // Wait a bit before retrying
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
@@ -416,9 +427,6 @@ pub struct NewOrderRequest {
     pub reduce_only: bool,
     pub client_order_id: Option<String>,
 }
-
-
-
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MarkPriceEvent {
@@ -519,8 +527,6 @@ pub(crate) struct PremiumIndex {
     pub event_time_ms: u64,
 }
 
-
-
 pub(crate) struct LiqState {
     pub entries: VecDeque<LiqEntry>,
     pub long_sum: f64,
@@ -534,7 +540,6 @@ pub(crate) struct LiqEntry {
     pub ratio: f64,
     pub is_long_cluster: bool,
 }
-
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListenKeyResponse {
@@ -570,9 +575,6 @@ pub(crate) struct OrderPayload {
     pub event_time: u64,
 }
 
-
-
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct AccountUpdate {
     #[serde(rename = "a")]
@@ -594,9 +596,6 @@ pub(crate) struct AccountBalance {
     #[serde(rename = "wb")]
     pub wallet_balance: String,
 }
-
-
-
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AccountPosition {
@@ -703,8 +702,24 @@ pub struct EventBus {
     pub(crate) signal_rx: Mutex<Option<mpsc::Receiver<TradeSignal>>>,
     pub(crate) close_tx: mpsc::Sender<CloseRequest>,
     pub(crate) close_rx: Mutex<Option<mpsc::Receiver<CloseRequest>>>,
+    pub(crate) rotation_tx: broadcast::Sender<SymbolRotationEvent>,
 }
 
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        Self {
+            market_tx: self.market_tx.clone(),
+            order_update_tx: self.order_update_tx.clone(),
+            position_update_tx: self.position_update_tx.clone(),
+            balance_tx: self.balance_tx.clone(),
+            signal_tx: self.signal_tx.clone(),
+            signal_rx: Mutex::new(None), // Receivers are taken, so None for clones
+            close_tx: self.close_tx.clone(),
+            close_rx: Mutex::new(None), // Receivers are taken, so None for clones
+            rotation_tx: self.rotation_tx.clone(),
+        }
+    }
+}
 
 pub struct TrendingChannels {
     pub market_rx: BReceiver<MarketTick>,
@@ -748,8 +763,10 @@ pub struct ConnectionChannels {
     pub balance_tx: BSender<BalanceSnapshot>,
 }
 
-
-
+#[derive(Debug)]
+pub struct RotationChannels {
+    pub rotation_rx: BReceiver<SymbolRotationEvent>,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct BalanceStore {
@@ -770,6 +787,18 @@ pub struct OrderState {
 pub struct PositionState {
     pub has_open_position: bool,
     pub last_position: Option<PositionUpdate>,
+    pub pending_meta: Option<PositionMeta>,
+    pub active_meta: Option<PositionMeta>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct EquityState {
+    pub peak_equity: f64,
+    pub current_equity: f64,
+    pub daily_peak: f64,
+    pub weekly_peak: f64,
+    pub daily_reset_time: chrono::DateTime<chrono::Utc>,
+    pub weekly_reset_time: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone)]
@@ -777,8 +806,13 @@ pub struct SharedState {
     pub balance: Arc<Mutex<BalanceStore>>,
     pub order_state: Arc<Mutex<OrderState>>,
     pub position_state: Arc<Mutex<PositionState>>,
+    pub equity_state: Arc<Mutex<EquityState>>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct PositionMeta {
+    pub atr_at_entry: Option<f64>,
+}
 
 // =======================
 //  Binance Futures Modelleri
@@ -963,11 +997,11 @@ pub struct AdvancedBacktestResult {
     pub recovery_factor: f64, // total_pnl / max_drawdown
     pub avg_trade_duration_hours: f64,
     pub kelly_criterion: f64, // optimal position size
-    
+
     // Time-based metrics
     pub best_hour_of_day: Option<u32>,
     pub worst_hour_of_day: Option<u32>,
-    
+
     // Drawdown periods
     pub longest_drawdown_duration_hours: f64,
     pub current_drawdown_pct: f64,
@@ -980,56 +1014,56 @@ pub struct AdvancedBacktestResult {
 #[derive(Debug, Clone)]
 pub struct AlgoConfig {
     // Sinyal eşiği
-    pub rsi_trend_long_min: f64,   // trend yukarıdaysa min RSI (örn: 55)
-    pub rsi_trend_short_max: f64,  // trend aşağıdaysa max RSI (örn: 45)
-    pub funding_extreme_pos: f64,  // aşırı long seviye (örn: +0.01 = 0.01%)
-    pub funding_extreme_neg: f64,  // aşırı short seviye (örn: -0.01)
-    pub lsr_crowded_long: f64,     // longShortRatio > X => crowded long
-    pub lsr_crowded_short: f64,    // longShortRatio < X => crowded short
-    pub long_min_score: usize,     // LONG sinyal için minimum score (örn: 4)
-    pub short_min_score: usize,    // SHORT sinyal için minimum score (örn: 4)
+    pub rsi_trend_long_min: f64,  // trend yukarıdaysa min RSI (örn: 55)
+    pub rsi_trend_short_max: f64, // trend aşağıdaysa max RSI (örn: 45)
+    pub funding_extreme_pos: f64, // aşırı long seviye (örn: +0.01 = 0.01%)
+    pub funding_extreme_neg: f64, // aşırı short seviye (örn: -0.01)
+    pub lsr_crowded_long: f64,    // longShortRatio > X => crowded long
+    pub lsr_crowded_short: f64,   // longShortRatio < X => crowded short
+    pub long_min_score: usize,    // LONG sinyal için minimum score (örn: 4)
+    pub short_min_score: usize,   // SHORT sinyal için minimum score (örn: 4)
 
     // Risk & maliyet
-    pub fee_bps_round_trip: f64,   // round-trip toplam taker fee bps (örn: 8 = 0.08%)
-    pub max_holding_bars: usize,   // maksimum bar sayısı (örn: 48 => 4 saat @5m)
-    
+    pub fee_bps_round_trip: f64, // round-trip toplam taker fee bps (örn: 8 = 0.08%)
+    pub max_holding_bars: usize, // maksimum bar sayısı (örn: 48 => 4 saat @5m)
+
     // Execution simulation (backtest için)
-    pub slippage_bps: f64,         // slippage in basis points (örn: 5 = 0.05%)
-                                   // Production'da gerçek slippage var, backtest'te simüle etmek için
-                                   // Default: 0 (optimistic backtest)
-    
+    pub slippage_bps: f64, // slippage in basis points (örn: 5 = 0.05%)
+    // Production'da gerçek slippage var, backtest'te simüle etmek için
+    // Default: 0 (optimistic backtest)
+
     // Signal Quality Filtering (TrendPlan.md önerileri)
-    pub min_volume_ratio: f64,     // Minimum volume ratio vs 20-bar average (örn: 1.5)
-                                   // Düşük volume = zayıf signal, Flat döner
-    pub max_volatility_pct: f64,   // Maximum ATR volatility % (örn: 2.0 = %2)
-                                   // Çok volatile = risky, Flat döner
+    pub min_volume_ratio: f64, // Minimum volume ratio vs 20-bar average (örn: 1.5)
+    // Düşük volume = zayıf signal, Flat döner
+    pub max_volatility_pct: f64, // Maximum ATR volatility % (örn: 2.0 = %2)
+    // Çok volatile = risky, Flat döner
     pub max_price_change_5bars_pct: f64, // 5 bar içinde max price change % (örn: 3.0 = %3)
-                                   // Parabolic move = reversal riski, Flat döner
+    // Parabolic move = reversal riski, Flat döner
     pub enable_signal_quality_filter: bool, // Signal quality filtering aktif mi?
-    
+
     // Stop Loss & Risk Management (coin-agnostic)
     pub atr_stop_loss_multiplier: f64, // ATR multiplier for stop-loss (örn: 3.0 = 3x ATR)
-                                       // Dynamic stop-loss: entry_price ± (ATR * multiplier)
-                                       // Higher multiplier = wider stop (daha az false stop)
-                                       // Lower multiplier = tighter stop (daha fazla risk kontrolü)
-                                       // Recommended: 2.5-3.5 for most coins, adjust based on volatility
+    // Dynamic stop-loss: entry_price ± (ATR * multiplier)
+    // Higher multiplier = wider stop (daha az false stop)
+    // Lower multiplier = tighter stop (daha fazla risk kontrolü)
+    // Recommended: 2.5-3.5 for most coins, adjust based on volatility
     pub atr_take_profit_multiplier: f64, // ATR multiplier for take-profit (örn: 4.0 = 4x ATR)
-                                         // Dynamic take-profit: entry_price ± (ATR * multiplier)
-                                         // Higher multiplier = wider TP (daha büyük kazançlar)
-                                         // Lower multiplier = tighter TP (daha erken çıkış)
-                                         // Recommended: 3.5-5.0 for most coins (R:R ratio için)
+    // Dynamic take-profit: entry_price ± (ATR * multiplier)
+    // Higher multiplier = wider TP (daha büyük kazançlar)
+    // Lower multiplier = tighter TP (daha erken çıkış)
+    // Recommended: 3.5-5.0 for most coins (R:R ratio için)
     pub min_holding_bars: usize, // Minimum holding time (bar sayısı)
-                                 // Çok kısa trade'leri filtrele (örn: 3 bar = 15 dakika @5m)
-                                 // Recommended: 3-6 bars (15-30 minutes @5m)
-    
+    // Çok kısa trade'leri filtrele (örn: 3 bar = 15 dakika @5m)
+    // Recommended: 3-6 bars (15-30 minutes @5m)
+
     // ✅ ADIM 2: Config.yaml parametreleri (TrendPlan.md)
-    pub hft_mode: bool,                    // HFT mode aktif mi?
-    pub base_min_score: f64,               // Base minimum score (örn: 6.5)
-    pub trend_threshold_hft: f64,          // Trend threshold HFT mode için (örn: 0.5)
-    pub trend_threshold_normal: f64,       // Trend threshold normal mode için (örn: 0.6)
-    pub weak_trend_score_multiplier: f64,  // Zayıf trend için score multiplier (örn: 1.15)
-    pub regime_multiplier_trending: f64,   // Trending regime için threshold multiplier (örn: 0.9)
-    pub regime_multiplier_ranging: f64,    // Ranging regime için threshold multiplier (örn: 1.15)
+    pub hft_mode: bool,                   // HFT mode aktif mi?
+    pub base_min_score: f64,              // Base minimum score (örn: 6.5)
+    pub trend_threshold_hft: f64,         // Trend threshold HFT mode için (örn: 0.5)
+    pub trend_threshold_normal: f64,      // Trend threshold normal mode için (örn: 0.6)
+    pub weak_trend_score_multiplier: f64, // Zayıf trend için score multiplier (örn: 1.15)
+    pub regime_multiplier_trending: f64,  // Trending regime için threshold multiplier (örn: 0.9)
+    pub regime_multiplier_ranging: f64,   // Ranging regime için threshold multiplier (örn: 1.15)
 }
 
 // =======================
@@ -1040,12 +1074,3 @@ pub struct FuturesClient {
     pub(crate) http: Client,
     pub(crate) base_url: Url,
 }
-
-
-
-
-
-
-
-
-

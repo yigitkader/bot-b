@@ -7,9 +7,9 @@ use tokio::sync::broadcast;
 /// No REST API polling is needed - WebSocket provides real-time updates
 pub async fn run_balance(ch: BalanceChannels, state: SharedState) {
     let mut balance_rx = ch.balance_tx.subscribe();
-    
+
     info!("BALANCE: started - listening to ACCOUNT_UPDATE WebSocket events");
-    
+
     loop {
         match balance_rx.recv().await {
             Ok(snapshot) => {

@@ -3,12 +3,12 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use log::{info, warn};
 
-use crate::types::{FuturesClient, FundingRate, LongShortRatioPoint, OpenInterestPoint};
+use crate::types::{FundingRate, FuturesClient, LongShortRatioPoint, OpenInterestPoint};
 
 #[derive(Debug, Clone)]
 pub struct LatestMetrics {
@@ -51,19 +51,27 @@ impl MetricsCache {
     /// Update metrics for a single symbol
     async fn update_symbol_metrics(&self, symbol: &str) -> Result<()> {
         let futures_period = "5m"; // Default period
-        
+
         // Fetch funding rate (latest)
         let funding_rates = self.client.fetch_funding_rates(symbol, 1).await?;
-        let funding_rate = funding_rates.first().map(|f| f.funding_rate.parse::<f64>().unwrap_or(0.0));
-        
+        let funding_rate = funding_rates
+            .first()
+            .map(|f| f.funding_rate.parse::<f64>().unwrap_or(0.0));
+
         // Fetch open interest (latest)
-        let oi_hist = self.client.fetch_open_interest_hist(symbol, futures_period, 1).await?;
+        let oi_hist = self
+            .client
+            .fetch_open_interest_hist(symbol, futures_period, 1)
+            .await?;
         let open_interest = oi_hist.first().map(|o| o.open_interest);
-        
+
         // Fetch long/short ratio (latest)
-        let lsr_hist = self.client.fetch_top_long_short_ratio(symbol, futures_period, 1).await?;
+        let lsr_hist = self
+            .client
+            .fetch_top_long_short_ratio(symbol, futures_period, 1)
+            .await?;
         let long_short_ratio = lsr_hist.first().map(|l| l.long_short_ratio);
-        
+
         // Update cache
         let mut cache = self.cache.write().await;
         cache.insert(
@@ -76,23 +84,26 @@ impl MetricsCache {
                 last_update: Utc::now(),
             },
         );
-        
+
         Ok(())
     }
 
     /// Update metrics for all tracked symbols
     pub async fn update_all_metrics(&self) -> Result<()> {
         let symbols = self.symbols.read().await.clone();
-        
+
         if symbols.is_empty() {
             return Ok(());
         }
-        
-        info!("METRICS_CACHE: Updating metrics for {} symbols", symbols.len());
-        
+
+        info!(
+            "METRICS_CACHE: Updating metrics for {} symbols",
+            symbols.len()
+        );
+
         let mut success_count = 0;
         let mut error_count = 0;
-        
+
         for symbol in &symbols {
             match self.update_symbol_metrics(symbol).await {
                 Ok(_) => success_count += 1,
@@ -101,33 +112,32 @@ impl MetricsCache {
                     warn!("METRICS_CACHE: Failed to update {}: {}", symbol, err);
                 }
             }
-            
+
             // Small delay to avoid rate limiting
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
-        
+
         info!(
             "METRICS_CACHE: Update completed: {} success, {} errors",
             success_count, error_count
         );
-        
+
         Ok(())
     }
 
     /// Background task: Periodically update metrics
     pub async fn run_update_task(&self) {
-        let mut interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(self.update_interval_secs),
-        );
-        
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(self.update_interval_secs));
+
         // Initial update
         if let Err(err) = self.update_all_metrics().await {
             warn!("METRICS_CACHE: Initial update failed: {}", err);
         }
-        
+
         loop {
             interval.tick().await;
-            
+
             if let Err(err) = self.update_all_metrics().await {
                 warn!("METRICS_CACHE: Periodic update failed: {}", err);
             }
@@ -180,7 +190,9 @@ impl MetricsCache {
             }])
         } else {
             // Fallback: fetch from API if cache miss
-            self.client.fetch_open_interest_hist(symbol, period, _limit).await
+            self.client
+                .fetch_open_interest_hist(symbol, period, _limit)
+                .await
         }
     }
 
@@ -196,13 +208,14 @@ impl MetricsCache {
             Ok(vec![LongShortRatioPoint {
                 timestamp: Utc::now(),
                 long_short_ratio: lsr,
-                long_account_pct: 0.0, // Not cached, use placeholder
+                long_account_pct: 0.0,  // Not cached, use placeholder
                 short_account_pct: 0.0, // Not cached, use placeholder
             }])
         } else {
             // Fallback: fetch from API if cache miss
-            self.client.fetch_top_long_short_ratio(symbol, period, _limit).await
+            self.client
+                .fetch_top_long_short_ratio(symbol, period, _limit)
+                .await
         }
     }
 }
-

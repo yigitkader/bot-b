@@ -1,15 +1,13 @@
 use crate::types::{
-    BalanceChannels, BalanceSnapshot, CloseRequest, ConnectionChannels, EventBus,
-    FollowChannels, LoggingChannels, MarketTick, OrderingChannels, OrderUpdate, PositionUpdate,
-    TradeSignal, TrendingChannels,
+    BalanceChannels, ConnectionChannels, EventBus, FollowChannels,
+    LoggingChannels, MarketTick, OrderingChannels, RotationChannels,
+    SymbolRotationEvent, TrendingChannels,
 };
 use std::sync::Mutex;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
-use tokio::sync::broadcast::{Receiver as BReceiver, Sender as BSender};
-use tokio::sync::mpsc::{Receiver as MReceiver, Sender as MSender};
-
-
+use tokio::sync::broadcast::Receiver as BReceiver;
 
 impl EventBus {
     /// Create a new EventBus with optimized buffer sizes for each channel
@@ -28,6 +26,7 @@ impl EventBus {
         let (balance_tx, _) = broadcast::channel(balance_update_buffer);
         let (signal_tx, signal_rx) = mpsc::channel(trade_signal_buffer);
         let (close_tx, close_rx) = mpsc::channel(close_request_buffer);
+        let (rotation_tx, _) = broadcast::channel(10); // Small buffer for rotation events
 
         Self {
             market_tx,
@@ -38,6 +37,7 @@ impl EventBus {
             signal_rx: Mutex::new(Some(signal_rx)),
             close_tx,
             close_rx: Mutex::new(Some(close_rx)),
+            rotation_tx,
         }
     }
 
@@ -81,6 +81,10 @@ impl EventBus {
         }
     }
 
+    pub fn market_receiver(&self) -> BReceiver<MarketTick> {
+        self.market_tx.subscribe()
+    }
+
     pub fn connection_channels(&self) -> ConnectionChannels {
         ConnectionChannels {
             market_tx: self.market_tx.clone(),
@@ -88,6 +92,16 @@ impl EventBus {
             position_update_tx: self.position_update_tx.clone(),
             balance_tx: self.balance_tx.clone(),
         }
+    }
+
+    pub fn rotation_channels(&self) -> RotationChannels {
+        RotationChannels {
+            rotation_rx: self.rotation_tx.subscribe(),
+        }
+    }
+
+    pub fn rotation_sender(&self) -> broadcast::Sender<SymbolRotationEvent> {
+        self.rotation_tx.clone()
     }
 
     fn take_receiver<T>(slot: &Mutex<Option<mpsc::Receiver<T>>>, name: &str) -> mpsc::Receiver<T> {

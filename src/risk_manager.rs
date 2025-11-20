@@ -1,10 +1,10 @@
 // ✅ ADIM 6: Risk & portföy yönetimi (TrendPlan.md)
 // Portföy bazlı limitler: toplam notional, coin başına limit, korelasyon kontrolü
 
+use log::info;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use log::{info, warn};
 
 use crate::types::{PositionUpdate, Side};
 
@@ -20,10 +20,13 @@ pub struct PositionInfo {
 
 #[derive(Debug, Clone)]
 pub struct RiskLimits {
-    pub max_total_notional_usd: f64,      // Toplam açık pozisyon notional limiti
+    pub max_total_notional_usd: f64, // Toplam açık pozisyon notional limiti
     pub max_position_per_symbol_usd: f64, // Coin başına maksimum notional
-    pub max_correlated_positions: usize,  // Aynı direction'da maksimum korele coin sayısı
-    pub max_quote_exposure_usd: f64,      // USDT/USDC bazlı toplam risk
+    pub max_correlated_positions: usize, // Aynı direction'da maksimum korele coin sayısı
+    pub max_quote_exposure_usd: f64, // USDT/USDC bazlı toplam risk
+    pub max_daily_drawdown_pct: f64, // Maximum daily drawdown (e.g., 0.05 = 5%)
+    pub max_weekly_drawdown_pct: f64, // Maximum weekly drawdown (e.g., 0.10 = 10%)
+    pub risk_per_trade_pct: f64, // Risk per trade as % of equity (e.g., 0.01 = 1%)
 }
 
 pub struct RiskManager {
@@ -39,17 +42,21 @@ impl RiskManager {
         }
     }
 
+    pub fn limits(&self) -> &RiskLimits {
+        &self.limits
+    }
+
     /// Update position (called when position opens/closes)
     pub async fn update_position(&self, update: &PositionUpdate) {
         let mut positions = self.positions.write().await;
-        
+
         if update.is_closed {
             positions.remove(&update.symbol);
             info!("RISK_MANAGER: Position closed for {}", update.symbol);
         } else {
             // Calculate notional
             let notional = update.size * update.entry_price * update.leverage;
-            
+
             positions.insert(
                 update.symbol.clone(),
                 PositionInfo {
@@ -61,7 +68,10 @@ impl RiskManager {
                     notional_usd: notional,
                 },
             );
-            info!("RISK_MANAGER: Position updated for {}: notional={:.2} USD", update.symbol, notional);
+            info!(
+                "RISK_MANAGER: Position updated for {}: notional={:.2} USD",
+                update.symbol, notional
+            );
         }
     }
 
@@ -75,14 +85,14 @@ impl RiskManager {
         leverage: f64,
     ) -> (bool, String) {
         let positions = self.positions.read().await;
-        
+
         // Calculate new position notional
         let new_notional = size * entry_price * leverage;
-        
+
         // 1. Check total notional limit
         let total_notional: f64 = positions.values().map(|p| p.notional_usd).sum();
         let new_total = total_notional + new_notional;
-        
+
         if new_total > self.limits.max_total_notional_usd {
             return (
                 false,
@@ -92,7 +102,7 @@ impl RiskManager {
                 ),
             );
         }
-        
+
         // 2. Check per-symbol limit
         if let Some(existing) = positions.get(symbol) {
             let new_symbol_notional = existing.notional_usd + new_notional;
@@ -114,13 +124,10 @@ impl RiskManager {
                 ),
             );
         }
-        
+
         // 3. Check correlated positions (same direction)
-        let same_direction_count = positions
-            .values()
-            .filter(|p| p.side == side)
-            .count();
-        
+        let same_direction_count = positions.values().filter(|p| p.side == side).count();
+
         if same_direction_count >= self.limits.max_correlated_positions {
             return (
                 false,
@@ -135,7 +142,7 @@ impl RiskManager {
                 ),
             );
         }
-        
+
         // 4. Check quote exposure (USDT/USDC)
         // For simplicity, assume all positions are in USDT/USDC quote
         // In reality, you'd need to track quote asset per symbol
@@ -149,15 +156,72 @@ impl RiskManager {
                 ),
             );
         }
-        
+
         // All checks passed
+        (true, String::new())
+    }
+
+    /// Calculate position size based on ATR and risk per trade
+    /// Returns: (size_usdt, stop_distance_quote)
+    pub fn calculate_position_size(
+        &self,
+        equity: f64,
+        atr_value: f64,
+        entry_price: f64,
+        atr_sl_multiplier: f64,
+    ) -> (f64, f64) {
+        // Risk per trade in USD
+        let risk_per_trade_usd = equity * self.limits.risk_per_trade_pct;
+
+        // Stop distance in quote currency (ATR-based)
+        let stop_distance_quote = atr_value * atr_sl_multiplier;
+
+        if stop_distance_quote <= 0.0 || entry_price <= 0.0 {
+            return (0.0, 0.0);
+        }
+
+        // Position size: risk / stop_distance
+        // This ensures that if price moves stop_distance, we lose exactly risk_per_trade_usd
+        let size_usdt = risk_per_trade_usd / (stop_distance_quote / entry_price);
+
+        (size_usdt, stop_distance_quote)
+    }
+
+    /// Check if drawdown limits are breached
+    pub fn check_drawdown_limits(
+        &self,
+        daily_dd_pct: f64,
+        weekly_dd_pct: f64,
+    ) -> (bool, String) {
+        if daily_dd_pct > self.limits.max_daily_drawdown_pct {
+            return (
+                false,
+                format!(
+                    "Daily drawdown limit breached: {:.2}% > {:.2}%",
+                    daily_dd_pct * 100.0,
+                    self.limits.max_daily_drawdown_pct * 100.0
+                ),
+            );
+        }
+
+        if weekly_dd_pct > self.limits.max_weekly_drawdown_pct {
+            return (
+                false,
+                format!(
+                    "Weekly drawdown limit breached: {:.2}% > {:.2}%",
+                    weekly_dd_pct * 100.0,
+                    self.limits.max_weekly_drawdown_pct * 100.0
+                ),
+            );
+        }
+
         (true, String::new())
     }
 
     /// Get current portfolio statistics
     pub async fn get_portfolio_stats(&self) -> PortfolioStats {
         let positions = self.positions.read().await;
-        
+
         let total_notional: f64 = positions.values().map(|p| p.notional_usd).sum();
         let long_count = positions.values().filter(|p| p.side == Side::Long).count();
         let short_count = positions.values().filter(|p| p.side == Side::Short).count();
@@ -171,7 +235,7 @@ impl RiskManager {
             .filter(|p| p.side == Side::Short)
             .map(|p| p.notional_usd)
             .sum();
-        
+
         PortfolioStats {
             total_positions: positions.len(),
             long_positions: long_count,
@@ -202,7 +266,9 @@ impl RiskLimits {
             max_position_per_symbol_usd: max_total_notional * 0.3, // 30% of total per symbol
             max_correlated_positions: 5, // Max 5 positions in same direction
             max_quote_exposure_usd: max_total_notional * 1.2, // 120% of total (allows some margin)
+            max_daily_drawdown_pct: 0.05, // 5% max daily drawdown
+            max_weekly_drawdown_pct: 0.10, // 10% max weekly drawdown
+            risk_per_trade_pct: 0.01, // 1% risk per trade
         }
     }
 }
-

@@ -7,12 +7,17 @@ pub mod logging;
 pub mod metrics_cache;
 pub mod ordering;
 pub mod risk_manager;
+pub mod slippage;
 pub mod state;
 pub mod symbol_scanner;
 pub mod trending;
 pub mod types;
 
 pub use config::BotConfig;
+pub use metrics_cache::MetricsCache;
+pub use risk_manager::{RiskLimits, RiskManager};
+pub use slippage::{run_slippage_tracker, SlippageStats, SlippageTracker};
+pub use symbol_scanner::{SymbolScanner, SymbolSelectionConfig};
 pub use trending::{
     calculate_advanced_metrics, export_backtest_to_csv, generate_signals, print_advanced_report,
     run_backtest, run_trending,
@@ -20,9 +25,6 @@ pub use trending::{
 pub use types::{
     AdvancedBacktestResult, AlgoConfig, BacktestResult, BalanceChannels, Connection,
     ConnectionChannels, EventBus, FollowChannels, FuturesClient, LoggingChannels, NewOrderRequest,
-    OrderingChannels, PositionSide, SharedState, Signal, SignalSide, TrendParams, TrendingChannels,
-    Trade,
+    OrderingChannels, PositionSide, SharedState, Signal, SignalSide, Trade, TrendParams,
+    TrendingChannels,
 };
-pub use symbol_scanner::{SymbolScanner, SymbolSelectionConfig};
-pub use metrics_cache::MetricsCache;
-pub use risk_manager::{RiskManager, RiskLimits};
