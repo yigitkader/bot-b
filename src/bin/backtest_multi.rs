@@ -113,6 +113,11 @@ async fn main() -> Result<()> {
         max_volatility_pct: 2.0,
         max_price_change_5bars_pct: 3.0,
         enable_signal_quality_filter: true,
+        // Enhanced Signal Scoring (TrendPlan.md)
+        enable_enhanced_scoring: false, // Enhanced scoring kapalı (default)
+        enhanced_score_excellent: 80.0, // 80-100: Excellent signal
+        enhanced_score_good: 65.0,      // 65-79: Good signal
+        enhanced_score_marginal: 50.0,  // 50-64: Marginal signal
         atr_stop_loss_multiplier: 3.0,
         atr_take_profit_multiplier: 4.0,
         min_holding_bars: 3,

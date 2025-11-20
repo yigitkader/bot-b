@@ -11,6 +11,7 @@ use crate::types::{
     AdvancedBacktestResult, AlgoConfig, BacktestResult, Candle, DepthSnapshot, FundingRate,
     FuturesClient, LongShortRatioPoint, MarketTick, OpenInterestHistPoint, OpenInterestPoint,
     PositionSide, Side, Signal, SignalContext, SignalSide, Trade, TrendDirection,
+    EnhancedSignalContext,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use uuid::Uuid;
@@ -1523,7 +1524,108 @@ fn generate_signal_enhanced(
         }
     }
 
-    // === 7. ORDER FLOW ANALYSIS CHECK ===
+    // === 7. ENHANCED SIGNAL SCORING (TrendPlan.md) ===
+    // Professional 0-100 point scoring system
+    if cfg.enable_enhanced_scoring {
+        // Build EnhancedSignalContext
+        let multi_timeframe_trends = mtf.and_then(|mtf_analysis| {
+            // Try to get multi-timeframe trends from MTF analysis
+            // For now, use current trend for all timeframes (will be improved later)
+            let current_trend = classify_trend(ctx);
+            Some((current_trend, current_trend, current_trend, current_trend))
+        });
+        
+        let enhanced_ctx = build_enhanced_signal_context(
+            ctx,
+            candle,
+            candles,
+            current_index,
+            market_tick,
+            multi_timeframe_trends,
+        );
+        
+        // Calculate enhanced scores
+        let long_score = calculate_enhanced_signal_score(&enhanced_ctx, SignalSide::Long);
+        let short_score = calculate_enhanced_signal_score(&enhanced_ctx, SignalSide::Short);
+        
+        // Apply enhanced scoring thresholds
+        match base_signal.side {
+            SignalSide::Long => {
+                // Excellent signal: take it!
+                if long_score >= cfg.enhanced_score_excellent {
+                    return base_signal;
+                }
+                // Good signal: take with smaller size (for now, just take it)
+                if long_score >= cfg.enhanced_score_good {
+                    return base_signal;
+                }
+                // Marginal signal: skip or very small size (skip for now)
+                if long_score >= cfg.enhanced_score_marginal {
+                    // Could reduce position size here, but for now skip
+                    return Signal {
+                        time: candle.close_time,
+                        price: candle.close,
+                        side: SignalSide::Flat,
+                        ctx: ctx.clone(),
+                    };
+                }
+                // Poor signal: definitely skip
+                return Signal {
+                    time: candle.close_time,
+                    price: candle.close,
+                    side: SignalSide::Flat,
+                    ctx: ctx.clone(),
+                };
+            }
+            SignalSide::Short => {
+                // Excellent signal: take it!
+                if short_score >= cfg.enhanced_score_excellent {
+                    return base_signal;
+                }
+                // Good signal: take with smaller size
+                if short_score >= cfg.enhanced_score_good {
+                    return base_signal;
+                }
+                // Marginal signal: skip
+                if short_score >= cfg.enhanced_score_marginal {
+                    return Signal {
+                        time: candle.close_time,
+                        price: candle.close,
+                        side: SignalSide::Flat,
+                        ctx: ctx.clone(),
+                    };
+                }
+                // Poor signal: definitely skip
+                return Signal {
+                    time: candle.close_time,
+                    price: candle.close,
+                    side: SignalSide::Flat,
+                    ctx: ctx.clone(),
+                };
+            }
+            SignalSide::Flat => {
+                // No base signal, but check if enhanced scoring suggests a signal
+                if long_score >= cfg.enhanced_score_excellent && long_score > short_score {
+                    return Signal {
+                        time: candle.close_time,
+                        price: candle.close,
+                        side: SignalSide::Long,
+                        ctx: ctx.clone(),
+                    };
+                }
+                if short_score >= cfg.enhanced_score_excellent && short_score > long_score {
+                    return Signal {
+                        time: candle.close_time,
+                        price: candle.close,
+                        side: SignalSide::Short,
+                        ctx: ctx.clone(),
+                    };
+                }
+            }
+        }
+    }
+
+    // === 8. ORDER FLOW ANALYSIS CHECK ===
     // Market maker behavior tracking (SECRET #1)
     if let Some(of) = orderflow {
         // Order flow confirmation
@@ -3065,6 +3167,11 @@ pub async fn run_trending(
         weak_trend_score_multiplier: params.weak_trend_score_multiplier,
         regime_multiplier_trending: params.regime_multiplier_trending,
         regime_multiplier_ranging: params.regime_multiplier_ranging,
+        // Enhanced Signal Scoring (TrendPlan.md)
+        enable_enhanced_scoring: params.enable_enhanced_scoring,
+        enhanced_score_excellent: params.enhanced_score_excellent,
+        enhanced_score_good: params.enhanced_score_good,
+        enhanced_score_marginal: params.enhanced_score_marginal,
     };
 
     let kline_interval = "5m"; // 5 dakikalık kline kullan
@@ -3580,4 +3687,831 @@ async fn generate_latest_signal(
         }
         SignalSide::Flat => Ok(None),
     }
+}
+
+// =======================
+//  Enhanced Signal Scoring System (TrendPlan.md)
+//  Professional 0-100 point scoring with 15+ factors
+// =======================
+
+/// PROFESSIONAL SCORING: 0-100 points system
+/// Based on TrendPlan.md recommendations
+/// 
+/// Usage:
+/// ```rust
+/// let score = calculate_enhanced_signal_score(&ctx, SignalSide::Long);
+/// 
+/// // Thresholds:
+/// // 80-100: Excellent signal (take it!)
+/// // 65-79:  Good signal (take with smaller size)
+/// // 50-64:  Marginal signal (skip or very small size)
+/// // <50:    Poor signal (definitely skip)
+/// ```
+pub fn calculate_enhanced_signal_score(
+    ctx: &EnhancedSignalContext,
+    side: SignalSide,
+) -> f64 {
+    let mut score = 0.0;
+
+    // === 1. TREND ALIGNMENT (0-20 points) - MOST IMPORTANT ===
+    let trend_score = calculate_trend_alignment_score(
+        side,
+        ctx.trend_1m,
+        ctx.trend_5m,
+        ctx.trend_15m,
+        ctx.trend_1h,
+    );
+    score += trend_score;
+    
+    // === 2. MOMENTUM (0-15 points) ===
+    let momentum_score = calculate_momentum_score(
+        side,
+        ctx.rsi,
+        ctx.macd,
+        ctx.macd_signal,
+        ctx.stochastic_k,
+        ctx.stochastic_d,
+    );
+    score += momentum_score;
+    
+    // === 3. VOLUME CONFIRMATION (0-15 points) - CRITICAL! ===
+    let volume_score = calculate_volume_score(
+        side,
+        ctx.volume_ratio,
+        ctx.buy_volume_ratio,
+    );
+    score += volume_score;
+    
+    // === 4. MARKET MICROSTRUCTURE (0-15 points) - EDGE! ===
+    let microstructure_score = calculate_microstructure_score(
+        side,
+        ctx.orderbook_imbalance,
+        ctx.bid_ask_spread_bps,
+        ctx.top_5_bid_depth_usd,
+        ctx.top_5_ask_depth_usd,
+    );
+    score += microstructure_score;
+    
+    // === 5. VOLATILITY CONDITIONS (0-10 points) ===
+    let volatility_score = calculate_volatility_score(
+        ctx.atr_percentile,
+        ctx.bollinger_width,
+    );
+    score += volatility_score;
+    
+    // === 6. MARKET SENTIMENT (0-10 points) ===
+    let sentiment_score = calculate_sentiment_score(
+        side,
+        ctx.funding_rate,
+        ctx.long_short_ratio,
+    );
+    score += sentiment_score;
+    
+    // === 7. SUPPORT/RESISTANCE (0-10 points) ===
+    let sr_score = calculate_support_resistance_score(
+        side,
+        ctx.nearest_support_distance,
+        ctx.nearest_resistance_distance,
+        ctx.support_strength,
+        ctx.resistance_strength,
+    );
+    score += sr_score;
+    
+    // === 8. RISK FACTORS (0-5 points) ===
+    let risk_score = calculate_risk_factors(
+        ctx.bid_ask_spread_bps,
+        ctx.open_interest,
+    );
+    score += risk_score;
+    
+    score
+}
+
+/// Trend alignment across multiple timeframes
+/// Perfect alignment = 20 points
+fn calculate_trend_alignment_score(
+    side: SignalSide,
+    trend_1m: TrendDirection,
+    trend_5m: TrendDirection,
+    trend_15m: TrendDirection,
+    trend_1h: TrendDirection,
+) -> f64 {
+    let mut aligned_count = 0;
+    let trends = vec![trend_1m, trend_5m, trend_15m, trend_1h];
+
+    for trend in trends {
+        let is_aligned = match (side, trend) {
+            (SignalSide::Long, TrendDirection::Up) => true,
+            (SignalSide::Short, TrendDirection::Down) => true,
+            _ => false,
+        };
+        if is_aligned {
+            aligned_count += 1;
+        }
+    }
+    
+    // Weighted scoring: Higher timeframes are more important
+    // 1m=3pts, 5m=5pts, 15m=6pts, 1h=6pts
+    match aligned_count {
+        4 => 20.0,  // Perfect alignment
+        3 => 15.0,  // Strong alignment
+        2 => 8.0,   // Weak alignment
+        1 => 3.0,   // Very weak
+        _ => 0.0,   // No alignment
+    }
+}
+
+/// Momentum indicators scoring
+fn calculate_momentum_score(
+    side: SignalSide,
+    rsi: f64,
+    macd: f64,
+    macd_signal: f64,
+    stoch_k: f64,
+    stoch_d: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    // RSI (0-5 points)
+    match side {
+        SignalSide::Long => {
+            if rsi >= 40.0 && rsi <= 60.0 {
+                score += 5.0; // Sweet spot
+            } else if rsi > 30.0 && rsi < 40.0 {
+                score += 3.0; // Recovering from oversold
+            }
+        }
+        SignalSide::Short => {
+            if rsi >= 40.0 && rsi <= 60.0 {
+                score += 5.0; // Sweet spot
+            } else if rsi > 60.0 && rsi < 70.0 {
+                score += 3.0; // Recovering from overbought
+            }
+        }
+        _ => {}
+    }
+    
+    // MACD (0-5 points)
+    let macd_histogram = macd - macd_signal;
+    match side {
+        SignalSide::Long => {
+            if macd_histogram > 0.0 {
+                score += 5.0; // Bullish crossover
+            } else if macd_histogram > -0.0001 {
+                score += 2.0; // About to cross
+            }
+        }
+        SignalSide::Short => {
+            if macd_histogram < 0.0 {
+                score += 5.0; // Bearish crossover
+            } else if macd_histogram < 0.0001 {
+                score += 2.0; // About to cross
+            }
+        }
+        _ => {}
+    }
+    
+    // Stochastic (0-5 points)
+    match side {
+        SignalSide::Long => {
+            if stoch_k > stoch_d && stoch_k < 80.0 {
+                score += 5.0; // Bullish and not overbought
+            } else if stoch_k < 20.0 {
+                score += 3.0; // Oversold, potential reversal
+            }
+        }
+        SignalSide::Short => {
+            if stoch_k < stoch_d && stoch_k > 20.0 {
+                score += 5.0; // Bearish and not oversold
+            } else if stoch_k > 80.0 {
+                score += 3.0; // Overbought, potential reversal
+            }
+        }
+        _ => {}
+    }
+    
+    score
+}
+
+/// Volume confirmation scoring - CRITICAL FOR CRYPTO!
+fn calculate_volume_score(
+    side: SignalSide,
+    volume_ratio: f64,
+    buy_volume_ratio: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    // Volume surge (0-8 points)
+    if volume_ratio > 2.0 {
+        score += 8.0; // Strong volume confirmation
+    } else if volume_ratio > 1.5 {
+        score += 5.0; // Good volume
+    } else if volume_ratio > 1.0 {
+        score += 2.0; // Normal volume
+    }
+    // volume_ratio < 1.0 = 0 points (weak volume)
+    
+    // Buy/Sell pressure (0-7 points)
+    match side {
+        SignalSide::Long => {
+            if buy_volume_ratio > 0.60 {
+                score += 7.0; // Strong buy pressure
+            } else if buy_volume_ratio > 0.55 {
+                score += 4.0; // Moderate buy pressure
+            }
+        }
+        SignalSide::Short => {
+            if buy_volume_ratio < 0.40 {
+                score += 7.0; // Strong sell pressure
+            } else if buy_volume_ratio < 0.45 {
+                score += 4.0; // Moderate sell pressure
+            }
+        }
+        _ => {}
+    }
+    
+    score
+}
+
+/// Market microstructure - THE EDGE!
+fn calculate_microstructure_score(
+    side: SignalSide,
+    orderbook_imbalance: f64,
+    spread_bps: f64,
+    bid_depth: f64,
+    ask_depth: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    // Orderbook imbalance (0-8 points) - MOST IMPORTANT
+    match side {
+        SignalSide::Long => {
+            if orderbook_imbalance > 1.3 {
+                score += 8.0; // Strong bid support
+            } else if orderbook_imbalance > 1.1 {
+                score += 5.0; // Moderate bid support
+            }
+        }
+        SignalSide::Short => {
+            if orderbook_imbalance < 0.7 {
+                score += 8.0; // Strong ask pressure
+            } else if orderbook_imbalance < 0.9 {
+                score += 5.0; // Moderate ask pressure
+            }
+        }
+        _ => {}
+    }
+    
+    // Spread quality (0-4 points)
+    if spread_bps < 5.0 {
+        score += 4.0; // Tight spread = good liquidity
+    } else if spread_bps < 10.0 {
+        score += 2.0; // Normal spread
+    }
+    // spread > 10bps = 0 points (poor liquidity)
+    
+    // Depth quality (0-3 points)
+    let min_depth = 50000.0; // $50k minimum depth
+    if bid_depth > min_depth && ask_depth > min_depth {
+        score += 3.0; // Good liquidity both sides
+    } else if bid_depth > min_depth || ask_depth > min_depth {
+        score += 1.0; // One-sided liquidity
+    }
+    
+    score
+}
+
+/// Volatility conditions scoring
+fn calculate_volatility_score(
+    atr_percentile: f64,
+    bb_width: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    // ATR percentile (0-5 points)
+    // Mid-range volatility is best for trend trading
+    if atr_percentile > 0.3 && atr_percentile < 0.7 {
+        score += 5.0; // Sweet spot
+    } else if atr_percentile > 0.2 && atr_percentile < 0.8 {
+        score += 3.0; // Acceptable
+    }
+    // Too low or too high volatility = 0 points
+    
+    // Bollinger Band width (0-5 points)
+    if bb_width > 0.02 && bb_width < 0.05 {
+        score += 5.0; // Good volatility for trading
+    } else if bb_width > 0.01 && bb_width < 0.07 {
+        score += 3.0; // Acceptable
+    }
+    
+    score
+}
+
+/// Market sentiment scoring
+fn calculate_sentiment_score(
+    side: SignalSide,
+    funding_rate: f64,
+    long_short_ratio: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    // Funding rate (0-5 points) - Contrarian approach
+    match side {
+        SignalSide::Long => {
+            if funding_rate < -0.0002 {
+                score += 5.0; // Shorts paying, bullish
+            } else if funding_rate < 0.0001 {
+                score += 3.0; // Neutral funding
+            }
+        }
+        SignalSide::Short => {
+            if funding_rate > 0.0002 {
+                score += 5.0; // Longs paying, bearish
+            } else if funding_rate > -0.0001 {
+                score += 3.0; // Neutral funding
+            }
+        }
+        _ => {}
+    }
+    
+    // Long/Short ratio (0-5 points) - Contrarian
+    match side {
+        SignalSide::Long => {
+            if long_short_ratio < 0.8 {
+                score += 5.0; // Too many shorts, squeeze potential
+            } else if long_short_ratio < 1.0 {
+                score += 3.0; // Balanced, slight short bias
+            }
+        }
+        SignalSide::Short => {
+            if long_short_ratio > 1.3 {
+                score += 5.0; // Too many longs, dump potential
+            } else if long_short_ratio > 1.1 {
+                score += 3.0; // Balanced, slight long bias
+            }
+        }
+        _ => {}
+    }
+    
+    score
+}
+
+/// Support/Resistance scoring
+fn calculate_support_resistance_score(
+    side: SignalSide,
+    support_distance: f64,
+    resistance_distance: f64,
+    support_strength: f64,
+    resistance_strength: f64,
+) -> f64 {
+    let mut score = 0.0;
+
+    match side {
+        SignalSide::Long => {
+            // Close to strong support = good long entry (0-5 points)
+            if support_distance < 0.01 && support_strength > 0.7 {
+                score += 5.0; // At strong support
+            } else if support_distance < 0.02 && support_strength > 0.5 {
+                score += 3.0; // Near moderate support
+            }
+            
+            // Far from resistance = room to run (0-5 points)
+            if resistance_distance > 0.03 {
+                score += 5.0; // Plenty of room
+            } else if resistance_distance > 0.02 {
+                score += 3.0; // Some room
+            }
+        }
+        SignalSide::Short => {
+            // Close to strong resistance = good short entry (0-5 points)
+            if resistance_distance < 0.01 && resistance_strength > 0.7 {
+                score += 5.0; // At strong resistance
+            } else if resistance_distance < 0.02 && resistance_strength > 0.5 {
+                score += 3.0; // Near moderate resistance
+            }
+            
+            // Far from support = room to fall (0-5 points)
+            if support_distance > 0.03 {
+                score += 5.0; // Plenty of room
+            } else if support_distance > 0.02 {
+                score += 3.0; // Some room
+            }
+        }
+        _ => {}
+    }
+    
+    score
+}
+
+/// Risk factors penalty
+fn calculate_risk_factors(
+    spread_bps: f64,
+    open_interest: f64,
+) -> f64 {
+    let mut score = 5.0; // Start with full points
+
+    // Wide spread = penalty
+    if spread_bps > 20.0 {
+        score -= 3.0; // Severe penalty
+    } else if spread_bps > 10.0 {
+        score -= 1.0; // Minor penalty
+    }
+    
+    // Low OI = penalty (less than $100M)
+    if open_interest < 100_000_000.0 {
+        score -= 2.0;
+    }
+    
+    if score < 0.0 {
+        0.0
+    } else {
+        score
+    }
+}
+
+// =======================
+//  Enhanced Signal Context Builder
+//  Converts SignalContext + MarketTick to EnhancedSignalContext
+// =======================
+
+/// Build EnhancedSignalContext from available data
+/// This function creates a comprehensive context for enhanced scoring
+pub fn build_enhanced_signal_context(
+    ctx: &SignalContext,
+    candle: &Candle,
+    candles: &[Candle],
+    current_index: usize,
+    market_tick: Option<&MarketTick>,
+    multi_timeframe_trends: Option<(TrendDirection, TrendDirection, TrendDirection, TrendDirection)>,
+) -> EnhancedSignalContext {
+    // Calculate volume metrics
+    let volume_ma_20 = if current_index >= 20 && candles.len() > current_index {
+        let recent_candles = &candles[current_index.saturating_sub(19)..=current_index.min(candles.len() - 1)];
+        recent_candles.iter().map(|c| c.volume).sum::<f64>() / recent_candles.len() as f64
+    } else {
+        candle.volume
+    };
+    let volume_ratio = candle.volume / volume_ma_20.max(0.0001);
+    
+    // Estimate buy volume ratio (if not available, use 0.5 as neutral)
+    let buy_volume_ratio = market_tick
+        .and_then(|t| t.obi)
+        .map(|obi| {
+            // OBI > 1.0 means more bid pressure = more buy volume
+            if obi > 1.0 {
+                0.5 + (obi - 1.0).min(1.0) * 0.3 // Max 0.8
+            } else {
+                0.5 - (1.0 - obi).min(1.0) * 0.3 // Min 0.2
+            }
+        })
+        .unwrap_or(0.5);
+
+    // Calculate MACD (simplified: EMA12 - EMA26)
+    let macd = calculate_macd(candles, current_index);
+    let macd_signal = calculate_macd_signal(candles, current_index);
+    
+    // Calculate Stochastic
+    let (stoch_k, stoch_d) = calculate_stochastic(candles, current_index);
+    
+    // Calculate ATR percentile
+    let atr_percentile = calculate_atr_percentile(ctx.atr, candles, current_index);
+    
+    // Calculate Bollinger Bands
+    let (bb_width, price_vs_bb_upper, price_vs_bb_lower) = calculate_bollinger_bands(candles, current_index, candle.close);
+    
+    // Market microstructure from MarketTick
+    let (bid_ask_spread_bps, orderbook_imbalance, top_5_bid_depth_usd, top_5_ask_depth_usd) = 
+        if let Some(tick) = market_tick {
+            let spread = if tick.ask > 0.0 && tick.bid > 0.0 {
+                ((tick.ask - tick.bid) / tick.price) * 10000.0 // Convert to bps
+            } else {
+                10.0 // Default spread estimate
+            };
+            let obi = tick.obi.unwrap_or(1.0);
+            let bid_depth = tick.bid_depth_usd.unwrap_or(0.0);
+            let ask_depth = tick.ask_depth_usd.unwrap_or(0.0);
+            (spread, obi, bid_depth, ask_depth)
+        } else {
+            // Estimate from price (fallback)
+            let spread = 5.0; // Default 5 bps
+            let obi = 1.0; // Balanced
+            (spread, obi, 0.0, 0.0)
+        };
+    
+    // Multi-timeframe trends (default to current trend if not available)
+    let current_trend = classify_trend(ctx);
+    let (trend_1m, trend_5m, trend_15m, trend_1h) = multi_timeframe_trends
+        .unwrap_or((current_trend, current_trend, current_trend, current_trend));
+    
+    // Support/Resistance (simplified calculation)
+    let (nearest_support_distance, nearest_resistance_distance, support_strength, resistance_strength) =
+        calculate_support_resistance(candles, current_index, candle.close);
+    
+    EnhancedSignalContext {
+        ema_fast: ctx.ema_fast,
+        ema_slow: ctx.ema_slow,
+        rsi: ctx.rsi,
+        atr: ctx.atr,
+        bid_ask_spread_bps,
+        orderbook_imbalance,
+        top_5_bid_depth_usd,
+        top_5_ask_depth_usd,
+        volume_ma_20,
+        volume_ratio,
+        buy_volume_ratio,
+        macd,
+        macd_signal,
+        stochastic_k: stoch_k,
+        stochastic_d: stoch_d,
+        atr_percentile,
+        bollinger_width: bb_width,
+        price_vs_bb_upper,
+        price_vs_bb_lower,
+        funding_rate: ctx.funding_rate,
+        open_interest: ctx.open_interest,
+        long_short_ratio: ctx.long_short_ratio,
+        trend_1m,
+        trend_5m,
+        trend_15m,
+        trend_1h,
+        nearest_support_distance,
+        nearest_resistance_distance,
+        support_strength,
+        resistance_strength,
+    }
+}
+
+/// Calculate MACD (EMA12 - EMA26)
+fn calculate_macd(candles: &[Candle], current_index: usize) -> f64 {
+    if current_index < 26 || candles.len() <= current_index {
+        return 0.0;
+    }
+    
+    let mut ema12 = ExponentialMovingAverage::new(12).unwrap();
+    let mut ema26 = ExponentialMovingAverage::new(26).unwrap();
+    
+    let start = current_index.saturating_sub(50).max(0);
+    for i in start..=current_index {
+        let c = &candles[i];
+        let di = DataItem::builder()
+            .open(c.open)
+            .high(c.high)
+            .low(c.low)
+            .close(c.close)
+            .volume(c.volume)
+            .build()
+            .unwrap();
+        ema12.next(&di);
+        ema26.next(&di);
+    }
+    
+    let c = &candles[current_index];
+    let di = DataItem::builder()
+        .open(c.open)
+        .high(c.high)
+        .low(c.low)
+        .close(c.close)
+        .volume(c.volume)
+        .build()
+        .unwrap();
+    
+    let ema12_val = ema12.next(&di);
+    let ema26_val = ema26.next(&di);
+    
+    ema12_val - ema26_val
+}
+
+/// Calculate MACD Signal (EMA9 of MACD)
+fn calculate_macd_signal(candles: &[Candle], current_index: usize) -> f64 {
+    if current_index < 35 || candles.len() <= current_index {
+        return 0.0;
+    }
+    
+    // Calculate MACD values for last 20 periods
+    let mut macd_values = Vec::new();
+    let start = current_index.saturating_sub(20).max(0);
+    
+    for i in start..=current_index {
+        let macd_val = calculate_macd(candles, i);
+        macd_values.push(macd_val);
+    }
+    
+    // Calculate EMA9 of MACD
+    let mut ema9 = ExponentialMovingAverage::new(9).unwrap();
+    for &macd_val in &macd_values {
+        // Use MACD value as close price for EMA calculation
+        let di = DataItem::builder()
+            .close(macd_val)
+            .open(macd_val)
+            .high(macd_val)
+            .low(macd_val)
+            .volume(0.0)
+            .build()
+            .unwrap();
+        ema9.next(&di);
+    }
+    
+    let last_macd = macd_values.last().copied().unwrap_or(0.0);
+    let di = DataItem::builder()
+        .close(last_macd)
+        .open(last_macd)
+        .high(last_macd)
+        .low(last_macd)
+        .volume(0.0)
+        .build()
+        .unwrap();
+    
+    ema9.next(&di)
+}
+
+/// Calculate Stochastic %K and %D
+fn calculate_stochastic(candles: &[Candle], current_index: usize) -> (f64, f64) {
+    if current_index < 14 || candles.len() <= current_index {
+        return (50.0, 50.0); // Neutral values
+    }
+    
+    let period = 14;
+    let lookback = current_index.min(candles.len() - 1).saturating_sub(period - 1);
+    let end = current_index.min(candles.len() - 1);
+    
+    let current_close = candles[end].close;
+    let mut highest_high = f64::MIN;
+    let mut lowest_low = f64::MAX;
+    
+    for i in lookback..=end {
+        highest_high = highest_high.max(candles[i].high);
+        lowest_low = lowest_low.min(candles[i].low);
+    }
+    
+    let range = highest_high - lowest_low;
+    let stoch_k = if range > 0.0 {
+        ((current_close - lowest_low) / range) * 100.0
+    } else {
+        50.0
+    };
+    
+    // %D is SMA of %K (3-period)
+    let stoch_d = if end >= 2 {
+        let k_values: Vec<f64> = (end.saturating_sub(2)..=end)
+            .map(|i| {
+                if i >= period {
+                    let lookback_k = i.saturating_sub(period - 1);
+                    let close_k = candles[i].close;
+                    let mut hh = f64::MIN;
+                    let mut ll = f64::MAX;
+                    for j in lookback_k..=i {
+                        hh = hh.max(candles[j].high);
+                        ll = ll.min(candles[j].low);
+                    }
+                    let r = hh - ll;
+                    if r > 0.0 {
+                        ((close_k - ll) / r) * 100.0
+                    } else {
+                        50.0
+                    }
+                } else {
+                    50.0
+                }
+            })
+            .collect();
+        k_values.iter().sum::<f64>() / k_values.len() as f64
+    } else {
+        stoch_k
+    };
+    
+    (stoch_k, stoch_d)
+}
+
+/// Calculate ATR percentile (0-1) based on historical ATR values
+fn calculate_atr_percentile(current_atr: f64, candles: &[Candle], current_index: usize) -> f64 {
+    if current_index < 50 || candles.len() <= current_index {
+        return 0.5; // Default to median
+    }
+    
+    let mut atr_calc = AverageTrueRange::new(14).unwrap();
+    let mut atr_values = Vec::new();
+    
+    let start = current_index.saturating_sub(100).max(0);
+    for i in start..=current_index {
+        let c = &candles[i];
+        let di = DataItem::builder()
+            .open(c.open)
+            .high(c.high)
+            .low(c.low)
+            .close(c.close)
+            .volume(c.volume)
+            .build()
+            .unwrap();
+        let atr_val = atr_calc.next(&di);
+        atr_values.push(atr_val);
+    }
+    
+    if atr_values.is_empty() {
+        return 0.5;
+    }
+    
+    // Count how many ATR values are below current
+    let below_count = atr_values.iter().filter(|&&v| v < current_atr).count();
+    below_count as f64 / atr_values.len() as f64
+}
+
+/// Calculate Bollinger Bands and return width and distances
+fn calculate_bollinger_bands(candles: &[Candle], current_index: usize, current_price: f64) -> (f64, f64, f64) {
+    if current_index < 20 || candles.len() <= current_index {
+        return (0.02, 0.0, 0.0); // Default values
+    }
+    
+    let period = 20;
+    let std_dev = 2.0;
+    let start = current_index.saturating_sub(period - 1);
+    let end = current_index.min(candles.len() - 1);
+    
+    // Calculate SMA
+    let closes: Vec<f64> = candles[start..=end].iter().map(|c| c.close).collect();
+    let sma = closes.iter().sum::<f64>() / closes.len() as f64;
+    
+    // Calculate standard deviation
+    let variance = closes.iter()
+        .map(|&c| (c - sma).powi(2))
+        .sum::<f64>() / closes.len() as f64;
+    let std = variance.sqrt();
+    
+    let upper_band = sma + (std_dev * std);
+    let lower_band = sma - (std_dev * std);
+    
+    // Width as % of price
+    let width = ((upper_band - lower_band) / current_price).max(0.0);
+    
+    // Distance to bands as % of price
+    let dist_upper = if current_price > 0.0 {
+        ((current_price - upper_band) / current_price).max(0.0)
+    } else {
+        0.0
+    };
+    let dist_lower = if current_price > 0.0 {
+        ((lower_band - current_price) / current_price).max(0.0)
+    } else {
+        0.0
+    };
+    
+    (width, dist_upper, dist_lower)
+}
+
+/// Calculate support and resistance levels
+fn calculate_support_resistance(
+    candles: &[Candle],
+    current_index: usize,
+    current_price: f64,
+) -> (f64, f64, f64, f64) {
+    if current_index < 20 || candles.len() <= current_index {
+        return (0.05, 0.05, 0.5, 0.5); // Default values
+    }
+    
+    let lookback = 50.min(current_index);
+    let start = current_index.saturating_sub(lookback);
+    
+    // Find local lows (support) and highs (resistance)
+    let mut support_levels = Vec::new();
+    let mut resistance_levels = Vec::new();
+    
+    for i in (start + 2)..current_index.min(candles.len() - 1) {
+        // Local low (support)
+        if candles[i].low < candles[i - 1].low && candles[i].low < candles[i + 1].low {
+            support_levels.push(candles[i].low);
+        }
+        // Local high (resistance)
+        if candles[i].high > candles[i - 1].high && candles[i].high > candles[i + 1].high {
+            resistance_levels.push(candles[i].high);
+        }
+    }
+    
+    // Find nearest support and resistance
+    let nearest_support = support_levels.iter()
+        .filter(|&&s| s < current_price)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .copied()
+        .unwrap_or(current_price * 0.95); // Default 5% below
+    
+    let nearest_resistance = resistance_levels.iter()
+        .filter(|&&r| r > current_price)
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .copied()
+        .unwrap_or(current_price * 1.05); // Default 5% above
+    
+    // Calculate distances as percentages
+    let support_distance = ((current_price - nearest_support) / current_price).max(0.0);
+    let resistance_distance = ((nearest_resistance - current_price) / current_price).max(0.0);
+    
+    // Calculate strength (how many times level was tested)
+    let support_strength = support_levels.iter()
+        .filter(|&&s| (s - nearest_support).abs() / current_price < 0.01) // Within 1%
+        .count() as f64 / 10.0; // Normalize to 0-1
+    let support_strength = support_strength.min(1.0);
+    
+    let resistance_strength = resistance_levels.iter()
+        .filter(|&&r| (r - nearest_resistance).abs() / current_price < 0.01) // Within 1%
+        .count() as f64 / 10.0; // Normalize to 0-1
+    let resistance_strength = resistance_strength.min(1.0);
+    
+    (support_distance, resistance_distance, support_strength, resistance_strength)
 }

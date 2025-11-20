@@ -56,6 +56,11 @@ pub struct BotConfig {
     pub weak_trend_score_multiplier: f64,
     pub regime_multiplier_trending: f64,
     pub regime_multiplier_ranging: f64,
+    // Enhanced Signal Scoring (TrendPlan.md)
+    pub enable_enhanced_scoring: bool,
+    pub enhanced_score_excellent: f64,
+    pub enhanced_score_good: f64,
+    pub enhanced_score_marginal: f64,
 }
 
 impl BotConfig {
@@ -227,6 +232,27 @@ impl BotConfig {
                 "BOT_REGIME_MULTIPLIER_RANGING",
                 trending_cfg.and_then(|t| t.regime_multiplier_ranging),
                 1.15,
+            ),
+            // Enhanced Signal Scoring (TrendPlan.md)
+            enable_enhanced_scoring: bool_setting(
+                "BOT_ENABLE_ENHANCED_SCORING",
+                trending_cfg.and_then(|t| t.enable_enhanced_scoring),
+                false, // Default: disabled
+            ),
+            enhanced_score_excellent: numeric_setting(
+                "BOT_ENHANCED_SCORE_EXCELLENT",
+                trending_cfg.and_then(|t| t.enhanced_score_excellent),
+                80.0,
+            ),
+            enhanced_score_good: numeric_setting(
+                "BOT_ENHANCED_SCORE_GOOD",
+                trending_cfg.and_then(|t| t.enhanced_score_good),
+                65.0,
+            ),
+            enhanced_score_marginal: numeric_setting(
+                "BOT_ENHANCED_SCORE_MARGINAL",
+                trending_cfg.and_then(|t| t.enhanced_score_marginal),
+                50.0,
             ),
         }
         .validate()
@@ -468,6 +494,11 @@ impl BotConfig {
             weak_trend_score_multiplier: self.weak_trend_score_multiplier,
             regime_multiplier_trending: self.regime_multiplier_trending,
             regime_multiplier_ranging: self.regime_multiplier_ranging,
+            // Enhanced Signal Scoring (TrendPlan.md)
+            enable_enhanced_scoring: self.enable_enhanced_scoring,
+            enhanced_score_excellent: self.enhanced_score_excellent,
+            enhanced_score_good: self.enhanced_score_good,
+            enhanced_score_marginal: self.enhanced_score_marginal,
         }
     }
 }

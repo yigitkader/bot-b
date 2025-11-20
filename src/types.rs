@@ -138,6 +138,11 @@ pub struct TrendParams {
     pub weak_trend_score_multiplier: f64,
     pub regime_multiplier_trending: f64,
     pub regime_multiplier_ranging: f64,
+    // Enhanced Signal Scoring (TrendPlan.md)
+    pub enable_enhanced_scoring: bool,
+    pub enhanced_score_excellent: f64,
+    pub enhanced_score_good: f64,
+    pub enhanced_score_marginal: f64,
 }
 
 // fallback for warmup default referencing EMA slow period
@@ -260,6 +265,15 @@ pub(crate) struct FileTrending {
     pub regime_multiplier_trending: Option<f64>,
     #[serde(default)]
     pub regime_multiplier_ranging: Option<f64>,
+    // Enhanced Signal Scoring (TrendPlan.md)
+    #[serde(default)]
+    pub enable_enhanced_scoring: Option<bool>,
+    #[serde(default)]
+    pub enhanced_score_excellent: Option<f64>,
+    #[serde(default)]
+    pub enhanced_score_good: Option<f64>,
+    #[serde(default)]
+    pub enhanced_score_marginal: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -930,6 +944,57 @@ pub struct SignalContext {
     pub long_short_ratio: f64, // top trader long/short account ratio
 }
 
+/// Enhanced signal context with 15+ factors for professional scoring (0-100 points)
+/// Based on TrendPlan.md recommendations
+#[derive(Debug, Clone)]
+pub struct EnhancedSignalContext {
+    // Technical indicators (existing)
+    pub ema_fast: f64,
+    pub ema_slow: f64,
+    pub rsi: f64,
+    pub atr: f64,
+
+    // Market microstructure (NEW - CRITICAL!)
+    pub bid_ask_spread_bps: f64,        // Spread ne kadar dar?
+    pub orderbook_imbalance: f64,       // Bid/Ask ratio (1.0 = balanced)
+    pub top_5_bid_depth_usd: f64,       // Liquidity depth
+    pub top_5_ask_depth_usd: f64,
+    
+    // Volume analysis (NEW - CRITICAL!)
+    pub volume_ma_20: f64,              // 20-bar volume average
+    pub volume_ratio: f64,              // Current volume / MA20
+    pub buy_volume_ratio: f64,          // Buy volume / Total volume
+    
+    // Momentum indicators (NEW)
+    pub macd: f64,                      // MACD histogram
+    pub macd_signal: f64,
+    pub stochastic_k: f64,              // Stochastic %K
+    pub stochastic_d: f64,              // Stochastic %D
+    
+    // Volatility analysis (NEW)
+    pub atr_percentile: f64,            // ATR percentile (0-1)
+    pub bollinger_width: f64,            // BB width as % of price
+    pub price_vs_bb_upper: f64,         // Distance to BB upper
+    pub price_vs_bb_lower: f64,         // Distance to BB lower
+    
+    // Market sentiment (existing)
+    pub funding_rate: f64,
+    pub open_interest: f64,
+    pub long_short_ratio: f64,
+    
+    // Multi-timeframe confirmation (NEW - CRITICAL!)
+    pub trend_1m: TrendDirection,       // 1-minute trend
+    pub trend_5m: TrendDirection,       // 5-minute trend (primary)
+    pub trend_15m: TrendDirection,     // 15-minute trend
+    pub trend_1h: TrendDirection,       // 1-hour trend
+    
+    // Support/Resistance (NEW)
+    pub nearest_support_distance: f64,  // Distance to nearest support (%)
+    pub nearest_resistance_distance: f64, // Distance to nearest resistance (%)
+    pub support_strength: f64,          // How strong is support? (0-1)
+    pub resistance_strength: f64,       // How strong is resistance? (0-1)
+}
+
 #[derive(Debug, Clone)]
 pub struct Signal {
     pub time: DateTime<Utc>,
@@ -1040,6 +1105,12 @@ pub struct AlgoConfig {
     pub max_price_change_5bars_pct: f64, // 5 bar içinde max price change % (örn: 3.0 = %3)
     // Parabolic move = reversal riski, Flat döner
     pub enable_signal_quality_filter: bool, // Signal quality filtering aktif mi?
+    
+    // Enhanced Signal Scoring (TrendPlan.md)
+    pub enable_enhanced_scoring: bool, // Enhanced 0-100 point scoring kullanılsın mı?
+    pub enhanced_score_excellent: f64, // 80-100: Excellent signal threshold
+    pub enhanced_score_good: f64,     // 65-79: Good signal threshold
+    pub enhanced_score_marginal: f64,  // 50-64: Marginal signal threshold
 
     // Stop Loss & Risk Management (coin-agnostic)
     pub atr_stop_loss_multiplier: f64, // ATR multiplier for stop-loss (örn: 3.0 = 3x ATR)

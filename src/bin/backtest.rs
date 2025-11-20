@@ -44,6 +44,11 @@ async fn main() -> Result<()> {
         max_volatility_pct: 2.0, // Maximum ATR volatility % (2% = çok volatile)
         max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
         enable_signal_quality_filter: true, // Signal quality filtering aktif
+        // Enhanced Signal Scoring (TrendPlan.md)
+        enable_enhanced_scoring: false, // Enhanced scoring kapalı (default)
+        enhanced_score_excellent: 80.0, // 80-100: Excellent signal
+        enhanced_score_good: 65.0,      // 65-79: Good signal
+        enhanced_score_marginal: 50.0,  // 50-64: Marginal signal
         // Stop Loss & Risk Management (coin-agnostic)
         atr_stop_loss_multiplier: 3.0, // ATR multiplier for stop-loss (3.0 = 3x ATR)
         // Recommended: 2.5-3.5 for most coins, adjust based on volatility
