@@ -47,6 +47,14 @@ pub struct BotConfig {
     pub min_margin_usd: f64,
     pub max_position_notional_usd: f64,
     pub min_quote_balance_usd: f64,
+    // ✅ ADIM 2: Config.yaml parametreleri (TrendPlan.md)
+    pub hft_mode: bool,
+    pub base_min_score: f64,
+    pub trend_threshold_hft: f64,
+    pub trend_threshold_normal: f64,
+    pub weak_trend_score_multiplier: f64,
+    pub regime_multiplier_trending: f64,
+    pub regime_multiplier_ranging: f64,
 }
 
 impl BotConfig {
@@ -186,6 +194,42 @@ impl BotConfig {
                 "BOT_LIQ_WINDOW_SECS",
                 file_cfg.risk.as_ref().and_then(|r| r.liq_window_secs),
                 30u64, // Default: 30 seconds
+            ),
+            // ✅ ADIM 2: Config.yaml parametreleri
+            hft_mode: bool_setting(
+                "BOT_HFT_MODE",
+                trending_cfg.and_then(|t| t.hft_mode),
+                false,
+            ),
+            base_min_score: numeric_setting(
+                "BOT_BASE_MIN_SCORE",
+                trending_cfg.and_then(|t| t.base_min_score),
+                6.5,
+            ),
+            trend_threshold_hft: numeric_setting(
+                "BOT_TREND_THRESHOLD_HFT",
+                trending_cfg.and_then(|t| t.trend_threshold_hft),
+                0.5,
+            ),
+            trend_threshold_normal: numeric_setting(
+                "BOT_TREND_THRESHOLD_NORMAL",
+                trending_cfg.and_then(|t| t.trend_threshold_normal),
+                0.6,
+            ),
+            weak_trend_score_multiplier: numeric_setting(
+                "BOT_WEAK_TREND_SCORE_MULTIPLIER",
+                trending_cfg.and_then(|t| t.weak_trend_score_multiplier),
+                1.15,
+            ),
+            regime_multiplier_trending: numeric_setting(
+                "BOT_REGIME_MULTIPLIER_TRENDING",
+                trending_cfg.and_then(|t| t.regime_multiplier_trending),
+                0.9,
+            ),
+            regime_multiplier_ranging: numeric_setting(
+                "BOT_REGIME_MULTIPLIER_RANGING",
+                trending_cfg.and_then(|t| t.regime_multiplier_ranging),
+                1.15,
             ),
         }
         .validate()
@@ -364,6 +408,14 @@ impl BotConfig {
             short_min_score: self.short_min_score,
             signal_cooldown_secs: self.signal_cooldown_secs,
             warmup_min_ticks: self.warmup_min_ticks,
+            // ✅ ADIM 2: Config.yaml parametreleri
+            hft_mode: self.hft_mode,
+            base_min_score: self.base_min_score,
+            trend_threshold_hft: self.trend_threshold_hft,
+            trend_threshold_normal: self.trend_threshold_normal,
+            weak_trend_score_multiplier: self.weak_trend_score_multiplier,
+            regime_multiplier_trending: self.regime_multiplier_trending,
+            regime_multiplier_ranging: self.regime_multiplier_ranging,
         }
     }
 }

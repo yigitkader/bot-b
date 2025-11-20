@@ -4,8 +4,11 @@ pub mod connection;
 pub mod event_bus;
 pub mod follow_orders;
 pub mod logging;
+pub mod metrics_cache;
 pub mod ordering;
+pub mod risk_manager;
 pub mod state;
+pub mod symbol_scanner;
 pub mod trending;
 pub mod types;
 
@@ -20,3 +23,4 @@ pub use types::{
     OrderingChannels, PositionSide, SharedState, Signal, SignalSide, TrendParams, TrendingChannels,
     Trade,
 };
+pub use symbol_scanner::{SymbolScanner, SymbolSelectionConfig};

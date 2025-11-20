@@ -7,6 +7,10 @@ edition = "2021"
 name = "backtest"
 path = "src/bin/backtest.rs"
 
+[[bin]]
+name = "backtest_multi"
+path = "src/bin/backtest_multi.rs"
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -29,3 +33,4 @@ hex = "0.4"
 ta = "0.5"
 dotenvy = "0.15"
 rand = "0.8"
+csv = "1.3"

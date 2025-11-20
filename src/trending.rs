@@ -1734,19 +1734,50 @@ fn generate_signal(
         }
     }
 
-    // ✅ DECISION: Adaptive threshold (TrendPlan.md Fix #4)
-    // Total possible: 10 points per side
-    // FIX: Adaptive threshold mantığını düzelt - çok agresif olmamalı
-    let min_score = if long_score + short_score >= 8 {
-        // Strong market conditions → lower threshold
-        cfg.long_min_score.min(5).max(4) // Min 4, max 5
-    } else {
-        // Weak market conditions → higher threshold ama çok yüksek olmamalı
-        cfg.long_min_score.max(5).min(6) // Min 5, max 6
+    // ✅ ADIM 2: Config.yaml parametrelerini kullan (TrendPlan.md)
+    // Trend gücünü hesapla (EMA separation)
+    let trend_strength = match trend {
+        TrendDirection::Up => (ctx.ema_fast - ctx.ema_slow) / ctx.ema_slow,
+        TrendDirection::Down => (ctx.ema_slow - ctx.ema_fast) / ctx.ema_slow,
+        TrendDirection::Flat => 0.0,
     };
     
-    let long_min = min_score;
-    let short_min = min_score;
+    // Regime belirleme: trending vs ranging
+    let is_trending = trend_strength.abs() > 0.001; // %0.1+ separation = trending
+    let is_weak_trend = trend_strength.abs() > 0.0005 && trend_strength.abs() <= 0.001; // %0.05-0.1 = weak trend
+    
+    // Base threshold seçimi (HFT mode vs normal)
+    let base_threshold = if cfg.hft_mode {
+        cfg.trend_threshold_hft
+    } else {
+        cfg.trend_threshold_normal
+    };
+    
+    // Regime multiplier uygula
+    let regime_multiplier = if is_trending {
+        cfg.regime_multiplier_trending
+    } else {
+        cfg.regime_multiplier_ranging
+    };
+    
+    // Zayıf trend için score multiplier uygula
+    let score_multiplier = if is_weak_trend {
+        cfg.weak_trend_score_multiplier
+    } else {
+        1.0
+    };
+    
+    // Adaptive threshold hesapla
+    let base_min = cfg.base_min_score as usize;
+    let adjusted_min = (base_min as f64 * regime_multiplier) as usize;
+    
+    // Zayıf trend için score'u çarp (daha yüksek threshold gerektirir)
+    let long_min = if is_weak_trend {
+        (adjusted_min as f64 * score_multiplier) as usize
+    } else {
+        adjusted_min
+    };
+    let short_min = long_min; // Aynı threshold her iki taraf için
     
     // Determine signal side with tie-break mechanism
     let side = if long_score >= long_min && short_score >= short_min {
@@ -2919,7 +2950,7 @@ pub async fn run_trending(
 ) {
     let client = FuturesClient::new();
     
-    // AlgoConfig'i TrendParams'den oluştur
+    // ✅ ADIM 2: AlgoConfig'i TrendParams'den oluştur (config.yaml parametreleri ile)
     let cfg = AlgoConfig {
         rsi_trend_long_min: params.rsi_long_min,
         rsi_trend_short_max: params.rsi_short_max,
@@ -2943,6 +2974,14 @@ pub async fn run_trending(
         atr_take_profit_multiplier: params.atr_tp_multiplier, // ATR TP multiplier from config
         min_holding_bars: 3, // Default minimum holding time (3 bars = 15 minutes @5m)
                              // Can be made configurable in future
+        // ✅ ADIM 2: Config.yaml parametreleri
+        hft_mode: params.hft_mode,
+        base_min_score: params.base_min_score,
+        trend_threshold_hft: params.trend_threshold_hft,
+        trend_threshold_normal: params.trend_threshold_normal,
+        weak_trend_score_multiplier: params.weak_trend_score_multiplier,
+        regime_multiplier_trending: params.regime_multiplier_trending,
+        regime_multiplier_ranging: params.regime_multiplier_ranging,
     };
 
     let kline_interval = "5m"; // 5 dakikalık kline kullan
@@ -3161,14 +3200,32 @@ async fn generate_signal_from_candle(
     }
 
     // En son candle ve context'i kullan
-    let latest_ctx = contexts.last().ok_or_else(|| anyhow::anyhow!("no contexts available"))?;
-    let prev_ctx = if contexts.len() > 1 {
-        Some(&contexts[contexts.len() - 2])
+    let latest_idx = matched_candles.len() - 1;
+    let latest_candle = &matched_candles[latest_idx];
+    let latest_ctx = &contexts[latest_idx];
+    let prev_ctx = if latest_idx > 0 {
+        Some(&contexts[latest_idx - 1])
     } else {
         None
     };
 
-    let signal = generate_signal(candle, latest_ctx, prev_ctx, cfg);
+    // ✅ ADIM 1: Production'da generate_signal_enhanced kullan (backtest ile aynı pipeline)
+    // Advanced filtreler: volume filter, volatility percentile, support/resistance, parabolic move check
+    let signal = generate_signal_enhanced(
+        latest_candle,
+        latest_ctx,
+        prev_ctx,
+        cfg,
+        &matched_candles,
+        &contexts,
+        latest_idx,
+        None, // funding_arbitrage (ileride gerçek funding stream'inden doldurulabilir)
+        None, // mtf (multi-timeframe - ileride eklenebilir)
+        None, // orderflow (orderbook depth - ileride eklenebilir)
+        None, // liquidation_map (ileride eklenebilir)
+        None, // volume_profile (ileride eklenebilir)
+        None, // market_tick (ileride eklenebilir)
+    );
 
     // Eğer sinyal Flat değilse, TradeSignal'e dönüştür
     match signal.side {

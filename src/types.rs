@@ -120,6 +120,14 @@ pub struct TrendParams {
     pub short_min_score: usize,
     pub signal_cooldown_secs: i64,
     pub warmup_min_ticks: usize,
+    // ✅ ADIM 2: Config.yaml parametreleri
+    pub hft_mode: bool,
+    pub base_min_score: f64,
+    pub trend_threshold_hft: f64,
+    pub trend_threshold_normal: f64,
+    pub weak_trend_score_multiplier: f64,
+    pub regime_multiplier_trending: f64,
+    pub regime_multiplier_ranging: f64,
 }
 
 // fallback for warmup default referencing EMA slow period
@@ -149,6 +157,32 @@ pub struct FileConfig {
     pub risk: Option<FileRisk>,
     #[serde(default)]
     pub event_bus: Option<FileEventBus>,
+    #[serde(default)]
+    pub dynamic_symbol_selection: Option<FileDynamicSymbolSelection>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct FileDynamicSymbolSelection {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub max_symbols: Option<usize>,
+    #[serde(default)]
+    pub rotation_interval_minutes: Option<u64>,
+    #[serde(default)]
+    pub min_volatility_pct: Option<f64>,
+    #[serde(default)]
+    pub min_quote_volume: Option<f64>,
+    #[serde(default)]
+    pub min_trades_24h: Option<u64>,
+    #[serde(default)]
+    pub volatility_weight: Option<f64>,
+    #[serde(default)]
+    pub volume_weight: Option<f64>,
+    #[serde(default)]
+    pub trades_weight: Option<f64>,
+    #[serde(default)]
+    pub spread_weight: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,6 +229,21 @@ pub(crate) struct FileTrending {
     pub atr_tp_multiplier: Option<f64>,
     #[serde(default)]
     pub warmup_min_ticks: Option<usize>,
+    // ✅ ADIM 2: Config.yaml parametrelerini ekle
+    #[serde(default)]
+    pub hft_mode: Option<bool>,
+    #[serde(default)]
+    pub base_min_score: Option<f64>,
+    #[serde(default)]
+    pub trend_threshold_hft: Option<f64>,
+    #[serde(default)]
+    pub trend_threshold_normal: Option<f64>,
+    #[serde(default)]
+    pub weak_trend_score_multiplier: Option<f64>,
+    #[serde(default)]
+    pub regime_multiplier_trending: Option<f64>,
+    #[serde(default)]
+    pub regime_multiplier_ranging: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -776,8 +825,8 @@ pub(crate) struct KlineData {
     pub is_closed: bool,
 }
 
-#[derive(Debug)]
-pub(crate) struct FundingRate {
+#[derive(Debug, Clone)]
+pub struct FundingRate {
     pub _symbol: String,
     pub funding_rate: String,
     pub funding_time: i64,
@@ -964,6 +1013,15 @@ pub struct AlgoConfig {
     pub min_holding_bars: usize, // Minimum holding time (bar sayısı)
                                  // Çok kısa trade'leri filtrele (örn: 3 bar = 15 dakika @5m)
                                  // Recommended: 3-6 bars (15-30 minutes @5m)
+    
+    // ✅ ADIM 2: Config.yaml parametreleri (TrendPlan.md)
+    pub hft_mode: bool,                    // HFT mode aktif mi?
+    pub base_min_score: f64,               // Base minimum score (örn: 6.5)
+    pub trend_threshold_hft: f64,          // Trend threshold HFT mode için (örn: 0.5)
+    pub trend_threshold_normal: f64,       // Trend threshold normal mode için (örn: 0.6)
+    pub weak_trend_score_multiplier: f64,  // Zayıf trend için score multiplier (örn: 1.15)
+    pub regime_multiplier_trending: f64,   // Trending regime için threshold multiplier (örn: 0.9)
+    pub regime_multiplier_ranging: f64,    // Ranging regime için threshold multiplier (örn: 1.15)
 }
 
 // =======================
