@@ -12,13 +12,22 @@ use tokio::sync::mpsc::{Receiver as MReceiver, Sender as MSender};
 
 
 impl EventBus {
-    pub fn new(buffer: usize) -> Self {
-        let (market_tx, _) = broadcast::channel(buffer);
-        let (order_update_tx, _) = broadcast::channel(buffer);
-        let (position_update_tx, _) = broadcast::channel(buffer);
-        let (balance_tx, _) = broadcast::channel(buffer);
-        let (signal_tx, signal_rx) = mpsc::channel(buffer);
-        let (close_tx, close_rx) = mpsc::channel(buffer);
+    /// Create a new EventBus with optimized buffer sizes for each channel
+    /// Buffer sizes are optimized based on message frequency and memory usage
+    pub fn new(
+        market_tick_buffer: usize,
+        trade_signal_buffer: usize,
+        close_request_buffer: usize,
+        order_update_buffer: usize,
+        position_update_buffer: usize,
+        balance_update_buffer: usize,
+    ) -> Self {
+        let (market_tx, _) = broadcast::channel(market_tick_buffer);
+        let (order_update_tx, _) = broadcast::channel(order_update_buffer);
+        let (position_update_tx, _) = broadcast::channel(position_update_buffer);
+        let (balance_tx, _) = broadcast::channel(balance_update_buffer);
+        let (signal_tx, signal_rx) = mpsc::channel(trade_signal_buffer);
+        let (close_tx, close_rx) = mpsc::channel(close_request_buffer);
 
         Self {
             market_tx,

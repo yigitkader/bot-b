@@ -127,7 +127,7 @@ impl BotConfig {
             recv_window_ms: numeric_setting(
                 "BINANCE_RECV_WINDOW_MS",
                 binance_cfg.and_then(|b| b.recv_window_ms),
-                5000u64,
+                2500u64, // Default: 2.5s (recommended: 2000-3000ms for security)
             ),
             use_isolated_margin: bool_setting(
                 "BOT_USE_ISOLATED_MARGIN",
@@ -159,6 +159,143 @@ impl BotConfig {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok()),
         }
+        .validate()
+    }
+
+    /// Validate configuration values and panic with helpful error messages if invalid
+    /// This prevents runtime errors from invalid config values
+    fn validate(self) -> Self {
+        use std::process;
+
+        // Leverage validation
+        if self.leverage <= 0.0 {
+            eprintln!("ERROR: leverage must be > 0, got: {}", self.leverage);
+            eprintln!("  Fix: Set BOT_LEVERAGE to a positive value (e.g., 10.0)");
+            process::exit(1);
+        }
+
+        // Take profit validation
+        if self.tp_percent <= 0.0 {
+            eprintln!("ERROR: tp_percent must be > 0, got: {}", self.tp_percent);
+            eprintln!("  Fix: Set BOT_TP_PERCENT to a positive value (e.g., 1.0 for 1%)");
+            process::exit(1);
+        }
+        if self.tp_percent > 100.0 {
+            eprintln!("WARNING: tp_percent is very high: {}%, this may be intentional", self.tp_percent);
+        }
+
+        // Stop loss validation
+        if self.sl_percent <= 0.0 {
+            eprintln!("ERROR: sl_percent must be > 0, got: {}", self.sl_percent);
+            eprintln!("  Fix: Set BOT_SL_PERCENT to a positive value (e.g., 0.5 for 0.5%)");
+            process::exit(1);
+        }
+        if self.sl_percent >= 100.0 {
+            eprintln!("ERROR: sl_percent >= 100% will cause instant liquidation, got: {}%", self.sl_percent);
+            eprintln!("  Fix: Set BOT_SL_PERCENT to a reasonable value (e.g., 0.5-5.0%)");
+            process::exit(1);
+        }
+
+        // Position size validation
+        if self.position_size_quote <= 0.0 {
+            eprintln!("ERROR: position_size_quote must be > 0, got: {}", self.position_size_quote);
+            eprintln!("  Fix: Set BOT_POSITION_SIZE_QUOTE to a positive value");
+            process::exit(1);
+        }
+
+        // Period validation
+        if self.ema_fast_period == 0 {
+            eprintln!("ERROR: ema_fast_period must be > 0, got: {}", self.ema_fast_period);
+            process::exit(1);
+        }
+        if self.ema_slow_period <= self.ema_fast_period {
+            eprintln!("ERROR: ema_slow_period ({}) must be > ema_fast_period ({}), got: {} <= {}", 
+                     self.ema_slow_period, self.ema_fast_period, self.ema_slow_period, self.ema_fast_period);
+            eprintln!("  Fix: Set BOT_EMA_SLOW_PERIOD to a value greater than BOT_EMA_FAST_PERIOD");
+            process::exit(1);
+        }
+        if self.rsi_period == 0 {
+            eprintln!("ERROR: rsi_period must be > 0, got: {}", self.rsi_period);
+            process::exit(1);
+        }
+        if self.atr_period == 0 {
+            eprintln!("ERROR: atr_period must be > 0, got: {}", self.atr_period);
+            process::exit(1);
+        }
+
+        // RSI bounds validation
+        if self.rsi_long_min < 0.0 || self.rsi_long_min > 100.0 {
+            eprintln!("ERROR: rsi_long_min must be between 0-100, got: {}", self.rsi_long_min);
+            process::exit(1);
+        }
+        if self.rsi_short_max < 0.0 || self.rsi_short_max > 100.0 {
+            eprintln!("ERROR: rsi_short_max must be between 0-100, got: {}", self.rsi_short_max);
+            process::exit(1);
+        }
+        if self.rsi_long_min <= self.rsi_short_max {
+            eprintln!("WARNING: rsi_long_min ({}) should be > rsi_short_max ({}) for proper signal generation", 
+                     self.rsi_long_min, self.rsi_short_max);
+        }
+
+        // OBI validation
+        if self.obi_long_min <= 0.0 {
+            eprintln!("ERROR: obi_long_min must be > 0, got: {}", self.obi_long_min);
+            process::exit(1);
+        }
+        if self.obi_short_max <= 0.0 {
+            eprintln!("ERROR: obi_short_max must be > 0, got: {}", self.obi_short_max);
+            process::exit(1);
+        }
+        if self.obi_short_max >= self.obi_long_min {
+            eprintln!("WARNING: obi_short_max ({}) should be < obi_long_min ({}) for proper signal generation", 
+                     self.obi_short_max, self.obi_long_min);
+        }
+
+        // Recv window validation (Binance: max 60000ms, recommended: 2000-3000ms)
+        if self.recv_window_ms > 60000 {
+            eprintln!("ERROR: recv_window_ms exceeds Binance maximum (60000ms), got: {}ms", self.recv_window_ms);
+            eprintln!("  Fix: Set BINANCE_RECV_WINDOW_MS to <= 60000");
+            process::exit(1);
+        }
+        if self.recv_window_ms < 1000 {
+            eprintln!("WARNING: recv_window_ms is very low ({}ms), may cause order rejections due to network latency", 
+                     self.recv_window_ms);
+            eprintln!("  Recommendation: Use 2000-3000ms for security and reliability");
+        }
+        if self.recv_window_ms > 5000 {
+            eprintln!("WARNING: recv_window_ms is large ({}ms), increases replay attack risk", self.recv_window_ms);
+            eprintln!("  Recommendation: Use 2000-3000ms for better security");
+        }
+
+        // Signal cooldown validation
+        if self.signal_cooldown_secs < 0 {
+            eprintln!("ERROR: signal_cooldown_secs must be >= 0, got: {}", self.signal_cooldown_secs);
+            process::exit(1);
+        }
+
+        // Score validation
+        if self.long_min_score == 0 {
+            eprintln!("WARNING: long_min_score is 0, all signals will pass (may be intentional)");
+        }
+        if self.short_min_score == 0 {
+            eprintln!("WARNING: short_min_score is 0, all signals will pass (may be intentional)");
+        }
+
+        // Margin and balance validation
+        if self.min_margin_usd <= 0.0 {
+            eprintln!("ERROR: min_margin_usd must be > 0, got: {}", self.min_margin_usd);
+            process::exit(1);
+        }
+        if self.min_quote_balance_usd <= 0.0 {
+            eprintln!("ERROR: min_quote_balance_usd must be > 0, got: {}", self.min_quote_balance_usd);
+            process::exit(1);
+        }
+        if self.max_position_notional_usd <= 0.0 {
+            eprintln!("ERROR: max_position_notional_usd must be > 0, got: {}", self.max_position_notional_usd);
+            process::exit(1);
+        }
+
+        self
     }
 
     pub fn trend_params(&self) -> TrendParams {
@@ -187,7 +324,7 @@ impl BotConfig {
 
 
 impl FileConfig {
-    fn load(path: &str) -> Option<Self> {
+    pub fn load(path: &str) -> Option<Self> {
         let content = fs::read_to_string(path).ok()?;
         serde_yaml::from_str(&content).ok()
     }

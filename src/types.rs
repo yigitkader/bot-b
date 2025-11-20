@@ -4,7 +4,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use uuid::Uuid;
 use anyhow::Result;
 
@@ -81,6 +81,16 @@ pub struct PositionUpdate {
     pub is_closed: bool,
 }
 
+impl PositionUpdate {
+    /// Generate a deterministic position ID from symbol and side
+    /// Uses UUID v5 (SHA-1 based) to ensure the same symbol+side always produces the same ID
+    /// This allows position matching across WebSocket events and API calls
+    pub fn position_id(symbol: &str, side: Side) -> Uuid {
+        let name = format!("{}:{:?}", symbol, side);
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalanceSnapshot {
     pub asset: String,
@@ -112,7 +122,7 @@ pub struct TrendParams {
 
 // fallback for warmup default referencing EMA slow period
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct FileConfig {
+pub struct FileConfig {
     #[serde(default)]
     pub symbols: Vec<String>,
     #[serde(default)]
@@ -135,6 +145,8 @@ pub(crate) struct FileConfig {
     pub binance: Option<FileBinance>,
     #[serde(default)]
     pub risk: Option<FileRisk>,
+    #[serde(default)]
+    pub event_bus: Option<FileEventBus>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -175,6 +187,22 @@ pub(crate) struct FileTrending {
     pub atr_period: Option<usize>,
     #[serde(default)]
     pub warmup_min_ticks: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct FileEventBus {
+    #[serde(default)]
+    pub market_tick_buffer: Option<usize>,
+    #[serde(default)]
+    pub trade_signal_buffer: Option<usize>,
+    #[serde(default)]
+    pub close_request_buffer: Option<usize>,
+    #[serde(default)]
+    pub order_update_buffer: Option<usize>,
+    #[serde(default)]
+    pub position_update_buffer: Option<usize>,
+    #[serde(default)]
+    pub balance_update_buffer: Option<usize>,
 }
 
 
@@ -255,13 +283,26 @@ impl RateLimiter {
     }
     
     /// Acquire permit for order (10 orders/second limit)
+    /// 
+    /// CRITICAL: The permit MUST be held for the entire request duration to prevent rate limit bypass.
+    /// The 100ms delay happens WHILE holding the permit (before returning it).
+    /// Caller must keep the returned permit until the request completes.
+    /// 
+    /// Rate limit bypass prevention:
+    /// - Sleep happens BEFORE returning permit (while permit is held)
+    /// - Caller must hold permit during entire request
+    /// - Permit is automatically released when dropped (at end of scope)
     pub async fn acquire_order_permit(&self) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
         use anyhow::anyhow;
-        // For orders: 10/sec means we need to space them out
-        // Acquire permit and wait 100ms between orders
+        // Acquire permit first (this blocks if rate limit is exceeded)
         let permit = self.order_limiter.acquire().await
             .map_err(|_| anyhow!("order limiter closed"))?;
+        
+        // CRITICAL: Sleep while holding the permit to space out orders (10/sec = 100ms between)
+        // This ensures the rate limit delay happens while the permit is held, preventing bypass
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Return permit - caller must hold it for entire request duration
         Ok(permit)
     }
     
@@ -296,6 +337,10 @@ pub struct Connection {
     pub(crate) config: crate::BotConfig,
     pub(crate) http: Client,
     pub(crate) rate_limiter: Arc<RateLimiter>,
+    /// Server time offset in milliseconds (server_time - client_time)
+    /// Used to sync with Binance server time for accurate timestamp generation
+    /// Positive value means server is ahead of client
+    pub(crate) server_time_offset: Arc<RwLock<i64>>,
 }
 
 #[derive(Debug)]
@@ -799,6 +844,11 @@ pub struct AlgoConfig {
     // Risk & maliyet
     pub fee_bps_round_trip: f64,   // round-trip toplam taker fee bps (örn: 8 = 0.08%)
     pub max_holding_bars: usize,   // maksimum bar sayısı (örn: 48 => 4 saat @5m)
+    
+    // Execution simulation (backtest için)
+    pub slippage_bps: f64,         // slippage in basis points (örn: 5 = 0.05%)
+                                   // Production'da gerçek slippage var, backtest'te simüle etmek için
+                                   // Default: 0 (optimistic backtest)
 }
 
 // =======================

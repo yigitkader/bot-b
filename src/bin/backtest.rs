@@ -30,14 +30,15 @@ async fn main() -> Result<()> {
     let cfg = AlgoConfig {
         rsi_trend_long_min: 55.0,
         rsi_trend_short_max: 45.0,
-        funding_extreme_pos: 0.0001,  // 0.01% (fundingRate decimal)
-        funding_extreme_neg: -0.0001, // -0.01%
+        funding_extreme_pos: 0.0005,  // 0.05% (extreme long funding, ~219% APR annualized)
+        funding_extreme_neg: -0.0005, // -0.05% (extreme short funding, ~-219% APR annualized)
         lsr_crowded_long: 1.3,        // longShortRatio > 1.3 => crowded long
         lsr_crowded_short: 0.8,       // longShortRatio < 0.8 => crowded short
         long_min_score: 4,             // Minimum 4 score gerekli (kullanıcının "en iyi sistem" tanımı)
         short_min_score: 4,            // Minimum 4 score gerekli
         fee_bps_round_trip: 8.0,      // giriş+çıkış toplam 0.08% varsayalım
         max_holding_bars: 48,          // max 48 bar (~4 saat @5m)
+        slippage_bps: 0.0,            // No slippage simulation (optimistic backtest)
     };
 
     println!("===== BACKTEST BAŞLIYOR =====");

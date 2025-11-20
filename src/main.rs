@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 use trading_bot::{
     balance, config::BotConfig, follow_orders, logging, ordering, trending,
 };
+use trading_bot::types::FileConfig;
 use trading_bot::{Connection, EventBus, SharedState};
 
 #[tokio::main]
@@ -24,7 +25,32 @@ async fn main() -> Result<()> {
         return Err(err);
     }
 
-    let bus = EventBus::new(2048);
+    // Load event bus buffer sizes from config
+    let file_cfg = trading_bot::types::FileConfig::load("config.yaml").unwrap_or_default();
+    let event_bus_cfg = file_cfg.event_bus.unwrap_or_default();
+    
+    // Optimized buffer sizes (defaults if not in config)
+    let market_tick_buffer = event_bus_cfg.market_tick_buffer.unwrap_or(2000);
+    let trade_signal_buffer = event_bus_cfg.trade_signal_buffer.unwrap_or(500);
+    let close_request_buffer = event_bus_cfg.close_request_buffer.unwrap_or(500);
+    let order_update_buffer = event_bus_cfg.order_update_buffer.unwrap_or(1000);
+    let position_update_buffer = event_bus_cfg.position_update_buffer.unwrap_or(500);
+    let balance_update_buffer = event_bus_cfg.balance_update_buffer.unwrap_or(100);
+    
+    info!(
+        "EventBus buffer sizes: market_tick={}, trade_signal={}, close_request={}, order_update={}, position_update={}, balance_update={}",
+        market_tick_buffer, trade_signal_buffer, close_request_buffer,
+        order_update_buffer, position_update_buffer, balance_update_buffer
+    );
+
+    let bus = EventBus::new(
+        market_tick_buffer,
+        trade_signal_buffer,
+        close_request_buffer,
+        order_update_buffer,
+        position_update_buffer,
+        balance_update_buffer,
+    );
 
     let trending_ch = bus.trending_channels();
     let ordering_ch = bus.ordering_channels();

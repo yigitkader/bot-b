@@ -127,17 +127,50 @@ impl SharedState {
 
     pub fn apply_position_update(&self, update: &PositionUpdate) {
         if let Ok(mut state) = self.position_state.lock() {
-            // Check for stale updates
+            // Check for duplicate or stale updates
             if let Some(last) = &state.last_position {
-                if update.ts < last.ts {
+                // Check for exact duplicate (same position_id and timestamp)
+                if update.position_id == last.position_id && update.ts == last.ts {
+                    // Exact duplicate - check if data actually changed
+                    if update.symbol == last.symbol
+                        && update.side == last.side
+                        && (update.entry_price - last.entry_price).abs() < f64::EPSILON
+                        && (update.size - last.size).abs() < f64::EPSILON
+                        && (update.leverage - last.leverage).abs() < f64::EPSILON
+                        && update.is_closed == last.is_closed
+                    {
+                        // Data is identical - duplicate update, ignore silently
+                        // (common with broadcast channels where same message can be received multiple times)
+                        return;
+                    }
+                    // Same position_id and timestamp but different data - this is unusual
                     warn!(
-                        "STATE: stale position update ignored (update: {:?}, last: {:?})",
-                        update.ts, last.ts
+                        "STATE: position update with same position_id and timestamp but different data (position_id: {})",
+                        update.position_id
                     );
-                    return;
+                    // Apply it anyway as it might be a correction
+                }
+                
+                // Check for stale updates (older timestamp) - but allow if it's a different position
+                if update.ts < last.ts {
+                    // If it's the same position_id, it's definitely stale
+                    if update.position_id == last.position_id {
+                        warn!(
+                            "STATE: stale position update ignored (update: {:?}, last: {:?}, position_id: {})",
+                            update.ts, last.ts, update.position_id
+                        );
+                        return;
+                    }
+                    // Different position_id with older timestamp - could be from a different position
+                    // Allow it but log a warning
+                    warn!(
+                        "STATE: position update with older timestamp but different position_id (update: {:?}, last: {:?}, update_id: {}, last_id: {})",
+                        update.ts, last.ts, update.position_id, last.position_id
+                    );
                 }
             }
             
+            // Apply the update
             state.has_open_position = !update.is_closed;
             state.last_position = Some(update.clone());
         }

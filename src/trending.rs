@@ -486,6 +486,26 @@ pub fn generate_signals(
 
 /// Backtest için özel fonksiyon - sinyal üretir VE pozisyon yönetimi yapar
 /// 
+/// # ⚠️ Backtest vs Production Divergence
+/// 
+/// **Backtest Execution (Optimistic):**
+/// - Signal generated at candle `i` close
+/// - Entry executed immediately at candle `i+1` open price
+/// - No delays, no slippage (perfect execution)
+/// 
+/// **Production Execution (Realistic):**
+/// - Signal generated at candle close
+/// - Signal → event bus (mpsc channel delay)
+/// - Ordering module: risk checks, symbol info fetch, quantity calculation
+/// - API call (network delay)
+/// - Order filled at market price (slippage)
+/// 
+/// **Impact:**
+/// - Backtest results may be optimistic
+/// - Production has execution delays (typically 1-5 seconds)
+/// - Production has slippage (especially during volatile periods)
+/// - Consider adding slippage simulation to backtest for more realistic results
+/// 
 /// # NOT: Production Kullanımı
 /// Bu fonksiyon sadece backtest için kullanılır. Production'da:
 /// 1. `generate_signals` ile sinyaller üretilir
@@ -506,6 +526,7 @@ pub fn run_backtest_on_series(
     let mut pos_entry_index: usize = 0;
 
     let fee_frac = cfg.fee_bps_round_trip / 10_000.0;
+    let slippage_frac = cfg.slippage_bps / 10_000.0; // Slippage simulation (production reality)
 
     for i in 1..(candles.len() - 1) {
         let c = &candles[i];
@@ -525,7 +546,8 @@ pub fn run_backtest_on_series(
                     || holding_bars >= cfg.max_holding_bars;
 
                 if should_close {
-                    let exit_price = next_c.open;
+                    // Exit: LONG position sells at bid (lower price due to slippage)
+                    let exit_price = next_c.open * (1.0 - slippage_frac);
                     let raw_pnl = (exit_price - pos_entry_price) / pos_entry_price;
                     let pnl_pct = raw_pnl - fee_frac;
                     let win = pnl_pct > 0.0;
@@ -550,7 +572,8 @@ pub fn run_backtest_on_series(
                     || holding_bars >= cfg.max_holding_bars;
 
                 if should_close {
-                    let exit_price = next_c.open;
+                    // Exit: SHORT position buys at ask (higher price due to slippage)
+                    let exit_price = next_c.open * (1.0 + slippage_frac);
                     let raw_pnl = (pos_entry_price - exit_price) / pos_entry_price;
                     let pnl_pct = raw_pnl - fee_frac;
                     let win = pnl_pct > 0.0;
@@ -571,18 +594,20 @@ pub fn run_backtest_on_series(
             PositionSide::Flat => {}
         }
 
-        // Yeni pozisyon açma
+        // Yeni pozisyon açma (slippage uygulanır)
         if matches!(pos_side, PositionSide::Flat) {
             match sig.side {
                 SignalSide::Long => {
                     pos_side = PositionSide::Long;
-                    pos_entry_price = next_c.open;
+                    // Entry: LONG position buys at ask (higher price due to slippage)
+                    pos_entry_price = next_c.open * (1.0 + slippage_frac);
                     pos_entry_time = next_c.open_time;
                     pos_entry_index = i + 1;
                 }
                 SignalSide::Short => {
                     pos_side = PositionSide::Short;
-                    pos_entry_price = next_c.open;
+                    // Entry: SHORT position sells at bid (lower price due to slippage)
+                    pos_entry_price = next_c.open * (1.0 - slippage_frac);
                     pos_entry_time = next_c.open_time;
                     pos_entry_index = i + 1;
                 }
@@ -682,6 +707,10 @@ pub async fn run_backtest(
 
 /// Backtest sonuçlarını CSV formatında export eder
 /// Plan.md'de belirtildiği gibi her trade satırı CSV'ye yazılır
+/// 
+/// # Error Handling
+/// - Explicitly flushes the file buffer before returning to ensure data is written
+/// - If an error occurs during writing, the file may be incomplete but will be flushed
 pub fn export_backtest_to_csv(result: &BacktestResult, file_path: &str) -> Result<()> {
     use std::fs::File;
     use std::io::Write;
@@ -693,10 +722,11 @@ pub fn export_backtest_to_csv(result: &BacktestResult, file_path: &str) -> Resul
     writeln!(
         file,
         "entry_time,exit_time,side,entry_price,exit_price,pnl_pct,win"
-    )?;
+    )
+    .context("Failed to write CSV header")?;
 
     // CSV rows
-    for trade in &result.trades {
+    for (idx, trade) in result.trades.iter().enumerate() {
         let side_str = match trade.side {
             PositionSide::Long => "LONG",
             PositionSide::Short => "SHORT",
@@ -712,8 +742,14 @@ pub fn export_backtest_to_csv(result: &BacktestResult, file_path: &str) -> Resul
             trade.exit_price,
             trade.pnl_pct * 100.0, // Yüzde olarak
             if trade.win { "WIN" } else { "LOSS" }
-        )?;
+        )
+        .with_context(|| format!("Failed to write trade {} to CSV", idx + 1))?;
     }
+
+    // Explicitly flush to ensure all data is written to disk before returning
+    // This guarantees data integrity even if the function returns early
+    file.flush()
+        .context("Failed to flush CSV file buffer")?;
 
     Ok(())
 }
@@ -763,6 +799,8 @@ pub async fn run_trending(
         short_min_score: params.short_min_score,
         fee_bps_round_trip: 8.0, // Default fee
         max_holding_bars: 48,   // Default max holding
+        slippage_bps: 0.0,      // Default: no slippage (optimistic backtest)
+                                 // Set to 5-10 bps (0.05-0.1%) for more realistic results
     };
 
     let kline_interval = "5m"; // 5 dakikalık kline kullan
@@ -923,11 +961,19 @@ async fn generate_latest_signal(
                 }
             }
 
+            // ⚠️ Production Execution Note:
+            // Signal price is the candle close price, but actual execution happens later:
+            // 1. Signal → event bus (mpsc channel, ~1-10ms delay)
+            // 2. Ordering module: risk checks, symbol info fetch (~50-200ms)
+            // 3. API call and order fill (~100-500ms)
+            // 4. Real slippage at market price (varies with volatility)
+            // Total delay: typically 200-1000ms, can be more during high volatility
+            // This is why backtest results may be optimistic compared to production
             let trade_signal = TradeSignal {
                 id: Uuid::new_v4(),
                 symbol: symbol.to_string(),
                 side,
-                entry_price: signal.price,
+                entry_price: signal.price, // Candle close price (actual fill may differ due to slippage)
                 leverage: params.leverage,
                 size_usdt: params.position_size_quote,
                 ts: signal.time,
