@@ -137,10 +137,9 @@ async fn main() -> Result<()> {
 
     {
         let ch = balance_ch;
-        let conn = connection.clone();
         let state = shared_state.clone();
         let handle = tokio::spawn(async move {
-            balance::run_balance(conn, ch, state).await;
+            balance::run_balance(ch, state).await;
         });
         task_infos.push(TaskInfo {
             name: "balance".to_string(),
@@ -163,8 +162,9 @@ async fn main() -> Result<()> {
         let ch = trending_ch;
         let symbol = config.symbol.clone();
         let trend_params = config.trend_params();
+        let ws_base_url = config.ws_base_url.clone();
         let handle = tokio::spawn(async move {
-            trending::run_trending(ch, symbol, trend_params).await;
+            trending::run_trending(ch, symbol, trend_params, ws_base_url).await;
         });
         task_infos.push(TaskInfo {
             name: "trending".to_string(),

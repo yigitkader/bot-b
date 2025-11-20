@@ -433,6 +433,18 @@ pub(crate) struct OpenInterestResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct OpenInterestEvent {
+    #[serde(rename = "e")]
+    pub event_type: String,
+    #[serde(rename = "E")]
+    pub event_time: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "o")]
+    pub open_interest: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct DepthSnapshot {
     pub bids: Vec<[String; 2]>,
     pub asks: Vec<[String; 2]>,
@@ -726,6 +738,42 @@ pub struct Candle {
     pub low: f64,
     pub close: f64,
     pub volume: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct KlineEvent {
+    #[serde(rename = "e")]
+    pub event_type: String,
+    #[serde(rename = "E")]
+    pub event_time: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "k")]
+    pub kline: KlineData,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct KlineData {
+    #[serde(rename = "t")]
+    pub open_time: i64,
+    #[serde(rename = "T")]
+    pub close_time: i64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "i")]
+    pub interval: String,
+    #[serde(rename = "o")]
+    pub open: String,
+    #[serde(rename = "c")]
+    pub close: String,
+    #[serde(rename = "h")]
+    pub high: String,
+    #[serde(rename = "l")]
+    pub low: String,
+    #[serde(rename = "v")]
+    pub volume: String,
+    #[serde(rename = "x")]
+    pub is_closed: bool,
 }
 
 #[derive(Debug)]

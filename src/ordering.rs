@@ -214,25 +214,31 @@ async fn handle_close_request(
         return;
     }
 
-    // Re-fetch position from API to ensure we have the latest size
-    // WebSocket events may be delayed, so we fetch fresh data to avoid
-    // "Order would increase position" errors
-    let fresh_position = match connection.fetch_position(&state_position.symbol).await {
-        Ok(Some(pos)) => pos,
-        Ok(None) => {
-            warn!(
-                "ORDERING: position {} already closed (fetched from API)",
-                request.position_id
-            );
-            return;
-        }
-        Err(err) => {
-            warn!(
-                "ORDERING: failed to fetch position from API for {}: {err:?}, using state position",
-                request.position_id
-            );
-            // Fallback to state position if API fetch fails
-            state_position
+    // Use position from state (updated via ACCOUNT_UPDATE WebSocket events)
+    // ACCOUNT_UPDATE events are real-time, so state should be up-to-date
+    // Only fetch from API if state position is missing or stale
+    let fresh_position = if state_position.size > 0.0 {
+        // State position is valid, use it (from WebSocket ACCOUNT_UPDATE)
+        state_position
+    } else {
+        // State position is zero or missing, try API fetch as fallback
+        // This handles edge cases where WebSocket event was missed
+        match connection.fetch_position(&state_position.symbol).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => {
+                warn!(
+                    "ORDERING: position {} already closed (fetched from API)",
+                    request.position_id
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    "ORDERING: failed to fetch position from API for {}: {err:?}, cannot close position",
+                    request.position_id
+                );
+                return;
+            }
         }
     };
 

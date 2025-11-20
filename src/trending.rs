@@ -762,11 +762,14 @@ pub fn export_backtest_to_csv(result: &BacktestResult, file_path: &str) -> Resul
 //  Production Trending Runner
 // =======================
 
-use crate::types::{Side, TradeSignal, TrendParams, TrendingChannels};
+use crate::types::{Candle, KlineData, KlineEvent, Side, TradeSignal, TrendParams, TrendingChannels};
 use log::{info, warn};
 use tokio::sync::broadcast;
-use tokio::time::{interval, Duration as TokioDuration};
-use uuid::Uuid;
+use tokio::time::{interval, sleep, Duration as TokioDuration};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures::StreamExt;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Her side için ayrı cooldown tracking (trend reversal'ları kaçırmamak için)
 /// LONG ve SHORT sinyalleri birbirini bloklamaz
@@ -775,19 +778,18 @@ struct LastSignalState {
     last_short_time: Option<chrono::DateTime<Utc>>,
 }
 
-/// Production için trending modülü - MarketTick eventlerini dinler ve TradeSignal üretir
+/// Production için trending modülü - Kline WebSocket stream'ini dinler ve TradeSignal üretir
 /// 
 /// Bu fonksiyon:
-/// 1. Periyodik olarak kline verilerini çeker (örn: her 5 dakikada bir)
-/// 2. Funding, OI, Long/Short ratio verilerini çeker
-/// 3. Sinyal üretir
-/// 4. TradeSignal eventlerini event bus'a gönderir
-
+/// 1. Kline WebSocket stream'ini dinler (gerçek zamanlı candle güncellemeleri)
+/// 2. Her yeni candle tamamlandığında (is_closed=true) sinyal üretir
+/// 3. Funding, OI, Long/Short ratio verilerini REST API'den çeker (daha az sıklıkla)
 /// 4. TradeSignal eventlerini event bus'a gönderir
 pub async fn run_trending(
     mut ch: TrendingChannels,
     symbol: String,
     params: TrendParams,
+    ws_base_url: String,
 ) {
     let client = FuturesClient::new();
     
@@ -811,60 +813,283 @@ pub async fn run_trending(
     let futures_period = "5m";
     let kline_limit = (params.warmup_min_ticks + 10) as u32; // Warmup için yeterli veri
 
+    // Candle buffer - son N candle'ı tutar (signal context hesaplama için)
+    let candle_buffer = Arc::new(RwLock::new(Vec::<Candle>::new()));
+    
+    // İlk candle'ları REST API'den çek (warmup için)
+    match client.fetch_klines(&symbol, kline_interval, kline_limit).await {
+        Ok(candles) => {
+            *candle_buffer.write().await = candles;
+            info!("TRENDING: loaded {} candles for warmup", candle_buffer.read().await.len());
+        }
+        Err(err) => {
+            warn!("TRENDING: failed to fetch initial candles: {err:?}");
+        }
+    }
+
     let mut signal_state = LastSignalState {
         last_long_time: None,
         last_short_time: None,
     };
-    let mut last_candle_time: Option<chrono::DateTime<Utc>> = None;
 
-    // 5 dakikalık kline için 5 dakikada bir kontrol et (API rate limit tasarrufu)
-    // generate_latest_signal içinde duplicate candle kontrolü de var (ek güvenlik)
-    let kline_interval_secs = 5 * 60; // 5 minutes = 300 seconds
-    let mut ticker = interval(TokioDuration::from_secs(kline_interval_secs));
+    info!("TRENDING: started for symbol {} with kline WebSocket stream", symbol);
+
+    // Kline WebSocket stream task
+    let kline_stream_symbol = symbol.clone();
+    let kline_stream_ws_url = ws_base_url.clone();
+    let kline_stream_buffer = candle_buffer.clone();
+    let kline_stream_signal_state = Arc::new(RwLock::new(signal_state));
+    let kline_stream_signal_tx = ch.signal_tx.clone();
     
-    info!("TRENDING: started for symbol {}", symbol);
+    let kline_task = tokio::spawn(async move {
+        run_kline_stream(
+            kline_stream_symbol,
+            kline_interval,
+            futures_period,
+            kline_stream_ws_url,
+            kline_stream_buffer,
+            client,
+            cfg,
+            params,
+            kline_stream_signal_state,
+            kline_stream_signal_tx,
+        ).await;
+    });
+
+    // Wait for kline stream task
+    let _ = kline_task.await;
+}
+
+async fn run_kline_stream(
+    symbol: String,
+    kline_interval: &str,
+    futures_period: &str,
+    ws_base_url: String,
+    candle_buffer: Arc<RwLock<Vec<Candle>>>,
+    client: FuturesClient,
+    cfg: AlgoConfig,
+    params: TrendParams,
+    signal_state: Arc<RwLock<LastSignalState>>,
+    signal_tx: tokio::sync::mpsc::Sender<TradeSignal>,
+) {
+    let mut retry_delay = TokioDuration::from_secs(1);
+    let ws_url = format!(
+        "{}/ws/{}@kline_{}",
+        ws_base_url.trim_end_matches('/'),
+        symbol.to_lowercase(),
+        kline_interval
+    );
 
     loop {
-        tokio::select! {
-            // MarketTick eventlerini dinle (monitoring için)
-            res = ch.market_rx.recv() => match res {
-                Ok(_tick) => {
-                    // MarketTick'leri dinliyoruz ama sinyal üretimi için kline API kullanıyoruz
-                    // Bu sayede OHLCV verilerine sahip oluyoruz
-                },
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => {
-                    warn!("TRENDING: market_rx closed");
-                    break;
-                }
-            },
-            // Periyodik sinyal kontrolü
-            _ = ticker.tick() => {
-                match generate_latest_signal(
-                    &client,
-                    &symbol,
-                    kline_interval,
-                    futures_period,
-                    kline_limit,
-                    &cfg,
-                    &params,
-                    &mut signal_state,
-                    &mut last_candle_time,
-                ).await {
-                    Ok(Some(signal)) => {
-                        if let Err(err) = ch.signal_tx.send(signal).await {
-                            warn!("TRENDING: failed to send signal: {err}");
+        match connect_async(&ws_url).await {
+            Ok((ws_stream, _)) => {
+                info!("TRENDING: kline stream connected ({ws_url})");
+                retry_delay = TokioDuration::from_secs(1);
+                let (_, mut read) = ws_stream.split();
+                while let Some(message) = read.next().await {
+                    match message {
+                        Ok(Message::Text(txt)) => {
+                            if let Ok(event) = serde_json::from_str::<KlineEvent>(&txt) {
+                                if event.symbol == symbol && event.kline.is_closed {
+                                    // Yeni candle tamamlandı - parse et ve buffer'a ekle
+                                    if let Some(candle) = parse_kline_to_candle(&event.kline) {
+                                        let mut buffer = candle_buffer.write().await;
+                                        buffer.push(candle.clone());
+                                        // Buffer'ı sınırla (son N candle'ı tut)
+                                        let max_candles = (params.warmup_min_ticks + 10) as usize;
+                                        if buffer.len() > max_candles {
+                                            buffer.remove(0);
+                                        }
+                                        drop(buffer);
+                                        
+                                        // Sinyal üret
+                                        if let Ok(Some(signal)) = generate_signal_from_candle(
+                                            &candle,
+                                            &candle_buffer,
+                                            &client,
+                                            &symbol,
+                                            futures_period,
+                                            &cfg,
+                                            &params,
+                                            signal_state.clone(),
+                                        ).await {
+                                            if let Err(err) = signal_tx.send(signal).await {
+                                                warn!("TRENDING: failed to send signal: {err}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    },
-                    Ok(None) => {
-                        // Yeni sinyal yok veya cooldown'da
-                    },
-                    Err(err) => {
-                        warn!("TRENDING: error generating signal: {err:?}");
+                        Ok(Message::Binary(bin)) => {
+                            if let Ok(txt) = String::from_utf8(bin) {
+                                if let Ok(event) = serde_json::from_str::<KlineEvent>(&txt) {
+                                    if event.symbol == symbol && event.kline.is_closed {
+                                        if let Some(candle) = parse_kline_to_candle(&event.kline) {
+                                            let mut buffer = candle_buffer.write().await;
+                                            buffer.push(candle.clone());
+                                            let max_candles = (params.warmup_min_ticks + 10) as usize;
+                                            if buffer.len() > max_candles {
+                                                buffer.remove(0);
+                                            }
+                                            drop(buffer);
+                                            
+                                            if let Ok(Some(signal)) = generate_signal_from_candle(
+                                                &candle,
+                                                &candle_buffer,
+                                                &client,
+                                                &symbol,
+                                                futures_period,
+                                                &cfg,
+                                                &params,
+                                                signal_state.clone(),
+                                            ).await {
+                                                if let Err(err) = signal_tx.send(signal).await {
+                                                    warn!("TRENDING: failed to send signal: {err}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                        Ok(Message::Close(frame)) => {
+                            warn!("TRENDING: kline stream closed: {:?}", frame);
+                            break;
+                        }
+                        Err(err) => {
+                            warn!("TRENDING: kline stream error: {err}");
+                            break;
+                        }
                     }
                 }
             }
+            Err(err) => warn!("TRENDING: kline stream connect error: {err:?}"),
         }
+        info!(
+            "TRENDING: kline stream reconnecting in {}s",
+            retry_delay.as_secs()
+        );
+        sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(TokioDuration::from_secs(60));
+    }
+}
+
+fn parse_kline_to_candle(kline: &KlineData) -> Option<Candle> {
+    let open_time = DateTime::<Utc>::from_timestamp_millis(kline.open_time)?;
+    let close_time = DateTime::<Utc>::from_timestamp_millis(kline.close_time)?;
+    let open = kline.open.parse::<f64>().ok()?;
+    let high = kline.high.parse::<f64>().ok()?;
+    let low = kline.low.parse::<f64>().ok()?;
+    let close = kline.close.parse::<f64>().ok()?;
+    let volume = kline.volume.parse::<f64>().ok()?;
+    
+    Some(Candle {
+        open_time,
+        close_time,
+        open,
+        high,
+        low,
+        close,
+        volume,
+    })
+}
+
+async fn generate_signal_from_candle(
+    candle: &Candle,
+    candle_buffer: &Arc<RwLock<Vec<Candle>>>,
+    client: &FuturesClient,
+    symbol: &str,
+    futures_period: &str,
+    cfg: &AlgoConfig,
+    params: &TrendParams,
+    signal_state: Arc<RwLock<LastSignalState>>,
+) -> Result<Option<TradeSignal>> {
+    let buffer = candle_buffer.read().await;
+    
+    if buffer.len() < params.warmup_min_ticks {
+        return Ok(None); // Henüz yeterli veri yok
+    }
+
+    // Funding, OI, Long/Short ratio verilerini çek (REST API - daha az sıklıkla)
+    let funding = client.fetch_funding_rates(symbol, 100).await?;
+    let oi_hist = client.fetch_open_interest_hist(symbol, futures_period, buffer.len() as u32).await?;
+    let lsr_hist = client.fetch_top_long_short_ratio(symbol, futures_period, buffer.len() as u32).await?;
+
+    // Signal context'leri oluştur
+    let (matched_candles, contexts) = build_signal_contexts(&buffer, &funding, &oi_hist, &lsr_hist);
+
+    if contexts.len() < params.warmup_min_ticks {
+        return Ok(None);
+    }
+
+    // En son candle ve context'i kullan
+    let latest_ctx = contexts.last()?;
+    let prev_ctx = if contexts.len() > 1 {
+        Some(&contexts[contexts.len() - 2])
+    } else {
+        None
+    };
+
+    let signal = generate_signal(candle, latest_ctx, prev_ctx, cfg);
+
+    // Eğer sinyal Flat değilse, TradeSignal'e dönüştür
+    match signal.side {
+        SignalSide::Long | SignalSide::Short => {
+            let side = match signal.side {
+                SignalSide::Long => Side::Long,
+                SignalSide::Short => Side::Short,
+                SignalSide::Flat => unreachable!(),
+            };
+
+            // Side-specific cooldown kontrolü
+            let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
+            let now = Utc::now();
+            let mut state = signal_state.write().await;
+            
+            match side {
+                Side::Long => {
+                    if let Some(last_time) = state.last_long_time {
+                        if now - last_time < cooldown_duration {
+                            return Ok(None); // Long cooldown aktif
+                        }
+                    }
+                    state.last_long_time = Some(now);
+                }
+                Side::Short => {
+                    if let Some(last_time) = state.last_short_time {
+                        if now - last_time < cooldown_duration {
+                            return Ok(None); // Short cooldown aktif
+                        }
+                    }
+                    state.last_short_time = Some(now);
+                }
+            }
+
+            let trade_signal = TradeSignal {
+                id: Uuid::new_v4(),
+                symbol: symbol.to_string(),
+                side,
+                entry_price: signal.price,
+                leverage: params.leverage,
+                size_usdt: params.position_size_quote,
+                ts: signal.time,
+            };
+
+            info!(
+                "TRENDING: generated {} signal for {} at price {:.2}",
+                match side {
+                    Side::Long => "LONG",
+                    Side::Short => "SHORT",
+                },
+                symbol,
+                signal.price
+            );
+
+            Ok(Some(trade_signal))
+        }
+        SignalSide::Flat => Ok(None),
     }
 }
 

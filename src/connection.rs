@@ -5,7 +5,7 @@ use crate::types::{
     DepthEvent, DepthSnapshot, ExchangeInfoResponse, Filter, ForceOrderRecord,
     ForceOrderStreamEvent, ForceOrderStreamOrder, ForceOrderStreamWrapper, FuturesBalance,
     LeverageBracketResponse, LiqEntry, LiqState, ListenKeyResponse, MarkPriceEvent, MarketTick,
-    NewOrderRequest, OpenInterestResponse, OrderPayload, OrderStatus, OrderTradeUpdate,
+    NewOrderRequest, OpenInterestEvent, OpenInterestResponse, OrderPayload, OrderStatus, OrderTradeUpdate,
     OrderUpdate, PositionRiskResponse, PositionUpdate, PremiumIndex, Side, SymbolInfo, SymbolPrecision,
 };
 use anyhow::{anyhow, Context, Result};
@@ -153,8 +153,8 @@ impl Connection {
                 }
             });
             let liq_oi_task = tokio::spawn(async move {
-                if let Err(err) = liq_oi_conn.run_open_interest_poller(liq_for_oi).await {
-                    warn!("CONNECTION: open interest poller exited: {err:?}");
+                if let Err(err) = liq_oi_conn.run_open_interest_stream(liq_for_oi).await {
+                    warn!("CONNECTION: open interest stream exited: {err:?}");
                 }
             });
 
@@ -982,18 +982,80 @@ impl Connection {
         Ok(())
     }
 
-    async fn run_open_interest_poller(
+    /// Consume Open Interest WebSocket stream
+    /// Replaces REST API polling with real-time WebSocket updates
+    async fn run_open_interest_stream(
         self: Arc<Self>,
         liq_state: Arc<RwLock<LiqState>>,
     ) -> Result<()> {
-        let mut ticker = interval(Duration::from_secs(5));
+        let mut retry_delay = Duration::from_secs(1);
         loop {
-            ticker.tick().await;
-            match self.fetch_open_interest().await {
-                Ok(value) => liq_state.write().await.set_open_interest(value),
-                Err(err) => warn!("CONNECTION: open interest fetch failed: {err:?}"),
+            let url = self.open_interest_stream_url();
+            match connect_async(&url).await {
+                Ok((ws_stream, _)) => {
+                    info!("CONNECTION: open interest stream connected ({url})");
+                    retry_delay = Duration::from_secs(1);
+                    let (_, mut read) = ws_stream.split();
+                    while let Some(message) = read.next().await {
+                        match message {
+                            Ok(Message::Text(txt)) => {
+                                // Check message size before processing (DOS protection)
+                                if let Err(err) = Self::check_message_size(txt.len(), "open-interest") {
+                                    warn!("CONNECTION: {err:?}");
+                                    break;
+                                }
+                                if let Ok(event) = serde_json::from_str::<OpenInterestEvent>(&txt) {
+                                    if event.symbol == self.config.symbol {
+                                        if let Ok(oi_value) = event.open_interest.parse::<f64>() {
+                                            liq_state.write().await.set_open_interest(oi_value);
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Message::Binary(bin)) => {
+                                // Check message size before processing (DOS protection)
+                                if let Err(err) = Self::check_message_size(bin.len(), "open-interest") {
+                                    warn!("CONNECTION: {err:?}");
+                                    break;
+                                }
+                                if let Ok(txt) = String::from_utf8(bin) {
+                                    if let Ok(event) = serde_json::from_str::<OpenInterestEvent>(&txt) {
+                                        if event.symbol == self.config.symbol {
+                                            if let Ok(oi_value) = event.open_interest.parse::<f64>() {
+                                                liq_state.write().await.set_open_interest(oi_value);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
+                            }
+                            Ok(Message::Close(frame)) => {
+                                warn!("CONNECTION: open interest stream closed: {:?}", frame);
+                                break;
+                            }
+                            Err(err) => {
+                                warn!("CONNECTION: open interest stream error: {err}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => warn!("CONNECTION: open interest connect error: {err:?}"),
             }
+            info!(
+                "CONNECTION: open interest reconnecting in {}s",
+                retry_delay.as_secs()
+            );
+            sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(60));
         }
+    }
+
+    fn open_interest_stream_url(&self) -> String {
+        let base = self.config.ws_base_url.trim_end_matches('/');
+        let symbol = self.config.symbol.to_lowercase();
+        format!("{base}/ws/{symbol}@openInterest")
     }
 
     async fn create_listen_key(&self) -> Result<String> {
