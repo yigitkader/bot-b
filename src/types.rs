@@ -885,6 +885,37 @@ pub struct BacktestResult {
     pub short_signals: usize,
 }
 
+#[derive(Debug)]
+pub struct AdvancedBacktestResult {
+    // Existing metrics
+    pub trades: Vec<Trade>,
+    pub total_trades: usize,
+    pub win_trades: usize,
+    pub loss_trades: usize,
+    pub win_rate: f64,
+    pub total_pnl_pct: f64,
+    pub avg_pnl_pct: f64,
+    pub avg_r: f64,
+
+    // Advanced metrics
+    pub max_drawdown_pct: f64,
+    pub max_consecutive_losses: usize,
+    pub sharpe_ratio: f64,
+    pub sortino_ratio: f64,
+    pub profit_factor: f64,
+    pub recovery_factor: f64, // total_pnl / max_drawdown
+    pub avg_trade_duration_hours: f64,
+    pub kelly_criterion: f64, // optimal position size
+    
+    // Time-based metrics
+    pub best_hour_of_day: Option<u32>,
+    pub worst_hour_of_day: Option<u32>,
+    
+    // Drawdown periods
+    pub longest_drawdown_duration_hours: f64,
+    pub current_drawdown_pct: f64,
+}
+
 // =======================
 //  Parametrik Config
 // =======================
@@ -909,6 +940,15 @@ pub struct AlgoConfig {
     pub slippage_bps: f64,         // slippage in basis points (örn: 5 = 0.05%)
                                    // Production'da gerçek slippage var, backtest'te simüle etmek için
                                    // Default: 0 (optimistic backtest)
+    
+    // Signal Quality Filtering (TrendPlan.md önerileri)
+    pub min_volume_ratio: f64,     // Minimum volume ratio vs 20-bar average (örn: 1.5)
+                                   // Düşük volume = zayıf signal, Flat döner
+    pub max_volatility_pct: f64,   // Maximum ATR volatility % (örn: 2.0 = %2)
+                                   // Çok volatile = risky, Flat döner
+    pub max_price_change_5bars_pct: f64, // 5 bar içinde max price change % (örn: 3.0 = %3)
+                                   // Parabolic move = reversal riski, Flat döner
+    pub enable_signal_quality_filter: bool, // Signal quality filtering aktif mi?
 }
 
 // =======================

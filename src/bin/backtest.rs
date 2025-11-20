@@ -39,6 +39,11 @@ async fn main() -> Result<()> {
         fee_bps_round_trip: 8.0,      // giriş+çıkış toplam 0.08% varsayalım
         max_holding_bars: 48,          // max 48 bar (~4 saat @5m)
         slippage_bps: 0.0,            // No slippage simulation (optimistic backtest)
+        // Signal Quality Filtering (TrendPlan.md önerileri)
+        min_volume_ratio: 1.5,        // Minimum volume ratio vs 20-bar average
+        max_volatility_pct: 2.0,      // Maximum ATR volatility % (2% = çok volatile)
+        max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
+        enable_signal_quality_filter: true, // Signal quality filtering aktif
     };
 
     println!("===== BACKTEST BAŞLIYOR =====");
