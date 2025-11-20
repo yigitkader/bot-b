@@ -374,6 +374,10 @@ fn generate_signal(
     if !crowded_long {
         long_score += 1;
     }
+    // 6) ATR volatility kontrolü: Yüksek volatility'de daha dikkatli ol
+    // ATR rising factor ile birlikte kullanılabilir (gelecekte)
+    // Şimdilik ATR hesaplanıyor ama signal generation'da kullanılmıyor
+    // Not: ATR değeri ctx.atr'de mevcut, ancak şu an için signal scoring'de kullanılmıyor
 
     // SHORT kuralları
     // 1) Trend aşağı

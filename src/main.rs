@@ -1,8 +1,9 @@
 use anyhow::Result;
-use futures::future::join_all;
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio::time::interval;
 use trading_bot::{
     balance, config::BotConfig, follow_orders, logging, ordering, trending,
 };
@@ -60,35 +61,54 @@ async fn main() -> Result<()> {
     let connection_market_ch = bus.connection_channels();
     let connection_user_ch = bus.connection_channels();
 
-    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Task monitoring: track task names and handles for health checking
+    #[derive(Clone)]
+    struct TaskInfo {
+        name: String,
+        handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    }
+    
+    let mut task_infos: Vec<TaskInfo> = Vec::new();
 
     {
         let conn = connection.clone();
         let ch = connection_market_ch.clone();
-        tasks.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(err) = conn.run_market_ws(ch).await {
                 error!("Market WS task failed: {err:?}");
             }
-        }));
+        });
+        task_infos.push(TaskInfo {
+            name: "market_ws".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
     {
         let conn = connection.clone();
         let ch = connection_user_ch.clone();
-        tasks.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(err) = conn.run_user_ws(ch).await {
                 error!("User WS task failed: {err:?}");
             }
-        }));
+        });
+        task_infos.push(TaskInfo {
+            name: "user_ws".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
     {
         let conn = connection.clone();
         let state = shared_state.clone();
         let ch = ordering_ch;
-        tasks.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             ordering::run_ordering(ch, state, conn).await;
-        }));
+        });
+        task_infos.push(TaskInfo {
+            name: "ordering".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
     {
@@ -96,36 +116,119 @@ async fn main() -> Result<()> {
         // Round-trip commission: 2x taker fee (entry + exit)
         // Default: 0.08% (2x 0.04% taker fee)
         let commission_pct = 0.08;
-        tasks.push(tokio::spawn(async move {
-            follow_orders::run_follow_orders(ch, config.tp_percent, config.sl_percent, commission_pct).await;
-        }));
+        // ATR multipliers for dynamic TP/SL (currently not used, but available in config)
+        let atr_sl_multiplier = config.atr_sl_multiplier;
+        let atr_tp_multiplier = config.atr_tp_multiplier;
+        let handle = tokio::spawn(async move {
+            follow_orders::run_follow_orders(
+                ch, 
+                config.tp_percent, 
+                config.sl_percent, 
+                commission_pct,
+                atr_sl_multiplier,
+                atr_tp_multiplier,
+            ).await;
+        });
+        task_infos.push(TaskInfo {
+            name: "follow_orders".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
     {
         let ch = balance_ch;
         let conn = connection.clone();
         let state = shared_state.clone();
-        tasks.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             balance::run_balance(conn, ch, state).await;
-        }));
+        });
+        task_infos.push(TaskInfo {
+            name: "balance".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
     {
         let ch = logging_ch;
-        tasks.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             logging::run_logging(ch).await;
-        }));
+        });
+        task_infos.push(TaskInfo {
+            name: "logging".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
     {
         let ch = trending_ch;
         let symbol = config.symbol.clone();
         let trend_params = config.trend_params();
-        tasks.push(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             trending::run_trending(ch, symbol, trend_params).await;
-        }));
+        });
+        task_infos.push(TaskInfo {
+            name: "trending".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+        });
     }
 
-    join_all(tasks).await;
+    // Health check task: monitor all tasks and log their status
+    let health_check_task_infos = task_infos.clone();
+    let health_check_task = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(30)); // Check every 30 seconds
+        loop {
+            interval.tick().await;
+            
+            let mut finished_count = 0;
+            for task_info in &health_check_task_infos {
+                let handle_guard = task_info.handle.lock().await;
+                if let Some(handle) = handle_guard.as_ref() {
+                    if handle.is_finished() {
+                        finished_count += 1;
+                        warn!("HEALTH: Task '{}' has finished (may have crashed)", task_info.name);
+                        // Note: In production, you might want to restart the task here
+                        // For now, we just log the event
+                    }
+                } else {
+                    warn!("HEALTH: Task '{}' handle is None", task_info.name);
+                }
+            }
+            
+            if finished_count > 0 {
+                error!("HEALTH: {} out of {} tasks have finished", finished_count, health_check_task_infos.len());
+            } else {
+                info!("HEALTH: All {} tasks running normally", health_check_task_infos.len());
+            }
+        }
+    });
+
+    // Wait for all tasks (including health check)
+    // Use tokio::select! to handle graceful shutdown
+    tokio::select! {
+        _ = async {
+            // Wait for all main tasks
+            for task_info in &task_infos {
+                let handle_guard = task_info.handle.lock().await;
+                if let Some(handle) = handle_guard.as_ref() {
+                    let result = handle.await;
+                    if let Err(err) = result {
+                        error!("MAIN: Task '{}' panicked: {err:?}", task_info.name);
+                    } else {
+                        warn!("MAIN: Task '{}' finished normally", task_info.name);
+                    }
+                }
+            }
+        } => {
+            warn!("MAIN: One or more tasks finished");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("MAIN: Received shutdown signal (Ctrl+C)");
+        }
+    }
+
+    // Cancel health check task
+    health_check_task.abort();
+    
+    info!("MAIN: Shutting down...");
     Ok(())
 }

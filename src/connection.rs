@@ -124,7 +124,7 @@ impl Connection {
 
     pub async fn run_market_ws(self: Arc<Self>, ch: ConnectionChannels) -> Result<()> {
         let depth_state = Arc::new(RwLock::new(DepthState::new(20)));
-        let liq_state = Arc::new(RwLock::new(LiqState::default()));
+        let liq_state = Arc::new(RwLock::new(LiqState::new(self.config.liq_window_secs)));
 
         loop {
             let mark_stream = self.clone();
@@ -1579,17 +1579,24 @@ impl DepthState {
     }
 }
 
-const LIQ_WINDOW_SECS: u64 = 30;
-
-
-
 impl LiqState {
+    /// Create a new LiqState with the specified aggregation window
+    pub(crate) fn new(window_secs: u64) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            long_sum: 0.0,
+            short_sum: 0.0,
+            open_interest: 0.0,
+            window_secs,
+        }
+    }
+
     /// Record a liquidation event and normalize by Open Interest
     /// 
     /// Normalization: liquidation_notional / open_interest
     /// - Values are typically very small (0.0001 to 0.01 range)
     /// - Represents the ratio of liquidation volume to total open interest
-    /// - Accumulated over LIQ_WINDOW_SECS (30 seconds) to detect clusters
+    /// - Accumulated over the configured window (default: 30 seconds) to detect clusters
     fn record(&mut self, side: &str, notional: f64) {
         if self.open_interest <= f64::EPSILON || notional <= 0.0 {
             return;
@@ -1645,7 +1652,7 @@ impl LiqState {
         )
     }
 
-    /// Prune entries older than LIQ_WINDOW_SECS
+    /// Prune entries older than the configured window
     /// 
     /// Handles edge cases:
     /// - Clock adjustments (NTP sync)
@@ -1656,9 +1663,9 @@ impl LiqState {
             // Use checked_duration_since to handle clock adjustments gracefully
             // If entry.ts is in the future (due to clock sync), treat it as expired
             let age = now.checked_duration_since(entry.ts)
-                .unwrap_or(StdDuration::from_secs(LIQ_WINDOW_SECS + 1));
+                .unwrap_or(StdDuration::from_secs(self.window_secs + 1));
             
-            if age > StdDuration::from_secs(LIQ_WINDOW_SECS) {
+            if age > StdDuration::from_secs(self.window_secs) {
                 let entry = self.entries.pop_front().unwrap();
                 if entry.is_long_cluster {
                     self.long_sum = (self.long_sum - entry.ratio).max(0.0);

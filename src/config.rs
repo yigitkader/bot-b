@@ -22,6 +22,8 @@ pub struct BotConfig {
     pub rsi_long_min: f64,
     pub rsi_short_max: f64,
     pub atr_rising_factor: f64,
+    pub atr_sl_multiplier: f64,  // ATR multiplier for stop loss (dynamic SL = ATR * multiplier)
+    pub atr_tp_multiplier: f64,  // ATR multiplier for take profit (dynamic TP = ATR * multiplier)
     pub obi_long_min: f64,
     pub obi_short_max: f64,
     pub funding_max_for_long: f64,
@@ -36,6 +38,10 @@ pub struct BotConfig {
     // Higher values indicate more significant liquidation pressure
     pub liq_long_cluster_min: Option<f64>,
     pub liq_short_cluster_min: Option<f64>,
+    // Liquidation cluster aggregation window (seconds)
+    // Lower values (10-20s) for high volatility markets
+    // Higher values (30-60s) for stable markets
+    pub liq_window_secs: u64,
 }
 
 impl BotConfig {
@@ -112,6 +118,16 @@ impl BotConfig {
                 45.0,
             ),
             atr_rising_factor: numeric_setting("BOT_ATR_RISING_FACTOR", None, 1.02),
+            atr_sl_multiplier: numeric_setting(
+                "BOT_ATR_SL_MULTIPLIER",
+                trending_cfg.and_then(|t| t.atr_sl_multiplier),
+                2.0, // Default: 2.0 (SL = 2 * ATR)
+            ),
+            atr_tp_multiplier: numeric_setting(
+                "BOT_ATR_TP_MULTIPLIER",
+                trending_cfg.and_then(|t| t.atr_tp_multiplier),
+                4.0, // Default: 4.0 (TP = 4 * ATR)
+            ),
             obi_long_min: numeric_setting("BOT_OBI_LONG_MIN", None, 1.15),
             obi_short_max: numeric_setting("BOT_OBI_SHORT_MAX", None, 0.85),
             funding_max_for_long: numeric_setting("BOT_FUNDING_MAX_FOR_LONG", None, 0.0),
@@ -158,6 +174,14 @@ impl BotConfig {
             liq_short_cluster_min: std::env::var("BOT_LIQ_SHORT_CLUSTER_MIN")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok()),
+            // Liquidation cluster aggregation window (seconds)
+            // Lower values (10-20s) for high volatility markets
+            // Higher values (30-60s) for stable markets
+            liq_window_secs: numeric_setting(
+                "BOT_LIQ_WINDOW_SECS",
+                file_cfg.risk.as_ref().and_then(|r| r.liq_window_secs),
+                30u64, // Default: 30 seconds
+            ),
         }
         .validate()
     }
@@ -295,6 +319,22 @@ impl BotConfig {
             process::exit(1);
         }
 
+        // Liquidation window validation
+        if self.liq_window_secs == 0 {
+            eprintln!("ERROR: liq_window_secs must be > 0, got: {}", self.liq_window_secs);
+            eprintln!("  Fix: Set BOT_LIQ_WINDOW_SECS to a positive value (recommended: 10-60 seconds)");
+            process::exit(1);
+        }
+        if self.liq_window_secs < 5 {
+            eprintln!("WARNING: liq_window_secs is very low ({}s), may cause excessive pruning", self.liq_window_secs);
+            eprintln!("  Recommendation: Use at least 10 seconds for stable operation");
+        }
+        if self.liq_window_secs > 300 {
+            eprintln!("WARNING: liq_window_secs is very high ({}s = {} minutes), may miss short-term liquidation clusters", 
+                     self.liq_window_secs, self.liq_window_secs / 60);
+            eprintln!("  Recommendation: Use 10-60 seconds for optimal detection");
+        }
+
         self
     }
 
@@ -309,6 +349,8 @@ impl BotConfig {
             rsi_long_min: self.rsi_long_min,
             rsi_short_max: self.rsi_short_max,
             atr_rising_factor: self.atr_rising_factor,
+            atr_sl_multiplier: self.atr_sl_multiplier,
+            atr_tp_multiplier: self.atr_tp_multiplier,
             obi_long_min: self.obi_long_min,
             obi_short_max: self.obi_short_max,
             funding_max_for_long: self.funding_max_for_long,

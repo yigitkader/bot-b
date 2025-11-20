@@ -9,6 +9,8 @@ pub async fn run_follow_orders(
     tp_percent: f64,
     sl_percent: f64,
     commission_pct: f64,
+    atr_sl_multiplier: f64,
+    atr_tp_multiplier: f64,
 ) {
     let FollowChannels {
         mut market_rx,
@@ -40,6 +42,8 @@ pub async fn run_follow_orders(
                             tp_percent,
                             sl_percent,
                             commission_pct,
+                            atr_sl_multiplier,
+                            atr_tp_multiplier,
                         ) {
                             if let Err(err) = close_tx.send(req).await {
                                 info!("FOLLOW_ORDERS: failed to send close request: {err}");
@@ -60,7 +64,13 @@ fn evaluate_position(
     tp_percent: f64,
     sl_percent: f64,
     commission_pct: f64,
+    atr_sl_multiplier: f64,
+    atr_tp_multiplier: f64,
 ) -> Option<CloseRequest> {
+    // Note: ATR multipliers are available but not yet used
+    // To use ATR-based dynamic TP/SL, we need ATR value in MarketTick
+    // Currently using fixed percentage-based TP/SL
+    // Future enhancement: Calculate ATR from recent price movements or add to MarketTick
     // Validate entry price
     if position.entry_price <= 0.0 {
         warn!(

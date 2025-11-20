@@ -110,6 +110,8 @@ pub struct TrendParams {
     pub rsi_long_min: f64,
     pub rsi_short_max: f64,
     pub atr_rising_factor: f64,
+    pub atr_sl_multiplier: f64,
+    pub atr_tp_multiplier: f64,
     pub obi_long_min: f64,
     pub obi_short_max: f64,
     pub funding_max_for_long: f64,
@@ -155,6 +157,8 @@ pub(crate) struct FileRisk {
     pub use_isolated_margin: Option<bool>,
     #[serde(default)]
     pub max_position_notional_usd: Option<f64>,
+    #[serde(default)]
+    pub liq_window_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -185,6 +189,10 @@ pub(crate) struct FileTrending {
     pub rsi_period: Option<usize>,
     #[serde(default)]
     pub atr_period: Option<usize>,
+    #[serde(default)]
+    pub atr_sl_multiplier: Option<f64>,
+    #[serde(default)]
+    pub atr_tp_multiplier: Option<f64>,
     #[serde(default)]
     pub warmup_min_ticks: Option<usize>,
 }
@@ -444,12 +452,12 @@ pub(crate) struct PremiumIndex {
 
 
 
-#[derive(Default)]
 pub(crate) struct LiqState {
     pub entries: VecDeque<LiqEntry>,
     pub long_sum: f64,
     pub short_sum: f64,
     pub open_interest: f64,
+    pub window_secs: u64, // Aggregation window in seconds
 }
 
 pub(crate) struct LiqEntry {
