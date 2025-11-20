@@ -24,6 +24,21 @@ async fn backtest_with_real_binance_data() {
         fee_bps_round_trip: 8.0,      // giriş+çıkış toplam 0.08% varsayalım
         max_holding_bars: 48,          // max 48 bar (~4 saat @5m)
         slippage_bps: 5.0,            // 0.05% slippage (realistic backtest)
+        // Signal Quality Filtering (TrendPlan.md önerileri)
+        min_volume_ratio: 1.5,        // Minimum volume ratio vs 20-bar average
+        max_volatility_pct: 2.0,      // Maximum ATR volatility % (2% = çok volatile)
+        max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
+        enable_signal_quality_filter: true, // Signal quality filtering aktif
+        // Stop Loss & Risk Management (coin-agnostic)
+        atr_stop_loss_multiplier: 3.0, // ATR multiplier for stop-loss (3.0 = 3x ATR)
+                                       // Recommended: 2.5-3.5 for most coins, adjust based on volatility
+        atr_take_profit_multiplier: 6.0, // ATR multiplier for take-profit (6.0 = 6x ATR)
+                                         // R:R ratio = 6:3 = 2.0x (iyi risk/reward)
+                                         // Büyük kazananları korumak için yeterince geniş
+                                         // Recommended: 5.0-7.0 for most coins
+        min_holding_bars: 3, // Minimum holding time (3 bars = 15 minutes @5m)
+                             // Çok kısa trade'leri filtrele (5-15 dakika çok riskli)
+                             // Recommended: 3-4 bars (15-20 minutes @5m)
     };
 
     println!("\n");

@@ -44,6 +44,15 @@ async fn main() -> Result<()> {
         max_volatility_pct: 2.0,      // Maximum ATR volatility % (2% = çok volatile)
         max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
         enable_signal_quality_filter: true, // Signal quality filtering aktif
+        // Stop Loss & Risk Management (coin-agnostic)
+        atr_stop_loss_multiplier: 3.0, // ATR multiplier for stop-loss (3.0 = 3x ATR)
+                                       // Recommended: 2.5-3.5 for most coins, adjust based on volatility
+        atr_take_profit_multiplier: 4.0, // ATR multiplier for take-profit (4.0 = 4x ATR)
+                                         // R:R ratio = 4:3 = 1.33x (iyi risk/reward)
+                                         // Recommended: 3.5-5.0 for most coins
+        min_holding_bars: 3, // Minimum holding time (3 bars = 15 minutes @5m)
+                             // Çok kısa trade'leri filtrele
+                             // Recommended: 3-6 bars (15-30 minutes @5m)
     };
 
     println!("===== BACKTEST BAŞLIYOR =====");

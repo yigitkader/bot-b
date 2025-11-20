@@ -949,6 +949,21 @@ pub struct AlgoConfig {
     pub max_price_change_5bars_pct: f64, // 5 bar içinde max price change % (örn: 3.0 = %3)
                                    // Parabolic move = reversal riski, Flat döner
     pub enable_signal_quality_filter: bool, // Signal quality filtering aktif mi?
+    
+    // Stop Loss & Risk Management (coin-agnostic)
+    pub atr_stop_loss_multiplier: f64, // ATR multiplier for stop-loss (örn: 3.0 = 3x ATR)
+                                       // Dynamic stop-loss: entry_price ± (ATR * multiplier)
+                                       // Higher multiplier = wider stop (daha az false stop)
+                                       // Lower multiplier = tighter stop (daha fazla risk kontrolü)
+                                       // Recommended: 2.5-3.5 for most coins, adjust based on volatility
+    pub atr_take_profit_multiplier: f64, // ATR multiplier for take-profit (örn: 4.0 = 4x ATR)
+                                         // Dynamic take-profit: entry_price ± (ATR * multiplier)
+                                         // Higher multiplier = wider TP (daha büyük kazançlar)
+                                         // Lower multiplier = tighter TP (daha erken çıkış)
+                                         // Recommended: 3.5-5.0 for most coins (R:R ratio için)
+    pub min_holding_bars: usize, // Minimum holding time (bar sayısı)
+                                 // Çok kısa trade'leri filtrele (örn: 3 bar = 15 dakika @5m)
+                                 // Recommended: 3-6 bars (15-30 minutes @5m)
 }
 
 // =======================

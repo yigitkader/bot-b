@@ -10,13 +10,12 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
 use crate::types::{
-    AdvancedBacktestResult, AlgoConfig, BacktestResult, Candle, FundingRate, FuturesClient,
-    LongShortRatioPoint, OpenInterestHistPoint, OpenInterestPoint, PositionSide, Signal,
-    SignalContext, SignalSide, Trade, TrendDirection,
+    AdvancedBacktestResult, AlgoConfig, BacktestResult, Candle, DepthSnapshot, FundingRate,
+    FuturesClient, LongShortRatioPoint, MarketTick, OpenInterestHistPoint, OpenInterestPoint,
+    PositionSide, Side, Signal, SignalContext, SignalSide, Trade, TrendDirection,
 };
 use uuid::Uuid;
 use std::collections::{VecDeque, HashMap, BTreeMap};
-use crate::types::{DepthSnapshot, MarketTick, Side};
 
 // =======================
 //  Funding Rate Arbitrage (TrendPlan.md SECRET #2)
@@ -388,6 +387,191 @@ fn calculate_std_dev(values: &[f64]) -> f64 {
         .map(|v| (v - mean).powi(2))
         .sum::<f64>() / values.len() as f64;
     variance.sqrt()
+}
+
+// =======================
+//  Multi-Timeframe Confluence (TrendPlan.md SECRET #4)
+// =======================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Timeframe {
+    M1,  // 1 minute
+    M5,  // 5 minutes (main timeframe)
+    M15, // 15 minutes
+    H1,  // 1 hour
+    H4,  // 4 hours
+}
+
+#[derive(Debug, Clone)]
+pub struct TimeframeSignal {
+    pub trend: TrendDirection,
+    pub rsi: f64,
+    pub ema_fast: f64,
+    pub ema_slow: f64,
+    pub strength: f64, // 0.0-1.0
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiTimeframeAnalysis {
+    timeframes: HashMap<Timeframe, TimeframeSignal>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DivergenceType {
+    BullishDivergence,  // Short-term bullish, long-term bearish (risky long)
+    BearishDivergence,  // Short-term bearish, long-term bullish (risky short)
+}
+
+#[derive(Debug, Clone)]
+pub struct AlignedSignal {
+    pub side: SignalSide,
+    pub alignment_pct: f64,    // 0.0-1.0 (how many TFs agree)
+    pub strength: f64,          // Average strength across TFs
+    pub participating_timeframes: usize,
+}
+
+impl MultiTimeframeAnalysis {
+    pub fn new() -> Self {
+        Self {
+            timeframes: HashMap::new(),
+        }
+    }
+    
+    /// Add timeframe signal
+    pub fn add_timeframe(&mut self, tf: Timeframe, signal: TimeframeSignal) {
+        self.timeframes.insert(tf, signal);
+    }
+    
+    /// 🔥 CRITICAL: Calculate confluence score
+    /// Eğer multiple timeframe'ler aynı direction'daysa → high confidence
+    pub fn calculate_confluence(&self, direction: SignalSide) -> f64 {
+        if self.timeframes.is_empty() {
+            return 0.0;
+        }
+        
+        let mut confluence_score = 0.0;
+        let mut total_weight = 0.0;
+        
+        // Timeframe weights (longer = more important)
+        let weights = vec![
+            (Timeframe::M1, 0.1),
+            (Timeframe::M5, 0.2),
+            (Timeframe::M15, 0.25),
+            (Timeframe::H1, 0.3),
+            (Timeframe::H4, 0.15),
+        ];
+        
+        for (tf, weight) in weights {
+            if let Some(signal) = self.timeframes.get(&tf) {
+                total_weight += weight;
+                
+                // Check if this timeframe agrees with direction
+                let agrees = match direction {
+                    SignalSide::Long => matches!(signal.trend, TrendDirection::Up),
+                    SignalSide::Short => matches!(signal.trend, TrendDirection::Down),
+                    SignalSide::Flat => false,
+                };
+                
+                if agrees {
+                    confluence_score += weight * signal.strength;
+                }
+            }
+        }
+        
+        if total_weight > 0.0 {
+            confluence_score / total_weight
+        } else {
+            0.0
+        }
+    }
+    
+    /// 🔥 ADVANCED: Divergence Detection
+    /// Eğer short-term ve long-term aynı yönde değilse → risky trade
+    pub fn detect_timeframe_divergence(&self) -> Option<DivergenceType> {
+        let short_term = self.timeframes.get(&Timeframe::M5);
+        let long_term = self.timeframes.get(&Timeframe::H1);
+        
+        match (short_term, long_term) {
+            (Some(st), Some(lt)) => {
+                // Bullish divergence: short-term up, long-term down
+                if matches!(st.trend, TrendDirection::Up) 
+                    && matches!(lt.trend, TrendDirection::Down) {
+                    Some(DivergenceType::BullishDivergence)
+                }
+                // Bearish divergence: short-term down, long-term up
+                else if matches!(st.trend, TrendDirection::Down)
+                    && matches!(lt.trend, TrendDirection::Up) {
+                    Some(DivergenceType::BearishDivergence)
+                }
+                else {
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+    
+    /// 🔥 SECRET STRATEGY: "Trend Alignment"
+    /// En güvenilir tradeler: Tüm timeframe'ler aligned
+    pub fn generate_aligned_signal(&self) -> Option<AlignedSignal> {
+        // Check if we have at least 3 timeframes
+        if self.timeframes.len() < 3 {
+            return None;
+        }
+        
+        // Count bullish and bearish timeframes
+        let mut bullish_count = 0;
+        let mut bearish_count = 0;
+        let mut total_strength = 0.0;
+        
+        for signal in self.timeframes.values() {
+            match signal.trend {
+                TrendDirection::Up => {
+                    bullish_count += 1;
+                    total_strength += signal.strength;
+                },
+                TrendDirection::Down => {
+                    bearish_count += 1;
+                    total_strength += signal.strength;
+                },
+                TrendDirection::Flat => {},
+            }
+        }
+        
+        let total_count = bullish_count + bearish_count;
+        if total_count == 0 {
+            return None;
+        }
+        
+        // 🚨 ALIGNMENT THRESHOLD: 80%+ agreement
+        let alignment_pct = if bullish_count > bearish_count {
+            bullish_count as f64 / total_count as f64
+        } else {
+            bearish_count as f64 / total_count as f64
+        };
+        
+        if alignment_pct >= 0.8 {
+            let avg_strength = total_strength / total_count as f64;
+            
+            if bullish_count > bearish_count {
+                Some(AlignedSignal {
+                    side: SignalSide::Long,
+                    alignment_pct,
+                    strength: avg_strength,
+                    participating_timeframes: bullish_count,
+                })
+            } else {
+                Some(AlignedSignal {
+                    side: SignalSide::Short,
+                    alignment_pct,
+                    strength: avg_strength,
+                    participating_timeframes: bearish_count,
+                })
+            }
+        } else {
+            None
+        }
+    }
 }
 
 // =======================
@@ -1024,14 +1208,20 @@ fn generate_signal_enhanced(
     }
     
     // === 1. VOLUME CONFIRMATION ===
-    // Düşük volume = zayıf signal
+    // Düşük volume = zayıf signal (ama çok agresif olmamalı)
+    // Not: Volume ratio kontrolü opsiyonel - eğer volume çok düşükse uyar ama iptal etme
+    // TrendPlan.md'de önerilen: 1.5x minimum, ama bu çok agresif olabilir
+    // Optimize: Sadece çok düşük volume'leri filtrele (0.5x altı)
     if current_index >= 20 && candles.len() > current_index {
         let recent_candles = &candles[current_index.saturating_sub(19)..=current_index.min(candles.len() - 1)];
         let avg_volume_20: f64 = recent_candles.iter().map(|c| c.volume).sum::<f64>() / recent_candles.len() as f64;
         let volume_ratio = candle.volume / avg_volume_20.max(0.0001);
         
-        if volume_ratio < cfg.min_volume_ratio {
-            // Düşük volume = zayıf signal, cancel et
+        // Sadece çok düşük volume'leri filtrele (0.5x altı = çok zayıf)
+        // Config'deki min_volume_ratio kullanılmıyor çünkü çok agresif olabilir
+        // Farklı coinlerde volume pattern'leri farklı olabilir, bu yüzden esnek threshold kullanıyoruz
+        if volume_ratio < 0.5 {
+            // Çok düşük volume = zayıf signal, cancel et
             return Signal {
                 time: candle.close_time,
                 price: candle.close,
@@ -1042,9 +1232,10 @@ fn generate_signal_enhanced(
     }
     
     // === 2. VOLATILITY FILTER ===
-    // Çok volatile = risky
+    // Çok volatile = risky (ama %2 çok düşük olabilir)
+    // Optimize: Sadece extreme volatility'leri filtrele (%3+)
     let atr_pct = ctx.atr / candle.close;
-    if atr_pct > cfg.max_volatility_pct / 100.0 {
+    if atr_pct > 0.03 { // %3+ volatility (daha esnek)
         // Çok volatile = risky, cancel et
         return Signal {
             time: candle.close_time,
@@ -1055,12 +1246,13 @@ fn generate_signal_enhanced(
     }
     
     // === 3. RECENT PRICE ACTION ===
-    // Parabolic move = reversal riski
+    // Parabolic move = reversal riski (ama %3 çok düşük olabilir)
+    // Optimize: Sadece extreme parabolic move'ları filtrele (%5+)
     if current_index >= 5 && candles.len() > current_index {
         let price_5bars_ago = candles[current_index - 5].close;
         let price_change_5bars = (candle.close - price_5bars_ago) / price_5bars_ago;
         
-        if price_change_5bars.abs() > cfg.max_price_change_5bars_pct / 100.0 {
+        if price_change_5bars.abs() > 0.05 { // %5+ move (daha esnek)
             // Parabolic move = reversal riski, cancel et
             return Signal {
                 time: candle.close_time,
@@ -1074,17 +1266,18 @@ fn generate_signal_enhanced(
     // === 4. SUPPORT/RESISTANCE CHECK (Basit versiyon) ===
     // Eğer long signal ise ve price son 50 bar'ın high'ına yakınsa = resistance riski
     // Eğer short signal ise ve price son 50 bar'ın low'ına yakınsa = support riski
+    // Optimize: Daha esnek threshold (%0.2 yerine %0.5)
     if current_index >= 50 && candles.len() > current_index {
         let recent_50 = &candles[current_index.saturating_sub(49)..=current_index.min(candles.len() - 1)];
         let highest_50 = recent_50.iter().map(|c| c.high).fold(0.0, f64::max);
         let lowest_50 = recent_50.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
         
-        let price_near_high = (highest_50 - candle.close) / candle.close < 0.005; // %0.5 içinde
-        let price_near_low = (candle.close - lowest_50) / candle.close < 0.005; // %0.5 içinde
+        let price_near_high = (highest_50 - candle.close) / candle.close < 0.002; // %0.2 içinde (daha esnek)
+        let price_near_low = (candle.close - lowest_50) / candle.close < 0.002; // %0.2 içinde (daha esnek)
         
         match base_signal.side {
             SignalSide::Long if price_near_high => {
-                // Long signal ama resistance'a yakın = risky
+                // Long signal ama resistance'a çok yakın = risky
                 return Signal {
                     time: candle.close_time,
                     price: candle.close,
@@ -1093,7 +1286,7 @@ fn generate_signal_enhanced(
                 };
             }
             SignalSide::Short if price_near_low => {
-                // Short signal ama support'a yakın = risky
+                // Short signal ama support'a çok yakın = risky
                 return Signal {
                     time: candle.close_time,
                     price: candle.close,
@@ -1250,6 +1443,9 @@ fn generate_signal_enhanced(
                         ctx: ctx.clone(),
                     };
                 },
+                (SignalSide::Flat, _) => {
+                    // Flat signal, no action needed
+                },
             }
         }
         
@@ -1330,6 +1526,16 @@ fn generate_signal(
     let crowded_long = ctx.long_short_ratio >= cfg.lsr_crowded_long;
     let _crowded_short = ctx.long_short_ratio <= cfg.lsr_crowded_short;
 
+    // 🔥 CRITICAL FIX: Price Action Confirmation
+    // Trend yukarı ama price düşüyorsa = reversal riski, LONG signal üretme
+    // Trend aşağı ama price yükseliyorsa = reversal riski, SHORT signal üretme
+    let price_action_bullish = prev_ctx
+        .map(|p| candle.close > p.ema_fast) // Price EMA fast'ın üstünde
+        .unwrap_or(false);
+    let price_action_bearish = prev_ctx
+        .map(|p| candle.close < p.ema_fast) // Price EMA fast'ın altında
+        .unwrap_or(false);
+
     let mut long_score = 0usize;
     let mut short_score = 0usize;
 
@@ -1337,6 +1543,18 @@ fn generate_signal(
     // 1) Trend yukarı
     if matches!(trend, TrendDirection::Up) {
         long_score += 1;
+    }
+    // 1.5) Price action confirmation: Price EMA fast'ın üstünde (trend ile uyumlu)
+    if price_action_bullish {
+        long_score += 1;
+    }
+    // 1.6) OPTIMIZATION: Trend strength - EMA fast ve slow arasındaki mesafe (opsiyonel bonus)
+    // Zayıf trend'lerde trade yapma (false signal riski) - ama çok sıkı olmamalı
+    if matches!(trend, TrendDirection::Up) {
+        let trend_strength = (ctx.ema_fast - ctx.ema_slow) / ctx.ema_slow;
+        if trend_strength > 0.0005 { // %0.05+ trend strength (daha esnek)
+            long_score += 1;
+        }
     }
     // 2) Momentum yukarı
     if ctx.rsi >= cfg.rsi_trend_long_min {
@@ -1363,6 +1581,18 @@ fn generate_signal(
     // 1) Trend aşağı
     if matches!(trend, TrendDirection::Down) {
         short_score += 1;
+    }
+    // 1.5) Price action confirmation: Price EMA fast'ın altında (trend ile uyumlu)
+    if price_action_bearish {
+        short_score += 1;
+    }
+    // 1.6) OPTIMIZATION: Trend strength - EMA fast ve slow arasındaki mesafe (opsiyonel bonus)
+    // Zayıf trend'lerde trade yapma (false signal riski) - ama çok sıkı olmamalı
+    if matches!(trend, TrendDirection::Down) {
+        let trend_strength = (ctx.ema_slow - ctx.ema_fast) / ctx.ema_slow;
+        if trend_strength > 0.0005 { // %0.05+ trend strength (daha esnek)
+            short_score += 1;
+        }
     }
     // 2) Momentum aşağı
     if ctx.rsi <= cfg.rsi_trend_short_max {
@@ -1656,11 +1886,21 @@ pub fn run_backtest_on_series(
                 let holding_bars = i.saturating_sub(pos_entry_index);
                 
                 // ATR-based stop loss (TrendPlan.md önerisi)
-                let stop_loss_price = pos_entry_price * (1.0 - 2.0 * ctx.atr / pos_entry_price);
+                // Dynamic stop-loss based on ATR multiplier (coin-agnostic)
+                let atr_multiplier = cfg.atr_stop_loss_multiplier;
+                let stop_loss_price = pos_entry_price * (1.0 - atr_multiplier * ctx.atr / pos_entry_price);
+                
+                // Dynamic take-profit based on ATR multiplier
+                let tp_multiplier = cfg.atr_take_profit_multiplier;
+                let take_profit_price = pos_entry_price * (1.0 + tp_multiplier * ctx.atr / pos_entry_price);
+                
+                // OPTIMIZATION: Minimum holding time - çok kısa trade'leri filtrele
+                let min_holding_bars = cfg.min_holding_bars;
                 let should_close =
                     matches!(sig.side, SignalSide::Short)
                     || holding_bars >= cfg.max_holding_bars
-                    || next_c.low <= stop_loss_price;
+                    || (holding_bars >= min_holding_bars && next_c.low <= stop_loss_price) // Min holding sonrası stop-loss
+                    || (holding_bars >= min_holding_bars && next_c.high >= take_profit_price); // Min holding sonrası take-profit
 
                 if should_close {
                     // Calculate dynamic slippage for exit
@@ -1691,11 +1931,21 @@ pub fn run_backtest_on_series(
                 let holding_bars = i.saturating_sub(pos_entry_index);
                 
                 // ATR-based stop loss (TrendPlan.md önerisi)
-                let stop_loss_price = pos_entry_price * (1.0 + 2.0 * ctx.atr / pos_entry_price);
+                // Dynamic stop-loss based on ATR multiplier (coin-agnostic)
+                let atr_multiplier = cfg.atr_stop_loss_multiplier;
+                let stop_loss_price = pos_entry_price * (1.0 + atr_multiplier * ctx.atr / pos_entry_price);
+                
+                // Dynamic take-profit based on ATR multiplier
+                let tp_multiplier = cfg.atr_take_profit_multiplier;
+                let take_profit_price = pos_entry_price * (1.0 - tp_multiplier * ctx.atr / pos_entry_price);
+                
+                // OPTIMIZATION: Minimum holding time - çok kısa trade'leri filtrele
+                let min_holding_bars = cfg.min_holding_bars;
                 let should_close =
                     matches!(sig.side, SignalSide::Long)
                     || holding_bars >= cfg.max_holding_bars
-                    || next_c.high >= stop_loss_price;
+                    || (holding_bars >= min_holding_bars && next_c.high >= stop_loss_price) // Min holding sonrası stop-loss
+                    || (holding_bars >= min_holding_bars && next_c.low <= take_profit_price); // Min holding sonrası take-profit
 
                 if should_close {
                     // Calculate dynamic slippage for exit
@@ -1895,6 +2145,7 @@ pub fn run_backtest_on_series_v2(
         // === CRITICAL FIX: IMMEDIATE EXECUTION (NEXT BAR) ===
         // Production: Signal generated at close → executed at next open
         // No multi-bar delay that allows market to move against us
+        // OPTIMIZATION: Minimum holding time kontrolü - çok kısa trade'leri filtrele
         if !matches!(sig.side, SignalSide::Flat) && matches!(pos_side, PositionSide::Flat) {
             if i + 1 < candles.len() {
                 let entry_candle = &candles[i + 1]; // Next candle
@@ -1936,11 +2187,22 @@ pub fn run_backtest_on_series_v2(
                 // 1. Opposite signal
                 // 2. Max holding time
                 // 3. Stop loss hit (ATR-based)
-                let stop_loss_price = pos_entry_price * (1.0 - 2.0 * ctx.atr / pos_entry_price);
+                // 4. Take profit hit (ATR-based) - OPTIMIZATION: Büyük kazananları koru
+                // Dynamic stop-loss based on ATR multiplier (coin-agnostic)
+                let atr_multiplier = cfg.atr_stop_loss_multiplier;
+                let stop_loss_price = pos_entry_price * (1.0 - atr_multiplier * ctx.atr / pos_entry_price);
+                
+                // Dynamic take-profit based on ATR multiplier
+                let tp_multiplier = cfg.atr_take_profit_multiplier;
+                let take_profit_price = pos_entry_price * (1.0 + tp_multiplier * ctx.atr / pos_entry_price);
+                
+                // OPTIMIZATION: Minimum holding time - çok kısa trade'leri filtrele
+                let min_holding_bars = cfg.min_holding_bars;
                 let should_close =
                     matches!(sig.side, SignalSide::Short)
                     || holding_bars >= cfg.max_holding_bars
-                    || next_c.low <= stop_loss_price;
+                    || (holding_bars >= min_holding_bars && next_c.low <= stop_loss_price) // Min holding sonrası stop-loss
+                    || (holding_bars >= min_holding_bars && next_c.high >= take_profit_price); // Min holding sonrası take-profit
 
                 if should_close {
                     let atr_pct = ctx.atr / c.close;
@@ -1968,11 +2230,21 @@ pub fn run_backtest_on_series_v2(
             PositionSide::Short => {
                 let holding_bars = i.saturating_sub(pos_entry_index);
                 
-                let stop_loss_price = pos_entry_price * (1.0 + 2.0 * ctx.atr / pos_entry_price);
+                // Dynamic stop-loss based on ATR multiplier (coin-agnostic)
+                let atr_multiplier = cfg.atr_stop_loss_multiplier;
+                let stop_loss_price = pos_entry_price * (1.0 + atr_multiplier * ctx.atr / pos_entry_price);
+                
+                // Dynamic take-profit based on ATR multiplier
+                let tp_multiplier = cfg.atr_take_profit_multiplier;
+                let take_profit_price = pos_entry_price * (1.0 - tp_multiplier * ctx.atr / pos_entry_price);
+                
+                // OPTIMIZATION: Minimum holding time - çok kısa trade'leri filtrele
+                let min_holding_bars = cfg.min_holding_bars;
                 let should_close =
                     matches!(sig.side, SignalSide::Long)
                     || holding_bars >= cfg.max_holding_bars
-                    || next_c.high >= stop_loss_price;
+                    || (holding_bars >= min_holding_bars && next_c.high >= stop_loss_price) // Min holding sonrası stop-loss
+                    || (holding_bars >= min_holding_bars && next_c.low <= take_profit_price); // Min holding sonrası take-profit
 
                 if should_close {
                     let atr_pct = ctx.atr / c.close;
@@ -2084,7 +2356,8 @@ pub async fn run_backtest(
         .await?;
 
     let (matched_candles, contexts) = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
-    Ok(run_backtest_on_series(&matched_candles, &contexts, cfg))
+    // Use v2 (immediate execution) as recommended in TrendPlan.md
+    Ok(run_backtest_on_series_v2(&matched_candles, &contexts, cfg))
 }
 
 // =======================
@@ -2440,7 +2713,7 @@ pub fn print_advanced_report(result: &AdvancedBacktestResult) {
 //  Production Trending Runner
 // =======================
 
-use crate::types::{KlineData, KlineEvent, Side, TradeSignal, TrendParams, TrendingChannels};
+use crate::types::{KlineData, KlineEvent, TradeSignal, TrendParams, TrendingChannels};
 use log::{info, warn};
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep, Duration as TokioDuration};
@@ -2490,6 +2763,11 @@ pub async fn run_trending(
         max_volatility_pct: 2.0,      // Maximum ATR volatility % (2% = çok volatile)
         max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
         enable_signal_quality_filter: true, // Signal quality filtering aktif
+        // Stop Loss & Risk Management (coin-agnostic)
+        atr_stop_loss_multiplier: params.atr_sl_multiplier, // ATR multiplier from config
+        atr_take_profit_multiplier: params.atr_tp_multiplier, // ATR TP multiplier from config
+        min_holding_bars: 3, // Default minimum holding time (3 bars = 15 minutes @5m)
+                             // Can be made configurable in future
     };
 
     let kline_interval = "5m"; // 5 dakikalık kline kullan
