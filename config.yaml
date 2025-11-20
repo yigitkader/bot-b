@@ -42,6 +42,11 @@ trending:
   rsi_upper_long: 65.0
   atr_sl_multiplier: 2.0
   atr_tp_multiplier: 4.0
+  # Enhanced Signal Scoring (TrendPlan.md) - Professional 0-100 point scoring
+  enable_enhanced_scoring: true  # Enhanced scoring aktif
+  enhanced_score_excellent: 80.0  # 80-100: Excellent signal (take it!)
+  enhanced_score_good: 65.0        # 65-79: Good signal (take it)
+  enhanced_score_marginal: 50.0    # 50-64: Marginal signal (skip)
 
 binance:
   futures_base: "https://fapi.binance.com"
