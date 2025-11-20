@@ -1,0 +1,5 @@
+# Cargo configuration for better test output
+[test]
+# Show test output even for passing tests
+nocapture = false
+

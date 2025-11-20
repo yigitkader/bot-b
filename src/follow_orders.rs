@@ -64,8 +64,8 @@ fn evaluate_position(
     tp_percent: f64,
     sl_percent: f64,
     commission_pct: f64,
-    atr_sl_multiplier: f64,
-    atr_tp_multiplier: f64,
+    _atr_sl_multiplier: f64,
+    _atr_tp_multiplier: f64,
 ) -> Option<CloseRequest> {
     // Note: ATR multipliers are available but not yet used
     // To use ATR-based dynamic TP/SL, we need ATR value in MarketTick

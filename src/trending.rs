@@ -14,6 +14,7 @@ use crate::types::{
     OpenInterestHistPoint, OpenInterestPoint, PositionSide, Signal, SignalContext, SignalSide,
     Trade, TrendDirection,
 };
+use uuid::Uuid;
 
 
 impl FuturesClient {
@@ -538,6 +539,11 @@ pub fn run_backtest_on_series(
     // Pending signals queue: (signal_index, entry_index, signal_side, signal_ctx)
     let mut pending_signals: Vec<(usize, usize, SignalSide, SignalContext)> = Vec::new();
     
+    // Signal statistics
+    let mut total_signals = 0usize;
+    let mut long_signals = 0usize;
+    let mut short_signals = 0usize;
+    
     // Deterministic RNG seed for reproducible results
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
@@ -548,6 +554,19 @@ pub fn run_backtest_on_series(
 
         // Sadece sinyal üretimi
         let sig = generate_signal(c, ctx, prev_ctx, cfg);
+        
+        // Count signals
+        match sig.side {
+            SignalSide::Long => {
+                total_signals += 1;
+                long_signals += 1;
+            }
+            SignalSide::Short => {
+                total_signals += 1;
+                short_signals += 1;
+            }
+            SignalSide::Flat => {}
+        }
         
         // Execution delay: Signal üretildikten sonra 1-2 bar bekle (production reality)
         // Production'da: Signal → EventBus → Ordering → API → Fill (1-5 seconds ≈ 1-2 bars)
@@ -560,8 +579,8 @@ pub fn run_backtest_on_series(
         }
 
         // Check pending signals for execution
-        pending_signals.retain(|&(_signal_idx, entry_idx, signal_side, _signal_ctx)| {
-            if entry_idx == i {
+        pending_signals.retain(|(_signal_idx, entry_idx, signal_side, _signal_ctx)| {
+            if *entry_idx == i {
                 // Execute signal now
                 if matches!(pos_side, PositionSide::Flat) {
                     // Calculate dynamic slippage based on ATR (volatility) at entry time
@@ -724,6 +743,9 @@ pub fn run_backtest_on_series(
         total_pnl_pct,
         avg_pnl_pct,
         avg_r,
+        total_signals,
+        long_signals,
+        short_signals,
     }
 }
 
@@ -810,7 +832,7 @@ pub fn export_backtest_to_csv(result: &BacktestResult, file_path: &str) -> Resul
 //  Production Trending Runner
 // =======================
 
-use crate::types::{Candle, KlineData, KlineEvent, Side, TradeSignal, TrendParams, TrendingChannels};
+use crate::types::{KlineData, KlineEvent, Side, TradeSignal, TrendParams, TrendingChannels};
 use log::{info, warn};
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep, Duration as TokioDuration};
@@ -834,7 +856,7 @@ struct LastSignalState {
 /// 3. Funding, OI, Long/Short ratio verilerini REST API'den çeker (daha az sıklıkla)
 /// 4. TradeSignal eventlerini event bus'a gönderir
 pub async fn run_trending(
-    mut ch: TrendingChannels,
+    ch: TrendingChannels,
     symbol: String,
     params: TrendParams,
     ws_base_url: String,
@@ -875,7 +897,7 @@ pub async fn run_trending(
         }
     }
 
-    let mut signal_state = LastSignalState {
+    let signal_state = LastSignalState {
         last_long_time: None,
         last_short_time: None,
     };
@@ -1073,7 +1095,7 @@ async fn generate_signal_from_candle(
     }
 
     // En son candle ve context'i kullan
-    let latest_ctx = contexts.last()?;
+    let latest_ctx = contexts.last().ok_or_else(|| anyhow::anyhow!("no contexts available"))?;
     let prev_ctx = if contexts.len() > 1 {
         Some(&contexts[contexts.len() - 2])
     } else {

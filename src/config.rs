@@ -42,6 +42,11 @@ pub struct BotConfig {
     // Lower values (10-20s) for high volatility markets
     // Higher values (30-60s) for stable markets
     pub liq_window_secs: u64,
+    // Risk management fields
+    pub use_isolated_margin: bool,
+    pub min_margin_usd: f64,
+    pub max_position_notional_usd: f64,
+    pub min_quote_balance_usd: f64,
 }
 
 impl BotConfig {

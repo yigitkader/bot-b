@@ -28,6 +28,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
+/// Binance server time response structure
+#[derive(Debug, Deserialize)]
+struct ServerTimeResponse {
+    #[serde(rename = "serverTime")]
+    server_time: i64,
+}
+
 // Maximum WebSocket message size (1MB) - prevents DOS attacks and memory exhaustion
 // Binance messages are typically < 10KB, but depth snapshots can be larger
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
@@ -1351,13 +1358,6 @@ impl Connection {
             .json::<PremiumIndex>()
             .await?;
         Ok(resp)
-    }
-
-    /// Binance server time response structure
-    #[derive(Debug, Deserialize)]
-    struct ServerTimeResponse {
-        #[serde(rename = "serverTime")]
-        server_time: i64,
     }
 
     /// Fetch Binance server time and calculate offset from client time

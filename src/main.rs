@@ -208,8 +208,13 @@ async fn main() -> Result<()> {
         _ = async {
             // Wait for all main tasks
             for task_info in &task_infos {
-                let handle_guard = task_info.handle.lock().await;
-                if let Some(handle) = handle_guard.as_ref() {
+                // Take handle from mutex to get owned value for await
+                let handle = {
+                    let mut handle_guard = task_info.handle.lock().await;
+                    handle_guard.take()
+                };
+                
+                if let Some(handle) = handle {
                     let result = handle.await;
                     if let Err(err) = result {
                         error!("MAIN: Task '{}' panicked: {err:?}", task_info.name);

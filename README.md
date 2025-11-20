@@ -1,5 +1,11 @@
-# Default ayarlarla (BTCUSDT, 5m, son 24 saat)
-cargo run --bin backtest
+cargo test
 
-# Environment variable'larla özelleştirme
-SYMBOL=ETHUSDT INTERVAL=15m PERIOD=15m LIMIT=96 cargo run --bin backtest
+
+### Sadece yeni testleri çalıştırmak için:
+cargo test --test position_and_pricing
+
+### Sadece backtest testlerini çalıştırmak için:
+cargo test --test backtest
+
+### Belirli bir test fonksiyonunu çalıştırmak için:
+cargo test test_position_id_collision

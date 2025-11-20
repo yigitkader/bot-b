@@ -3,7 +3,7 @@ use crate::types::TradeSignal;
 use log::info;
 use tokio::sync::{broadcast, mpsc};
 
-pub async fn run_logging(mut ch: LoggingChannels) {
+pub async fn run_logging(ch: LoggingChannels) {
     let mut market_rx = ch.market_rx;
     let mut order_rx = ch.order_update_rx;
     let mut position_rx = ch.position_update_rx;

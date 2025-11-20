@@ -82,25 +82,11 @@ pub struct PositionUpdate {
 }
 
 impl PositionUpdate {
-    /// Generate a unique position ID from symbol, side, and timestamp
-    /// Uses UUID v5 (SHA-1 based) with timestamp to ensure each position gets a unique ID
-    /// 
-    /// # Why timestamp?
-    /// Without timestamp, the same symbol+side would always produce the same ID.
-    /// This causes ID collision when:
-    /// 1. A position closes
-    /// 2. A new position opens immediately in the same direction
-    /// 
-    /// Adding timestamp ensures each position gets a unique ID while still being
-    /// deterministic (useful for matching across WebSocket events and API calls).
-    /// 
-    /// # Note
-    /// If two positions open in the same millisecond, they will have the same ID.
-    /// This is extremely rare but possible. For production, consider using UUID v4 (random)
-    /// if absolute uniqueness is required.
     pub fn position_id(symbol: &str, side: Side) -> Uuid {
         let timestamp = chrono::Utc::now().timestamp_millis();
         let name = format!("{}:{:?}:{}", symbol, side, timestamp);
+        // Use UUID v5 for deterministic IDs based on symbol+side+timestamp
+        // This ensures uniqueness while being deterministic
         Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes())
     }
 }
@@ -893,6 +879,10 @@ pub struct BacktestResult {
     pub total_pnl_pct: f64,
     pub avg_pnl_pct: f64,
     pub avg_r: f64, // Average Risk/Reward ratio (average win / average loss)
+    // Signal statistics
+    pub total_signals: usize,
+    pub long_signals: usize,
+    pub short_signals: usize,
 }
 
 // =======================
