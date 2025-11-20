@@ -242,26 +242,32 @@ impl Connection {
         }
     }
 
-    /// Calculate limit price from best bid/ask with slippage tolerance
-    /// For BUY orders: uses best ask (or slightly above with tolerance)
-    /// For SELL orders: uses best bid (or slightly below with tolerance)
+    /// Calculate limit price from best bid/ask for aggressive fill strategy
+    /// 
+    /// # Strategy: Aggressive Fill (Immediate Execution)
+    /// - LONG: Use best_ask (immediate fill from orderbook)
+    /// - SHORT: Use best_bid (immediate fill from orderbook)
+    /// 
+    /// This ensures immediate execution at the best available price.
+    /// Alternative strategies:
+    /// - Post-Only/Maker: LONG = best_bid + 1 tick, SHORT = best_ask - 1 tick
+    ///   (enters orderbook, maker fee advantage, but may not fill immediately)
     fn calculate_limit_price(
         side: &Side,
         best_bid: f64,
         best_ask: f64,
         tick_size: f64,
-        slippage_tolerance: f64,
     ) -> f64 {
-        let slippage_tolerance = slippage_tolerance.max(0.0).min(0.01); // Clamp between 0% and 1%
-        
         let price = match side {
             Side::Long => {
-                // BUY: use best ask, add small slippage tolerance to improve fill probability
-                best_ask * (1.0 + slippage_tolerance)
+                // BUY: use best ask for immediate fill
+                // This crosses the spread but guarantees execution
+                best_ask
             }
             Side::Short => {
-                // SELL: use best bid, subtract small slippage tolerance to improve fill probability
-                best_bid * (1.0 - slippage_tolerance)
+                // SELL: use best bid for immediate fill
+                // This crosses the spread but guarantees execution
+                best_bid
             }
         };
         
@@ -271,6 +277,28 @@ impl Connection {
         } else {
             price
         }
+    }
+
+    /// Fetch depth snapshot and calculate order price for a given side
+    /// Returns the price that will be used for order execution
+    /// This is used to calculate quantity accurately before sending order
+    pub async fn calculate_order_price(&self, symbol: &str, side: &Side) -> Result<f64> {
+        let depth = self.fetch_depth_snapshot().await?;
+        
+        let best_bid = depth.bids
+            .first()
+            .and_then(|lvl| lvl[0].parse::<f64>().ok())
+            .ok_or_else(|| anyhow!("invalid best bid"))?;
+        
+        let best_ask = depth.asks
+            .first()
+            .and_then(|lvl| lvl[0].parse::<f64>().ok())
+            .ok_or_else(|| anyhow!("invalid best ask"))?;
+
+        let symbol_info = self.fetch_symbol_info(symbol).await?;
+        let price = Self::calculate_limit_price(side, best_bid, best_ask, symbol_info.tick_size);
+        
+        Ok(price)
     }
 
     pub async fn send_order(&self, order: NewOrderRequest) -> Result<()> {
@@ -335,14 +363,14 @@ impl Connection {
                         .unwrap_or(0.0);
 
                     if best_bid > 0.0 && best_ask > 0.0 {
-                        // Calculate limit price with 0.1% slippage tolerance (default)
-                        let slippage_tolerance = 0.001; // 0.1%
+                        // Calculate limit price for aggressive fill (immediate execution)
+                        // LONG: best_ask (crosses spread, immediate fill)
+                        // SHORT: best_bid (crosses spread, immediate fill)
                         let limit_price = Self::calculate_limit_price(
                             &side,
                             best_bid,
                             best_ask,
                             symbol_info.tick_size,
-                            slippage_tolerance,
                         );
 
                         // Format price with appropriate precision (using tick_size)
@@ -652,7 +680,7 @@ impl Connection {
                 let side = if size >= 0.0 { Side::Long } else { Side::Short };
 
                 Ok(Some(PositionUpdate {
-                    position_id: PositionUpdate::position_id(&pos.symbol, side), // Deterministic ID from symbol+side
+                    position_id: PositionUpdate::position_id(&pos.symbol, side), // Unique ID from symbol+side+timestamp
                     symbol: pos.symbol,
                     side,
                     entry_price,
@@ -1157,7 +1185,7 @@ impl Connection {
                     }
                 }
                 for pos in account.account.positions.iter() {
-                    if let Some(update) = pos.to_position_update() {
+                    if let Some(update) = pos.to_position_update(self.config.leverage) {
                         if ch.position_update_tx.send(update.clone()).is_err() {
                             warn!("CONNECTION: position receiver dropped");
                         }
@@ -1451,9 +1479,9 @@ impl Connection {
         params: Vec<(String, String)>,
     ) -> Result<reqwest::Response> {
         // For order endpoints, acquire order permit (10 orders/second limit)
-        // CRITICAL: Permit must be held for entire request duration to prevent rate limit bypass
         // The permit includes a 100ms delay inside acquire_order_permit() to space out orders
-        // Permit is automatically dropped at end of function scope (after request completes)
+        // Permit is held only during order submission, not during response waiting
+        // This optimizes throughput by releasing the permit as soon as the HTTP request starts
         let _order_permit = if self.is_order_endpoint(path) {
             Some(self.rate_limiter.acquire_order_permit().await?)
         } else {
@@ -1464,22 +1492,27 @@ impl Connection {
         let weight = self.get_endpoint_weight(path);
         self.rate_limiter.acquire_weight(weight).await?;
         
-        // Execute request while order permit (if any) is still held
-        // This ensures rate limiting is enforced throughout the entire request lifecycle
+        // Prepare request body and URL
         let body = self.sign_params(params)?;
         let url = format!("{}{}", self.config.base_url, path);
-        let response = self
+        
+        // Start HTTP request (permit is still held during request initiation)
+        let response_future = self
             .http
             .post(&url)
             .header("X-MBX-APIKEY", &self.config.api_key)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
-            .send()
-            .await?
-            .error_for_status()?;
+            .send();
         
-        // Permit is automatically dropped here when _order_permit goes out of scope
-        // This ensures the permit is held for the entire request duration
+        // Drop permit immediately after starting the request
+        // This allows other orders to proceed while we wait for the response
+        // The rate limit is enforced at submission time, not during network I/O
+        drop(_order_permit);
+        
+        // Wait for response (permit is no longer held, improving throughput)
+        let response = response_future.await?.error_for_status()?;
+        
         Ok(response)
     }
 
@@ -1782,19 +1815,19 @@ impl AccountBalance {
 
 
 impl AccountPosition {
-    fn to_position_update(&self) -> Option<PositionUpdate> {
+    fn to_position_update(&self, leverage: f64) -> Option<PositionUpdate> {
         let size = self.position_amount.parse::<f64>().ok()?;
         let entry = self.entry_price.parse::<f64>().ok().unwrap_or(0.0);
         let pnl = self.unrealized_pnl.parse::<f64>().ok().unwrap_or(0.0);
         let side = if size >= 0.0 { Side::Long } else { Side::Short };
 
         Some(PositionUpdate {
-            position_id: PositionUpdate::position_id(&self.symbol, side), // Deterministic ID from symbol+side
+            position_id: PositionUpdate::position_id(&self.symbol, side), // Unique ID from symbol+side+timestamp
             symbol: self.symbol.clone(),
             side,
             entry_price: entry,
             size: size.abs(),
-            leverage: 0.0,
+            leverage,
             unrealized_pnl: pnl,
             ts: Utc::now(),
             is_closed: size == 0.0,

@@ -34,6 +34,13 @@ impl SharedState {
         }
     }
     
+    /// Clear order sent timestamp (used when order fails to send)
+    pub fn clear_order_sent(&self) {
+        if let Ok(mut state) = self.order_state.lock() {
+            state.order_sent_at = None;
+        }
+    }
+    
     /// Check if order was sent but no update received (timeout check)
     pub fn check_order_timeout(&self, timeout_secs: u64) -> bool {
         if let Ok(state) = self.order_state.lock() {
@@ -129,26 +136,18 @@ impl SharedState {
         if let Ok(mut state) = self.position_state.lock() {
             // Check for duplicate or stale updates
             if let Some(last) = &state.last_position {
-                // Check for exact duplicate (same position_id and timestamp)
-                if update.position_id == last.position_id && update.ts == last.ts {
-                    // Exact duplicate - check if data actually changed
-                    if update.symbol == last.symbol
-                        && update.side == last.side
-                        && (update.entry_price - last.entry_price).abs() < f64::EPSILON
-                        && (update.size - last.size).abs() < f64::EPSILON
-                        && (update.leverage - last.leverage).abs() < f64::EPSILON
-                        && update.is_closed == last.is_closed
-                    {
-                        // Data is identical - duplicate update, ignore silently
-                        // (common with broadcast channels where same message can be received multiple times)
-                        return;
-                    }
-                    // Same position_id and timestamp but different data - this is unusual
-                    warn!(
-                        "STATE: position update with same position_id and timestamp but different data (position_id: {})",
-                        update.position_id
-                    );
-                    // Apply it anyway as it might be a correction
+                // Check for duplicate using position_id + entry_price + size + is_closed combination
+                // This is more reliable than timestamp because Binance may send the same event
+                // multiple times with different timestamps during WebSocket reconnects
+                if update.position_id == last.position_id
+                    && (update.entry_price - last.entry_price).abs() < f64::EPSILON
+                    && (update.size - last.size).abs() < f64::EPSILON
+                    && update.is_closed == last.is_closed
+                {
+                    // Position ID, entry price, size, and closed status are identical
+                    // This is definitely a duplicate update, ignore silently
+                    // (common with broadcast channels or WebSocket reconnects where same message can be received multiple times)
+                    return;
                 }
                 
                 // Check for stale updates (older timestamp) - but allow if it's a different position

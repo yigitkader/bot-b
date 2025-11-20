@@ -6,6 +6,8 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use ta::indicators::{AverageTrueRange, ExponentialMovingAverage, RelativeStrengthIndex};
 use ta::{DataItem, Next};
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 
 use crate::types::{
     AlgoConfig, BacktestResult, Candle, FundingRate, FuturesClient, LongShortRatioPoint,
@@ -490,25 +492,26 @@ pub fn generate_signals(
 
 /// Backtest için özel fonksiyon - sinyal üretir VE pozisyon yönetimi yapar
 /// 
-/// # ⚠️ Backtest vs Production Divergence
+/// # ⚠️ Backtest vs Production Divergence (Now Realistic!)
 /// 
-/// **Backtest Execution (Optimistic):**
+/// **Backtest Execution (Realistic):**
 /// - Signal generated at candle `i` close
-/// - Entry executed immediately at candle `i+1` open price
-/// - No delays, no slippage (perfect execution)
+/// - Execution delay: 1-2 bars (simulates production delay: Signal → EventBus → Ordering → API → Fill)
+/// - Dynamic slippage: Base slippage (0.05%) multiplied by volatility (ATR-based) and random factor (1.0-3.0x)
+/// - High volatility periods: slippage can reach 0.1-0.5% (production reality)
 /// 
 /// **Production Execution (Realistic):**
 /// - Signal generated at candle close
-/// - Signal → event bus (mpsc channel delay)
-/// - Ordering module: risk checks, symbol info fetch, quantity calculation
-/// - API call (network delay)
-/// - Order filled at market price (slippage)
+/// - Signal → event bus (mpsc channel delay: ~1-10ms)
+/// - Ordering module: risk checks, symbol info fetch, quantity calculation (~50-200ms)
+/// - API call (network delay: ~100-500ms)
+/// - Order filled at market price (slippage: 0.05% normal, 0.1-0.5% during volatility)
+/// - Total delay: typically 1-5 seconds (≈ 1-2 bars for 5m candles)
 /// 
 /// **Impact:**
-/// - Backtest results may be optimistic
-/// - Production has execution delays (typically 1-5 seconds)
-/// - Production has slippage (especially during volatile periods)
-/// - Consider adding slippage simulation to backtest for more realistic results
+/// - Backtest results are now more realistic and closer to production
+/// - Execution delays and dynamic slippage simulate production conditions
+/// - Results may still be slightly optimistic due to perfect signal timing, but much closer to reality
 /// 
 /// # NOT: Production Kullanımı
 /// Bu fonksiyon sadece backtest için kullanılır. Production'da:
@@ -530,7 +533,13 @@ pub fn run_backtest_on_series(
     let mut pos_entry_index: usize = 0;
 
     let fee_frac = cfg.fee_bps_round_trip / 10_000.0;
-    let slippage_frac = cfg.slippage_bps / 10_000.0; // Slippage simulation (production reality)
+    let base_slippage_frac = cfg.slippage_bps / 10_000.0; // Base slippage (production reality)
+    
+    // Pending signals queue: (signal_index, entry_index, signal_side, signal_ctx)
+    let mut pending_signals: Vec<(usize, usize, SignalSide, SignalContext)> = Vec::new();
+    
+    // Deterministic RNG seed for reproducible results
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
     for i in 1..(candles.len() - 1) {
         let c = &candles[i];
@@ -539,6 +548,56 @@ pub fn run_backtest_on_series(
 
         // Sadece sinyal üretimi
         let sig = generate_signal(c, ctx, prev_ctx, cfg);
+        
+        // Execution delay: Signal üretildikten sonra 1-2 bar bekle (production reality)
+        // Production'da: Signal → EventBus → Ordering → API → Fill (1-5 seconds ≈ 1-2 bars)
+        if !matches!(sig.side, SignalSide::Flat) {
+            let execution_delay = rng.gen_range(1..=2); // 1-2 bar delay
+            let entry_index = i + execution_delay;
+            if entry_index < candles.len() {
+                pending_signals.push((i, entry_index, sig.side, ctx.clone()));
+            }
+        }
+
+        // Check pending signals for execution
+        pending_signals.retain(|&(_signal_idx, entry_idx, signal_side, _signal_ctx)| {
+            if entry_idx == i {
+                // Execute signal now
+                if matches!(pos_side, PositionSide::Flat) {
+                    // Calculate dynamic slippage based on ATR (volatility) at entry time
+                    // Higher ATR = higher volatility = higher slippage
+                    // Base slippage: 0.05% (5 bps), can increase to 0.1-0.5% during high volatility
+                    let entry_ctx = &contexts[i]; // Use context at entry time, not signal time
+                    let atr_pct = entry_ctx.atr / c.close; // ATR as percentage of price
+                    let volatility_multiplier = (atr_pct * 100.0).min(10.0).max(1.0); // Cap at 10x
+                    let dynamic_slippage_frac = base_slippage_frac * volatility_multiplier * rng.gen_range(1.0..3.0);
+                    
+                    let entry_candle = &candles[i];
+                    
+                    match signal_side {
+                        SignalSide::Long => {
+                            pos_side = PositionSide::Long;
+                            // Entry: LONG position buys at ask (higher price due to slippage)
+                            pos_entry_price = entry_candle.open * (1.0 + dynamic_slippage_frac);
+                            pos_entry_time = entry_candle.open_time;
+                            pos_entry_index = i;
+                        }
+                        SignalSide::Short => {
+                            pos_side = PositionSide::Short;
+                            // Entry: SHORT position sells at bid (lower price due to slippage)
+                            pos_entry_price = entry_candle.open * (1.0 - dynamic_slippage_frac);
+                            pos_entry_time = entry_candle.open_time;
+                            pos_entry_index = i;
+                        }
+                        SignalSide::Flat => {}
+                    }
+                }
+                false // Remove from pending signals
+            } else {
+                true // Keep in pending signals
+            }
+        });
+
         let next_c = &candles[i + 1];
 
         // Pozisyon varsa: max holding check + sinyal yönü
@@ -550,8 +609,13 @@ pub fn run_backtest_on_series(
                     || holding_bars >= cfg.max_holding_bars;
 
                 if should_close {
+                    // Calculate dynamic slippage for exit
+                    let atr_pct = ctx.atr / c.close;
+                    let volatility_multiplier = (atr_pct * 100.0).min(10.0).max(1.0);
+                    let dynamic_slippage_frac = base_slippage_frac * volatility_multiplier * rng.gen_range(1.0..3.0);
+                    
                     // Exit: LONG position sells at bid (lower price due to slippage)
-                    let exit_price = next_c.open * (1.0 - slippage_frac);
+                    let exit_price = next_c.open * (1.0 - dynamic_slippage_frac);
                     let raw_pnl = (exit_price - pos_entry_price) / pos_entry_price;
                     let pnl_pct = raw_pnl - fee_frac;
                     let win = pnl_pct > 0.0;
@@ -576,8 +640,13 @@ pub fn run_backtest_on_series(
                     || holding_bars >= cfg.max_holding_bars;
 
                 if should_close {
+                    // Calculate dynamic slippage for exit
+                    let atr_pct = ctx.atr / c.close;
+                    let volatility_multiplier = (atr_pct * 100.0).min(10.0).max(1.0);
+                    let dynamic_slippage_frac = base_slippage_frac * volatility_multiplier * rng.gen_range(1.0..3.0);
+                    
                     // Exit: SHORT position buys at ask (higher price due to slippage)
-                    let exit_price = next_c.open * (1.0 + slippage_frac);
+                    let exit_price = next_c.open * (1.0 + dynamic_slippage_frac);
                     let raw_pnl = (pos_entry_price - exit_price) / pos_entry_price;
                     let pnl_pct = raw_pnl - fee_frac;
                     let win = pnl_pct > 0.0;
@@ -596,27 +665,6 @@ pub fn run_backtest_on_series(
                 }
             }
             PositionSide::Flat => {}
-        }
-
-        // Yeni pozisyon açma (slippage uygulanır)
-        if matches!(pos_side, PositionSide::Flat) {
-            match sig.side {
-                SignalSide::Long => {
-                    pos_side = PositionSide::Long;
-                    // Entry: LONG position buys at ask (higher price due to slippage)
-                    pos_entry_price = next_c.open * (1.0 + slippage_frac);
-                    pos_entry_time = next_c.open_time;
-                    pos_entry_index = i + 1;
-                }
-                SignalSide::Short => {
-                    pos_side = PositionSide::Short;
-                    // Entry: SHORT position sells at bid (lower price due to slippage)
-                    pos_entry_price = next_c.open * (1.0 - slippage_frac);
-                    pos_entry_time = next_c.open_time;
-                    pos_entry_index = i + 1;
-                }
-                SignalSide::Flat => {}
-            }
         }
     }
 
@@ -902,8 +950,8 @@ async fn run_kline_stream(
                                         }
                                         drop(buffer);
                                         
-                                        // Sinyal üret
-                                        if let Ok(Some(signal)) = generate_signal_from_candle(
+                                        // Sinyal üret (signal gönderme işlemi fonksiyon içinde yapılıyor)
+                                        if let Err(err) = generate_signal_from_candle(
                                             &candle,
                                             &candle_buffer,
                                             &client,
@@ -912,10 +960,9 @@ async fn run_kline_stream(
                                             &cfg,
                                             &params,
                                             signal_state.clone(),
+                                            &signal_tx,
                                         ).await {
-                                            if let Err(err) = signal_tx.send(signal).await {
-                                                warn!("TRENDING: failed to send signal: {err}");
-                                            }
+                                            warn!("TRENDING: failed to generate signal: {err}");
                                         }
                                     }
                                 }
@@ -934,7 +981,8 @@ async fn run_kline_stream(
                                             }
                                             drop(buffer);
                                             
-                                            if let Ok(Some(signal)) = generate_signal_from_candle(
+                                            // Sinyal üret (signal gönderme işlemi fonksiyon içinde yapılıyor)
+                                            if let Err(err) = generate_signal_from_candle(
                                                 &candle,
                                                 &candle_buffer,
                                                 &client,
@@ -943,10 +991,9 @@ async fn run_kline_stream(
                                                 &cfg,
                                                 &params,
                                                 signal_state.clone(),
+                                                &signal_tx,
                                             ).await {
-                                                if let Err(err) = signal_tx.send(signal).await {
-                                                    warn!("TRENDING: failed to send signal: {err}");
-                                                }
+                                                warn!("TRENDING: failed to generate signal: {err}");
                                             }
                                         }
                                     }
@@ -1005,6 +1052,7 @@ async fn generate_signal_from_candle(
     cfg: &AlgoConfig,
     params: &TrendParams,
     signal_state: Arc<RwLock<LastSignalState>>,
+    signal_tx: &tokio::sync::mpsc::Sender<TradeSignal>,
 ) -> Result<Option<TradeSignal>> {
     let buffer = candle_buffer.read().await;
     
@@ -1046,8 +1094,9 @@ async fn generate_signal_from_candle(
             // Side-specific cooldown kontrolü
             let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
             let now = Utc::now();
-            let mut state = signal_state.write().await;
+            let state = signal_state.read().await;
             
+            // Cooldown kontrolü yap (ama henüz set etme)
             match side {
                 Side::Long => {
                     if let Some(last_time) = state.last_long_time {
@@ -1055,7 +1104,6 @@ async fn generate_signal_from_candle(
                             return Ok(None); // Long cooldown aktif
                         }
                     }
-                    state.last_long_time = Some(now);
                 }
                 Side::Short => {
                     if let Some(last_time) = state.last_short_time {
@@ -1063,10 +1111,11 @@ async fn generate_signal_from_candle(
                             return Ok(None); // Short cooldown aktif
                         }
                     }
-                    state.last_short_time = Some(now);
                 }
             }
+            drop(state); // Lock'u serbest bırak
 
+            // TradeSignal oluştur
             let trade_signal = TradeSignal {
                 id: Uuid::new_v4(),
                 symbol: symbol.to_string(),
@@ -1077,17 +1126,34 @@ async fn generate_signal_from_candle(
                 ts: signal.time,
             };
 
-            info!(
-                "TRENDING: generated {} signal for {} at price {:.2}",
-                match side {
-                    Side::Long => "LONG",
-                    Side::Short => "SHORT",
-                },
-                symbol,
-                signal.price
-            );
-
-            Ok(Some(trade_signal))
+            // Önce signal'i göndermeyi dene
+            match signal_tx.send(trade_signal.clone()).await {
+                Ok(_) => {
+                    // Başarılı, şimdi cooldown set et
+                    let mut state = signal_state.write().await;
+                    match side {
+                        Side::Long => state.last_long_time = Some(now),
+                        Side::Short => state.last_short_time = Some(now),
+                    }
+                    
+                    info!(
+                        "TRENDING: generated {} signal for {} at price {:.2}",
+                        match side {
+                            Side::Long => "LONG",
+                            Side::Short => "SHORT",
+                        },
+                        symbol,
+                        signal.price
+                    );
+                    
+                    Ok(Some(trade_signal))
+                }
+                Err(err) => {
+                    // Signal gönderilemedi, cooldown set etme
+                    warn!("TRENDING: failed to send signal: {err}, cooldown not set");
+                    Ok(None)
+                }
+            }
         }
         SignalSide::Flat => Ok(None),
     }
@@ -1104,6 +1170,7 @@ async fn generate_latest_signal(
     params: &TrendParams,
     signal_state: &mut LastSignalState,
     last_candle_time: &mut Option<chrono::DateTime<Utc>>,
+    signal_tx: &tokio::sync::mpsc::Sender<TradeSignal>,
 ) -> Result<Option<TradeSignal>> {
     // Kline verilerini çek
     let candles = match client.fetch_klines(symbol, kline_interval, kline_limit).await {
@@ -1171,6 +1238,7 @@ async fn generate_latest_signal(
             let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
             let now = Utc::now();
             
+            // Cooldown kontrolü yap (ama henüz set etme)
             match side {
                 Side::Long => {
                     if let Some(last_time) = signal_state.last_long_time {
@@ -1178,7 +1246,6 @@ async fn generate_latest_signal(
                             return Ok(None); // Long cooldown aktif
                         }
                     }
-                    signal_state.last_long_time = Some(now);
                 }
                 Side::Short => {
                     if let Some(last_time) = signal_state.last_short_time {
@@ -1186,7 +1253,6 @@ async fn generate_latest_signal(
                             return Ok(None); // Short cooldown aktif
                         }
                     }
-                    signal_state.last_short_time = Some(now);
                 }
             }
 
@@ -1208,17 +1274,33 @@ async fn generate_latest_signal(
                 ts: signal.time,
             };
 
-            info!(
-                "TRENDING: generated {} signal for {} at price {:.2}",
-                match side {
-                    Side::Long => "LONG",
-                    Side::Short => "SHORT",
-                },
-                symbol,
-                signal.price
-            );
-
-            Ok(Some(trade_signal))
+            // Önce signal'i göndermeyi dene
+            match signal_tx.send(trade_signal.clone()).await {
+                Ok(_) => {
+                    // Başarılı, şimdi cooldown set et
+                    match side {
+                        Side::Long => signal_state.last_long_time = Some(now),
+                        Side::Short => signal_state.last_short_time = Some(now),
+                    }
+                    
+                    info!(
+                        "TRENDING: generated {} signal for {} at price {:.2}",
+                        match side {
+                            Side::Long => "LONG",
+                            Side::Short => "SHORT",
+                        },
+                        symbol,
+                        signal.price
+                    );
+                    
+                    Ok(Some(trade_signal))
+                }
+                Err(err) => {
+                    // Signal gönderilemedi, cooldown set etme
+                    warn!("TRENDING: failed to send signal: {err}, cooldown not set");
+                    Ok(None)
+                }
+            }
         }
         SignalSide::Flat => Ok(None),
     }

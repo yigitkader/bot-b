@@ -71,6 +71,18 @@ fn evaluate_position(
     // To use ATR-based dynamic TP/SL, we need ATR value in MarketTick
     // Currently using fixed percentage-based TP/SL
     // Future enhancement: Calculate ATR from recent price movements or add to MarketTick
+    
+    // CRITICAL: Validate position size first
+    // Position size <= 0 means position is already closed or invalid (data corruption)
+    // TP/SL calculation should not proceed with invalid position size
+    if position.size <= f64::EPSILON {
+        warn!(
+            "FOLLOW_ORDERS: invalid position size {} for position {} (position already closed or corrupted)",
+            position.size, position.position_id
+        );
+        return None;
+    }
+
     // Validate entry price
     if position.entry_price <= 0.0 {
         warn!(

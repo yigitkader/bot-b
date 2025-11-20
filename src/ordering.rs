@@ -124,22 +124,59 @@ async fn handle_signal(
         }
     };
 
-    // Calculate quantity with leverage included
+    // CRITICAL: Calculate quantity using actual order price, not signal.entry_price
+    // The actual order price will be best_ask (LONG) or best_bid (SHORT) from depth snapshot
+    // Using signal.entry_price would cause notional mismatch
+    
+    // Fetch actual order price (same logic as send_order uses)
+    let order_price = match connection.calculate_order_price(&signal.symbol, &signal.side).await {
+        Ok(price) => price,
+        Err(err) => {
+            warn!(
+                "ORDERING: failed to calculate order price for {}: {err:?}, using signal.entry_price as fallback",
+                signal.symbol
+            );
+            signal.entry_price
+        }
+    };
+
+    // Calculate quantity with leverage included using actual order price
     // Notional = position_size * leverage (total position value)
     let notional = signal.size_usdt * signal.leverage;
-    let qty = (notional / signal.entry_price).abs();
+    let qty = (notional / order_price).abs();
     
     if qty <= 0.0 {
         warn!(
-            "ORDERING: invalid quantity computed from signal {} (size={}, leverage={}, price={})",
-            signal.id, signal.size_usdt, signal.leverage, signal.entry_price
+            "ORDERING: invalid quantity computed from signal {} (size={}, leverage={}, order_price={})",
+            signal.id, signal.size_usdt, signal.leverage, order_price
         );
         state.set_open_order(false);
         return;
     }
 
     // Round quantity to step size
-    let qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+    let mut qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+    
+    // Final check: verify rounded quantity with actual order price doesn't exceed notional limits
+    let final_notional = qty * order_price;
+    if final_notional > config.max_position_notional_usd {
+        warn!(
+            "ORDERING: final notional {} exceeds max {} after rounding (qty={}, price={}), reducing quantity",
+            final_notional, config.max_position_notional_usd, qty, order_price
+        );
+        // Reduce quantity to stay within notional limit
+        let max_qty = config.max_position_notional_usd / order_price;
+        qty = Connection::round_to_step_size(max_qty, symbol_info.step_size);
+        
+        if qty < symbol_info.min_quantity {
+            warn!(
+                "ORDERING: reduced quantity {} below minimum {} for symbol {}, ignoring signal {}",
+                qty, symbol_info.min_quantity, signal.symbol, signal.id
+            );
+            state.set_open_order(false);
+            return;
+        }
+    }
 
     // Check minimum quantity after rounding
     if qty < symbol_info.min_quantity {
@@ -169,19 +206,25 @@ async fn handle_signal(
         client_order_id: Some(signal.id.to_string()),
     };
 
+    // CRITICAL: Mark order as sent BEFORE API call to prevent race condition
+    // If OrderUpdate arrives very quickly (WebSocket), order_sent_at must already be set
+    // Otherwise timeout check will fail incorrectly
+    state.mark_order_sent();
+
     if let Err(err) = connection.send_order(order).await {
         warn!("ORDERING: send_order failed: {err:?}");
         // Order failed - reset state immediately
         state.set_open_order(false);
+        // Clear timestamp since order was not actually sent
+        state.clear_order_sent();
     } else {
         info!("ORDERING: open order submitted {}", signal.id);
-        // Mark that order was sent (for timeout tracking)
-        state.mark_order_sent();
         // Order successfully sent - state.has_open_order=true will remain until OrderUpdate event arrives
         // apply_order_update() will update the state based on order status:
         // - If order is Filled/Canceled/Rejected -> has_open_order=false
         // - If order is New/PartiallyFilled -> has_open_order=true
         // This ensures state synchronization with actual order status from Binance
+        // order_sent_at is already set above, so timeout tracking will work correctly
     }
 }
 
@@ -214,31 +257,24 @@ async fn handle_close_request(
         return;
     }
 
-    // Use position from state (updated via ACCOUNT_UPDATE WebSocket events)
-    // ACCOUNT_UPDATE events are real-time, so state should be up-to-date
-    // Only fetch from API if state position is missing or stale
-    let fresh_position = if state_position.size > 0.0 {
-        // State position is valid, use it (from WebSocket ACCOUNT_UPDATE)
-        state_position
-    } else {
-        // State position is zero or missing, try API fetch as fallback
-        // This handles edge cases where WebSocket event was missed
-        match connection.fetch_position(&state_position.symbol).await {
-            Ok(Some(pos)) => pos,
-            Ok(None) => {
-                warn!(
-                    "ORDERING: position {} already closed (fetched from API)",
-                    request.position_id
-                );
-                return;
-            }
-            Err(err) => {
-                warn!(
-                    "ORDERING: failed to fetch position from API for {}: {err:?}, cannot close position",
-                    request.position_id
-                );
-                return;
-            }
+    // Always fetch fresh position from API to get accurate leverage information
+    // WebSocket ACCOUNT_UPDATE events don't include leverage, so we need API data
+    // for correct PnL calculations (follow_orders.rs uses leverage)
+    let fresh_position = match connection.fetch_position(&state_position.symbol).await {
+        Ok(Some(pos)) => pos,
+        Ok(None) => {
+            warn!(
+                "ORDERING: position {} already closed (fetched from API)",
+                request.position_id
+            );
+            return;
+        }
+        Err(err) => {
+            warn!(
+                "ORDERING: failed to fetch position from API for {}: {err:?}, cannot close position",
+                request.position_id
+            );
+            return;
         }
     };
 
