@@ -24,3 +24,5 @@ pub use types::{
     Trade,
 };
 pub use symbol_scanner::{SymbolScanner, SymbolSelectionConfig};
+pub use metrics_cache::MetricsCache;
+pub use risk_manager::{RiskManager, RiskLimits};

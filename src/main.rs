@@ -6,8 +6,10 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 use trading_bot::{
     balance, config::BotConfig, follow_orders, logging, ordering, trending,
+    symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
+    metrics_cache::MetricsCache,
+    risk_manager::{RiskManager, RiskLimits},
 };
-use trading_bot::types::FileConfig;
 use trading_bot::{Connection, EventBus, SharedState};
 
 #[tokio::main]
@@ -28,7 +30,7 @@ async fn main() -> Result<()> {
 
     // Load event bus buffer sizes from config
     let file_cfg = trading_bot::types::FileConfig::load("config.yaml").unwrap_or_default();
-    let event_bus_cfg = file_cfg.event_bus.unwrap_or_default();
+    let event_bus_cfg = file_cfg.event_bus.as_ref().cloned().unwrap_or_default();
     
     // Optimized buffer sizes (defaults if not in config)
     let market_tick_buffer = event_bus_cfg.market_tick_buffer.unwrap_or(2000);
@@ -53,7 +55,7 @@ async fn main() -> Result<()> {
         balance_update_buffer,
     );
 
-    let trending_ch = bus.trending_channels();
+    // trending_ch will be created per symbol in the loop below
     let ordering_ch = bus.ordering_channels();
     let follow_ch = bus.follow_channels();
     let balance_ch = bus.balance_channels();
@@ -98,12 +100,17 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ✅ ADIM 6: Risk manager oluştur
+    let risk_limits = RiskLimits::from_config(config.max_position_notional_usd);
+    let risk_manager = Arc::new(RiskManager::new(risk_limits));
+
     {
         let conn = connection.clone();
         let state = shared_state.clone();
         let ch = ordering_ch;
+        let rm = risk_manager.clone();
         let handle = tokio::spawn(async move {
-            ordering::run_ordering(ch, state, conn).await;
+            ordering::run_ordering(ch, state, conn, Some(rm)).await;
         });
         task_infos.push(TaskInfo {
             name: "ordering".to_string(),
@@ -158,18 +165,166 @@ async fn main() -> Result<()> {
         });
     }
 
-    {
-        let ch = trending_ch;
-        let symbol = config.symbol.clone();
-        let trend_params = config.trend_params();
-        let ws_base_url = config.ws_base_url.clone();
-        let handle = tokio::spawn(async move {
-            trending::run_trending(ch, symbol, trend_params, ws_base_url).await;
+    // ✅ ADIM 4: Metrics cache oluştur ve background task başlat
+    // Cache update interval'i config'den oku (default: 300 = 5 dakika)
+    let cache_update_interval = file_cfg
+        .event_bus
+        .as_ref()
+        .and_then(|eb| eb.metrics_cache_update_interval_secs)
+        .unwrap_or(300);
+    let metrics_cache = Arc::new(MetricsCache::new(cache_update_interval));
+    
+    // ✅ ADIM 3: Multi-symbol scanner desteği
+    // Önce balance kontrolü yap - yeterli balance yoksa o quote için tarama yapma
+    
+    // Önce scanner config'i oluştur (min_balance_threshold için)
+    let temp_allowed_quotes = if file_cfg.allow_usdt_quote.unwrap_or(false) {
+        vec!["USDT".to_string(), "USDC".to_string()]
+    } else {
+        vec![file_cfg.quote_asset.clone().unwrap_or_else(|| "USDT".to_string())]
+    };
+    let temp_scanner_config = SymbolSelectionConfig::from_file_config(&file_cfg, temp_allowed_quotes);
+    let min_balance_threshold = temp_scanner_config.min_balance_threshold(&file_cfg);
+    
+    // Balance'ı fetch et (bot başlarken) - tek seferde hem USDT hem USDC
+    let (usdt_balance, usdc_balance) = match connection.fetch_balance().await {
+        Ok(balances) => {
+            let usdt = balances
+                .iter()
+                .find(|b| b.asset == "USDT")
+                .map(|b| b.free)
+                .unwrap_or(0.0);
+            let usdc = balances
+                .iter()
+                .find(|b| b.asset == "USDC")
+                .map(|b| b.free)
+                .unwrap_or(0.0);
+            (usdt, usdc)
+        }
+        Err(err) => {
+            warn!("SYMBOL_SCANNER: Failed to fetch balance: {}, assuming 0 for both", err);
+            (0.0, 0.0)
+        }
+    };
+    
+    info!(
+        "SYMBOL_SCANNER: Balance check - USDT: {:.2}, USDC: {:.2} (min threshold: {:.2})",
+        usdt_balance, usdc_balance, min_balance_threshold
+    );
+    
+    // Balance'a göre allowed_quotes'u filtrele
+    let mut allowed_quotes = Vec::new();
+    
+    if file_cfg.allow_usdt_quote.unwrap_or(false) {
+        // USDT balance yeterli mi?
+        if usdt_balance >= min_balance_threshold {
+            allowed_quotes.push("USDT".to_string());
+            info!("SYMBOL_SCANNER: USDT balance sufficient ({:.2}), including USDT symbols", usdt_balance);
+        } else {
+            warn!("SYMBOL_SCANNER: USDT balance insufficient ({:.2} < {:.2}), excluding USDT symbols", usdt_balance, min_balance_threshold);
+        }
+        
+        // USDC balance yeterli mi?
+        if usdc_balance >= min_balance_threshold {
+            allowed_quotes.push("USDC".to_string());
+            info!("SYMBOL_SCANNER: USDC balance sufficient ({:.2}), including USDC symbols", usdc_balance);
+        } else {
+            warn!("SYMBOL_SCANNER: USDC balance insufficient ({:.2} < {:.2}), excluding USDC symbols", usdc_balance, min_balance_threshold);
+        }
+    } else {
+        // Sadece config'teki quote_asset
+        let quote = file_cfg.quote_asset.clone().unwrap_or_else(|| "USDT".to_string());
+        let balance = if quote == "USDT" {
+            usdt_balance
+        } else if quote == "USDC" {
+            usdc_balance
+        } else {
+            0.0
+        };
+        
+        if balance >= min_balance_threshold {
+            allowed_quotes.push(quote.clone());
+            info!("SYMBOL_SCANNER: {} balance sufficient ({:.2}), including {} symbols", quote, balance, quote);
+        } else {
+            warn!("SYMBOL_SCANNER: {} balance insufficient ({:.2} < {:.2}), excluding {} symbols", quote, balance, min_balance_threshold, quote);
+            // Fallback: Eğer hiç balance yoksa, yine de tek symbol kullan (config.symbol)
+            allowed_quotes.push(quote);
+        }
+    }
+    
+    // Eğer hiç allowed_quotes yoksa, fallback olarak config.symbol kullan
+    if allowed_quotes.is_empty() {
+        warn!("SYMBOL_SCANNER: No sufficient balance for any quote asset, falling back to single symbol mode");
+        // allowed_quotes boş kalacak, scanner disabled olacak
+    }
+    
+    let scanner_config = SymbolSelectionConfig::from_file_config(
+        &file_cfg,
+        allowed_quotes,
+    );
+    
+    let scanner = Arc::new(SymbolScanner::new(scanner_config));
+    
+    // İlk symbol seçimini yap
+    let initial_symbols = if scanner.config.enabled {
+        match scanner.select_symbols().await {
+            Ok(symbols) => {
+                info!("SYMBOL_SCANNER: Selected {} symbols for trading", symbols.len());
+                symbols
+            }
+            Err(err) => {
+                warn!("SYMBOL_SCANNER: Failed to select symbols: {}, falling back to single symbol", err);
+                vec![config.symbol.clone()]
+            }
+        }
+    } else {
+        vec![config.symbol.clone()]
+    };
+    
+    // Cache'e symbol'leri set et
+    metrics_cache.set_symbols(initial_symbols.clone()).await;
+    
+    // Cache update task
+    let cache_for_update = metrics_cache.clone();
+    let cache_update_handle = tokio::spawn(async move {
+        cache_for_update.run_update_task().await;
+    });
+    task_infos.push(TaskInfo {
+        name: "metrics_cache".to_string(),
+        handle: Arc::new(tokio::sync::Mutex::new(Some(cache_update_handle))),
+    });
+    
+    // ✅ ADIM 3: Symbol scanner rotation task (eğer enabled ise)
+    if scanner.config.enabled {
+        let scanner_for_rotation = scanner.clone();
+        let rotation_handle = tokio::spawn(async move {
+            scanner_for_rotation.run_rotation_task().await;
         });
         task_infos.push(TaskInfo {
-            name: "trending".to_string(),
+            name: "symbol_scanner_rotation".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(rotation_handle))),
+        });
+    }
+
+    // ✅ ADIM 3: Her symbol için ayrı trending task spawn et
+    let trend_params = config.trend_params();
+    let ws_base_url = config.ws_base_url.clone();
+    
+    // Her symbol için ayrı trending channel oluştur (signal_tx shared, market_rx her biri için ayrı)
+    for symbol in initial_symbols.iter() {
+        let ch = bus.trending_channels(); // Her symbol için yeni channel (market_rx subscribe)
+        let symbol_clone = symbol.clone();
+        let trend_params_clone = trend_params.clone(); // Clone for each iteration
+        let ws_base_url_clone = ws_base_url.clone(); // Clone for each iteration
+        let cache = metrics_cache.clone();
+        let handle = tokio::spawn(async move {
+            trending::run_trending(ch, symbol_clone, trend_params_clone, ws_base_url_clone, Some(cache)).await;
+        });
+        task_infos.push(TaskInfo {
+            name: format!("trending_{}", symbol),
             handle: Arc::new(tokio::sync::Mutex::new(Some(handle))),
         });
+        info!("TRENDING: Started trending task for symbol {}", symbol);
     }
 
     // Health check task: monitor all tasks and log their status

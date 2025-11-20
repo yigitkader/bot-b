@@ -2947,6 +2947,7 @@ pub async fn run_trending(
     symbol: String,
     params: TrendParams,
     ws_base_url: String,
+    metrics_cache: Option<Arc<crate::metrics_cache::MetricsCache>>, // ✅ ADIM 4: Cache desteği
 ) {
     let client = FuturesClient::new();
     
@@ -3028,6 +3029,7 @@ pub async fn run_trending(
             params,
             kline_stream_signal_state,
             kline_stream_signal_tx,
+            metrics_cache, // ✅ ADIM 4: Cache'i geçir
         ).await;
     });
 
@@ -3046,6 +3048,7 @@ async fn run_kline_stream(
     params: TrendParams,
     signal_state: Arc<RwLock<LastSignalState>>,
     signal_tx: tokio::sync::mpsc::Sender<TradeSignal>,
+    metrics_cache: Option<Arc<crate::metrics_cache::MetricsCache>>, // ✅ ADIM 4: Cache desteği
 ) {
     let mut retry_delay = TokioDuration::from_secs(1);
     let ws_url = format!(
@@ -3088,6 +3091,7 @@ async fn run_kline_stream(
                                             &params,
                                             signal_state.clone(),
                                             &signal_tx,
+                                            metrics_cache.as_deref(), // ✅ ADIM 4: Cache'i geçir
                                         ).await {
                                             warn!("TRENDING: failed to generate signal: {err}");
                                         }
@@ -3119,6 +3123,7 @@ async fn run_kline_stream(
                                                 &params,
                                                 signal_state.clone(),
                                                 &signal_tx,
+                                                metrics_cache.as_deref(), // ✅ ADIM 4: Cache'i geçir
                                             ).await {
                                                 warn!("TRENDING: failed to generate signal: {err}");
                                             }
@@ -3180,6 +3185,7 @@ async fn generate_signal_from_candle(
     params: &TrendParams,
     signal_state: Arc<RwLock<LastSignalState>>,
     signal_tx: &tokio::sync::mpsc::Sender<TradeSignal>,
+    metrics_cache: Option<&crate::metrics_cache::MetricsCache>, // ✅ ADIM 4: Cache desteği
 ) -> Result<Option<TradeSignal>> {
     let buffer = candle_buffer.read().await;
     
@@ -3187,10 +3193,20 @@ async fn generate_signal_from_candle(
         return Ok(None); // Henüz yeterli veri yok
     }
 
-    // Funding, OI, Long/Short ratio verilerini çek (REST API - daha az sıklıkla)
-    let funding = client.fetch_funding_rates(symbol, 100).await?;
-    let oi_hist = client.fetch_open_interest_hist(symbol, futures_period, buffer.len() as u32).await?;
-    let lsr_hist = client.fetch_top_long_short_ratio(symbol, futures_period, buffer.len() as u32).await?;
+    // ✅ ADIM 4: Cache'ten oku, yoksa REST API'den çek (fallback)
+    let (funding, oi_hist, lsr_hist) = if let Some(cache) = metrics_cache {
+        // Cache'ten oku
+        let funding = cache.get_funding_rates(symbol, 100).await?;
+        let oi_hist = cache.get_open_interest_hist(symbol, futures_period, buffer.len() as u32).await?;
+        let lsr_hist = cache.get_top_long_short_ratio(symbol, futures_period, buffer.len() as u32).await?;
+        (funding, oi_hist, lsr_hist)
+    } else {
+        // Fallback: REST API'den çek (cache yoksa)
+        let funding = client.fetch_funding_rates(symbol, 100).await?;
+        let oi_hist = client.fetch_open_interest_hist(symbol, futures_period, buffer.len() as u32).await?;
+        let lsr_hist = client.fetch_top_long_short_ratio(symbol, futures_period, buffer.len() as u32).await?;
+        (funding, oi_hist, lsr_hist)
+    };
 
     // Signal context'leri oluştur
     let (matched_candles, contexts) = build_signal_contexts(&buffer, &funding, &oi_hist, &lsr_hist);

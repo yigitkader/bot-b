@@ -1,5 +1,6 @@
 use crate::types::{Connection, NewOrderRequest, OrderingChannels, SharedState};
-use crate::types::{CloseRequest, Side, TradeSignal};
+use crate::types::{CloseRequest, PositionUpdate, Side, TradeSignal};
+use crate::risk_manager::{RiskManager, RiskLimits};
 use log::{info, warn};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -8,6 +9,7 @@ pub async fn run_ordering(
     mut ch: OrderingChannels,
     state: SharedState,
     connection: Arc<Connection>,
+    risk_manager: Option<Arc<RiskManager>>, // ✅ ADIM 6: Risk manager desteği
 ) {
     let order_lock = Arc::new(Mutex::new(()));
     let mut order_update_rx = ch.order_update_rx;
@@ -30,7 +32,7 @@ pub async fn run_ordering(
     loop {
         tokio::select! {
             Some(signal) = ch.signal_rx.recv() => {
-                handle_signal(signal, &state, order_lock.clone(), connection.clone()).await;
+                handle_signal(signal, &state, order_lock.clone(), connection.clone(), risk_manager.as_deref()).await;
             },
             Some(request) = ch.close_rx.recv() => {
                 handle_close_request(request, &state, order_lock.clone(), connection.clone()).await;
@@ -41,7 +43,13 @@ pub async fn run_ordering(
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             res = position_update_rx.recv() => match res {
-                Ok(update) => state.apply_position_update(&update),
+                Ok(update) => {
+                    state.apply_position_update(&update);
+                    // ✅ ADIM 6: Risk manager'a position update'i bildir
+                    if let Some(rm) = &risk_manager {
+                        rm.update_position(&update).await;
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -56,6 +64,7 @@ async fn handle_signal(
     state: &SharedState,
     lock: Arc<Mutex<()>>,
     connection: Arc<Connection>,
+    risk_manager: Option<&RiskManager>, // ✅ ADIM 6: Risk manager desteği
 ) {
     if state.has_open_position() || state.has_open_order() {
         warn!(
@@ -144,6 +153,26 @@ async fn handle_signal(
     // Notional = position_size * leverage (total position value)
     let notional = signal.size_usdt * signal.leverage;
     let qty = (notional / order_price).abs();
+    
+    // ✅ ADIM 6: Risk manager kontrolü (portföy bazlı limitler) - qty hesaplandıktan sonra
+    if let Some(rm) = risk_manager {
+        let (allowed, reason) = rm.can_open_position(
+            &signal.symbol,
+            signal.side,
+            order_price, // Gerçek order price kullan
+            qty,
+            signal.leverage,
+        ).await;
+        
+        if !allowed {
+            warn!(
+                "ORDERING: risk manager blocked signal {}: {}",
+                signal.id, reason
+            );
+            state.set_open_order(false);
+            return;
+        }
+    }
     
     if qty <= 0.0 {
         warn!(

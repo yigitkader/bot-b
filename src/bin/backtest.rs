@@ -53,6 +53,14 @@ async fn main() -> Result<()> {
         min_holding_bars: 3, // Minimum holding time (3 bars = 15 minutes @5m)
                              // Çok kısa trade'leri filtrele
                              // Recommended: 3-6 bars (15-30 minutes @5m)
+        // ✅ ADIM 2: Config.yaml parametreleri (default değerler)
+        hft_mode: false,
+        base_min_score: 6.5,
+        trend_threshold_hft: 0.5,
+        trend_threshold_normal: 0.6,
+        weak_trend_score_multiplier: 1.15,
+        regime_multiplier_trending: 0.9,
+        regime_multiplier_ranging: 1.15,
     };
 
     println!("===== BACKTEST BAŞLIYOR =====");

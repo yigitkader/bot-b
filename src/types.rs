@@ -131,12 +131,16 @@ pub struct TrendParams {
 }
 
 // fallback for warmup default referencing EMA slow period
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct FileConfig {
     #[serde(default)]
     pub symbols: Vec<String>,
     #[serde(default)]
     pub quote_asset: Option<String>,
+    #[serde(default)]
+    pub auto_discover_quote: Option<bool>,
+    #[serde(default)]
+    pub allow_usdt_quote: Option<bool>,
     #[serde(default)]
     pub leverage: Option<f64>,
     #[serde(default)]
@@ -161,7 +165,7 @@ pub struct FileConfig {
     pub dynamic_symbol_selection: Option<FileDynamicSymbolSelection>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(crate) struct FileDynamicSymbolSelection {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -183,9 +187,11 @@ pub(crate) struct FileDynamicSymbolSelection {
     pub trades_weight: Option<f64>,
     #[serde(default)]
     pub spread_weight: Option<f64>,
+    #[serde(default)]
+    pub min_balance_threshold: Option<f64>, // Minimum balance (USDT/USDC) required to scan symbols
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(crate) struct FileRisk {
     #[serde(default)]
     pub use_isolated_margin: Option<bool>,
@@ -195,7 +201,7 @@ pub(crate) struct FileRisk {
     pub liq_window_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(crate) struct FileBinance {
     #[serde(default)]
     pub futures_base: Option<String>,
@@ -207,7 +213,7 @@ pub(crate) struct FileBinance {
     pub recv_window_ms: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(crate) struct FileTrending {
     #[serde(default)]
     pub rsi_lower_long: Option<f64>,
@@ -246,7 +252,7 @@ pub(crate) struct FileTrending {
     pub regime_multiplier_ranging: Option<f64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct FileEventBus {
     #[serde(default)]
     pub market_tick_buffer: Option<usize>,
@@ -260,6 +266,8 @@ pub struct FileEventBus {
     pub position_update_buffer: Option<usize>,
     #[serde(default)]
     pub balance_update_buffer: Option<usize>,
+    #[serde(default)]
+    pub metrics_cache_update_interval_secs: Option<u64>, // Metrics cache update interval (default: 300 = 5 minutes)
 }
 
 

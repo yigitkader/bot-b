@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
         atr_stop_loss_multiplier: 3.0,
         atr_take_profit_multiplier: 4.0,
         min_holding_bars: 3,
-        // ✅ ADIM 2: Config parametreleri
+        // ✅ ADIM 2: Config parametreleri (default değerler)
         hft_mode: false,
         base_min_score: 6.5,
         trend_threshold_hft: 0.5,
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
 
     let mut success_count = 0;
     let mut error_count = 0;
-    let mut total_start = Utc::now();
+    let total_start = Utc::now();
 
     // Her symbol için backtest çalıştır
     for (idx, symbol) in selected_symbols.iter().enumerate() {

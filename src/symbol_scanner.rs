@@ -7,7 +7,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use log::{info, warn};
 
 use crate::types::FuturesClient;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ pub struct SymbolSelectionConfig {
 
 pub struct SymbolScanner {
     client: FuturesClient,
-    config: SymbolSelectionConfig,
+    pub config: SymbolSelectionConfig, // Public for access in main.rs
     selected_symbols: Arc<RwLock<Vec<String>>>,
     last_update: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
@@ -406,6 +406,15 @@ impl SymbolSelectionConfig {
                 .unwrap_or(1.0),
             allowed_quotes,
         }
+    }
+    
+    /// Get minimum balance threshold from config
+    pub fn min_balance_threshold(&self, file_cfg: &crate::types::FileConfig) -> f64 {
+        file_cfg
+            .dynamic_symbol_selection
+            .as_ref()
+            .and_then(|s| s.min_balance_threshold)
+            .unwrap_or(10.0) // Default: 10 USD
     }
 }
 
