@@ -29,9 +29,12 @@ pub async fn run_ordering(
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            // Check if order was sent but no update received within 30 seconds
-            if state_for_timeout.check_order_timeout(30) {
-                warn!("ORDERING: order timeout detected - no OrderUpdate received within 30s, resetting state");
+            // ✅ FIX: Reduced timeout from 30s to 10s for post_only orders
+            // In fast markets, 30 seconds is too long - market can reverse significantly
+            // If order doesn't fill within 10s, cancel and re-evaluate (better than waiting)
+            // post_only orders should fill quickly or not at all
+            if state_for_timeout.check_order_timeout(10) {
+                warn!("ORDERING: order timeout detected - no OrderUpdate received within 10s, resetting state");
                 state_for_timeout.set_open_order(false);
             }
         }

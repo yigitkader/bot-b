@@ -594,10 +594,13 @@ impl MultiTimeframeAnalysis {
         let mut total_weight = 0.0;
 
         // Base timeframe weights (longer = more important)
+        // ✅ FIX: M1 (1-minute) timeframe removed or heavily reduced - too noisy for crypto
+        // 1-minute charts produce too many false signals in crypto markets
+        // 5m and 15m combination is more stable and reliable
         let base_weights = vec![
-            (Timeframe::M1, 0.1),
-            (Timeframe::M5, 0.2),
-            (Timeframe::M15, 0.25),
+            (Timeframe::M1, 0.0),   // ✅ FIX: Reduced to 0.0 - 1m timeframe too noisy for crypto
+            (Timeframe::M5, 0.25),  // Increased from 0.2 to compensate for M1 removal
+            (Timeframe::M15, 0.3),  // Increased from 0.25 - more reliable than M1
             (Timeframe::H1, 0.3),
             (Timeframe::H4, 0.15),
         ];
@@ -607,22 +610,24 @@ impl MultiTimeframeAnalysis {
         // Low volatility (ATR < 1%) → use base weights
         let volatility_multiplier = if let Some(atr) = atr_pct {
             if atr > 0.02 {
-                // High volatility: reduce M1/M5, increase H1/H4
+                // High volatility: reduce short-term, increase H1/H4
+                // ✅ FIX: M1 removed (0.0) - too noisy in high volatility
                 vec![
-                    (Timeframe::M1, 0.05),   // Reduced from 0.1
-                    (Timeframe::M5, 0.1),    // Reduced from 0.2
+                    (Timeframe::M1, 0.0),   // ✅ FIX: Removed - too noisy
+                    (Timeframe::M5, 0.15),   // Reduced from 0.1 (was 0.2 in base)
                     (Timeframe::M15, 0.25), // Same
                     (Timeframe::H1, 0.4),   // Increased from 0.3
                     (Timeframe::H4, 0.2),   // Increased from 0.15
                 ]
             } else if atr < 0.01 {
-                // Low volatility: can use more short-term signals
+                // Low volatility: can use more short-term signals (but still avoid M1)
+                // ✅ FIX: M1 still removed even in low volatility - 1m charts are unreliable
                 vec![
-                    (Timeframe::M1, 0.15),  // Increased from 0.1
-                    (Timeframe::M5, 0.25),  // Increased from 0.2
-                    (Timeframe::M15, 0.25), // Same
+                    (Timeframe::M1, 0.0),   // ✅ FIX: Removed - too noisy even in low vol
+                    (Timeframe::M5, 0.3),   // Increased from 0.25 to compensate
+                    (Timeframe::M15, 0.3),  // Increased from 0.25
                     (Timeframe::H1, 0.25),  // Reduced from 0.3
-                    (Timeframe::H4, 0.1),   // Reduced from 0.15
+                    (Timeframe::H4, 0.15),  // Slightly increased from 0.1
                 ]
             } else {
                 // Normal volatility: use base weights
@@ -1815,7 +1820,10 @@ fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> Multi
     match base_interval_minutes {
         1 => {
             // Base is 1m: Calculate 1m, 5m, 15m, 1h
-            // 1-minute: Use current context directly
+            // ⚠️ NOTE: M1 timeframe is calculated but has weight 0.0 in confluence calculation
+            // M1 (1-minute) charts are too noisy for crypto - produces many false signals
+            // 5m and 15m combination is more stable and reliable
+            // 1-minute: Use current context directly (kept for completeness, but not used in signals)
             let trend_1m = classify_trend(current_ctx);
             let strength_1m = (current_ctx.rsi / 100.0).min(1.0).max(0.0);
             mtf.add_timeframe(
@@ -1955,6 +1963,7 @@ fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> Multi
         _ => {
             // Unknown base interval: Use current context for all timeframes
             // This is a fallback for edge cases
+            // ⚠️ NOTE: M1 timeframe added but has weight 0.0 in confluence calculation
             let trend = classify_trend(current_ctx);
             let strength = (current_ctx.rsi / 100.0).min(1.0).max(0.0);
             let signal = TimeframeSignal {
@@ -1964,7 +1973,7 @@ fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> Multi
                 ema_slow: current_ctx.ema_slow,
                 strength,
             };
-            mtf.add_timeframe(Timeframe::M1, signal.clone());
+            mtf.add_timeframe(Timeframe::M1, signal.clone()); // Weight 0.0 - not used in signals
             mtf.add_timeframe(Timeframe::M5, signal.clone());
             mtf.add_timeframe(Timeframe::M15, signal.clone());
             mtf.add_timeframe(Timeframe::H1, signal);
@@ -2032,8 +2041,24 @@ fn create_orderflow_from_real_depth(
     Some(orderflow)
 }
 
-/// ✅ CRITICAL FIX: Realistic depth estimation for backtest
-/// Uses volume, price action, OBI, and market microstructure patterns
+/// ⚠️ CRITICAL WARNING: This function generates SIMULATED depth data for backtest
+/// ⚠️ This is NOT real orderbook data - it's a mathematical estimate based on volume
+/// ⚠️ Backtest results using Order Flow strategies will be MISLEADING/OPTIMISTIC
+/// 
+/// Real Order Flow strategies (Spoofing, Iceberg, Absorption detection) require:
+/// - Real tick-by-tick orderbook snapshots from Binance
+/// - Real depth data (bid/ask levels with actual quantities)
+/// 
+/// This function estimates depth from candle volume, which is NOT sufficient for:
+/// - Detecting real spoofing (fake large orders that disappear)
+/// - Detecting real iceberg orders (hidden large orders)
+/// - Detecting real absorption (large orders being eaten)
+/// 
+/// ⚠️ RECOMMENDATION: 
+/// - For accurate backtest: Download real tick/orderbook data from Binance
+/// - OR: Ignore Order Flow strategy profits in backtest results (they're simulated)
+/// - OR: Disable Order Flow in backtest (set enable_order_flow: false)
+/// 
 /// Based on empirical observations:
 /// - Depth typically 10-50% of daily volume (scaled to candle timeframe)
 /// - OBI imbalance affects bid/ask depth distribution
@@ -2326,7 +2351,12 @@ fn generate_signal_enhanced(
     }
     
     // === PRIORITY #2: FUNDING ARBITRAGE (En Karlı - 8 Saatte Bir Garantili Hareket) ===
-    // 8 saatte bir %0.01-0.1 garantili hareket - Risk yok, saf math
+    // ⚠️ CRITICAL WARNING: Funding arbitrage relies on 8-hour funding windows (00:00, 08:00, 16:00 UTC)
+    // ⚠️ This may be INSUFFICIENT - market can move significantly between funding windows
+    // ⚠️ Funding arbitrage is NOT risk-free - price can move against you before funding payment
+    // ⚠️ Recommendation: Use funding arbitrage as ONE signal among many, not the only strategy
+    // 
+    // 8 saatte bir %0.01-0.1 hareket - ⚠️ NOT guaranteed, there IS risk
     // ⚠️ CRITICAL RISK: Funding arbitrage sadece funding rate'e bakarak işlem açmak tehlikelidir
     // Güçlü trend varsa funding arbitrage sinyallerini filtrelemeliyiz
     // ✅ CRITICAL FIX: Add trend confirmation to prevent trading against strong trends
@@ -2656,13 +2686,18 @@ fn generate_signal_enhanced(
         }
 
         // Check confluence score (risk management - filter low quality signals)
+        // ✅ ACTION PLAN: Multi-Timeframe Confluence - focus on 75%+ alignment
+        // When 5m, 15m, and 1h trends align in same direction, it's the safest entry method
         // ✅ FIX: Pass ATR percentage for dynamic timeframe weights (TrendPlan.md)
         let atr_pct = Some(ctx.atr / candle.close);
         let confluence = mtf_analysis.calculate_confluence(base_signal.side, atr_pct);
 
         // 🚨 Low confluence = cancel signal (risk management)
-        if confluence < 0.4 {
-            // ✅ FIX: Lower threshold (0.4 instead of 0.5) - more lenient
+        // ✅ ACTION PLAN: Require 75%+ alignment for safe trading
+        // This ensures 5m, 15m, and 1h timeframes agree before entering trade
+        if confluence < 0.75 {
+            // ✅ ACTION PLAN: Increased threshold from 0.4 to 0.75 (75% alignment required)
+            // This is the safest method: only trade when multiple timeframes agree
             return Signal {
                 time: candle.close_time,
                 price: candle.close,
@@ -3382,9 +3417,17 @@ pub fn run_backtest_on_series(
     
     if cfg.enable_order_flow {
         log::warn!(
-            "BACKTEST: ⚠️ Order Flow enabled but requires real depth data. \
-            Current backtest uses ESTIMATED depth (not real orderbook snapshots). \
-            For accurate Order Flow testing, provide real orderbook snapshot data."
+            "BACKTEST: ⚠️⚠️⚠️ CRITICAL WARNING: Order Flow enabled but uses SIMULATED depth data. \
+            Current backtest uses estimate_realistic_depth() which generates FAKE orderbook data. \
+            Order Flow strategies (Spoofing, Iceberg, Absorption) will show profits in backtest, \
+            BUT these profits are from SIMULATED data, NOT real orderbook snapshots. \
+            \
+            ⚠️ RECOMMENDATION: \
+            - Ignore Order Flow strategy profits in backtest results (they're misleading) \
+            - OR: Download real tick/orderbook data from Binance for accurate backtest \
+            - OR: Disable Order Flow in backtest (set enable_order_flow: false) \
+            \
+            Real Order Flow requires actual orderbook snapshots with bid/ask levels and quantities."
         );
     }
     
@@ -3569,10 +3612,13 @@ pub fn run_backtest_on_series(
             Some((1.0 / ctx.long_short_ratio.max(0.1)).min(3.0).max(0.5))
         };
         
-        // 4. ✅ CRITICAL FIX: Realistic depth estimation for Order Flow analysis
-        // Uses volume, price action, OBI, and market microstructure patterns
-        // This enables Order Flow strategies (Spoofing, Iceberg, Absorption) in backtest
+        // 4. ⚠️ CRITICAL WARNING: Order Flow depth estimation for backtest
+        // ⚠️ This uses SIMULATED depth data (estimate_realistic_depth) - NOT real orderbook data
+        // ⚠️ Backtest results with Order Flow strategies will be MISLEADING/OPTIMISTIC
+        // ⚠️ Real Order Flow requires actual tick/orderbook snapshots from Binance
+        // ⚠️ Recommendation: Disable Order Flow in backtest OR ignore Order Flow profits in results
         let (bid_depth_usd, ask_depth_usd) = if cfg.enable_order_flow {
+            // ⚠️ WARNING: This is simulated data, not real orderbook depth
             estimate_realistic_depth(c, ctx, obi, candles, i)
         } else {
             (None, None)
@@ -3602,10 +3648,15 @@ pub fn run_backtest_on_series(
             None
         };
 
-        // OrderFlow Analyzer - ✅ CRITICAL FIX: Now enabled with realistic depth estimation
+        // OrderFlow Analyzer - ⚠️ CRITICAL WARNING: Uses SIMULATED depth data in backtest
+        // ⚠️ Order Flow strategies (Spoofing, Iceberg, Absorption) will show profits in backtest
+        // ⚠️ BUT these profits are from SIMULATED data, not real orderbook snapshots
+        // ⚠️ Real Order Flow requires actual tick/orderbook data from Binance
+        // ⚠️ Recommendation: Ignore Order Flow strategy profits in backtest results
         let orderflow_analyzer: Option<OrderFlowAnalyzer> = if cfg.enable_order_flow {
             if let (Some(bid_depth), Some(ask_depth)) = (bid_depth_usd, ask_depth_usd) {
-                // Realistic depth data available - create OrderFlow analyzer
+                // ⚠️ WARNING: Using SIMULATED depth data (estimate_realistic_depth)
+                // This is NOT real orderbook data - backtest results will be optimistic
                 create_orderflow_from_real_depth(&market_tick, &candles[..=i], bid_depth, ask_depth)
             } else {
                 // Depth estimation failed - skip Order Flow

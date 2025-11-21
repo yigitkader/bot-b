@@ -1,5 +1,11 @@
 // ✅ ADIM 5: Backtest script - 100 coin için seri çalıştırma (TrendPlan.md)
 // ✅ ENHANCED: Individual reports + Top 10 optimization
+// 
+// ⚠️ CRITICAL WARNING: Top 10 Coin Optimization has HIGH overfitting risk
+// - Coins selected based on PAST performance (historical backtest)
+// - Optimized config may not work in future
+// - Always use Walk-Forward Analysis and Out-of-Sample Testing
+// - Past performance does NOT guarantee future results
 
 use anyhow::Result;
 use chrono::Utc;
@@ -314,8 +320,26 @@ async fn main() -> Result<()> {
     println!();
 
     // ✅ NEW: Identify Top 10 coins by total PnL
+    // ⚠️⚠️⚠️ CRITICAL OVERFITTING WARNING ⚠️⚠️⚠️
+    // This "Top 10 Coin Optimization" has HIGH overfitting risk:
+    // 1. Coins are selected based on PAST performance (historical backtest results)
+    // 2. Optimized config is applied to coins that already performed well
+    // 3. Settings that worked in the past may NOT work in the future
+    // 
+    // ⚠️ RECOMMENDATIONS to reduce overfitting:
+    // - Use Walk-Forward Analysis: Split data into train/test periods
+    // - Use Out-of-Sample Testing: Test on data NOT used for optimization
+    // - Use Cross-Validation: Test on multiple time periods
+    // - Be conservative: Don't assume past winners will continue winning
+    // - Monitor live performance closely and be ready to adjust
+    //
+    // ⚠️ The "Top 10" coins are selected from HISTORICAL data only.
+    // Market conditions change - what worked yesterday may fail tomorrow.
     if all_results.len() >= 10 {
         println!("===== TOP 10 COIN IDENTIFICATION =====");
+        println!("⚠️  OVERFITTING WARNING: Top 10 selection based on PAST performance only.");
+        println!("⚠️  These coins performed well in historical backtest - future may differ.");
+        println!();
         all_results.sort_by(|a, b| {
             b.1.total_pnl_pct
                 .partial_cmp(&a.1.total_pnl_pct)
@@ -339,6 +363,16 @@ async fn main() -> Result<()> {
         
         println!();
         println!("===== TOP 10 COIN OPTIMIZED BACKTEST =====");
+        println!("⚠️⚠️⚠️  CRITICAL OVERFITTING WARNING  ⚠️⚠️⚠️");
+        println!("This optimized backtest uses:");
+        println!("  1. Coins selected from PAST performance (may not work in future)");
+        println!("  2. Optimized config tuned for these specific coins (overfitting risk)");
+        println!("  3. Same historical period (no out-of-sample testing)");
+        println!();
+        println!("⚠️  RECOMMENDATION: Use these results with EXTREME CAUTION.");
+        println!("⚠️  Past performance does NOT guarantee future results.");
+        println!("⚠️  Always test on out-of-sample data before live trading.");
+        println!();
         println!("Running optimized backtest with enhanced scoring enabled...");
         println!();
         
@@ -444,6 +478,10 @@ async fn main() -> Result<()> {
         // ✅ NEW: Summary report
         println!();
         println!("===== SUMMARY REPORT =====");
+        println!("⚠️  OVERFITTING WARNING: These results are from optimized backtest.");
+        println!("⚠️  Coins and config were selected/tuned based on PAST data.");
+        println!("⚠️  Future performance may differ significantly.");
+        println!();
         println!("Top 10 Coins (Optimized):");
         optimized_results.sort_by(|a, b| {
             b.1.total_pnl_pct
@@ -466,6 +504,13 @@ async fn main() -> Result<()> {
         
         println!();
         println!("Optimized results saved to: {}", optimized_output_file);
+        println!();
+        println!("===== FINAL OVERFITTING WARNING =====");
+        println!("⚠️  These optimized results are from HISTORICAL backtest only.");
+        println!("⚠️  Market conditions change - past winners may become future losers.");
+        println!("⚠️  Always validate on out-of-sample data before live trading.");
+        println!("⚠️  Monitor live performance closely and be ready to adjust strategy.");
+        println!();
     }
     
     println!();

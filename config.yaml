@@ -1,4 +1,14 @@
 # Trading Bot Configuration - Clean Architecture
+# ✅ ACTION PLAN: Safe Mode Configuration for Profitability
+# 
+# Strategy Focus:
+# - Multi-Timeframe Confluence (MTF): Primary strategy - requires 75%+ alignment (5m, 15m, 1h)
+# - Enhanced Signal Scoring: Enabled - superior to individual indicators
+# - Order Flow: Disabled until real orderbook data available
+# - Risk Management: Conservative leverage (10x), auto-close on WebSocket disconnect
+#
+# Paper Trading: Test with virtual money for 1 week before going live
+# Analyze logs/paper_trading_orders.log for slippage and latency effects
 
 symbols: []
 auto_discover_quote: true
@@ -13,7 +23,7 @@ max_margin_usd: 100.0
 margin_strategy: "balance_based"
 min_quote_balance_usd: 20.0
 
-leverage: 125
+leverage: 10  # ✅ ACTION PLAN: Safe mode - 10x leverage. Conservative approach for profitability. If algorithm is successful, it will profit with lower leverage.
 
 price_tick: 0.001
 qty_step: 0.001
@@ -30,7 +40,7 @@ trending:
   min_spread_bps: 0.01
   max_spread_bps: 200.0
   signal_cooldown_seconds: 12
-  hft_mode: true  # ⚠️ ACTION PLAN: HFT mode requires co-location near exchange. Without it, commissions and latency usually cause losses.
+  hft_mode: false  # ✅ FIX: Disabled HFT mode. HFT requires co-location (physical proximity to Binance servers). With home internet or standard VPS, latency causes losses. Use trend_threshold_normal strategy instead.
   require_volume_confirmation: false
   base_min_score: 6.5
   trend_threshold_hft: 0.5
@@ -48,12 +58,11 @@ trending:
   enhanced_score_good: 55.0        # 55-69: Good signal (take it)
   enhanced_score_marginal: 40.0    # 40-54: Marginal signal (skip)
   # Order Flow Analysis (TrendPlan.md - Action Plan)
-  enable_order_flow: true  # Enable Order Flow analysis (requires real depth data)
-  # Set to false for backtest consistency when depth data is not available
+  enable_order_flow: false  # ✅ ACTION PLAN: Disabled until real orderbook data stream is available. Backtest uses SIMULATED data which is misleading. Focus on MTF Confluence strategy instead.
   # Execution & Backtest Parameters (no hardcoded values)
   fee_bps_round_trip: 10.0  # ✅ ACTION PLAN: Round-trip fee in basis points (10.0 = 0.10%) - Binance VIP 0 realistic. Minimum 10.0 recommended for realistic backtest results, especially with HFT mode.
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
-  slippage_bps: 0.0  # Slippage in basis points (0.0 = optimistic backtest, use 5-10 for realistic)
+  slippage_bps: 5.0  # ✅ FIX: Changed from 0.0 to 5.0 (0.05%). Zero slippage makes backtest results overly optimistic (fake). Real markets always have slippage. Minimum 5.0 recommended for realistic backtest.
   min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)
   # Signal Quality Filtering (configurable)
   min_volume_ratio: 1.5  # Minimum volume ratio vs 20-bar average
@@ -69,7 +78,7 @@ binance:
   hedge_mode: false
 
 risk:
-  max_leverage: 200
+  max_leverage: 20  # ✅ FIX: Reduced from 200x to 20x (safe maximum). Matches the safe leverage range (10x-20x).
   use_isolated_margin: true
   max_position_notional_usd: 30000.0
   maker_commission_pct: 0.02
@@ -84,11 +93,16 @@ risk:
   max_correlated_positions: 5  # Max correlated positions in same direction
   max_correlated_notional_pct: 0.5  # Max % of total notional in correlated positions (0.5 = 50%)
   max_position_per_symbol_pct: 0.3  # Max % of total notional per symbol (0.3 = 30%)
-  correlation_cache_update_interval_secs: 60  # Correlation cache update interval
-  correlation_cache_retention_minutes: 5  # Correlation cache retention time
+  correlation_cache_update_interval_secs: 600  # ✅ FIX: Increased from 60s to 600s (10 minutes). Reduces CPU load when tracking 100+ coins. Correlation doesn't change rapidly.
+  correlation_cache_retention_minutes: 10  # ✅ FIX: Increased from 5 to 10 minutes. Longer retention reduces recalculation overhead.
   max_daily_drawdown_pct: 0.05  # Max daily drawdown (0.05 = 5%)
   max_weekly_drawdown_pct: 0.10  # Max weekly drawdown (0.10 = 10%)
   risk_per_trade_pct: 0.01  # Risk per trade as % of equity (0.01 = 1%)
+  # ✅ ACTION PLAN: WebSocket Disconnection Strategy
+  # If WebSocket disconnects for more than timeout_secs, close all positions for safety
+  # This prevents trading with stale data which can cause significant losses
+  ws_disconnect_close_positions: true  # ✅ ACTION PLAN: Enable auto-close on WebSocket disconnect
+  ws_disconnect_timeout_secs: 30  # Close positions if WebSocket disconnected for 30+ seconds
 
 websocket:
   enabled: true
@@ -148,3 +162,10 @@ dynamic_symbol_selection:
   # If balance < min_balance_threshold, symbols with that quote will be excluded
   # Default: 10.0 USD
   min_balance_threshold: 10.0
+
+# ✅ ACTION PLAN: Paper Trading Mode
+# Test bot with real market data but virtual money before going live
+# Run for 1 week and analyze logs/paper_trading_orders.log for slippage and latency effects
+paper_trading:
+  enabled: false  # ✅ ACTION PLAN: Set to true for paper trading mode (virtual orders, real data)
+  log_file: "logs/paper_trading_orders.log"  # Log file for virtual orders (analyze slippage/latency)
