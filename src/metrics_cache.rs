@@ -205,14 +205,32 @@ impl MetricsCache {
     ) -> Result<Vec<LongShortRatioPoint>> {
         // Return cached LSR as a single-item vector
         if let Some(lsr) = self.get_long_short_ratio(symbol).await {
-            Ok(vec![LongShortRatioPoint {
-                timestamp: Utc::now(),
-                long_short_ratio: lsr,
-                long_account_pct: 0.0,  // Not cached, use placeholder
-                short_account_pct: 0.0, // Not cached, use placeholder
-            }])
+            // Cache only stores ratio, not account percentages
+            // Fetch from API to get complete data
+            match self.client
+                .fetch_top_long_short_ratio(symbol, period, _limit)
+                .await
+            {
+                Ok(mut points) => {
+                    // Update with cached ratio if available
+                    if let Some(last_point) = points.last_mut() {
+                        last_point.long_short_ratio = lsr;
+                    }
+                    Ok(points)
+                }
+                Err(_) => {
+                    // If API fails, return cached ratio with neutral account percentages
+                    // This is a fallback, but we prefer real API data
+                    Ok(vec![LongShortRatioPoint {
+                        timestamp: Utc::now(),
+                        long_short_ratio: lsr,
+                        long_account_pct: 50.0, // Neutral fallback (not from cache)
+                        short_account_pct: 50.0, // Neutral fallback (not from cache)
+                    }])
+                }
+            }
         } else {
-            // Fallback: fetch from API if cache miss
+            // No cache - fetch from API
             self.client
                 .fetch_top_long_short_ratio(symbol, period, _limit)
                 .await

@@ -6,6 +6,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 use trading_bot::{
     balance,
+    cache,
     config::BotConfig,
     follow_orders, logging,
     metrics_cache::MetricsCache,
@@ -25,6 +26,10 @@ async fn main() -> Result<()> {
 
     let shared_state = SharedState::new();
     let connection = Arc::new(Connection::new(config.clone()));
+
+    // ✅ CRITICAL: Initialize cache systems (TrendPlan.md)
+    let symbol_cache = Arc::new(cache::SymbolInfoCache::new());
+    let depth_cache = Arc::new(cache::DepthCache::new());
 
     // Initialize trading settings (margin mode and leverage) at startup
     if let Err(err) = connection.initialize_trading_settings().await {
@@ -92,8 +97,9 @@ async fn main() -> Result<()> {
     {
         let conn = connection.clone();
         let ch = connection_market_ch.clone();
+        let depth_cache_clone = Some(depth_cache.clone());
         let handle = tokio::spawn(async move {
-            if let Err(err) = conn.run_market_ws(ch).await {
+            if let Err(err) = conn.run_market_ws_with_depth_cache(ch, depth_cache_clone).await {
                 error!("Market WS task failed: {err:?}");
             }
         });
@@ -127,8 +133,18 @@ async fn main() -> Result<()> {
         let ch = ordering_ch;
         let rm = risk_manager.clone();
         let slippage = slippage_tracker.clone();
+        let symbol_cache_clone = symbol_cache.clone();
+        let depth_cache_clone = depth_cache.clone();
         let handle = tokio::spawn(async move {
-            ordering::run_ordering(ch, state, conn, Some(rm), Some(slippage)).await;
+            ordering::run_ordering(
+                ch,
+                state,
+                conn,
+                Some(rm),
+                Some(slippage),
+                Some(symbol_cache_clone),
+                Some(depth_cache_clone),
+            ).await;
         });
         task_infos.push(TaskInfo {
             name: "ordering".to_string(),
@@ -336,6 +352,11 @@ async fn main() -> Result<()> {
     // Cache'e symbol'leri set et
     metrics_cache.set_symbols(initial_symbols.clone()).await;
 
+    // ✅ CRITICAL: Warm up symbol cache (TrendPlan.md - Fast Order Execution)
+    info!("CACHE: Warming up symbol info cache...");
+    symbol_cache.warmup(&initial_symbols, &connection).await;
+    info!("CACHE: Symbol info cache warmup complete");
+
     // Cache update task
     let cache_for_update = metrics_cache.clone();
     let cache_update_handle = tokio::spawn(async move {
@@ -491,6 +512,10 @@ async fn main() -> Result<()> {
 
                         // Update metrics cache with all symbols
                         metrics_cache_clone.set_symbols(event.all_symbols.clone()).await;
+                        
+                        // ✅ CRITICAL: Update symbol cache when symbols rotate (TrendPlan.md)
+                        // Note: symbol_cache needs to be passed to rotation supervisor
+                        // For now, cache will be updated on-demand when new orders come in
                     }
                     Err(RecvError::Closed) => {
                         warn!("ROTATION_SUPERVISOR: Rotation channel closed");

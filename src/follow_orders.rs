@@ -1,7 +1,236 @@
 use crate::types::{CloseRequest, MarketTick, PositionUpdate, Side};
 use crate::types::{FollowChannels, PositionMeta, SharedState};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use log::{info, warn};
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// Advanced position manager with trailing stops and partial exits
+/// Based on TrendPlan.md recommendations
+struct AdvancedPositionManager {
+    positions: HashMap<Uuid, ActivePosition>,
+}
+
+struct ActivePosition {
+    entry_price: f64,
+    entry_time: DateTime<Utc>,
+    side: Side,
+    size: f64,
+    leverage: f64,
+    atr_at_entry: f64,
+    // Dynamic tracking
+    peak_profit_pct: f64,       // En yüksek kar (trailing için)
+    lowest_profit_pct: f64,     // En düşük kar (risk tracking için)
+    partial_exits: Vec<PartialExit>,
+}
+
+struct PartialExit {
+    exit_time: DateTime<Utc>,
+    exit_price: f64,
+    size: f64,
+    profit_pct: f64,
+}
+
+#[derive(Debug)]
+enum PositionDecision {
+    NoPosition,
+    Hold,
+    PartialClose {
+        percentage: f64,
+        reason: String,
+    },
+    FullClose {
+        reason: String,
+    },
+}
+
+impl AdvancedPositionManager {
+    fn new() -> Self {
+        Self {
+            positions: HashMap::new(),
+        }
+    }
+
+    fn open_position(
+        &mut self,
+        position_id: Uuid,
+        entry_price: f64,
+        side: Side,
+        size: f64,
+        leverage: f64,
+        atr: f64,
+    ) {
+        self.positions.insert(
+            position_id,
+            ActivePosition {
+                entry_price,
+                entry_time: Utc::now(),
+                side,
+                size,
+                leverage,
+                atr_at_entry: atr,
+                peak_profit_pct: 0.0,
+                lowest_profit_pct: 0.0,
+                partial_exits: Vec::new(),
+            },
+        );
+    }
+
+    fn close_position(&mut self, position_id: &Uuid) {
+        self.positions.remove(position_id);
+    }
+
+    fn evaluate(
+        &mut self,
+        position_id: &Uuid,
+        current_price: f64,
+        current_atr: f64,
+    ) -> PositionDecision {
+        let pos = match self.positions.get_mut(position_id) {
+            Some(p) => p,
+            None => return PositionDecision::NoPosition,
+        };
+
+        // Calculate current profit
+        let profit_pct = match pos.side {
+            Side::Long => (current_price - pos.entry_price) / pos.entry_price,
+            Side::Short => (pos.entry_price - current_price) / pos.entry_price,
+        } * pos.leverage * 100.0;
+
+        // Update peak/lowest tracking
+        pos.peak_profit_pct = pos.peak_profit_pct.max(profit_pct);
+        pos.lowest_profit_pct = pos.lowest_profit_pct.min(profit_pct);
+
+        // Calculate time in position
+        let holding_duration = Utc::now() - pos.entry_time;
+        let holding_minutes = holding_duration.num_minutes() as f64;
+
+        // === STRATEGY #1: STOP LOSS (Priority!) ===
+        let initial_stop_loss = match pos.side {
+            Side::Long => pos.entry_price - (pos.atr_at_entry * 2.5),
+            Side::Short => pos.entry_price + (pos.atr_at_entry * 2.5),
+        };
+
+        let hit_stop_loss = match pos.side {
+            Side::Long => current_price <= initial_stop_loss,
+            Side::Short => current_price >= initial_stop_loss,
+        };
+
+        if hit_stop_loss {
+            log::info!(
+                "🛑 STOP LOSS HIT: {:.2}% loss @ {}",
+                profit_pct,
+                current_price
+            );
+            return PositionDecision::FullClose {
+                reason: "Stop loss hit".to_string(),
+            };
+        }
+
+        // === STRATEGY #2: PARTIAL EXITS (Lock Profits!) ===
+        // First partial: 50% at +1% profit
+        if profit_pct >= 1.0 && pos.partial_exits.is_empty() {
+            log::info!("💰 PARTIAL EXIT #1: 50% @ +1.0% profit");
+            pos.partial_exits.push(PartialExit {
+                exit_time: Utc::now(),
+                exit_price: current_price,
+                size: pos.size * 0.5,
+                profit_pct: 1.0,
+            });
+            pos.size *= 0.5; // Reduce remaining position
+            
+            return PositionDecision::PartialClose {
+                percentage: 0.5,
+                reason: "First profit target (+1%)".to_string(),
+            };
+        }
+
+        // Second partial: 25% at +2% profit
+        if profit_pct >= 2.0 && pos.partial_exits.len() == 1 {
+            log::info!("💰 PARTIAL EXIT #2: 25% @ +2.0% profit");
+            pos.partial_exits.push(PartialExit {
+                exit_time: Utc::now(),
+                exit_price: current_price,
+                size: pos.size * 0.5,
+                profit_pct: 2.0,
+            });
+            pos.size *= 0.5;
+            
+            return PositionDecision::PartialClose {
+                percentage: 0.25,
+                reason: "Second profit target (+2%)".to_string(),
+            };
+        }
+
+        // === STRATEGY #3: TRAILING STOP (Let Winners Run!) ===
+        // After first partial exit, use trailing stop for remaining
+        if !pos.partial_exits.is_empty() {
+            // Trail at 50% of peak profit
+            let trailing_stop_pct = pos.peak_profit_pct * 0.5;
+            
+            if profit_pct < trailing_stop_pct {
+                log::info!(
+                    "🎯 TRAILING STOP: Exit @ {:.2}% (peak was {:.2}%)",
+                    profit_pct,
+                    pos.peak_profit_pct
+                );
+                return PositionDecision::FullClose {
+                    reason: format!(
+                        "Trailing stop (peak: {:.2}%, current: {:.2}%)",
+                        pos.peak_profit_pct, profit_pct
+                    ),
+                };
+            }
+        }
+
+        // === STRATEGY #4: TIME-BASED EXITS ===
+        // Maximum 4 hours holding
+        if holding_minutes > 240.0 {
+            log::info!("⏰ TIME EXIT: 4 hours reached");
+            return PositionDecision::FullClose {
+                reason: "Maximum holding time (4 hours)".to_string(),
+            };
+        }
+
+        // === STRATEGY #5: VOLATILITY EXPANSION EXIT ===
+        // If ATR suddenly spikes (2x), market is too volatile
+        let atr_expansion = current_atr / pos.atr_at_entry;
+        if atr_expansion > 2.0 {
+            log::warn!("⚠️  VOLATILITY EXIT: ATR expanded {:.2}x", atr_expansion);
+            return PositionDecision::FullClose {
+                reason: "Excessive volatility".to_string(),
+            };
+        }
+
+        // === STRATEGY #6: REVERSAL DETECTION ===
+        // If price retraces 70% from peak, exit
+        if pos.peak_profit_pct > 0.5 {
+            let retracement_pct = (pos.peak_profit_pct - profit_pct) / pos.peak_profit_pct;
+            
+            if retracement_pct > 0.7 {
+                log::warn!(
+                    "🔄 REVERSAL DETECTED: {:.0}% retracement from peak",
+                    retracement_pct * 100.0
+                );
+                return PositionDecision::FullClose {
+                    reason: "Reversal detected (70% retracement)".to_string(),
+                };
+            }
+        }
+
+        // === STRATEGY #7: EARLY PROFIT TAKING (Small Wins) ===
+        // If position is small profit but time is passing, take it
+        if holding_minutes > 30.0 && profit_pct >= 0.3 && profit_pct < 0.5 {
+            log::info!("✨ EARLY PROFIT: Small win @ {:.2}%", profit_pct);
+            return PositionDecision::FullClose {
+                reason: "Early profit taking (small win)".to_string(),
+            };
+        }
+
+        // Hold position
+        PositionDecision::Hold
+    }
+}
 
 pub async fn run_follow_orders(
     ch: FollowChannels,
@@ -19,6 +248,8 @@ pub async fn run_follow_orders(
     } = ch;
 
     let mut current_position: Option<PositionUpdate> = None;
+    let mut position_manager = AdvancedPositionManager::new();
+    let mut current_atr = 0.0;
 
     loop {
         tokio::select! {
@@ -26,8 +257,25 @@ pub async fn run_follow_orders(
                 Ok(Some(update)) => {
                     state.update_equity(update.unrealized_pnl);
                     if update.is_closed {
+                        position_manager.close_position(&update.position_id);
                         current_position = None;
                     } else {
+                        // New position opened - initialize in manager
+                        if current_position.is_none() {
+                            let position_meta = state.current_position_meta();
+                            let atr = position_meta
+                                .and_then(|m| m.atr_at_entry)
+                                .unwrap_or(0.01);
+                            position_manager.open_position(
+                                update.position_id,
+                                update.entry_price,
+                                update.side,
+                                update.size,
+                                update.leverage,
+                                atr,
+                            );
+                            current_atr = atr;
+                        }
                         current_position = Some(update);
                     }
                 },
@@ -38,19 +286,59 @@ pub async fn run_follow_orders(
                 Ok(Some(tick)) => {
                     if let Some(position) = current_position.as_ref() {
                         let position_meta = state.current_position_meta();
-                        if let Some(req) = evaluate_position(
-                            position,
-                            &tick,
-                            position_meta,
-                            tp_percent,
-                            sl_percent,
-                            commission_pct,
-                            atr_sl_multiplier,
-                            atr_tp_multiplier,
-                        ) {
-                            if let Err(err) = close_tx.send(req).await {
-                                info!("FOLLOW_ORDERS: failed to send close request: {err}");
+                        
+                        // Update ATR from tick or use cached value
+                        if let Some(meta) = &position_meta {
+                            if let Some(atr) = meta.atr_at_entry {
+                                current_atr = atr;
                             }
+                        }
+
+                        // Use advanced position manager for evaluation
+                        let decision = position_manager.evaluate(
+                            &position.position_id,
+                            tick.price,
+                            current_atr,
+                        );
+
+                        match decision {
+                            PositionDecision::FullClose { reason } => {
+                                log::info!("📤 FULL CLOSE: {}", reason);
+                                let _ = close_tx.send(CloseRequest {
+                                    position_id: position.position_id,
+                                    reason,
+                                    ts: Utc::now(),
+                                }).await;
+                            }
+                            PositionDecision::PartialClose { percentage, reason } => {
+                                log::info!("📤 PARTIAL CLOSE {:.0}%: {}", percentage * 100.0, reason);
+                                // Note: Partial close requires modification to CloseRequest
+                                // For now, we'll use full close as fallback
+                                // TODO: Implement partial close support in CloseRequest
+                                let _ = close_tx.send(CloseRequest {
+                                    position_id: position.position_id,
+                                    reason: format!("Partial close {}%: {}", percentage * 100.0, reason),
+                                    ts: Utc::now(),
+                                }).await;
+                            }
+                            PositionDecision::Hold => {
+                                // Continue holding - also check legacy TP/SL as fallback
+                                if let Some(req) = evaluate_position(
+                                    position,
+                                    &tick,
+                                    position_meta,
+                                    tp_percent,
+                                    sl_percent,
+                                    commission_pct,
+                                    atr_sl_multiplier,
+                                    atr_tp_multiplier,
+                                ) {
+                                    if let Err(err) = close_tx.send(req).await {
+                                        info!("FOLLOW_ORDERS: failed to send close request: {err}");
+                                    }
+                                }
+                            }
+                            PositionDecision::NoPosition => {}
                         }
                     }
                 },

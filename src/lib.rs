@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod cache;
 pub mod config;
 pub mod connection;
 pub mod event_bus;
@@ -13,6 +14,8 @@ pub mod symbol_scanner;
 pub mod test_utils;
 pub mod trending;
 pub mod types;
+
+pub use cache::{DepthCache, SymbolInfoCache};
 
 pub use config::BotConfig;
 pub use metrics_cache::MetricsCache;

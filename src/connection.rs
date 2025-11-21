@@ -142,6 +142,15 @@ impl Connection {
     }
 
     pub async fn run_market_ws(self: Arc<Self>, ch: ConnectionChannels) -> Result<()> {
+        self.run_market_ws_with_depth_cache(ch, None).await
+    }
+
+    /// Market WebSocket with depth cache integration (TrendPlan.md)
+    pub async fn run_market_ws_with_depth_cache(
+        self: Arc<Self>,
+        ch: ConnectionChannels,
+        depth_cache: Option<Arc<crate::cache::DepthCache>>,
+    ) -> Result<()> {
         let depth_state = Arc::new(RwLock::new(DepthState::new(20)));
         let liq_state = Arc::new(RwLock::new(LiqState::new(self.config.liq_window_secs)));
 
@@ -153,6 +162,8 @@ impl Connection {
             let ch_mark = ch.clone();
             let depth_for_mark = depth_state.clone();
             let depth_for_depth = depth_state.clone();
+            let depth_cache_for_stream = depth_cache.clone();
+            let symbol = self.config.symbol.clone();
             let liq_for_mark = liq_state.clone();
             let liq_for_stream = liq_state.clone();
             let liq_for_oi = liq_state.clone();
@@ -162,10 +173,15 @@ impl Connection {
                     .consume_mark_price_stream(ch_mark, depth_for_mark, liq_for_mark)
                     .await
             });
-            let depth_task =
-                tokio::spawn(
-                    async move { depth_stream.consume_depth_stream(depth_for_depth).await },
-                );
+            let depth_task = tokio::spawn(async move {
+                depth_stream
+                    .consume_depth_stream_with_cache(
+                        depth_for_depth,
+                        depth_cache_for_stream,
+                        symbol,
+                    )
+                    .await
+            });
             let liq_stream_task = tokio::spawn(async move {
                 if let Err(err) = liq_stream_conn.run_liq_stream(liq_for_stream).await {
                     warn!("CONNECTION: liq stream exited: {err:?}");
@@ -337,6 +353,60 @@ impl Connection {
             "CONNECTION: order sent (type={}, reduce_only={})",
             order_type, reduce_only
         );
+        Ok(())
+    }
+
+    /// Fast order sender (minimal validation, uses cached data)
+    /// Target: Signal → Fill in <50ms
+    /// Eliminates redundant API calls by using pre-cached symbol info and depth data
+    pub async fn send_order_fast(
+        &self,
+        order: &NewOrderRequest,
+        symbol_info: &crate::types::SymbolPrecision,
+        _best_bid: f64,
+        _best_ask: f64,
+    ) -> Result<()> {
+        self.ensure_credentials()?;
+
+        let NewOrderRequest {
+            symbol,
+            side,
+            quantity,
+            reduce_only,
+            client_order_id,
+        } = order;
+
+        if *quantity <= 0.0 {
+            return Err(anyhow!("order quantity must be positive"));
+        }
+
+        // Only essential validation
+        let qty_rounded = Self::round_to_step_size(*quantity, symbol_info.step_size);
+        let qty_formatted = Self::format_quantity(qty_rounded, symbol_info.step_size);
+
+        let side_str = match side {
+            Side::Long => "BUY",
+            Side::Short => "SELL",
+        };
+
+        // Always use MARKET for speed (fastest execution)
+        let mut params = vec![
+            ("symbol".to_string(), symbol.clone()),
+            ("side".to_string(), side_str.to_string()),
+            ("type".to_string(), "MARKET".to_string()),
+            ("quantity".to_string(), qty_formatted),
+        ];
+
+        if *reduce_only {
+            params.push(("reduceOnly".into(), "true".into()));
+        }
+        if let Some(id) = client_order_id {
+            params.push(("newClientOrderId".into(), id.clone()));
+        }
+
+        // Send order (single API call)
+        self.signed_post("/fapi/v1/order", params).await?;
+        
         Ok(())
     }
 
@@ -686,10 +756,41 @@ impl Connection {
         self: Arc<Self>,
         depth_state: Arc<RwLock<DepthState>>,
     ) -> Result<()> {
+        let symbol = self.config.symbol.clone();
+        self.consume_depth_stream_with_cache(depth_state, None, symbol)
+            .await
+    }
+
+    /// Depth stream with cache integration (TrendPlan.md)
+    async fn consume_depth_stream_with_cache(
+        self: Arc<Self>,
+        depth_state: Arc<RwLock<DepthState>>,
+        depth_cache: Option<Arc<crate::cache::DepthCache>>,
+        symbol: String,
+    ) -> Result<()> {
         let mut retry_delay = Duration::from_secs(1);
         loop {
             // Fetch snapshot before reconnecting to restore state
-            if let Ok(snapshot) = self.fetch_depth_snapshot().await {
+            let snapshot_result = self.fetch_depth_snapshot().await;
+            if let Ok(snapshot) = snapshot_result {
+                // ✅ CRITICAL: Update depth cache from snapshot FIRST (TrendPlan.md)
+                if let Some(cache) = &depth_cache {
+                    let best_bid = snapshot
+                        .bids
+                        .first()
+                        .and_then(|lvl| lvl[0].parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let best_ask = snapshot
+                        .asks
+                        .first()
+                        .and_then(|lvl| lvl[0].parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    if best_bid > 0.0 && best_ask > 0.0 {
+                        cache.update(symbol.clone(), best_bid, best_ask).await;
+                    }
+                }
+                
+                // Then update depth state
                 depth_state.write().await.reset_with_snapshot(snapshot);
                 info!("CONNECTION: depth state restored from snapshot");
             } else {
@@ -703,10 +804,27 @@ impl Connection {
                     retry_delay = Duration::from_secs(1);
                     let (_, mut read) = ws_stream.split();
                     while let Some(message) = read.next().await {
-                        match Self::extract_text_from_message(&message, "depth") {
+                        match Connection::extract_text_from_message(&message, "depth") {
                             Ok(Some(txt)) => {
                                 if let Ok(event) = serde_json::from_str::<DepthEvent>(&txt) {
                                     depth_state.write().await.update(&event);
+                                    
+                                    // ✅ CRITICAL: Update depth cache from WebSocket event (TrendPlan.md)
+                                    if let Some(cache) = &depth_cache {
+                                        let best_bid = event
+                                            .bids
+                                            .first()
+                                            .and_then(|lvl| lvl[0].parse::<f64>().ok())
+                                            .unwrap_or(0.0);
+                                        let best_ask = event
+                                            .asks
+                                            .first()
+                                            .and_then(|lvl| lvl[0].parse::<f64>().ok())
+                                            .unwrap_or(0.0);
+                                        if best_bid > 0.0 && best_ask > 0.0 {
+                                            cache.update(symbol.clone(), best_bid, best_ask).await;
+                                        }
+                                    }
                                 }
                             }
                             Ok(None) => {}

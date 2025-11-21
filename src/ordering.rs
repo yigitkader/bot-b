@@ -1,9 +1,11 @@
+use crate::cache;
 use crate::risk_manager::RiskManager;
 use crate::slippage::SlippageTracker;
 use crate::types::{CloseRequest, PositionMeta, Side, TradeSignal};
 use crate::types::{Connection, NewOrderRequest, OrderingChannels, SharedState};
 use log::{info, warn};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 pub async fn run_ordering(
@@ -12,6 +14,8 @@ pub async fn run_ordering(
     connection: Arc<Connection>,
     risk_manager: Option<Arc<RiskManager>>,
     slippage_tracker: Option<Arc<SlippageTracker>>,
+    symbol_cache: Option<Arc<cache::SymbolInfoCache>>,
+    depth_cache: Option<Arc<cache::DepthCache>>,
 ) {
     let order_lock = Arc::new(Mutex::new(()));
     let mut order_update_rx = ch.order_update_rx;
@@ -35,6 +39,8 @@ pub async fn run_ordering(
         tokio::select! {
             Some(signal) = ch.signal_rx.recv() => {
                 let tracker = slippage_tracker.clone();
+                let symbol_cache_clone = symbol_cache.clone();
+                let depth_cache_clone = depth_cache.clone();
                 handle_signal(
                     signal,
                     &state,
@@ -42,6 +48,8 @@ pub async fn run_ordering(
                     connection.clone(),
                     risk_manager.as_deref(),
                     tracker,
+                    symbol_cache_clone,
+                    depth_cache_clone,
                 ).await;
             },
             Some(request) = ch.close_rx.recv() => {
@@ -75,6 +83,8 @@ async fn handle_signal(
     connection: Arc<Connection>,
     risk_manager: Option<&RiskManager>,
     slippage_tracker: Option<Arc<SlippageTracker>>,
+    symbol_cache: Option<Arc<cache::SymbolInfoCache>>,
+    depth_cache: Option<Arc<cache::DepthCache>>,
 ) {
     if state.has_open_position() || state.has_open_order() {
         warn!(
@@ -181,36 +191,107 @@ async fn handle_signal(
     let _guard = lock.lock().await;
     state.set_open_order(true);
 
-    // Fetch symbol precision info (stepSize, minQuantity, etc.)
-    let symbol_info = match connection.fetch_symbol_info(&signal.symbol).await {
-        Ok(info) => info,
-        Err(err) => {
-            warn!(
-                "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
-                signal.symbol, signal.id
-            );
-            state.set_open_order(false);
-            return;
+    let start_time = Instant::now();
+
+    // ✅ CRITICAL: Use cached symbol info (TrendPlan.md - Fast Order Execution)
+    let symbol_info = if let Some(cache) = &symbol_cache {
+        match cache.get(&signal.symbol).await {
+            Some(cached) => {
+                // Convert cached info to SymbolPrecision
+                crate::types::SymbolPrecision {
+                    step_size: cached.step_size,
+                    min_quantity: cached.min_quantity,
+                    max_quantity: cached.max_quantity,
+                    tick_size: cached.tick_size,
+                    min_price: 0.0,
+                    max_price: f64::MAX,
+                }
+            }
+            None => {
+                warn!(
+                    "ORDERING: symbol {} not in cache, fetching from API (cache miss)",
+                    signal.symbol
+                );
+                match connection.fetch_symbol_info(&signal.symbol).await {
+                    Ok(info) => info,
+                    Err(err) => {
+                        warn!(
+                            "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
+                            signal.symbol, signal.id
+                        );
+                        state.set_open_order(false);
+                        return;
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: fetch from API if cache not available
+        match connection.fetch_symbol_info(&signal.symbol).await {
+            Ok(info) => info,
+            Err(err) => {
+                warn!(
+                    "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
+                    signal.symbol, signal.id
+                );
+                state.set_open_order(false);
+                return;
+            }
         }
     };
 
-    // CRITICAL: Calculate quantity using actual order price, not signal.entry_price
-    // The actual order price will be best_ask (LONG) or best_bid (SHORT) from depth snapshot
-    // Using signal.entry_price would cause notional mismatch
-
-    // Fetch actual order price (same logic as send_order uses)
-    let order_price = match connection
-        .calculate_order_price(&signal.symbol, &signal.side)
-        .await
-    {
-        Ok(price) => price,
-        Err(err) => {
-            warn!(
-                "ORDERING: failed to calculate order price for {}: {err:?}, using signal.entry_price as fallback",
-                signal.symbol
-            );
-            signal.entry_price
+    // ✅ CRITICAL: Use cached depth data (TrendPlan.md - Fast Order Execution)
+    let (best_bid, best_ask) = if let Some(cache) = &depth_cache {
+        match cache.get_best_prices(&signal.symbol).await {
+            Some((bid, ask)) => (bid, ask),
+            None => {
+                warn!(
+                    "ORDERING: depth cache miss for {}, using calculate_order_price",
+                    signal.symbol
+                );
+                // Fallback to calculate_order_price
+                match connection
+                    .calculate_order_price(&signal.symbol, &signal.side)
+                    .await
+                {
+                    Ok(price) => {
+                        // Use price as both bid and ask (approximation)
+                        (price * 0.9999, price * 1.0001)
+                    }
+                    Err(err) => {
+                        warn!(
+                            "ORDERING: failed to calculate order price for {}: {err:?}, using signal.entry_price",
+                            signal.symbol
+                        );
+                        (signal.entry_price, signal.entry_price)
+                    }
+                }
+            }
         }
+    } else {
+        // Fallback: use calculate_order_price
+        match connection
+            .calculate_order_price(&signal.symbol, &signal.side)
+            .await
+        {
+            Ok(price) => {
+                // Use price as both bid and ask (approximation)
+                (price * 0.9999, price * 1.0001)
+            }
+            Err(err) => {
+                warn!(
+                    "ORDERING: failed to calculate order price for {}: {err:?}, using signal.entry_price",
+                    signal.symbol
+                );
+                (signal.entry_price, signal.entry_price)
+            }
+        }
+    };
+
+    // Calculate order price from cached depth
+    let order_price = match signal.side {
+        Side::Long => best_ask,
+        Side::Short => best_bid,
     };
 
     // Calculate quantity with leverage included using actual order price
@@ -310,15 +391,34 @@ async fn handle_signal(
     // Otherwise timeout check will fail incorrectly
     state.mark_order_sent();
 
-    if let Err(err) = connection.send_order(order).await {
-        warn!("ORDERING: send_order failed: {err:?}");
+    // ✅ CRITICAL: Use fast order execution with cached data (TrendPlan.md)
+    let order_result = if symbol_cache.is_some() && depth_cache.is_some() {
+        // Fast path: use cached data
+        connection
+            .send_order_fast(&order, &symbol_info, best_bid, best_ask)
+            .await
+    } else {
+        // Fallback: use regular order execution
+        connection.send_order(order.clone()).await
+    };
+
+    let elapsed_ms = start_time.elapsed().as_millis() as f64;
+
+    if let Err(err) = order_result {
+        warn!(
+            "ORDERING: send_order failed: {err:?} (elapsed: {:.2}ms)",
+            elapsed_ms
+        );
         // Order failed - reset state immediately
         state.set_open_order(false);
         // Clear timestamp since order was not actually sent
         state.clear_order_sent();
         state.clear_pending_position_meta();
     } else {
-        info!("ORDERING: open order submitted {}", signal.id);
+        info!(
+            "ORDERING: ⚡ FAST ORDER submitted {} in {:.2}ms (target: <50ms)",
+            signal.id, elapsed_ms
+        );
         // Order successfully sent - state.has_open_order=true will remain until OrderUpdate event arrives
         // apply_order_update() will update the state based on order status:
         // - If order is Filled/Canceled/Rejected -> has_open_order=false

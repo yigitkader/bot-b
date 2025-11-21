@@ -432,7 +432,7 @@ pub struct Connection {
     pub(crate) server_time_offset: Arc<RwLock<i64>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NewOrderRequest {
     pub symbol: String,
     pub side: Side,
