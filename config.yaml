@@ -30,7 +30,7 @@ trending:
   min_spread_bps: 0.01
   max_spread_bps: 200.0
   signal_cooldown_seconds: 12
-  hft_mode: true
+  hft_mode: true  # ⚠️ ACTION PLAN: HFT mode requires co-location near exchange. Without it, commissions and latency usually cause losses.
   require_volume_confirmation: false
   base_min_score: 6.5
   trend_threshold_hft: 0.5
@@ -51,7 +51,7 @@ trending:
   enable_order_flow: true  # Enable Order Flow analysis (requires real depth data)
   # Set to false for backtest consistency when depth data is not available
   # Execution & Backtest Parameters (no hardcoded values)
-  fee_bps_round_trip: 10.0  # Round-trip fee in basis points (10.0 = 0.10%) - Binance VIP 0 realistic
+  fee_bps_round_trip: 10.0  # ✅ ACTION PLAN: Round-trip fee in basis points (10.0 = 0.10%) - Binance VIP 0 realistic. Minimum 10.0 recommended for realistic backtest results, especially with HFT mode.
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
   slippage_bps: 0.0  # Slippage in basis points (0.0 = optimistic backtest, use 5-10 for realistic)
   min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)
