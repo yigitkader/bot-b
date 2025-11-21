@@ -106,9 +106,18 @@ impl AdvancedPositionManager {
         let holding_minutes = holding_duration.num_minutes() as f64;
 
         // === STRATEGY #1: STOP LOSS (Priority!) ===
+        // ✅ CRITICAL FIX: Use ATR/Price ratio instead of absolute ATR
+        // This ensures consistent stop loss across different price levels
+        // Example: BTC $40k (ATR $500 = 1.25%) vs Altcoin $0.001 (ATR $0.00005 = 5%)
+        let atr_ratio = if pos.entry_price > 0.0 {
+            pos.atr_at_entry / pos.entry_price
+        } else {
+            0.01 // Fallback: 1% if entry price is invalid
+        };
+        let stop_loss_multiplier = 2.5;
         let initial_stop_loss = match pos.side {
-            Side::Long => pos.entry_price - (pos.atr_at_entry * 2.5),
-            Side::Short => pos.entry_price + (pos.atr_at_entry * 2.5),
+            Side::Long => pos.entry_price * (1.0 - stop_loss_multiplier * atr_ratio),
+            Side::Short => pos.entry_price * (1.0 + stop_loss_multiplier * atr_ratio),
         };
 
         let hit_stop_loss = match pos.side {
@@ -389,11 +398,16 @@ fn evaluate_position(
 
     if let Some(meta) = position_meta {
         if let Some(atr_value) = meta.atr_at_entry {
-            if atr_value > 0.0 {
+            if atr_value > 0.0 && position.entry_price > 0.0 {
+                // ✅ CRITICAL FIX: Use ATR/Price ratio instead of absolute ATR
+                // This ensures consistent stop loss across different price levels
+                // Example: BTC $40k (ATR $500 = 1.25%) vs Altcoin $0.001 (ATR $0.00005 = 5%)
+                let atr_ratio = atr_value / position.entry_price;
+                
                 let (sl_hit, tp_hit, sl_price, tp_price) = match position.side {
                     Side::Long => {
-                        let sl_price = position.entry_price - atr_sl_multiplier * atr_value;
-                        let tp_price = position.entry_price + atr_tp_multiplier * atr_value;
+                        let sl_price = position.entry_price * (1.0 - atr_sl_multiplier * atr_ratio);
+                        let tp_price = position.entry_price * (1.0 + atr_tp_multiplier * atr_ratio);
                         (
                             tick.price <= sl_price,
                             tick.price >= tp_price,
@@ -402,8 +416,8 @@ fn evaluate_position(
                         )
                     }
                     Side::Short => {
-                        let sl_price = position.entry_price + atr_sl_multiplier * atr_value;
-                        let tp_price = position.entry_price - atr_tp_multiplier * atr_value;
+                        let sl_price = position.entry_price * (1.0 + atr_sl_multiplier * atr_ratio);
+                        let tp_price = position.entry_price * (1.0 - atr_tp_multiplier * atr_ratio);
                         (
                             tick.price >= sl_price,
                             tick.price <= tp_price,
