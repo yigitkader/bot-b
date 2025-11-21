@@ -10,7 +10,7 @@ pub async fn run_ordering(
     mut ch: OrderingChannels,
     state: SharedState,
     connection: Arc<Connection>,
-    risk_manager: Option<Arc<RiskManager>>, // ✅ ADIM 6: Risk manager desteği
+    risk_manager: Option<Arc<RiskManager>>,
     slippage_tracker: Option<Arc<SlippageTracker>>,
 ) {
     let order_lock = Arc::new(Mutex::new(()));
@@ -73,7 +73,7 @@ async fn handle_signal(
     state: &SharedState,
     lock: Arc<Mutex<()>>,
     connection: Arc<Connection>,
-    risk_manager: Option<&RiskManager>, // ✅ ADIM 6: Risk manager desteği
+    risk_manager: Option<&RiskManager>,
     slippage_tracker: Option<Arc<SlippageTracker>>,
 ) {
     if state.has_open_position() || state.has_open_order() {
@@ -96,7 +96,6 @@ async fn handle_signal(
         return;
     }
 
-    // ✅ Drawdown check (if risk manager available)
     if let Some(rm) = risk_manager {
         let daily_dd = state.get_daily_drawdown_pct();
         let weekly_dd = state.get_weekly_drawdown_pct();
@@ -110,7 +109,6 @@ async fn handle_signal(
         }
     }
 
-    // ✅ ATR-based position sizing (if ATR and risk manager available)
     let mut size_usdt = signal.size_usdt;
     if let (Some(atr), Some(rm)) = (signal.atr_value, risk_manager) {
         if atr > 0.0 {
@@ -220,7 +218,6 @@ async fn handle_signal(
     let notional = size_usdt * signal.leverage;
     let qty = (notional / order_price).abs();
 
-    // ✅ ADIM 6: Risk manager kontrolü (portföy bazlı limitler) - qty hesaplandıktan sonra
     if let Some(rm) = risk_manager {
         let (allowed, reason) = rm
             .can_open_position(

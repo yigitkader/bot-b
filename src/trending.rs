@@ -4946,15 +4946,9 @@ fn calculate_bollinger_bands(candles: &[Candle], current_index: usize, current_p
     let start = current_index.saturating_sub(period - 1);
     let end = current_index.min(candles.len() - 1);
     
-    // Calculate SMA
     let closes: Vec<f64> = candles[start..=end].iter().map(|c| c.close).collect();
     let sma = closes.iter().sum::<f64>() / closes.len() as f64;
-    
-    // Calculate standard deviation
-    let variance = closes.iter()
-        .map(|&c| (c - sma).powi(2))
-        .sum::<f64>() / closes.len() as f64;
-    let std = variance.sqrt();
+    let std = calculate_std_dev(&closes);
     
     let upper_band = sma + (std_dev * std);
     let lower_band = sma - (std_dev * std);
