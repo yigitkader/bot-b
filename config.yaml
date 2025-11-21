@@ -47,6 +47,19 @@ trending:
   enhanced_score_excellent: 70.0  # 70-100: Excellent signal (take it!)
   enhanced_score_good: 55.0        # 55-69: Good signal (take it)
   enhanced_score_marginal: 40.0    # 40-54: Marginal signal (skip)
+  # Order Flow Analysis (TrendPlan.md - Action Plan)
+  enable_order_flow: true  # Enable Order Flow analysis (requires real depth data)
+  # Set to false for backtest consistency when depth data is not available
+  # Execution & Backtest Parameters (no hardcoded values)
+  fee_bps_round_trip: 8.0  # Round-trip fee in basis points (8.0 = 0.08%)
+  max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
+  slippage_bps: 0.0  # Slippage in basis points (0.0 = optimistic backtest, use 5-10 for realistic)
+  min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)
+  # Signal Quality Filtering (configurable)
+  min_volume_ratio: 1.5  # Minimum volume ratio vs 20-bar average
+  max_volatility_pct: 2.0  # Maximum ATR volatility % (2.0 = 2%)
+  max_price_change_5bars_pct: 3.0  # Max price change in 5 bars % (3.0 = 3%)
+  enable_signal_quality_filter: true  # Enable signal quality filtering
 
 binance:
   futures_base: "https://fapi.binance.com"
@@ -66,6 +79,16 @@ risk:
   # Higher values (30-60s) for stable markets
   # Default: 30 seconds
   liq_window_secs: 30
+  # Risk Management - Correlation & Portfolio Limits
+  correlation_threshold: 0.7  # High correlation threshold (0.7 = 70%)
+  max_correlated_positions: 5  # Max correlated positions in same direction
+  max_correlated_notional_pct: 0.5  # Max % of total notional in correlated positions (0.5 = 50%)
+  max_position_per_symbol_pct: 0.3  # Max % of total notional per symbol (0.3 = 30%)
+  correlation_cache_update_interval_secs: 60  # Correlation cache update interval
+  correlation_cache_retention_minutes: 5  # Correlation cache retention time
+  max_daily_drawdown_pct: 0.05  # Max daily drawdown (0.05 = 5%)
+  max_weekly_drawdown_pct: 0.10  # Max weekly drawdown (0.10 = 10%)
+  risk_per_trade_pct: 0.01  # Risk per trade as % of equity (0.01 = 1%)
 
 websocket:
   enabled: true

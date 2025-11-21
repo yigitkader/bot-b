@@ -124,8 +124,9 @@ async fn main() -> Result<()> {
     }
 
     // ✅ ADIM 6: Risk manager oluştur
-    let risk_limits = RiskLimits::from_config(config.max_position_notional_usd);
-    let risk_manager = Arc::new(RiskManager::new(risk_limits));
+    let risk_config = file_cfg.risk.as_ref();
+    let risk_limits = RiskLimits::from_config(config.max_position_notional_usd, risk_config);
+    let risk_manager = Arc::new(RiskManager::new(risk_limits, risk_config));
 
     // ✅ CRITICAL: Price history updater for dynamic correlation (TrendPlan.md - Action Plan)
     // This task updates price history from market ticks to enable real-time correlation calculation
@@ -487,16 +488,19 @@ async fn main() -> Result<()> {
                 lsr_crowded_short: trend_params.obi_short_max.min(0.8),
                 long_min_score: trend_params.long_min_score,
                 short_min_score: trend_params.short_min_score,
-                fee_bps_round_trip: 8.0,
-                max_holding_bars: 48,
-                slippage_bps: 0.0,
-                min_volume_ratio: 1.5,
-                max_volatility_pct: 2.0,
-                max_price_change_5bars_pct: 3.0,
-                enable_signal_quality_filter: true,
+                // Execution & Backtest Parameters (from config, no hardcoded values)
+                fee_bps_round_trip: trend_params.fee_bps_round_trip,
+                max_holding_bars: trend_params.max_holding_bars,
+                slippage_bps: trend_params.slippage_bps,
+                min_holding_bars: trend_params.min_holding_bars,
+                // Signal Quality Filtering (from config)
+                min_volume_ratio: trend_params.min_volume_ratio,
+                max_volatility_pct: trend_params.max_volatility_pct,
+                max_price_change_5bars_pct: trend_params.max_price_change_5bars_pct,
+                enable_signal_quality_filter: trend_params.enable_signal_quality_filter,
+                // Stop Loss & Risk Management
                 atr_stop_loss_multiplier: trend_params.atr_sl_multiplier,
                 atr_take_profit_multiplier: trend_params.atr_tp_multiplier,
-                min_holding_bars: 3,
                 hft_mode: trend_params.hft_mode,
                 base_min_score: trend_params.base_min_score,
                 trend_threshold_hft: trend_params.trend_threshold_hft,

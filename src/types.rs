@@ -150,6 +150,16 @@ pub struct TrendParams {
     pub enhanced_score_marginal: f64,
     // Order Flow Analysis (TrendPlan.md - Action Plan)
     pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
+    // Execution & Backtest Parameters (no hardcoded values)
+    pub fee_bps_round_trip: f64, // Round-trip fee in basis points
+    pub max_holding_bars: usize, // Maximum holding time in bars
+    pub slippage_bps: f64, // Slippage in basis points
+    pub min_holding_bars: usize, // Minimum holding time in bars
+    // Signal Quality Filtering (configurable)
+    pub min_volume_ratio: f64, // Minimum volume ratio vs 20-bar average
+    pub max_volatility_pct: f64, // Maximum ATR volatility %
+    pub max_price_change_5bars_pct: f64, // Max price change in 5 bars %
+    pub enable_signal_quality_filter: bool, // Enable signal quality filtering
 }
 
 // fallback for warmup default referencing EMA slow period
@@ -231,6 +241,25 @@ pub(crate) struct FileRisk {
     pub max_position_notional_usd: Option<f64>,
     #[serde(default)]
     pub liq_window_secs: Option<u64>,
+    // Risk Management - Correlation & Portfolio Limits
+    #[serde(default)]
+    pub correlation_threshold: Option<f64>, // High correlation threshold (default: 0.7 = 70%)
+    #[serde(default)]
+    pub max_correlated_positions: Option<usize>, // Max correlated positions in same direction (default: 5)
+    #[serde(default)]
+    pub max_correlated_notional_pct: Option<f64>, // Max % of total notional in correlated positions (default: 0.5 = 50%)
+    #[serde(default)]
+    pub max_position_per_symbol_pct: Option<f64>, // Max % of total notional per symbol (default: 0.3 = 30%)
+    #[serde(default)]
+    pub correlation_cache_update_interval_secs: Option<u64>, // Correlation cache update interval (default: 60)
+    #[serde(default)]
+    pub correlation_cache_retention_minutes: Option<u64>, // Correlation cache retention time (default: 5)
+    #[serde(default)]
+    pub max_daily_drawdown_pct: Option<f64>, // Max daily drawdown (default: 0.05 = 5%)
+    #[serde(default)]
+    pub max_weekly_drawdown_pct: Option<f64>, // Max weekly drawdown (default: 0.10 = 10%)
+    #[serde(default)]
+    pub risk_per_trade_pct: Option<f64>, // Risk per trade as % of equity (default: 0.01 = 1%)
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -294,6 +323,24 @@ pub(crate) struct FileTrending {
     // Order Flow Analysis (TrendPlan.md - Action Plan)
     #[serde(default)]
     pub enable_order_flow: Option<bool>, // Enable Order Flow analysis (requires real depth data)
+    // Execution & Backtest Parameters (no hardcoded values)
+    #[serde(default)]
+    pub fee_bps_round_trip: Option<f64>, // Round-trip fee in basis points (default: 8.0)
+    #[serde(default)]
+    pub max_holding_bars: Option<usize>, // Maximum holding time in bars (default: 48)
+    #[serde(default)]
+    pub slippage_bps: Option<f64>, // Slippage in basis points (default: 0.0)
+    #[serde(default)]
+    pub min_holding_bars: Option<usize>, // Minimum holding time in bars (default: 3)
+    // Signal Quality Filtering (configurable)
+    #[serde(default)]
+    pub min_volume_ratio: Option<f64>, // Minimum volume ratio vs 20-bar average (default: 1.5)
+    #[serde(default)]
+    pub max_volatility_pct: Option<f64>, // Maximum ATR volatility % (default: 2.0)
+    #[serde(default)]
+    pub max_price_change_5bars_pct: Option<f64>, // Max price change in 5 bars % (default: 3.0)
+    #[serde(default)]
+    pub enable_signal_quality_filter: Option<bool>, // Enable signal quality filtering (default: true)
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1164,6 +1211,16 @@ pub struct AlgoConfig {
     pub regime_multiplier_ranging: f64,   // Ranging regime için threshold multiplier (örn: 1.15)
     // Order Flow Analysis (TrendPlan.md - Action Plan)
     pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
+    // Execution & Backtest Parameters (configurable, no hardcoded values)
+    pub fee_bps_round_trip: f64, // Round-trip fee in basis points (default: 8.0 = 0.08%)
+    pub max_holding_bars: usize, // Maximum holding time in bars (default: 48)
+    pub slippage_bps: f64, // Slippage in basis points (default: 0.0 for optimistic backtest)
+    pub min_holding_bars: usize, // Minimum holding time in bars (default: 3)
+    // Signal Quality Filtering (configurable)
+    pub min_volume_ratio: f64, // Minimum volume ratio vs 20-bar average (default: 1.5)
+    pub max_volatility_pct: f64, // Maximum ATR volatility % (default: 2.0)
+    pub max_price_change_5bars_pct: f64, // Max price change in 5 bars % (default: 3.0)
+    pub enable_signal_quality_filter: bool, // Enable signal quality filtering (default: true)
 }
 
 // =======================

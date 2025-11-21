@@ -40,6 +40,11 @@ pub struct RiskManager {
     // Cache correlation matrix to avoid O(N^2) recalculation on every position check
     correlation_cache: Arc<RwLock<HashMap<(String, String), (f64, DateTime<Utc>)>>>, // (symbol1, symbol2) -> (correlation, timestamp)
     last_cache_update: Arc<RwLock<DateTime<Utc>>>, // Last time correlation cache was updated
+    // ✅ CONFIG: Configurable thresholds (no hardcoded values)
+    correlation_threshold: f64, // High correlation threshold (default: 0.7 = 70%)
+    max_correlated_notional_pct: f64, // Max % of total notional in correlated positions (default: 0.5 = 50%)
+    correlation_cache_update_interval_secs: i64, // Cache update interval (default: 60)
+    correlation_cache_retention_minutes: i64, // Cache retention time (default: 5)
 }
 
 #[derive(Debug, Clone)]
@@ -49,13 +54,30 @@ struct PricePoint {
 }
 
 impl RiskManager {
-    pub fn new(limits: RiskLimits) -> Self {
+    pub fn new(limits: RiskLimits, risk_config: Option<&crate::types::FileRisk>) -> Self {
+        let correlation_threshold = risk_config
+            .and_then(|r| r.correlation_threshold)
+            .unwrap_or(0.7); // Default: 70%
+        let max_correlated_notional_pct = risk_config
+            .and_then(|r| r.max_correlated_notional_pct)
+            .unwrap_or(0.5); // Default: 50%
+        let correlation_cache_update_interval_secs = risk_config
+            .and_then(|r| r.correlation_cache_update_interval_secs)
+            .unwrap_or(60) as i64; // Default: 60 seconds
+        let correlation_cache_retention_minutes = risk_config
+            .and_then(|r| r.correlation_cache_retention_minutes)
+            .unwrap_or(5) as i64; // Default: 5 minutes
+
         Self {
             limits,
             positions: Arc::new(RwLock::new(HashMap::new())),
             price_history: Arc::new(RwLock::new(HashMap::new())),
             correlation_cache: Arc::new(RwLock::new(HashMap::new())),
             last_cache_update: Arc::new(RwLock::new(Utc::now() - ChronoDuration::minutes(2))), // Initialize to 2 minutes ago to trigger first update
+            correlation_threshold,
+            max_correlated_notional_pct,
+            correlation_cache_update_interval_secs,
+            correlation_cache_retention_minutes,
         }
     }
 
@@ -167,10 +189,10 @@ impl RiskManager {
 
         // 3. ✅ CRITICAL FIX: Check correlated positions using dynamic Pearson correlation (TrendPlan.md - Action Plan)
         // ✅ PERFORMANCE FIX: Use cached correlation matrix (updated every minute) instead of O(N^2) recalculation
-        // Update cache if it's been more than 1 minute since last update
+        // Update cache if it's been more than configured interval since last update
         let cache_needs_update = {
             let last_update = self.last_cache_update.read().await;
-            Utc::now().signed_duration_since(*last_update).num_seconds() >= 60
+            Utc::now().signed_duration_since(*last_update).num_seconds() >= self.correlation_cache_update_interval_secs
         };
         
         if cache_needs_update {
@@ -179,8 +201,8 @@ impl RiskManager {
             let mut cache = self.correlation_cache.write().await;
             let mut last_update = self.last_cache_update.write().await;
             
-            // Clear old cache entries (older than 5 minutes)
-            let cutoff = Utc::now() - ChronoDuration::minutes(5);
+            // Clear old cache entries (older than configured retention time)
+            let cutoff = Utc::now() - ChronoDuration::minutes(self.correlation_cache_retention_minutes);
             cache.retain(|_, (_, ts)| *ts > cutoff);
             
             // Update cache with current positions
@@ -229,7 +251,7 @@ impl RiskManager {
                 }
                 // Use cached correlation if available, otherwise calculate on-the-fly
                 if let Some(corr) = get_correlation(symbol, &p.symbol) {
-                    corr > 0.7 // High correlation threshold (70%)
+                    corr > self.correlation_threshold // Configurable correlation threshold
                 } else {
                     false // Insufficient data for correlation
                 }
@@ -247,7 +269,7 @@ impl RiskManager {
                                     return false;
                                 }
                                 if let Some(correlation) = get_correlation(symbol, &p.symbol) {
-                                    correlation > 0.7
+                                    correlation > self.correlation_threshold
                                 } else {
                                     false
                                 }
@@ -286,7 +308,7 @@ impl RiskManager {
             .map(|p| p.notional_usd)
             .sum();
         
-        let max_correlated_notional = self.limits.max_total_notional_usd * 0.5; // Max 50% in correlated positions
+        let max_correlated_notional = self.limits.max_total_notional_usd * self.max_correlated_notional_pct; // Configurable % of total in correlated positions
         if correlated_notional + new_notional > max_correlated_notional {
             return (
                 false,
@@ -298,7 +320,7 @@ impl RiskManager {
                                     return false;
                                 }
                                 if let Some(correlation) = get_correlation(symbol, &p.symbol) {
-                                    correlation > 0.7
+                                    correlation > self.correlation_threshold
                                 } else {
                                     false
                                 }
@@ -439,15 +461,31 @@ pub struct PortfolioStats {
 }
 
 impl RiskLimits {
-    pub fn from_config(max_total_notional: f64) -> Self {
+    pub fn from_config(max_total_notional: f64, risk_config: Option<&crate::types::FileRisk>) -> Self {
+        let max_position_per_symbol_pct = risk_config
+            .and_then(|r| r.max_position_per_symbol_pct)
+            .unwrap_or(0.3); // Default: 30%
+        let max_correlated_positions = risk_config
+            .and_then(|r| r.max_correlated_positions)
+            .unwrap_or(5); // Default: 5
+        let max_daily_drawdown_pct = risk_config
+            .and_then(|r| r.max_daily_drawdown_pct)
+            .unwrap_or(0.05); // Default: 5%
+        let max_weekly_drawdown_pct = risk_config
+            .and_then(|r| r.max_weekly_drawdown_pct)
+            .unwrap_or(0.10); // Default: 10%
+        let risk_per_trade_pct = risk_config
+            .and_then(|r| r.risk_per_trade_pct)
+            .unwrap_or(0.01); // Default: 1%
+
         Self {
             max_total_notional_usd: max_total_notional,
-            max_position_per_symbol_usd: max_total_notional * 0.3, // 30% of total per symbol
-            max_correlated_positions: 5, // Max 5 correlated positions in same direction
+            max_position_per_symbol_usd: max_total_notional * max_position_per_symbol_pct,
+            max_correlated_positions,
             max_quote_exposure_usd: max_total_notional * 1.2, // 120% of total (allows some margin)
-            max_daily_drawdown_pct: 0.05, // 5% max daily drawdown
-            max_weekly_drawdown_pct: 0.10, // 10% max weekly drawdown
-            risk_per_trade_pct: 0.01, // 1% risk per trade
+            max_daily_drawdown_pct,
+            max_weekly_drawdown_pct,
+            risk_per_trade_pct,
         }
     }
 }

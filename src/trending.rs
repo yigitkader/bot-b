@@ -3911,20 +3911,19 @@ pub async fn run_trending(
         lsr_crowded_short: params.obi_short_max.min(0.8),
         long_min_score: params.long_min_score,
         short_min_score: params.short_min_score,
-        fee_bps_round_trip: 8.0, // Default fee
-        max_holding_bars: 48,    // Default max holding
-        slippage_bps: 0.0,       // Default: no slippage (optimistic backtest)
-        // Set to 5-10 bps (0.05-0.1%) for more realistic results
-        // Signal Quality Filtering (TrendPlan.md önerileri)
-        min_volume_ratio: 1.5,   // Minimum volume ratio vs 20-bar average
-        max_volatility_pct: 2.0, // Maximum ATR volatility % (2% = çok volatile)
-        max_price_change_5bars_pct: 3.0, // 5 bar içinde max price change % (3% = parabolic move)
-        enable_signal_quality_filter: true, // Signal quality filtering aktif
+        // Execution & Backtest Parameters (from config, no hardcoded values)
+        fee_bps_round_trip: params.fee_bps_round_trip,
+        max_holding_bars: params.max_holding_bars,
+        slippage_bps: params.slippage_bps,
+        min_holding_bars: params.min_holding_bars,
+        // Signal Quality Filtering (from config)
+        min_volume_ratio: params.min_volume_ratio,
+        max_volatility_pct: params.max_volatility_pct,
+        max_price_change_5bars_pct: params.max_price_change_5bars_pct,
+        enable_signal_quality_filter: params.enable_signal_quality_filter,
         // Stop Loss & Risk Management (coin-agnostic)
         atr_stop_loss_multiplier: params.atr_sl_multiplier, // ATR multiplier from config
         atr_take_profit_multiplier: params.atr_tp_multiplier, // ATR TP multiplier from config
-        min_holding_bars: 3, // Default minimum holding time (3 bars = 15 minutes @5m)
-        // Can be made configurable in future
         // ✅ ADIM 2: Config.yaml parametreleri
         hft_mode: params.hft_mode,
         base_min_score: params.base_min_score,

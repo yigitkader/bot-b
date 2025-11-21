@@ -63,6 +63,16 @@ pub struct BotConfig {
     pub enhanced_score_marginal: f64,
     // Order Flow Analysis (TrendPlan.md - Action Plan)
     pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
+    // Execution & Backtest Parameters (no hardcoded values)
+    pub fee_bps_round_trip: f64, // Round-trip fee in basis points
+    pub max_holding_bars: usize, // Maximum holding time in bars
+    pub slippage_bps: f64, // Slippage in basis points
+    pub min_holding_bars: usize, // Minimum holding time in bars
+    // Signal Quality Filtering (configurable)
+    pub min_volume_ratio: f64, // Minimum volume ratio vs 20-bar average
+    pub max_volatility_pct: f64, // Maximum ATR volatility %
+    pub max_price_change_5bars_pct: f64, // Max price change in 5 bars %
+    pub enable_signal_quality_filter: bool, // Enable signal quality filtering
     // Paper Trading Mode (TrendPlan.md - Action Plan)
     pub paper_trading_enabled: bool,
     pub paper_trading_log_file: String, // Path to log file for virtual orders
@@ -265,6 +275,48 @@ impl BotConfig {
                 trending_cfg.and_then(|t| t.enable_order_flow),
                 true, // Default: enabled (can be disabled for backtest consistency)
             ),
+            // Execution & Backtest Parameters (no hardcoded values)
+            fee_bps_round_trip: numeric_setting(
+                "BOT_FEE_BPS_ROUND_TRIP",
+                trending_cfg.and_then(|t| t.fee_bps_round_trip),
+                8.0, // Default: 8.0 bps = 0.08%
+            ),
+            max_holding_bars: numeric_setting(
+                "BOT_MAX_HOLDING_BARS",
+                trending_cfg.and_then(|t| t.max_holding_bars),
+                48usize, // Default: 48 bars = 4 hours @5m
+            ),
+            slippage_bps: numeric_setting(
+                "BOT_SLIPPAGE_BPS",
+                trending_cfg.and_then(|t| t.slippage_bps),
+                0.0, // Default: 0.0 (optimistic backtest)
+            ),
+            min_holding_bars: numeric_setting(
+                "BOT_MIN_HOLDING_BARS",
+                trending_cfg.and_then(|t| t.min_holding_bars),
+                3usize, // Default: 3 bars = 15 minutes @5m
+            ),
+            // Signal Quality Filtering (configurable)
+            min_volume_ratio: numeric_setting(
+                "BOT_MIN_VOLUME_RATIO",
+                trending_cfg.and_then(|t| t.min_volume_ratio),
+                1.5, // Default: 1.5
+            ),
+            max_volatility_pct: numeric_setting(
+                "BOT_MAX_VOLATILITY_PCT",
+                trending_cfg.and_then(|t| t.max_volatility_pct),
+                2.0, // Default: 2.0%
+            ),
+            max_price_change_5bars_pct: numeric_setting(
+                "BOT_MAX_PRICE_CHANGE_5BARS_PCT",
+                trending_cfg.and_then(|t| t.max_price_change_5bars_pct),
+                3.0, // Default: 3.0%
+            ),
+            enable_signal_quality_filter: bool_setting(
+                "BOT_ENABLE_SIGNAL_QUALITY_FILTER",
+                trending_cfg.and_then(|t| t.enable_signal_quality_filter),
+                true, // Default: enabled
+            ),
             // Paper Trading Mode (TrendPlan.md - Action Plan)
             paper_trading_enabled: bool_setting(
                 "BOT_PAPER_TRADING_ENABLED",
@@ -414,6 +466,16 @@ impl BotConfig {
             enhanced_score_marginal: self.enhanced_score_marginal,
             // Order Flow Analysis (TrendPlan.md - Action Plan)
             enable_order_flow: self.enable_order_flow,
+            // Execution & Backtest Parameters (no hardcoded values)
+            fee_bps_round_trip: self.fee_bps_round_trip,
+            max_holding_bars: self.max_holding_bars,
+            slippage_bps: self.slippage_bps,
+            min_holding_bars: self.min_holding_bars,
+            // Signal Quality Filtering (configurable)
+            min_volume_ratio: self.min_volume_ratio,
+            max_volatility_pct: self.max_volatility_pct,
+            max_price_change_5bars_pct: self.max_price_change_5bars_pct,
+            enable_signal_quality_filter: self.enable_signal_quality_filter,
         }
     }
 }
