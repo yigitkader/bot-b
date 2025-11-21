@@ -326,8 +326,14 @@ async fn main() -> Result<()> {
     // 2. Optimized config is applied to coins that already performed well
     // 3. Settings that worked in the past may NOT work in the future
     // 
-    // ⚠️ RECOMMENDATIONS to reduce overfitting:
-    // - Use Walk-Forward Analysis: Split data into train/test periods
+    // ⚠️ RECOMMENDATIONS to reduce overfitting (Plan.md - Action Plan):
+    // ✅ CRITICAL: Use Walk-Forward Analysis - Split data into train/test periods
+    //   - Step 1: Run backtest on FIRST HALF of data (e.g., first 12 hours of 24h period)
+    //   - Step 2: Select Top 10 coins from FIRST HALF results
+    //   - Step 3: Run backtest on SECOND HALF (unseen data) with Top 10 coins
+    //   - Step 4: If second half also profitable, strategy is validated
+    //   - If second half fails, strategy is overfitted - DO NOT use in production
+    //
     // - Use Out-of-Sample Testing: Test on data NOT used for optimization
     // - Use Cross-Validation: Test on multiple time periods
     // - Be conservative: Don't assume past winners will continue winning
@@ -335,6 +341,12 @@ async fn main() -> Result<()> {
     //
     // ⚠️ The "Top 10" coins are selected from HISTORICAL data only.
     // Market conditions change - what worked yesterday may fail tomorrow.
+    //
+    // ⚠️ IMPLEMENTATION NOTE: Walk-Forward Analysis requires:
+    //   - Split kline_limit in half (e.g., 288 -> 144 for train, 144 for test)
+    //   - Run first backtest with limit=144, select Top 10
+    //   - Run second backtest with limit=144 but different time period (out-of-sample)
+    //   - Compare results - if test period fails, strategy is overfitted
     if all_results.len() >= 10 {
         println!("===== TOP 10 COIN IDENTIFICATION =====");
         println!("⚠️  OVERFITTING WARNING: Top 10 selection based on PAST performance only.");

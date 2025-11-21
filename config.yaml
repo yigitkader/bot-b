@@ -62,7 +62,7 @@ trending:
   # Execution & Backtest Parameters (no hardcoded values)
   fee_bps_round_trip: 10.0  # ✅ ACTION PLAN: Round-trip fee in basis points (10.0 = 0.10%) - Binance VIP 0 realistic. Minimum 10.0 recommended for realistic backtest results, especially with HFT mode.
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
-  slippage_bps: 5.0  # ✅ FIX: Changed from 0.0 to 5.0 (0.05%). Zero slippage makes backtest results overly optimistic (fake). Real markets always have slippage. Minimum 5.0 recommended for realistic backtest.
+  slippage_bps: 15.0  # ✅ FIX (Plan.md): Increased from 5.0 to 15.0 (0.15%). Plan.md recommends conservative approach - in crisis moments or volatile coins, slippage can be 20-30 bps. Setting to 15 bps for worst-case scenario backtesting ensures realistic results. Real markets always have slippage, especially during volatility.
   min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)
   # Signal Quality Filtering (configurable)
   min_volume_ratio: 1.5  # Minimum volume ratio vs 20-bar average

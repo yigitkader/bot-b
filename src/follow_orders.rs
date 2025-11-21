@@ -137,20 +137,23 @@ impl AdvancedPositionManager {
         }
 
         // === STRATEGY #2: PARTIAL EXITS (Lock Profits!) ===
-        // First partial: 50% at +1% profit
-        if profit_pct >= 1.0 && pos.partial_exits.is_empty() {
-            log::info!("💰 PARTIAL EXIT #1: 50% @ +1.0% profit");
+        // ✅ FIX (Plan.md): Increased threshold from 1.0% to 1.5% to avoid premature exits
+        // Crypto markets are very noisy - 1% profit can be hit by normal volatility (stop hunting)
+        // 1.5% threshold reduces false exits while still locking profits early
+        // First partial: 50% at +1.5% profit
+        if profit_pct >= 1.5 && pos.partial_exits.is_empty() {
+            log::info!("💰 PARTIAL EXIT #1: 50% @ +1.5% profit");
             pos.partial_exits.push(PartialExit {
                 exit_time: Utc::now(),
                 exit_price: current_price,
                 size: pos.size * 0.5,
-                profit_pct: 1.0,
+                profit_pct: 1.5,
             });
             pos.size *= 0.5; // Reduce remaining position
             
             return PositionDecision::PartialClose {
                 percentage: 0.5,
-                reason: "First profit target (+1%)".to_string(),
+                reason: "First profit target (+1.5%)".to_string(),
             };
         }
 

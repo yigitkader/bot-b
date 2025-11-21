@@ -2257,7 +2257,23 @@ fn generate_signal_enhanced(
     // ⚠️ CRITICAL RISK: Liquidation Map historical force orders kullanıyor (geçmiş veri)
     // Gelecekteki liquidasyonları tahmin etmek zor - daha konservatif yaklaşım gerekli
     // ✅ CRITICAL FIX: Use higher confidence threshold to avoid false signals
+    // ✅ ACTION PLAN FIX (Plan.md): ONLY use LiquidationMap when REAL forceOrder data is available
+    // DO NOT use mathematical estimates (estimate_future_liquidations) - it's unreliable
+    // Real data: market_tick.liq_long_cluster and liq_short_cluster from WebSocket forceOrder stream
     if let (Some(liq_map), Some(tick)) = (liquidation_map, market_tick) {
+        // ✅ CRITICAL: Check if we have REAL liquidation data (not mathematical estimates)
+        // Plan.md: "LiquidationMap stratejisini canlı veri (forceOrder stream) olmadan sinyal üretimine dahil etmeyin"
+        // Real data indicators: liq_long_cluster and liq_short_cluster from WebSocket
+        let has_real_liquidation_data = tick.liq_long_cluster.is_some() || tick.liq_short_cluster.is_some();
+        
+        if !has_real_liquidation_data {
+            // ⚠️ ACTION PLAN FIX: No real liquidation data - skip LiquidationMap strategy
+            // estimate_future_liquidations is unreliable - don't trade on mathematical assumptions
+            log::debug!(
+                "TRENDING: ⚠️ LiquidationMap strategy SKIPPED - no real forceOrder data (liq_long_cluster/liq_short_cluster). \
+                Only trade when real liquidation data is available from WebSocket stream."
+            );
+        } else {
         if let Some(cascade_sig) = liq_map.generate_cascade_signal(candle.close, tick) {
             // ✅ CRITICAL FIX: Higher confidence threshold (0.5 instead of 0.35) for safety
             // Historical liquidation data is not perfect - need higher confidence
@@ -2337,15 +2353,16 @@ fn generate_signal_enhanced(
                     }
                 }
             }
-        }
-        
-        // ✅ ADDITIONAL: Check for nearby liquidation walls (risk management)
-        let walls = liq_map.detect_liquidation_walls(candle.close, 2_000_000.0);
-        if !walls.is_empty() {
-            let nearest_wall = &walls[0];
-            // If very close to wall (< 0.15%), cancel opposite signals
-            if nearest_wall.distance_pct < 0.15 {
-                // Will be checked against base signal later
+            
+            // ✅ ADDITIONAL: Check for nearby liquidation walls (risk management)
+            // Only check walls if we have real liquidation data
+            let walls = liq_map.detect_liquidation_walls(candle.close, 2_000_000.0);
+            if !walls.is_empty() {
+                let nearest_wall = &walls[0];
+                // If very close to wall (< 0.15%), cancel opposite signals
+                if nearest_wall.distance_pct < 0.15 {
+                    // Will be checked against base signal later
+                }
             }
         }
     }
@@ -3669,6 +3686,18 @@ pub fn run_backtest_on_series(
 
         // Enhanced signal generation with ALL REAL DATA (including MTF, OrderFlow, and LiquidationMap)
         // ✅ CRITICAL FIX: All strategies now enabled in backtest with realistic data
+        // ✅ ACTION PLAN FIX (Plan.md): Only pass LiquidationMap if it has REAL data
+        // Backtest'te historical_force_orders yoksa liquidation_map boş - None geçmeliyiz
+        // Plan.md: "LiquidationMap stratejisini canlı veri (forceOrder stream) olmadan sinyal üretimine dahil etmeyin"
+        let liquidation_map_for_signal = if historical_force_orders.is_some() && 
+            (!liquidation_map.long_liquidations.is_empty() || !liquidation_map.short_liquidations.is_empty()) {
+            // Real liquidation data available - use it
+            Some(&liquidation_map)
+        } else {
+            // No real liquidation data - don't use LiquidationMap strategy
+            None
+        };
+        
         let sig = generate_signal_enhanced(
             c,
             ctx,
@@ -3680,7 +3709,7 @@ pub fn run_backtest_on_series(
             Some(&funding_arbitrage),
             mtf_analysis.as_ref(), // ✅ MTF enabled in backtest
             orderflow_analyzer.as_ref(), // ✅ OrderFlow enabled in backtest with realistic depth
-            Some(&liquidation_map), // ✅ LiquidationMap enabled (from historical force orders or estimates)
+            liquidation_map_for_signal, // ✅ ACTION PLAN FIX: Only pass if real data available
             volume_profile.as_ref(), // GERÇEK VERİ: Candle verilerinden
             Some(&market_tick), // GERÇEK VERİ: Candle + Context'ten oluşturuldu
         );
@@ -3831,11 +3860,14 @@ pub fn run_backtest_on_series(
                 let stop_loss_price = pos_entry_price * (1.0 - stop_loss_distance);
 
                 // ✅ TRAILING STOP LOGIC (TrendPlan.md Fix #4)
+                // ✅ FIX (Plan.md): Increased threshold from 1.0% to 1.5% to avoid premature exits
+                // Crypto markets are very noisy - 1% profit can be hit by normal volatility (stop hunting)
+                // 1.5% threshold reduces false exits while still protecting profits
                 let current_pnl_pct = (c.close - pos_entry_price) / pos_entry_price;
                 let mut final_stop_price = stop_loss_price;
 
-                if current_pnl_pct > 0.01 {
-                    // %1+ profit
+                if current_pnl_pct > 0.015 {
+                    // %1.5+ profit (increased from 1.0% per Plan.md recommendation)
                     // ✅ Activate trailing stop at breakeven
                     let trailing_stop = pos_entry_price * 0.999; // -0.1% from entry
                     final_stop_price = stop_loss_price.max(trailing_stop);
@@ -3956,11 +3988,14 @@ pub fn run_backtest_on_series(
                 let stop_loss_price = pos_entry_price * (1.0 + stop_loss_distance);
 
                 // ✅ TRAILING STOP LOGIC (TrendPlan.md Fix #4)
+                // ✅ FIX (Plan.md): Increased threshold from 1.0% to 1.5% to avoid premature exits
+                // Crypto markets are very noisy - 1% profit can be hit by normal volatility (stop hunting)
+                // 1.5% threshold reduces false exits while still protecting profits
                 let current_pnl_pct = (pos_entry_price - c.close) / pos_entry_price;
                 let mut final_stop_price = stop_loss_price;
 
-                if current_pnl_pct > 0.01 {
-                    // %1+ profit
+                if current_pnl_pct > 0.015 {
+                    // %1.5+ profit (increased from 1.0% per Plan.md recommendation)
                     // ✅ Activate trailing stop at breakeven
                     let trailing_stop = pos_entry_price * 1.001; // +0.1% from entry
                     final_stop_price = stop_loss_price.min(trailing_stop);
