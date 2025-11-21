@@ -183,6 +183,16 @@ pub struct FileConfig {
     pub event_bus: Option<FileEventBus>,
     #[serde(default)]
     pub dynamic_symbol_selection: Option<FileDynamicSymbolSelection>,
+    #[serde(default)]
+    pub paper_trading: Option<FilePaperTrading>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub(crate) struct FilePaperTrading {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub log_file: Option<String>, // Path to log file for virtual orders (default: "paper_trading_orders.log")
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -859,6 +869,14 @@ pub(crate) struct KlineEvent {
     pub symbol: String,
     #[serde(rename = "k")]
     pub kline: KlineData,
+}
+
+/// Combined Stream wrapper for Binance WebSocket
+/// Format: {"stream":"btcusdt@kline_5m","data":{...KlineEvent...}}
+#[derive(Debug, Deserialize)]
+pub(crate) struct CombinedStreamEvent {
+    pub stream: String,
+    pub data: KlineEvent,
 }
 
 #[derive(Debug, Deserialize)]

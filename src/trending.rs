@@ -3036,29 +3036,23 @@ pub fn run_backtest_on_series(
             Some((1.0 / ctx.long_short_ratio.max(0.1)).min(3.0).max(0.5))
         };
         
-        // 4. Estimate depth from volume and OBI (realistic orderbook depth)
-        // Higher volume = more depth, OBI affects bid/ask depth distribution
-        // Typical orderbook: top 5 levels contain ~20-30% of total depth
-        let volume_usd = c.volume * c.close; // Approximate USD volume
-        let depth_factor = (volume_usd / 100_000.0).min(10.0).max(0.1); // Scale with volume
+        // 4. ⚠️ CRITICAL: Depth estimation from volume is NOT real data
+        // This is a simplified approximation for backtest purposes only
+        // Order Flow strategies should NOT use this estimated depth data
+        // Real Order Flow requires actual orderbook depth snapshots from exchange
+        // 
+        // For backtest: We set depth to None to disable Order Flow analysis
+        // This prevents over-optimistic results from using estimated depth
+        // If you have real historical depth data, use that instead
+        let bid_depth_usd: Option<f64> = None; // Disabled: estimated depth is not reliable for Order Flow
+        let ask_depth_usd: Option<f64> = None; // Disabled: estimated depth is not reliable for Order Flow
         
-        // Distribute depth based on OBI
-        let obi_value = obi.unwrap_or(1.0);
-        let bid_depth_usd = if obi_value > 1.0 {
-            // More bid pressure = more bid depth
-            Some(volume_usd * 0.2 * depth_factor * (obi_value / 2.0).min(1.5))
-        } else {
-            // Less bid pressure = less bid depth
-            Some(volume_usd * 0.2 * depth_factor * (obi_value * 0.5).max(0.3))
-        };
-        
-        let ask_depth_usd = if obi_value < 1.0 {
-            // More ask pressure = more ask depth
-            Some(volume_usd * 0.2 * depth_factor * ((1.0 / obi_value) / 2.0).min(1.5))
-        } else {
-            // Less ask pressure = less ask depth
-            Some(volume_usd * 0.2 * depth_factor * (obi_value * 0.5).max(0.3))
-        };
+        // OLD CODE (DISABLED - DO NOT USE):
+        // let volume_usd = c.volume * c.close;
+        // let depth_factor = (volume_usd / 100_000.0).min(10.0).max(0.1);
+        // let obi_value = obi.unwrap_or(1.0);
+        // let bid_depth_usd = Some(volume_usd * 0.2 * depth_factor * ...);
+        // let ask_depth_usd = Some(volume_usd * 0.2 * depth_factor * ...);
 
         let market_tick = MarketTick {
             symbol: symbol.to_string(),
@@ -3084,13 +3078,11 @@ pub fn run_backtest_on_series(
             None
         };
 
-        // OrderFlow Analyzer - create from market_tick depth data (same as production)
-        let orderflow_analyzer = if let (Some(bid_depth), Some(ask_depth)) = (bid_depth_usd, ask_depth_usd) {
-            // Use candles up to current index for orderflow (same as production)
-            create_orderflow_from_real_depth(&market_tick, &candles[..=i], bid_depth, ask_depth)
-        } else {
-            None
-        };
+        // OrderFlow Analyzer - DISABLED in backtest (estimated depth is not reliable)
+        // ⚠️ CRITICAL: Order Flow strategies require REAL orderbook depth data
+        // Estimated depth from volume creates over-optimistic backtest results
+        // To test Order Flow strategies properly, you need historical tick data with real depth
+        let orderflow_analyzer: Option<OrderFlowAnalyzer> = None; // Disabled in backtest
 
         // Enhanced signal generation with ALL REAL DATA (including MTF and OrderFlow)
         let sig = generate_signal_enhanced(
@@ -3751,7 +3743,7 @@ pub fn print_advanced_report(result: &AdvancedBacktestResult) {
 //  Production Trending Runner
 // =======================
 
-use crate::types::{KlineData, KlineEvent, TradeSignal, TrendParams, TrendingChannels};
+use crate::types::{KlineData, KlineEvent, CombinedStreamEvent, TradeSignal, TrendParams, TrendingChannels};
 use futures::StreamExt;
 use log::{info, warn};
 use std::sync::Arc;
@@ -3761,9 +3753,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Her side için ayrı cooldown tracking (trend reversal'ları kaçırmamak için)
 /// LONG ve SHORT sinyalleri birbirini bloklamaz
-struct LastSignalState {
-    last_long_time: Option<chrono::DateTime<Utc>>,
-    last_short_time: Option<chrono::DateTime<Utc>>,
+pub(crate) struct LastSignalState {
+    pub last_long_time: Option<chrono::DateTime<Utc>>,
+    pub last_short_time: Option<chrono::DateTime<Utc>>,
 }
 
 /// ✅ CRITICAL FIX: Atomic cooldown check-and-set helper function
@@ -3979,6 +3971,201 @@ pub async fn run_trending(
     let _ = tokio::join!(kline_task, market_tick_updater);
 }
 
+/// ✅ CRITICAL FIX: Combined Stream handler for multiple symbols (TrendPlan.md - Action Plan)
+/// This reduces WebSocket connections from N (one per symbol) to 1 (combined stream)
+/// Binance limit: Up to 200 streams per combined connection
+/// 
+/// Structure:
+/// - Single WebSocket connection for all symbols
+/// - Symbol-based message routing to individual handlers
+/// - Each symbol maintains its own candle buffer and signal generation
+pub async fn run_combined_kline_stream(
+    symbols: Vec<String>,
+    kline_interval: &str,
+    futures_period: &str,
+    ws_base_url: String,
+    // Symbol -> (candle_buffer, signal_state, signal_tx, latest_market_tick, client, cfg, params, metrics_cache)
+    symbol_handlers: Arc<RwLock<HashMap<String, SymbolHandler>>>,
+) {
+    use crate::types::CombinedStreamEvent;
+    
+    let mut retry_delay = TokioDuration::from_secs(1);
+    
+    // Build combined stream URL
+    let ws_url = crate::Connection::build_combined_stream_url(&symbols, "kline", Some(kline_interval));
+    
+    info!("TRENDING: Combined kline stream connecting for {} symbols: {}", symbols.len(), symbols.join(", "));
+    info!("TRENDING: Combined stream URL: {}", ws_url);
+
+    loop {
+        match connect_async(&ws_url).await {
+            Ok((ws_stream, _)) => {
+                info!("TRENDING: Combined kline stream connected ({})", ws_url);
+                retry_delay = TokioDuration::from_secs(1);
+                let (_, mut read) = ws_stream.split();
+                
+                while let Some(message) = read.next().await {
+                    match message {
+                        Ok(Message::Text(txt)) => {
+                            // Try to parse as combined stream event first
+                            if let Ok(combined_event) = serde_json::from_str::<CombinedStreamEvent>(&txt) {
+                                let event = combined_event.data;
+                                let symbol = event.symbol.clone();
+                                
+                                // Route to symbol handler
+                                if let Some(handler) = symbol_handlers.read().await.get(&symbol) {
+                                    if event.kline.is_closed {
+                                        if let Some(candle) = parse_kline_to_candle(&event.kline) {
+                                            // Update candle buffer
+                                            {
+                                                let mut buffer = handler.candle_buffer.write().await;
+                                                buffer.push(candle.clone());
+                                                let max_candles = (handler.params.warmup_min_ticks + 10) as usize;
+                                                if buffer.len() > max_candles {
+                                                    buffer.remove(0);
+                                                }
+                                            }
+                                            
+                                            // Generate signal
+                                            if let Err(err) = generate_signal_from_candle(
+                                                &candle,
+                                                &handler.candle_buffer,
+                                                &handler.client,
+                                                &symbol,
+                                                futures_period,
+                                                &handler.cfg,
+                                                &handler.params,
+                                                handler.signal_state.clone(),
+                                                &handler.signal_tx,
+                                                handler.metrics_cache.as_deref(),
+                                                handler.latest_market_tick.clone(),
+                                            )
+                                            .await
+                                            {
+                                                warn!("TRENDING: failed to generate signal for {}: {err}", symbol);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    warn!("TRENDING: Received event for unknown symbol: {}", symbol);
+                                }
+                            } else {
+                                // Fallback: try parsing as single stream event (for backward compatibility)
+                                if let Ok(event) = serde_json::from_str::<KlineEvent>(&txt) {
+                                    let symbol = event.symbol.clone();
+                                    if let Some(handler) = symbol_handlers.read().await.get(&symbol) {
+                                        if event.kline.is_closed {
+                                            if let Some(candle) = parse_kline_to_candle(&event.kline) {
+                                                let mut buffer = handler.candle_buffer.write().await;
+                                                buffer.push(candle.clone());
+                                                let max_candles = (handler.params.warmup_min_ticks + 10) as usize;
+                                                if buffer.len() > max_candles {
+                                                    buffer.remove(0);
+                                                }
+                                                drop(buffer);
+                                                
+                                                if let Err(err) = generate_signal_from_candle(
+                                                    &candle,
+                                                    &handler.candle_buffer,
+                                                    &handler.client,
+                                                    &symbol,
+                                                    futures_period,
+                                                    &handler.cfg,
+                                                    &handler.params,
+                                                    handler.signal_state.clone(),
+                                                    &handler.signal_tx,
+                                                    handler.metrics_cache.as_deref(),
+                                                    handler.latest_market_tick.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    warn!("TRENDING: failed to generate signal for {}: {err}", symbol);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Binary(bin)) => {
+                            if let Ok(txt) = String::from_utf8(bin) {
+                                // Same parsing logic as Text message
+                                if let Ok(combined_event) = serde_json::from_str::<CombinedStreamEvent>(&txt) {
+                                    let event = combined_event.data;
+                                    let symbol = event.symbol.clone();
+                                    if let Some(handler) = symbol_handlers.read().await.get(&symbol) {
+                                        if event.kline.is_closed {
+                                            if let Some(candle) = parse_kline_to_candle(&event.kline) {
+                                                let mut buffer = handler.candle_buffer.write().await;
+                                                buffer.push(candle.clone());
+                                                let max_candles = (handler.params.warmup_min_ticks + 10) as usize;
+                                                if buffer.len() > max_candles {
+                                                    buffer.remove(0);
+                                                }
+                                                drop(buffer);
+                                                
+                                                if let Err(err) = generate_signal_from_candle(
+                                                    &candle,
+                                                    &handler.candle_buffer,
+                                                    &handler.client,
+                                                    &symbol,
+                                                    futures_period,
+                                                    &handler.cfg,
+                                                    &handler.params,
+                                                    handler.signal_state.clone(),
+                                                    &handler.signal_tx,
+                                                    handler.metrics_cache.as_deref(),
+                                                    handler.latest_market_tick.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    warn!("TRENDING: failed to generate signal for {}: {err}", symbol);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
+                        Ok(Message::Close(_)) => {
+                            warn!("TRENDING: Combined kline stream closed");
+                            break;
+                        }
+                        Err(err) => {
+                            warn!("TRENDING: Combined kline stream error: {err:?}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!("TRENDING: Combined kline stream connect error: {err:?}");
+            }
+        }
+        
+        info!(
+            "TRENDING: Combined kline stream reconnecting in {}s",
+            retry_delay.as_secs()
+        );
+        sleep(retry_delay).await;
+        retry_delay = (retry_delay * 2).min(TokioDuration::from_secs(60));
+    }
+}
+
+/// Symbol handler structure for combined stream
+/// Each symbol has its own candle buffer, signal state, and generation logic
+pub(crate) struct SymbolHandler {
+    pub candle_buffer: Arc<RwLock<Vec<Candle>>>,
+    pub signal_state: Arc<RwLock<LastSignalState>>,
+    pub signal_tx: tokio::sync::mpsc::Sender<TradeSignal>,
+    pub latest_market_tick: Arc<RwLock<Option<MarketTick>>>,
+    pub client: FuturesClient,
+    pub cfg: AlgoConfig,
+    pub params: TrendParams,
+    pub metrics_cache: Option<Arc<crate::metrics_cache::MetricsCache>>,
+}
+
 async fn run_kline_stream(
     symbol: String,
     kline_interval: &str,
@@ -3994,6 +4181,10 @@ async fn run_kline_stream(
     latest_market_tick: Arc<RwLock<Option<MarketTick>>>,
 ) {
     let mut retry_delay = TokioDuration::from_secs(1);
+    // ⚠️ CRITICAL: Using individual WebSocket per symbol (may hit Binance connection limits)
+    // For multi-symbol mode (30+ symbols), consider using Combined Stream instead
+    // Combined Stream format: /stream?streams=btcusdt@kline_5m/ethusdt@kline_5m
+    // This reduces from N connections to 1 connection for N symbols
     let ws_url = format!(
         "{}/ws/{}@kline_{}",
         ws_base_url.trim_end_matches('/'),

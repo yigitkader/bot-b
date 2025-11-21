@@ -127,6 +127,34 @@ async fn main() -> Result<()> {
     let risk_limits = RiskLimits::from_config(config.max_position_notional_usd);
     let risk_manager = Arc::new(RiskManager::new(risk_limits));
 
+    // ✅ CRITICAL: Price history updater for dynamic correlation (TrendPlan.md - Action Plan)
+    // This task updates price history from market ticks to enable real-time correlation calculation
+    {
+        let risk_manager_for_price = risk_manager.clone();
+        let market_rx = bus.market_receiver();
+        let price_update_handle = tokio::spawn(async move {
+            loop {
+                match market_rx.recv().await {
+                    Ok(tick) => {
+                        // Update price history for correlation calculation
+                        risk_manager_for_price.update_price_history(&tick.symbol, tick.price).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        warn!("PRICE_HISTORY: lagged by {} market ticks", count);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        warn!("PRICE_HISTORY: market channel closed, stopping price history updater");
+                        break;
+                    }
+                }
+            }
+        });
+        task_infos.push(TaskInfo {
+            name: "price_history_updater".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(price_update_handle))),
+        });
+    }
+
     {
         let conn = connection.clone();
         let state = shared_state.clone();
@@ -432,23 +460,144 @@ async fn main() -> Result<()> {
         info!("TRENDING: Started trending task for symbol {}", symbol);
     }
 
-    // Spawn initial trending tasks
-    let task_infos_arc = Arc::new(tokio::sync::Mutex::new(task_infos.clone()));
-    for symbol in initial_symbols.iter() {
-        spawn_trending_task(
-            symbol.clone(),
-            &bus,
-            &trend_params,
-            &ws_base_url,
-            metrics_cache.clone(),
-            active_trending_tasks.clone(),
-            task_infos_arc.clone(),
-        ).await;
-    }
-    // Update task_infos from arc
-    {
-        let infos = task_infos_arc.lock().await;
-        task_infos = (*infos).clone();
+    // ✅ CRITICAL FIX: Use Combined Stream for 3+ symbols to avoid connection limits (TrendPlan.md - Action Plan)
+    // Combined Stream reduces WebSocket connections from N to 1, preventing IP bans
+    // Threshold: 3+ symbols = use combined stream, <3 symbols = use individual streams
+    let use_combined_stream = initial_symbols.len() >= 3;
+    
+    if use_combined_stream {
+        info!("TRENDING: Using Combined Stream for {} symbols (reduces {} WebSocket connections to 1)", 
+              initial_symbols.len(), initial_symbols.len());
+        
+        // Create symbol handlers for combined stream
+        use std::collections::HashMap;
+        let symbol_handlers: Arc<tokio::sync::RwLock<HashMap<String, trending::SymbolHandler>>> = 
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        
+        // Initialize handlers for each symbol
+        for symbol in initial_symbols.iter() {
+            let client = trading_bot::types::FuturesClient::new();
+            // Create AlgoConfig from TrendParams (same as run_trending)
+            let cfg = trading_bot::types::AlgoConfig {
+                rsi_trend_long_min: trend_params.rsi_long_min,
+                rsi_trend_short_max: trend_params.rsi_short_max,
+                funding_extreme_pos: trend_params.funding_max_for_long.max(0.0001),
+                funding_extreme_neg: trend_params.funding_min_for_short.min(-0.0001),
+                lsr_crowded_long: trend_params.obi_long_min.max(1.3),
+                lsr_crowded_short: trend_params.obi_short_max.min(0.8),
+                long_min_score: trend_params.long_min_score,
+                short_min_score: trend_params.short_min_score,
+                fee_bps_round_trip: 8.0,
+                max_holding_bars: 48,
+                slippage_bps: 0.0,
+                min_volume_ratio: 1.5,
+                max_volatility_pct: 2.0,
+                max_price_change_5bars_pct: 3.0,
+                enable_signal_quality_filter: true,
+                atr_stop_loss_multiplier: trend_params.atr_sl_multiplier,
+                atr_take_profit_multiplier: trend_params.atr_tp_multiplier,
+                min_holding_bars: 3,
+                hft_mode: trend_params.hft_mode,
+                base_min_score: trend_params.base_min_score,
+                trend_threshold_hft: trend_params.trend_threshold_hft,
+                trend_threshold_normal: trend_params.trend_threshold_normal,
+                weak_trend_score_multiplier: trend_params.weak_trend_score_multiplier,
+                regime_multiplier_trending: trend_params.regime_multiplier_trending,
+                regime_multiplier_ranging: trend_params.regime_multiplier_ranging,
+                enable_enhanced_scoring: trend_params.enable_enhanced_scoring,
+                enhanced_score_excellent: trend_params.enhanced_score_excellent,
+                enhanced_score_good: trend_params.enhanced_score_good,
+                enhanced_score_marginal: trend_params.enhanced_score_marginal,
+            };
+            let kline_interval = "5m";
+            let kline_limit = (trend_params.warmup_min_ticks + 10) as u32;
+            
+            // Create candle buffer and load initial candles
+            let candle_buffer = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+            match client.fetch_klines(symbol, kline_interval, kline_limit).await {
+                Ok(candles) => {
+                    *candle_buffer.write().await = candles;
+                    info!("TRENDING: loaded {} candles for {} (combined stream)", 
+                          candle_buffer.read().await.len(), symbol);
+                }
+                Err(err) => {
+                    warn!("TRENDING: failed to fetch initial candles for {}: {err:?}", symbol);
+                }
+            }
+            
+            // Create signal state and market tick state
+            let signal_state = Arc::new(tokio::sync::RwLock::new(trending::LastSignalState {
+                last_long_time: None,
+                last_short_time: None,
+            }));
+            let latest_market_tick = Arc::new(tokio::sync::RwLock::new(None));
+            let signal_tx = bus.trending_channels().signal_tx.clone();
+            
+            // Create market tick updater for this symbol
+            let market_rx = bus.market_receiver();
+            let latest_tick_clone = latest_market_tick.clone();
+            let symbol_clone = symbol.clone();
+            tokio::spawn(async move {
+                loop {
+                    match crate::types::handle_broadcast_recv(market_rx.recv().await) {
+                        Ok(Some(tick)) => {
+                            if tick.symbol == symbol_clone {
+                                *latest_tick_clone.write().await = Some(tick);
+                            }
+                        }
+                        Ok(None) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+            
+            // Insert handler
+            symbol_handlers.write().await.insert(symbol.clone(), trending::SymbolHandler {
+                candle_buffer,
+                signal_state,
+                signal_tx,
+                latest_market_tick,
+                client,
+                cfg,
+                params: trend_params.clone(),
+                metrics_cache: Some(metrics_cache.clone()),
+            });
+        }
+        
+        // Spawn combined stream task
+        let combined_stream_handle = tokio::spawn(async move {
+            trending::run_combined_kline_stream(
+                initial_symbols.clone(),
+                "5m",
+                "5m",
+                ws_base_url,
+                symbol_handlers,
+            ).await;
+        });
+        task_infos.push(TaskInfo {
+            name: "combined_kline_stream".to_string(),
+            handle: Arc::new(tokio::sync::Mutex::new(Some(combined_stream_handle))),
+        });
+    } else {
+        // Use individual streams for <3 symbols (backward compatibility)
+        info!("TRENDING: Using individual streams for {} symbols", initial_symbols.len());
+        let task_infos_arc = Arc::new(tokio::sync::Mutex::new(task_infos.clone()));
+        for symbol in initial_symbols.iter() {
+            spawn_trending_task(
+                symbol.clone(),
+                &bus,
+                &trend_params,
+                &ws_base_url,
+                metrics_cache.clone(),
+                active_trending_tasks.clone(),
+                task_infos_arc.clone(),
+            ).await;
+        }
+        // Update task_infos from arc
+        {
+            let infos = task_infos_arc.lock().await;
+            task_infos = (*infos).clone();
+        }
     }
 
     // ✅ Rotation supervisor task: handles symbol rotation events

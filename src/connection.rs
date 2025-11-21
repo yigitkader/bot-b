@@ -1060,6 +1060,26 @@ impl Connection {
         format!("{base}/ws/{symbol}@depth20@100ms")
     }
 
+    /// ✅ CRITICAL FIX: Build Combined Stream URL for multiple symbols (TrendPlan.md - Action Plan)
+    /// This reduces WebSocket connections from N (one per symbol) to 1 (combined stream)
+    /// Format: /stream?streams=btcusdt@kline_5m/ethusdt@kline_5m/...
+    /// Binance limit: Combined streams can handle up to 200 streams per connection
+    pub fn build_combined_stream_url(symbols: &[String], stream_type: &str, interval: Option<&str>) -> String {
+        let base = "wss://fstream.binance.com";
+        let streams: Vec<String> = symbols
+            .iter()
+            .map(|s| {
+                let symbol_lower = s.to_lowercase();
+                if let Some(interval) = interval {
+                    format!("{}@{}@{}", symbol_lower, stream_type, interval)
+                } else {
+                    format!("{}@{}", symbol_lower, stream_type)
+                }
+            })
+            .collect();
+        format!("{}/stream?streams={}", base, streams.join("/"))
+    }
+
     fn parse_mark_price(&self, payload: &str) -> Option<MarketTick> {
         let event: MarkPriceEvent = serde_json::from_str(payload).ok()?;
         let price = event.mark_price.parse::<f64>().ok()?;

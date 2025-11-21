@@ -2,9 +2,10 @@
 // Portföy bazlı limitler: toplam notional, coin başına limit, korelasyon kontrolü
 
 use log::info;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use chrono::{DateTime, Utc, Duration as ChronoDuration};
 
 use crate::types::{PositionUpdate, Side};
 
@@ -32,6 +33,15 @@ pub struct RiskLimits {
 pub struct RiskManager {
     limits: RiskLimits,
     positions: Arc<RwLock<HashMap<String, PositionInfo>>>, // symbol -> position
+    // ✅ CRITICAL FIX: Dynamic correlation tracking (TrendPlan.md - Action Plan)
+    // Store price history for last 24 hours to calculate real-time correlation
+    price_history: Arc<RwLock<HashMap<String, VecDeque<PricePoint>>>>, // symbol -> price history
+}
+
+#[derive(Debug, Clone)]
+struct PricePoint {
+    price: f64,
+    timestamp: DateTime<Utc>,
 }
 
 impl RiskManager {
@@ -39,6 +49,30 @@ impl RiskManager {
         Self {
             limits,
             positions: Arc::new(RwLock::new(HashMap::new())),
+            price_history: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Update price history for correlation calculation (TrendPlan.md - Action Plan)
+    /// Call this periodically (e.g., every minute) with current prices
+    pub async fn update_price_history(&self, symbol: &str, price: f64) {
+        let mut history = self.price_history.write().await;
+        let entry = history.entry(symbol.to_string()).or_insert_with(|| VecDeque::new());
+        
+        let now = Utc::now();
+        entry.push_back(PricePoint {
+            price,
+            timestamp: now,
+        });
+
+        // Keep only last 24 hours of data (1440 minutes if updating every minute)
+        let cutoff = now - ChronoDuration::hours(24);
+        while let Some(front) = entry.front() {
+            if front.timestamp < cutoff {
+                entry.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
@@ -125,47 +159,56 @@ impl RiskManager {
             );
         }
 
-        // 3. ✅ CRITICAL FIX: Check correlated positions (real correlation, not just same direction)
-        // Extract base asset from symbol (e.g., "BTCUSDT" -> "BTC")
-        let new_base_asset = extract_base_asset(symbol);
+        // 3. ✅ CRITICAL FIX: Check correlated positions using dynamic Pearson correlation (TrendPlan.md - Action Plan)
+        // Calculate real-time correlation based on last 24 hours of price movements
+        let price_history = self.price_history.read().await;
         
-        // Find correlated positions (same correlation group and same direction)
+        // Find correlated positions (same direction and high correlation)
         let correlated_count = positions
             .values()
             .filter(|p| {
                 if p.side != side {
                     return false; // Different direction, not correlated risk
                 }
-                let existing_base = extract_base_asset(&p.symbol);
-                are_correlated(&new_base_asset, &existing_base)
+                // Calculate Pearson correlation between symbols
+                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
+                    correlation > 0.7 // High correlation threshold (70%)
+                } else {
+                    false // Insufficient data for correlation
+                }
             })
             .count();
 
         if correlated_count >= self.limits.max_correlated_positions {
             return (
                 false,
-                format!(
-                    "Too many correlated {} positions: {} >= {} (max). New: {}, Existing correlated: {}",
-                    match side {
-                        Side::Long => "LONG",
-                        Side::Short => "SHORT",
+                    {
+                        let correlated_symbols: Vec<String> = positions
+                            .values()
+                            .filter(|p| {
+                                if p.side != side {
+                                    return false;
+                                }
+                                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
+                                    correlation > 0.7
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|p| p.symbol.clone())
+                            .collect();
+                        format!(
+                            "Too many correlated {} positions: {} >= {} (max). New: {}, Existing correlated: {}",
+                            match side {
+                                Side::Long => "LONG",
+                                Side::Short => "SHORT",
+                            },
+                            correlated_count + 1,
+                            self.limits.max_correlated_positions,
+                            symbol,
+                            correlated_symbols.join(", ")
+                        )
                     },
-                    correlated_count + 1,
-                    self.limits.max_correlated_positions,
-                    symbol,
-                    positions
-                        .values()
-                        .filter(|p| {
-                            if p.side != side {
-                                return false;
-                            }
-                            let existing_base = extract_base_asset(&p.symbol);
-                            are_correlated(&new_base_asset, &existing_base)
-                        })
-                        .map(|p| p.symbol.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
             );
         }
 
@@ -176,8 +219,12 @@ impl RiskManager {
                 if p.side != side {
                     return false;
                 }
-                let existing_base = extract_base_asset(&p.symbol);
-                are_correlated(&new_base_asset, &existing_base)
+                // Calculate Pearson correlation between symbols
+                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
+                    correlation > 0.7 // High correlation threshold (70%)
+                } else {
+                    false // Insufficient data for correlation
+                }
             })
             .map(|p| p.notional_usd)
             .sum();
@@ -186,24 +233,29 @@ impl RiskManager {
         if correlated_notional + new_notional > max_correlated_notional {
             return (
                 false,
-                format!(
-                    "Correlated positions notional would exceed limit: {:.2} > {:.2} USD. New: {}, Correlated group: {}",
-                    correlated_notional + new_notional,
-                    max_correlated_notional,
-                    symbol,
-                    positions
-                        .values()
-                        .filter(|p| {
-                            if p.side != side {
-                                return false;
-                            }
-                            let existing_base = extract_base_asset(&p.symbol);
-                            are_correlated(&new_base_asset, &existing_base)
-                        })
-                        .map(|p| p.symbol.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                    {
+                        let correlated_symbols: Vec<String> = positions
+                            .values()
+                            .filter(|p| {
+                                if p.side != side {
+                                    return false;
+                                }
+                                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
+                                    correlation > 0.7
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|p| p.symbol.clone())
+                            .collect();
+                        format!(
+                            "Correlated positions notional would exceed limit: {:.2} > {:.2} USD. New: {}, Correlated group: {}",
+                            correlated_notional + new_notional,
+                            max_correlated_notional,
+                            symbol,
+                            correlated_symbols.join(", ")
+                        )
+                    },
             );
         }
 
@@ -343,88 +395,76 @@ impl RiskLimits {
     }
 }
 
-// ✅ CRITICAL FIX: Extract base asset from symbol (e.g., "BTCUSDT" -> "BTC", "ETHUSDC" -> "ETH")
-fn extract_base_asset(symbol: &str) -> String {
-    // Common quote assets
-    let quote_assets = ["USDT", "USDC", "BUSD", "BTC", "ETH", "BNB"];
-    
-    for quote in &quote_assets {
-        if symbol.ends_with(quote) {
-            return symbol[..symbol.len() - quote.len()].to_string();
+// ✅ CRITICAL FIX: Calculate Pearson correlation coefficient between two symbols (TrendPlan.md - Action Plan)
+// Returns correlation coefficient (-1.0 to 1.0) or None if insufficient data
+// Correlation > 0.7 indicates high positive correlation (assets move together)
+fn calculate_correlation(
+    symbol1: &str,
+    symbol2: &str,
+    price_history: &HashMap<String, VecDeque<PricePoint>>,
+) -> Option<f64> {
+    if symbol1 == symbol2 {
+        return Some(1.0); // Same symbol = perfect correlation
+    }
+
+    let hist1 = price_history.get(symbol1)?;
+    let hist2 = price_history.get(symbol2)?;
+
+    // Need at least 30 data points for reliable correlation
+    if hist1.len() < 30 || hist2.len() < 30 {
+        return None;
+    }
+
+    // Align price histories by timestamp (use common timestamps)
+    let mut aligned_prices1 = Vec::new();
+    let mut aligned_prices2 = Vec::new();
+
+    // Create a map of symbol2 prices by timestamp (rounded to nearest minute for alignment)
+    let mut prices2_by_minute: HashMap<i64, f64> = HashMap::new();
+    for point in hist2.iter() {
+        let minute = point.timestamp.timestamp() / 60;
+        prices2_by_minute.insert(minute, point.price);
+    }
+
+    // Align symbol1 prices with symbol2 prices
+    for point1 in hist1.iter() {
+        let minute = point1.timestamp.timestamp() / 60;
+        if let Some(&price2) = prices2_by_minute.get(&minute) {
+            aligned_prices1.push(point1.price);
+            aligned_prices2.push(price2);
         }
     }
-    
-    // If no known quote asset found, assume last 4 chars are quote (e.g., "BTCUSDT")
-    if symbol.len() > 4 {
-        symbol[..symbol.len() - 4].to_string()
-    } else {
-        symbol.to_string()
-    }
-}
 
-// ✅ CRITICAL FIX: Check if two assets are correlated
-// Major coins (BTC, ETH) are highly correlated
-// Altcoins are generally correlated with BTC
-fn are_correlated(asset1: &str, asset2: &str) -> bool {
-    if asset1 == asset2 {
-        return true; // Same asset
+    // Need at least 30 aligned points
+    if aligned_prices1.len() < 30 {
+        return None;
     }
-    
-    // Major coins correlation group (highly correlated)
-    let major_coins = ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOT", "AVAX", "MATIC", "LINK"];
-    let is_major1 = major_coins.contains(&asset1);
-    let is_major2 = major_coins.contains(&asset2);
-    
-    if is_major1 && is_major2 {
-        return true; // Both are major coins, highly correlated
+
+    // Calculate Pearson correlation coefficient
+    // r = Σ((x - x̄)(y - ȳ)) / sqrt(Σ(x - x̄)² * Σ(y - ȳ)²)
+    let n = aligned_prices1.len() as f64;
+    let mean1: f64 = aligned_prices1.iter().sum::<f64>() / n;
+    let mean2: f64 = aligned_prices2.iter().sum::<f64>() / n;
+
+    let mut numerator = 0.0;
+    let mut sum_sq_diff1 = 0.0;
+    let mut sum_sq_diff2 = 0.0;
+
+    for i in 0..aligned_prices1.len() {
+        let diff1 = aligned_prices1[i] - mean1;
+        let diff2 = aligned_prices2[i] - mean2;
+        numerator += diff1 * diff2;
+        sum_sq_diff1 += diff1 * diff1;
+        sum_sq_diff2 += diff2 * diff2;
     }
-    
-    // BTC is the market leader - all altcoins are correlated with BTC
-    if asset1 == "BTC" || asset2 == "BTC" {
-        return true; // Any coin is correlated with BTC
+
+    let denominator = (sum_sq_diff1 * sum_sq_diff2).sqrt();
+    if denominator == 0.0 {
+        return None; // No variance, cannot calculate correlation
     }
+
+    let correlation = numerator / denominator;
     
-    // ETH is also a major market leader
-    if asset1 == "ETH" || asset2 == "ETH" {
-        return true; // Any coin is correlated with ETH
-    }
-    
-    // Layer 1 blockchains are correlated with each other
-    let layer1_coins = ["SOL", "AVAX", "ADA", "DOT", "ATOM", "NEAR", "FTM", "ALGO"];
-    let is_layer1_1 = layer1_coins.contains(&asset1);
-    let is_layer1_2 = layer1_coins.contains(&asset2);
-    
-    if is_layer1_1 && is_layer1_2 {
-        return true; // Both are Layer 1 blockchains, correlated
-    }
-    
-    // DeFi tokens are correlated with each other
-    let defi_coins = ["UNI", "AAVE", "SUSHI", "CRV", "COMP", "MKR", "SNX", "YFI"];
-    let is_defi_1 = defi_coins.contains(&asset1);
-    let is_defi_2 = defi_coins.contains(&asset2);
-    
-    if is_defi_1 && is_defi_2 {
-        return true; // Both are DeFi tokens, correlated
-    }
-    
-    // Gaming/Metaverse tokens are correlated
-    let gaming_coins = ["AXS", "SAND", "MANA", "ENJ", "GALA", "IMX"];
-    let is_gaming_1 = gaming_coins.contains(&asset1);
-    let is_gaming_2 = gaming_coins.contains(&asset2);
-    
-    if is_gaming_1 && is_gaming_2 {
-        return true; // Both are gaming tokens, correlated
-    }
-    
-    // Meme coins are correlated
-    let meme_coins = ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK"];
-    let is_meme_1 = meme_coins.contains(&asset1);
-    let is_meme_2 = meme_coins.contains(&asset2);
-    
-    if is_meme_1 && is_meme_2 {
-        return true; // Both are meme coins, correlated
-    }
-    
-    // Default: assume low correlation if not in same category
-    false
+    // Clamp to [-1.0, 1.0] range (should already be in range, but ensure it)
+    Some(correlation.max(-1.0).min(1.0))
 }

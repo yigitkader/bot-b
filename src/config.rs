@@ -61,6 +61,9 @@ pub struct BotConfig {
     pub enhanced_score_excellent: f64,
     pub enhanced_score_good: f64,
     pub enhanced_score_marginal: f64,
+    // Paper Trading Mode (TrendPlan.md - Action Plan)
+    pub paper_trading_enabled: bool,
+    pub paper_trading_log_file: String, // Path to log file for virtual orders
 }
 
 impl BotConfig {
@@ -253,6 +256,17 @@ impl BotConfig {
                 "BOT_ENHANCED_SCORE_MARGINAL",
                 trending_cfg.and_then(|t| t.enhanced_score_marginal),
                 50.0,
+            ),
+            // Paper Trading Mode (TrendPlan.md - Action Plan)
+            paper_trading_enabled: bool_setting(
+                "BOT_PAPER_TRADING_ENABLED",
+                file_cfg.paper_trading.as_ref().and_then(|pt| pt.enabled),
+                false,
+            ),
+            paper_trading_log_file: string_setting(
+                "BOT_PAPER_TRADING_LOG_FILE",
+                file_cfg.paper_trading.as_ref().and_then(|pt| pt.log_file.clone()),
+                "paper_trading_orders.log",
             ),
         }
         .validate()

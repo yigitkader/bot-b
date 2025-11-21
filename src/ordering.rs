@@ -7,6 +7,9 @@ use log::{info, warn};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use std::fs::OpenOptions;
+use std::io::Write;
+use chrono::Utc;
 
 pub async fn run_ordering(
     mut ch: OrderingChannels,
@@ -408,40 +411,55 @@ async fn handle_signal(
     // Otherwise timeout check will fail incorrectly
     state.mark_order_sent();
 
-    // ✅ CRITICAL: Use fast order execution with cached data (TrendPlan.md)
-    let order_result = if symbol_cache.is_some() && depth_cache.is_some() {
-        // Fast path: use cached data
-        connection
-            .send_order_fast(&order, &symbol_info, best_bid, best_ask)
-            .await
-    } else {
-        // Fallback: use regular order execution
-        connection.send_order(order.clone()).await
-    };
-
+    let config = connection.config();
     let elapsed_ms = start_time.elapsed().as_millis() as f64;
 
-    if let Err(err) = order_result {
-        warn!(
-            "ORDERING: send_order failed: {err:?} (elapsed: {:.2}ms)",
-            elapsed_ms
-        );
-        // Order failed - reset state immediately
-        state.set_open_order(false);
-        // Clear timestamp since order was not actually sent
-        state.clear_order_sent();
-        state.clear_pending_position_meta();
-    } else {
+    // ✅ Paper Trading Mode: Log order instead of sending to exchange (TrendPlan.md - Action Plan)
+    if config.paper_trading_enabled {
+        if let Err(err) = log_paper_trading_order(&config.paper_trading_log_file, &order, "OPEN", signal.id).await {
+            warn!("ORDERING: Failed to log paper trading order: {err:?}");
+        }
         info!(
-            "ORDERING: ⚡ FAST ORDER submitted {} in {:.2}ms (target: <50ms)",
-            signal.id, elapsed_ms
+            "ORDERING: 📝 PAPER TRADING - Virtual order logged {} (symbol: {}, side: {:?}, qty: {:.8}, price: {:.8}) in {:.2}ms",
+            signal.id, order.symbol, order.side, order.quantity, order_price, elapsed_ms
         );
-        // Order successfully sent - state.has_open_order=true will remain until OrderUpdate event arrives
-        // apply_order_update() will update the state based on order status:
-        // - If order is Filled/Canceled/Rejected -> has_open_order=false
-        // - If order is New/PartiallyFilled -> has_open_order=true
-        // This ensures state synchronization with actual order status from Binance
-        // order_sent_at is already set above, so timeout tracking will work correctly
+        // In paper trading mode, we simulate order acceptance
+        // The order is logged but not sent to exchange
+        // State management remains the same for consistency
+    } else {
+        // ✅ CRITICAL: Use fast order execution with cached data (TrendPlan.md)
+        let order_result = if symbol_cache.is_some() && depth_cache.is_some() {
+            // Fast path: use cached data
+            connection
+                .send_order_fast(&order, &symbol_info, best_bid, best_ask)
+                .await
+        } else {
+            // Fallback: use regular order execution
+            connection.send_order(order.clone()).await
+        };
+
+        if let Err(err) = order_result {
+            warn!(
+                "ORDERING: send_order failed: {err:?} (elapsed: {:.2}ms)",
+                elapsed_ms
+            );
+            // Order failed - reset state immediately
+            state.set_open_order(false);
+            // Clear timestamp since order was not actually sent
+            state.clear_order_sent();
+            state.clear_pending_position_meta();
+        } else {
+            info!(
+                "ORDERING: ⚡ FAST ORDER submitted {} in {:.2}ms (target: <50ms)",
+                signal.id, elapsed_ms
+            );
+            // Order successfully sent - state.has_open_order=true will remain until OrderUpdate event arrives
+            // apply_order_update() will update the state based on order status:
+            // - If order is Filled/Canceled/Rejected -> has_open_order=false
+            // - If order is New/PartiallyFilled -> has_open_order=true
+            // This ensures state synchronization with actual order status from Binance
+            // order_sent_at is already set above, so timeout tracking will work correctly
+        }
     }
 }
 
@@ -627,31 +645,81 @@ async fn handle_close_request(
 
     // ✅ CRITICAL: Use fast order execution with cached data (TrendPlan.md)
     let start_time = std::time::Instant::now();
-    let (best_bid, best_ask) = if let Some(cache) = &depth_cache {
-        cache.get_best_prices(&fresh_position.symbol).await.unwrap_or((0.0, 0.0))
-    } else {
-        (0.0, 0.0)
-    };
-
-    let order_result = if symbol_cache.is_some() && depth_cache.is_some() && best_bid > 0.0 && best_ask > 0.0 {
-        // Fast path: use cached data
-        connection.send_order_fast(&order, &symbol_info, best_bid, best_ask).await
-    } else {
-        // Fallback: use regular order execution
-        connection.send_order(order.clone()).await
-    };
-
+    let config = connection.config();
     let elapsed_ms = start_time.elapsed().as_millis() as f64;
 
-    if let Err(err) = order_result {
-        warn!(
-            "ORDERING: close send_order failed for position {}: {err:?} (elapsed: {:.2}ms)",
-            request.position_id, elapsed_ms
+    // ✅ Paper Trading Mode: Log order instead of sending to exchange (TrendPlan.md - Action Plan)
+    if config.paper_trading_enabled {
+        if let Err(err) = log_paper_trading_order(&config.paper_trading_log_file, &order, "CLOSE", request.position_id).await {
+            warn!("ORDERING: Failed to log paper trading order: {err:?}");
+        }
+        info!(
+            "ORDERING: 📝 PAPER TRADING - Virtual close order logged for position {} (symbol: {}, side: {:?}, qty: {:.8}) in {:.2}ms",
+            request.position_id, order.symbol, order.side, order.quantity, elapsed_ms
         );
     } else {
-        info!(
-            "ORDERING: ⚡ FAST CLOSE order submitted for position {} (size: {}, side: {:?}) in {:.2}ms (target: <50ms)",
-            request.position_id, qty, side, elapsed_ms
-        );
+        let (best_bid, best_ask) = if let Some(cache) = &depth_cache {
+            cache.get_best_prices(&fresh_position.symbol).await.unwrap_or((0.0, 0.0))
+        } else {
+            (0.0, 0.0)
+        };
+
+        let order_result = if symbol_cache.is_some() && depth_cache.is_some() && best_bid > 0.0 && best_ask > 0.0 {
+            // Fast path: use cached data
+            connection.send_order_fast(&order, &symbol_info, best_bid, best_ask).await
+        } else {
+            // Fallback: use regular order execution
+            connection.send_order(order.clone()).await
+        };
+
+        if let Err(err) = order_result {
+            warn!(
+                "ORDERING: close send_order failed for position {}: {err:?} (elapsed: {:.2}ms)",
+                request.position_id, elapsed_ms
+            );
+        } else {
+            info!(
+                "ORDERING: ⚡ FAST CLOSE order submitted for position {} (size: {}, side: {:?}) in {:.2}ms (target: <50ms)",
+                request.position_id, qty, side, elapsed_ms
+            );
+        }
     }
+}
+
+/// Log paper trading order to file (TrendPlan.md - Action Plan)
+/// This function writes virtual orders to a log file instead of sending them to the exchange
+async fn log_paper_trading_order(
+    log_file: &str,
+    order: &NewOrderRequest,
+    order_type: &str, // "OPEN" or "CLOSE"
+    order_id: impl std::fmt::Display,
+) -> Result<(), std::io::Error> {
+    let timestamp = Utc::now().to_rfc3339();
+    let side_str = match order.side {
+        Side::Long => "BUY",
+        Side::Short => "SELL",
+    };
+    
+    let log_entry = format!(
+        "[{}] {} ORDER | ID: {} | Symbol: {} | Side: {} | Quantity: {:.8} | ReduceOnly: {} | ClientOrderId: {}\n",
+        timestamp,
+        order_type,
+        order_id,
+        order.symbol,
+        side_str,
+        order.quantity,
+        order.reduce_only,
+        order.client_order_id.as_ref().map(|s| s.as_str()).unwrap_or("N/A")
+    );
+
+    // Use tokio::fs for async file operations
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .await?
+        .write_all(log_entry.as_bytes())
+        .await?;
+
+    Ok(())
 }
