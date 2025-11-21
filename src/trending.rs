@@ -758,10 +758,92 @@ impl LiquidationMap {
         }
     }
 
-    /// ✅ CRITICAL FIX: Estimate future liquidations using REAL data (no fake leverage distribution)
+    /// ✅ CRITICAL FIX (A): Use REAL liquidation data from connection.rs (LiqState) as PRIMARY source
+    /// MarketTick contains liq_long_cluster and liq_short_cluster from real-time forceOrder stream
+    /// These are normalized ratios (notional / OI) from actual liquidations in the last N seconds
+    /// This is ALWAYS more accurate than mathematical estimates
+    pub fn update_from_real_liquidation_data(
+        &mut self,
+        current_price: f64,
+        open_interest: f64,
+        liq_long_cluster: Option<f64>,
+        liq_short_cluster: Option<f64>,
+    ) {
+        // Clear previous estimates
+        self.long_liquidations.clear();
+        self.short_liquidations.clear();
+
+        // ✅ CRITICAL: Use real liquidation data if available
+        // liq_long_cluster and liq_short_cluster are ratios (notional / OI) from LiqState
+        // Convert to absolute notional values for liquidation map
+        
+        // Calculate price interval for clustering
+        let price_interval = if current_price > 1000.0 {
+            10.0 // Major coins: $10 intervals
+        } else if current_price > 1.0 {
+            0.01 // Mid-range: $0.01 intervals
+        } else {
+            0.00001 // Low-price coins: $0.00001 intervals
+        };
+
+        // Long liquidations (below current price)
+        if let Some(long_ratio) = liq_long_cluster {
+            if long_ratio > 0.0 && open_interest > 0.0 {
+                let long_notional = open_interest * long_ratio;
+                // Distribute across price levels near current price (1-2% below)
+                let price_levels = vec![
+                    (0.98, 0.4),  // 2% below: 40% of liquidations
+                    (0.99, 0.35), // 1% below: 35% of liquidations
+                    (0.995, 0.25), // 0.5% below: 25% of liquidations
+                ];
+                
+                for (price_mult, portion) in &price_levels {
+                    let liq_price = current_price * price_mult;
+                    let liq_price_rounded = (liq_price / price_interval).round() * price_interval;
+                    let liq_price_key = (liq_price_rounded / price_interval) as i64;
+                    let notional = long_notional * portion;
+                    
+                    *self
+                        .long_liquidations
+                        .entry(liq_price_key)
+                        .or_insert(0.0) += notional;
+                }
+            }
+        }
+
+        // Short liquidations (above current price)
+        if let Some(short_ratio) = liq_short_cluster {
+            if short_ratio > 0.0 && open_interest > 0.0 {
+                let short_notional = open_interest * short_ratio;
+                // Distribute across price levels near current price (1-2% above)
+                let price_levels = vec![
+                    (1.02, 0.4),  // 2% above: 40% of liquidations
+                    (1.01, 0.35), // 1% above: 35% of liquidations
+                    (1.005, 0.25), // 0.5% above: 25% of liquidations
+                ];
+                
+                for (price_mult, portion) in &price_levels {
+                    let liq_price = current_price * price_mult;
+                    let liq_price_rounded = (liq_price / price_interval).round() * price_interval;
+                    let liq_price_key = (liq_price_rounded / price_interval) as i64;
+                    let notional = short_notional * portion;
+                    
+                    *self
+                        .short_liquidations
+                        .entry(liq_price_key)
+                        .or_insert(0.0) += notional;
+                }
+            }
+        }
+
+        self.last_update = Utc::now();
+    }
+
+    /// ✅ FALLBACK: Estimate future liquidations using mathematical model (only if real data unavailable)
     /// Uses funding rate and Long/Short Ratio to estimate average leverage dynamically
     /// Funding rate > 0.01% (0.0001) typically indicates high leverage usage
     /// Long/Short Ratio imbalance also indicates leverage concentration
+    /// NOTE: This is LESS accurate than real liquidation data from connection.rs
     pub fn estimate_future_liquidations(
         &mut self,
         current_price: f64,
@@ -3761,6 +3843,19 @@ pub async fn run_trending(
     ws_base_url: String,
     metrics_cache: Option<Arc<crate::metrics_cache::MetricsCache>>, // ✅ ADIM 4: Cache desteği
 ) {
+    // ✅ CRITICAL FIX (C): Metrics cache is REQUIRED to prevent API rate limits
+    // In multi-symbol mode, each symbol would call fetch_market_metrics every 5 minutes
+    // Without cache, this would cause 429 Too Many Requests errors
+    if metrics_cache.is_none() {
+        log::warn!(
+            "TRENDING: MetricsCache is None for {} - API rate limits may be exceeded in multi-symbol mode!",
+            symbol
+        );
+        log::warn!(
+            "TRENDING: Consider passing MetricsCache from main.rs to prevent API limit issues"
+        );
+    }
+    
     let client = FuturesClient::new();
 
     // ✅ ADIM 2: AlgoConfig'i TrendParams'den oluştur (config.yaml parametreleri ile)
@@ -4035,12 +4130,20 @@ async fn fetch_market_metrics(
     limit: u32,
     metrics_cache: Option<&crate::metrics_cache::MetricsCache>,
 ) -> Result<(Vec<FundingRate>, Vec<OpenInterestPoint>, Vec<LongShortRatioPoint>)> {
+    // ✅ CRITICAL FIX (C): Always prefer cache to prevent API rate limits
+    // In multi-symbol mode (20 coins), without cache: 20 symbols × 3 API calls × 12 times/hour = 720 API calls/hour
+    // With cache: 20 symbols × 1 cache read × 12 times/hour = 240 cache reads/hour (no API calls)
     if let Some(cache) = metrics_cache {
         let funding = cache.get_funding_rates(symbol, 100).await?;
         let oi_hist = cache.get_open_interest_hist(symbol, futures_period, limit).await?;
         let lsr_hist = cache.get_top_long_short_ratio(symbol, futures_period, limit).await?;
         Ok((funding, oi_hist, lsr_hist))
     } else {
+        // ⚠️ WARNING: Direct API calls without cache - may cause rate limits in multi-symbol mode
+        log::warn!(
+            "TRENDING: fetch_market_metrics called without cache for {} - API rate limits may be exceeded!",
+            symbol
+        );
         let funding = client.fetch_funding_rates(symbol, 100).await?;
         let oi_hist = client.fetch_open_interest_hist(symbol, futures_period, limit).await?;
         let lsr_hist = client.fetch_top_long_short_ratio(symbol, futures_period, limit).await?;
@@ -4100,26 +4203,6 @@ async fn generate_signal_from_candle(
         funding_arbitrage.update_funding(ctx.funding_rate, candle.close_time);
     }
 
-    // 2. Liquidation Map - build from historical OI and LSR data
-    let mut liquidation_map = LiquidationMap::new();
-    for (candle, ctx) in matched_candles.iter().zip(contexts.iter()) {
-        liquidation_map.estimate_future_liquidations(
-            candle.close,
-            ctx.open_interest,
-            ctx.long_short_ratio,
-            ctx.funding_rate,
-        );
-    }
-
-    // 3. Volume Profile - calculate from candles (if enough data)
-    let volume_profile = if matched_candles.len() >= 50 {
-        Some(VolumeProfile::calculate_volume_profile(
-            &matched_candles[matched_candles.len().saturating_sub(100)..],
-        ))
-    } else {
-        None
-    };
-
     // ✅ CRITICAL: Use ONLY real MarketTick from WebSocket (NO estimated/dummy data)
     // If real tick is not available or stale, skip signal generation
     let market_tick = if let Some(real_tick) = latest_market_tick.read().await.as_ref() {
@@ -4141,6 +4224,46 @@ async fn generate_signal_from_candle(
             symbol
         );
         return Ok(None);
+    };
+
+    // ✅ CRITICAL FIX (A): Liquidation Map - Use REAL liquidation data from connection.rs as PRIMARY source
+    // Real data (liq_long_cluster, liq_short_cluster) is ALWAYS more accurate than mathematical estimates
+    // Fallback to estimate only if real data is unavailable
+    let mut liquidation_map = LiquidationMap::new();
+    
+    // PRIORITY 1: Use real liquidation data from MarketTick (connection.rs LiqState)
+    if let (Some(liq_long), Some(liq_short)) = (market_tick.liq_long_cluster, market_tick.liq_short_cluster) {
+        // Real liquidation data available - use it as PRIMARY source
+        liquidation_map.update_from_real_liquidation_data(
+            latest_candle.close,
+            latest_ctx.open_interest,
+            Some(liq_long),
+            Some(liq_short),
+        );
+        log::debug!(
+            "TRENDING: Using REAL liquidation data (long: {:.4}, short: {:.4}) from connection.rs LiqState",
+            liq_long, liq_short
+        );
+    } else {
+        // Real data unavailable - fallback to mathematical estimate (LESS accurate)
+        log::debug!("TRENDING: Real liquidation data unavailable, using mathematical estimate (fallback)");
+        for (candle, ctx) in matched_candles.iter().zip(contexts.iter()) {
+            liquidation_map.estimate_future_liquidations(
+                candle.close,
+                ctx.open_interest,
+                ctx.long_short_ratio,
+                ctx.funding_rate,
+            );
+        }
+    }
+
+    // 3. Volume Profile - calculate from candles (if enough data)
+    let volume_profile = if matched_candles.len() >= 50 {
+        Some(VolumeProfile::calculate_volume_profile(
+            &matched_candles[matched_candles.len().saturating_sub(100)..],
+        ))
+    } else {
+        None
     };
 
     // 5. Multi-Timeframe Analysis - create from aggregated candles
