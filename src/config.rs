@@ -76,6 +76,15 @@ pub struct BotConfig {
     // Paper Trading Mode (TrendPlan.md - Action Plan)
     pub paper_trading_enabled: bool,
     pub paper_trading_log_file: String, // Path to log file for virtual orders
+    // WebSocket Interruption Tolerance (TrendPlan.md - Critical Warnings)
+    pub market_tick_stale_tolerance_secs: i64, // Tolerance period for stale MarketTick (default: 30 seconds)
+    // If MarketTick is stale but within tolerance, continue signal generation with MTF/Funding
+    // but skip Order Flow and Liquidation strategies that require real-time data
+    // WebSocket Disconnection Strategy (Plan.md - Veri Akışı Sağlamlığı)
+    pub ws_disconnect_close_positions: bool, // Close positions when WebSocket disconnects for too long (default: false)
+    pub ws_disconnect_timeout_secs: i64, // Timeout before closing positions on disconnect (default: 60 seconds)
+    // If true, bot will close all open positions if WebSocket is disconnected for more than timeout_secs
+    // This prevents trading with stale data during extended disconnections
 }
 
 impl BotConfig {
@@ -328,6 +337,23 @@ impl BotConfig {
                 file_cfg.paper_trading.as_ref().and_then(|pt| pt.log_file.clone()),
                 "paper_trading_orders.log",
             ),
+            // WebSocket Interruption Tolerance (TrendPlan.md - Critical Warnings)
+            market_tick_stale_tolerance_secs: numeric_setting(
+                "BOT_MARKET_TICK_STALE_TOLERANCE_SECS",
+                trending_cfg.and_then(|t| t.market_tick_stale_tolerance_secs),
+                30i64, // Default: 30 seconds
+            ),
+            // WebSocket Disconnection Strategy (Plan.md - Veri Akışı Sağlamlığı)
+            ws_disconnect_close_positions: bool_setting(
+                "BOT_WS_DISCONNECT_CLOSE_POSITIONS",
+                file_cfg.risk.as_ref().and_then(|r| r.ws_disconnect_close_positions),
+                false, // Default: false (don't auto-close positions on disconnect)
+            ),
+            ws_disconnect_timeout_secs: numeric_setting(
+                "BOT_WS_DISCONNECT_TIMEOUT_SECS",
+                file_cfg.risk.as_ref().and_then(|r| r.ws_disconnect_timeout_secs),
+                60i64, // Default: 60 seconds
+            ),
         }
         .validate()
     }
@@ -422,14 +448,20 @@ impl BotConfig {
         warn_if!(self.liq_window_secs < 5, "liq_window_secs is very low, may cause excessive pruning. Recommendation: Use at least 10 seconds for stable operation", self.liq_window_secs);
         warn_if!(self.liq_window_secs > 300, format!("liq_window_secs is very high ({} minutes), may miss short-term liquidation clusters. Recommendation: Use 10-60 seconds for optimal detection", self.liq_window_secs / 60), self.liq_window_secs);
 
-        // ✅ FIX: Fee validation (TrendPlan.md - Action Plan)
+        // ✅ CRITICAL: HFT Mode Commission Warning (Plan.md - HFT Modu Komisyonu)
         // HFT modu çok sık işlem açar. Binance Futures taker komisyonu (yaklaşık %0.04 - %0.05) kârı eritir.
         // fee_bps_round_trip mutlaka 8.0 (0.08%) veya üzeri tutulmalı.
         if self.hft_mode {
             if self.fee_bps_round_trip < 8.0 {
-                eprintln!("WARNING: HFT mode enabled but fee_bps_round_trip ({}) is below recommended 8.0 (0.08%)", self.fee_bps_round_trip);
+                eprintln!("⚠️  CRITICAL WARNING: HFT mode enabled but fee_bps_round_trip ({}) is below recommended 8.0 (0.08%)", self.fee_bps_round_trip);
                 eprintln!("  HFT mode opens many trades. Binance Futures taker commission (~0.04-0.05%) will eat profits.");
                 eprintln!("  Recommendation: Set fee_bps_round_trip to at least 8.0 for realistic backtest results.");
+                eprintln!("  If your VIP level is low, consider disabling HFT mode or using higher fee settings.");
+            }
+            // Additional warning for very high frequency
+            if self.signal_cooldown_secs < 10 {
+                eprintln!("⚠️  WARNING: HFT mode with very low cooldown ({}s) will generate many trades.", self.signal_cooldown_secs);
+                eprintln!("  Each trade pays commission. Ensure fee_bps_round_trip is realistic (>= 8.0).");
             }
         }
         warn_if!(self.fee_bps_round_trip < 5.0, "fee_bps_round_trip is very low, may cause over-optimistic backtest results. Recommendation: Use at least 8.0 (0.08%) for realistic results", self.fee_bps_round_trip);
@@ -488,6 +520,8 @@ impl BotConfig {
             max_volatility_pct: self.max_volatility_pct,
             max_price_change_5bars_pct: self.max_price_change_5bars_pct,
             enable_signal_quality_filter: self.enable_signal_quality_filter,
+            // WebSocket Interruption Tolerance (TrendPlan.md - Critical Warnings)
+            market_tick_stale_tolerance_secs: self.market_tick_stale_tolerance_secs,
         }
     }
 }

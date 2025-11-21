@@ -160,6 +160,10 @@ pub struct TrendParams {
     pub max_volatility_pct: f64, // Maximum ATR volatility %
     pub max_price_change_5bars_pct: f64, // Max price change in 5 bars %
     pub enable_signal_quality_filter: bool, // Enable signal quality filtering
+    // WebSocket Interruption Tolerance (TrendPlan.md - Critical Warnings)
+    pub market_tick_stale_tolerance_secs: i64, // Tolerance period for stale MarketTick (default: 30 seconds)
+    // If MarketTick is stale but within tolerance, continue signal generation with MTF/Funding
+    // but skip Order Flow and Liquidation strategies that require real-time data
 }
 
 // fallback for warmup default referencing EMA slow period
@@ -260,6 +264,11 @@ pub(crate) struct FileRisk {
     pub max_weekly_drawdown_pct: Option<f64>, // Max weekly drawdown (default: 0.10 = 10%)
     #[serde(default)]
     pub risk_per_trade_pct: Option<f64>, // Risk per trade as % of equity (default: 0.01 = 1%)
+    // WebSocket Disconnection Strategy (Plan.md - Veri Akışı Sağlamlığı)
+    #[serde(default)]
+    pub ws_disconnect_close_positions: Option<bool>, // Close positions on WebSocket disconnect (default: false)
+    #[serde(default)]
+    pub ws_disconnect_timeout_secs: Option<i64>, // Timeout before closing positions (default: 60 seconds)
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -323,6 +332,9 @@ pub(crate) struct FileTrending {
     // Order Flow Analysis (TrendPlan.md - Action Plan)
     #[serde(default)]
     pub enable_order_flow: Option<bool>, // Enable Order Flow analysis (requires real depth data)
+    // WebSocket Interruption Tolerance (TrendPlan.md - Critical Warnings)
+    #[serde(default)]
+    pub market_tick_stale_tolerance_secs: Option<i64>, // Tolerance period for stale MarketTick (default: 30 seconds)
     // Execution & Backtest Parameters (no hardcoded values)
     #[serde(default)]
     pub fee_bps_round_trip: Option<f64>, // Round-trip fee in basis points (default: 8.0)
@@ -497,6 +509,11 @@ pub struct Connection {
     /// Used to sync with Binance server time for accurate timestamp generation
     /// Positive value means server is ahead of client
     pub(crate) server_time_offset: Arc<RwLock<i64>>,
+    // ✅ CRITICAL: WebSocket Connection Health Tracking (Plan.md - Veri Akışı Sağlamlığı)
+    /// Last successful MarketTick timestamp - used to detect stale data
+    pub(crate) last_market_tick_ts: Arc<RwLock<Option<DateTime<Utc>>>>,
+    /// Last successful WebSocket connection time - used to detect disconnections
+    pub(crate) last_ws_connection_ts: Arc<RwLock<Option<DateTime<Utc>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1211,16 +1228,6 @@ pub struct AlgoConfig {
     pub regime_multiplier_ranging: f64,   // Ranging regime için threshold multiplier (örn: 1.15)
     // Order Flow Analysis (TrendPlan.md - Action Plan)
     pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
-    // Execution & Backtest Parameters (configurable, no hardcoded values)
-    pub fee_bps_round_trip: f64, // Round-trip fee in basis points (default: 8.0 = 0.08%)
-    pub max_holding_bars: usize, // Maximum holding time in bars (default: 48)
-    pub slippage_bps: f64, // Slippage in basis points (default: 0.0 for optimistic backtest)
-    pub min_holding_bars: usize, // Minimum holding time in bars (default: 3)
-    // Signal Quality Filtering (configurable)
-    pub min_volume_ratio: f64, // Minimum volume ratio vs 20-bar average (default: 1.5)
-    pub max_volatility_pct: f64, // Maximum ATR volatility % (default: 2.0)
-    pub max_price_change_5bars_pct: f64, // Max price change in 5 bars % (default: 3.0)
-    pub enable_signal_quality_filter: bool, // Enable signal quality filtering (default: true)
 }
 
 // =======================

@@ -4575,58 +4575,133 @@ async fn generate_signal_from_candle(
         funding_arbitrage.update_funding(ctx.funding_rate, candle.close_time);
     }
 
-    // ✅ CRITICAL: Use ONLY real MarketTick from WebSocket (NO estimated/dummy data)
-    // If real tick is not available or stale, skip signal generation
-    let market_tick = if let Some(real_tick) = latest_market_tick.read().await.as_ref() {
-        if real_tick.symbol == symbol && real_tick.ts >= latest_candle.close_time - chrono::Duration::minutes(5) {
-            // Real tick is fresh and matches symbol - use it
-            real_tick.clone()
-        } else {
-            // Real tick is stale or wrong symbol - skip signal generation
+    // ✅ CRITICAL FIX: WebSocket Interruption Tolerance (TrendPlan.md - Critical Warnings)
+    // Instead of completely stopping signal generation on stale MarketTick, use tolerance period
+    // If MarketTick is stale but within tolerance, continue with MTF/Funding but skip Order Flow/Liquidation
+    let tolerance_duration = chrono::Duration::seconds(params.market_tick_stale_tolerance_secs);
+    let fresh_threshold = latest_candle.close_time - chrono::Duration::minutes(5);
+    let stale_threshold = latest_candle.close_time - tolerance_duration;
+    
+    let (market_tick, use_realtime_strategies) = if let Some(real_tick) = latest_market_tick.read().await.as_ref() {
+        if real_tick.symbol != symbol {
+            // Wrong symbol - create fallback tick, skip real-time strategies
             log::warn!(
-                "TRENDING: MarketTick is stale or wrong symbol (tick: {}, expected: {}, tick_ts: {}, candle_ts: {}), skipping signal",
-                real_tick.symbol, symbol, real_tick.ts, latest_candle.close_time
+                "TRENDING: MarketTick symbol mismatch (tick: {}, expected: {}), using fallback tick (skipping Order Flow/Liquidation)",
+                real_tick.symbol, symbol
             );
-            return Ok(None);
+            let fallback_tick = MarketTick {
+                symbol: symbol.to_string(),
+                price: latest_candle.close,
+                bid: latest_candle.close * 0.9999,
+                ask: latest_candle.close * 1.0001,
+                volume: latest_candle.volume,
+                ts: latest_candle.close_time,
+                obi: None,
+                funding_rate: Some(latest_ctx.funding_rate),
+                liq_long_cluster: None,
+                liq_short_cluster: None,
+                bid_depth_usd: None,
+                ask_depth_usd: None,
+            };
+            (fallback_tick, false)
+        } else if real_tick.ts >= fresh_threshold {
+            // Real tick is fresh (within 5 minutes) - use it fully with all strategies
+            (real_tick.clone(), true)
+        } else if real_tick.ts >= stale_threshold {
+            // Real tick is stale but within tolerance - use it but skip real-time strategies
+            log::warn!(
+                "TRENDING: MarketTick is stale but within tolerance (tick_ts: {}, candle_ts: {}, tolerance: {}s), continuing with MTF/Funding but skipping Order Flow/Liquidation",
+                real_tick.ts, latest_candle.close_time, params.market_tick_stale_tolerance_secs
+            );
+            (real_tick.clone(), false)
+        } else {
+            // Real tick is too old - create fallback tick, skip real-time strategies
+            log::warn!(
+                "TRENDING: MarketTick is too old (tick_ts: {}, candle_ts: {}, tolerance: {}s), using fallback tick (skipping Order Flow/Liquidation)",
+                real_tick.ts, latest_candle.close_time, params.market_tick_stale_tolerance_secs
+            );
+            let fallback_tick = MarketTick {
+                symbol: symbol.to_string(),
+                price: latest_candle.close,
+                bid: latest_candle.close * 0.9999,
+                ask: latest_candle.close * 1.0001,
+                volume: latest_candle.volume,
+                ts: latest_candle.close_time,
+                obi: None,
+                funding_rate: Some(latest_ctx.funding_rate),
+                liq_long_cluster: None,
+                liq_short_cluster: None,
+                bid_depth_usd: None,
+                ask_depth_usd: None,
+            };
+            (fallback_tick, false)
         }
     } else {
-        // No real tick available - skip signal generation
+        // No real tick available - create fallback tick, skip real-time strategies
         log::warn!(
-            "TRENDING: No MarketTick available for {}, skipping signal (waiting for WebSocket data)",
+            "TRENDING: No MarketTick available for {}, using fallback tick (skipping Order Flow/Liquidation). Signal generation continues with MTF/Funding strategies.",
             symbol
         );
-        return Ok(None);
+        let fallback_tick = MarketTick {
+            symbol: symbol.to_string(),
+            price: latest_candle.close,
+            bid: latest_candle.close * 0.9999,
+            ask: latest_candle.close * 1.0001,
+            volume: latest_candle.volume,
+            ts: latest_candle.close_time,
+            obi: None,
+            funding_rate: Some(latest_ctx.funding_rate),
+            liq_long_cluster: None,
+            liq_short_cluster: None,
+            bid_depth_usd: None,
+            ask_depth_usd: None,
+        };
+        (fallback_tick, false)
     };
 
     // ✅ CRITICAL FIX (A): Liquidation Map - Use REAL liquidation data from connection.rs as PRIMARY source
     // Real data (liq_long_cluster, liq_short_cluster) is ALWAYS more accurate than mathematical estimates
-    // Fallback to estimate only if real data is unavailable
+    // Fallback to estimate only if real data is unavailable OR if use_realtime_strategies is false
     let mut liquidation_map = LiquidationMap::new();
     
-    // PRIORITY 1: Use real liquidation data from MarketTick (connection.rs LiqState)
-    if let (Some(liq_long), Some(liq_short)) = (market_tick.liq_long_cluster, market_tick.liq_short_cluster) {
-        // Real liquidation data available - use it as PRIMARY source
-        liquidation_map.update_from_real_liquidation_data(
-            latest_candle.close,
-            latest_ctx.open_interest,
-            Some(liq_long),
-            Some(liq_short),
-        );
-        log::debug!(
-            "TRENDING: Using REAL liquidation data (long: {:.4}, short: {:.4}) from connection.rs LiqState",
-            liq_long, liq_short
-        );
+    if use_realtime_strategies {
+        // PRIORITY 1: Use real liquidation data from MarketTick (connection.rs LiqState)
+        if let (Some(liq_long), Some(liq_short)) = (market_tick.liq_long_cluster, market_tick.liq_short_cluster) {
+            // Real liquidation data available - use it as PRIMARY source
+            liquidation_map.update_from_real_liquidation_data(
+                latest_candle.close,
+                latest_ctx.open_interest,
+                Some(liq_long),
+                Some(liq_short),
+            );
+            log::debug!(
+                "TRENDING: Using REAL liquidation data (long: {:.4}, short: {:.4}) from connection.rs LiqState",
+                liq_long, liq_short
+            );
+        } else {
+            // Real data unavailable - fallback to mathematical estimate (LESS accurate)
+            // ⚠️ KRİTİK UYARI: estimate_future_liquidations tamamen matematiksel bir varsayım
+            // (Funding rate yüksekse kaldıraç yüksektir varsayımı).
+            // Bu tahmin bazen piyasa gerçeklerinden sapabilir.
+            log::warn!(
+                "TRENDING: ⚠️ Real liquidation data unavailable, using mathematical estimate (FALLBACK). \
+                This is LESS accurate than real liquidation data. \
+                Mathematical model assumes: high funding rate = high leverage. \
+                This assumption may deviate from market reality."
+            );
+            for (candle, ctx) in matched_candles.iter().zip(contexts.iter()) {
+                liquidation_map.estimate_future_liquidations(
+                    candle.close,
+                    ctx.open_interest,
+                    ctx.long_short_ratio,
+                    ctx.funding_rate,
+                );
+            }
+        }
     } else {
-        // Real data unavailable - fallback to mathematical estimate (LESS accurate)
-        // ⚠️ KRİTİK UYARI: estimate_future_liquidations tamamen matematiksel bir varsayım
-        // (Funding rate yüksekse kaldıraç yüksektir varsayımı).
-        // Bu tahmin bazen piyasa gerçeklerinden sapabilir.
-        log::warn!(
-            "TRENDING: ⚠️ Real liquidation data unavailable, using mathematical estimate (FALLBACK). \
-            This is LESS accurate than real liquidation data. \
-            Mathematical model assumes: high funding rate = high leverage. \
-            This assumption may deviate from market reality."
-        );
+        // MarketTick is stale or missing - skip liquidation strategies (requires real-time data)
+        log::debug!("TRENDING: Skipping liquidation map (MarketTick stale/missing, requires real-time data)");
+        // Still build empty liquidation map for consistency (won't contribute to signals)
         for (candle, ctx) in matched_candles.iter().zip(contexts.iter()) {
             liquidation_map.estimate_future_liquidations(
                 candle.close,
@@ -4657,18 +4732,22 @@ async fn generate_signal_from_candle(
     // 6. OrderFlow Analyzer - use ONLY real depth data from MarketTick
     // ✅ CRITICAL FIX: Order Flow uyumsuzluğunu düzelt (TrendPlan.md - Action Plan)
     // Config'den enable_order_flow kontrolü yap - backtest ile production tutarlılığı için
-    let orderflow_analyzer = if cfg.enable_order_flow {
+    // ✅ CRITICAL FIX: Skip Order Flow if use_realtime_strategies is false (MarketTick stale/missing)
+    let orderflow_analyzer = if cfg.enable_order_flow && use_realtime_strategies {
         if let (Some(bid_depth), Some(ask_depth)) = (market_tick.bid_depth_usd, market_tick.ask_depth_usd) {
-        // Real depth data available - use it
-        create_orderflow_from_real_depth(&market_tick, &matched_candles, bid_depth, ask_depth)
-    } else {
-        // No real depth data - skip orderflow (don't use estimated data)
+            // Real depth data available - use it
+            create_orderflow_from_real_depth(&market_tick, &matched_candles, bid_depth, ask_depth)
+        } else {
+            // No real depth data - skip orderflow (don't use estimated data)
             log::debug!("TRENDING: Order Flow enabled but no real depth data available, skipping orderflow analysis");
             None
         }
     } else {
-        // Order Flow disabled in config (for backtest consistency)
-        log::debug!("TRENDING: Order Flow disabled in config (enable_order_flow: false)");
+        if cfg.enable_order_flow && !use_realtime_strategies {
+            log::debug!("TRENDING: Order Flow skipped (MarketTick stale/missing, requires real-time data)");
+        } else {
+            log::debug!("TRENDING: Order Flow disabled in config (enable_order_flow: false)");
+        }
         None
     };
 

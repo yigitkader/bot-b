@@ -84,12 +84,43 @@ impl Connection {
             .expect("failed to build reqwest client");
         let rate_limiter = Arc::new(crate::types::RateLimiter::new());
         let server_time_offset = Arc::new(tokio::sync::RwLock::new(0i64));
+        // ✅ CRITICAL: Initialize WebSocket health tracking (Plan.md - Veri Akışı Sağlamlığı)
+        let last_market_tick_ts = Arc::new(tokio::sync::RwLock::new(None));
+        let last_ws_connection_ts = Arc::new(tokio::sync::RwLock::new(None));
         Self {
             config,
             http,
             rate_limiter,
             server_time_offset,
+            last_market_tick_ts,
+            last_ws_connection_ts,
         }
+    }
+
+    /// ✅ CRITICAL: Check if WebSocket data is stale (Plan.md - Veri Akışı Sağlamlığı)
+    /// Returns (is_stale, seconds_since_last_update)
+    pub async fn check_websocket_health(&self) -> (bool, i64) {
+        let now = Utc::now();
+        let last_tick = self.last_market_tick_ts.read().await;
+        
+        if let Some(last_ts) = *last_tick {
+            let elapsed = now.signed_duration_since(last_ts).num_seconds();
+            let stale_threshold = self.config.market_tick_stale_tolerance_secs;
+            (elapsed > stale_threshold, elapsed)
+        } else {
+            // No data received yet - consider as stale
+            (true, i64::MAX)
+        }
+    }
+
+    /// ✅ CRITICAL: Update last MarketTick timestamp (Plan.md - Veri Akışı Sağlamlığı)
+    pub(crate) async fn update_market_tick_timestamp(&self, ts: DateTime<Utc>) {
+        *self.last_market_tick_ts.write().await = Some(ts);
+    }
+
+    /// ✅ CRITICAL: Update last WebSocket connection timestamp (Plan.md - Veri Akışı Sağlamlığı)
+    pub(crate) async fn update_ws_connection_timestamp(&self) {
+        *self.last_ws_connection_ts.write().await = Some(Utc::now());
     }
 
     pub fn quote_asset(&self) -> &str {
@@ -690,6 +721,8 @@ impl Connection {
             match connect_async(&url).await {
                 Ok((ws_stream, _)) => {
                     info!("CONNECTION: mark price stream connected ({url})");
+                    // ✅ CRITICAL: Update WebSocket connection timestamp (Plan.md - Veri Akışı Sağlamlığı)
+                    self.update_ws_connection_timestamp().await;
                     retry_delay = Duration::from_secs(1);
                     let (_, mut read) = ws_stream.split();
                     let mut lag_monitor = ch.market_tx.subscribe();
@@ -703,6 +736,9 @@ impl Connection {
                                     tick.liq_short_cluster = liq_short;
                                     populate_tick_with_depth(&depth_state, &mut tick).await;
 
+                                    // ✅ CRITICAL: Update MarketTick timestamp for health tracking (Plan.md)
+                                    self.update_market_tick_timestamp(tick.ts).await;
+                                    
                                     match lag_monitor.try_recv() {
                                         Ok(_) | Err(broadcast::error::TryRecvError::Empty) => {
                                             if ch.market_tx.send(tick).is_err() {
@@ -801,6 +837,8 @@ impl Connection {
             match connect_async(&url).await {
                 Ok((ws_stream, _)) => {
                     info!("CONNECTION: depth stream connected ({url})");
+                    // ✅ CRITICAL: Update WebSocket connection timestamp (Plan.md - Veri Akışı Sağlamlığı)
+                    self.update_ws_connection_timestamp().await;
                     retry_delay = Duration::from_secs(1);
                     let (_, mut read) = ws_stream.split();
                     while let Some(message) = read.next().await {

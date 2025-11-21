@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -723,6 +723,68 @@ async fn main() -> Result<()> {
                     "HEALTH: All {} tasks running normally",
                     health_check_task_infos.len()
                 );
+            }
+        }
+    });
+
+    // ✅ CRITICAL: WebSocket Health Monitoring Task (Plan.md - Veri Akışı Sağlamlığı)
+    // Monitor WebSocket connection health and handle disconnections
+    let connection_health = connection.clone();
+    let shared_state_health = shared_state.clone();
+    let ordering_close_tx_health = ordering_ch.close_tx.clone();
+    let config_health = config.clone();
+    let ws_health_task = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(10)); // Check every 10 seconds
+        loop {
+            interval.tick().await;
+
+            let (is_stale, seconds_since_update) = connection_health.check_websocket_health().await;
+            
+            if is_stale {
+                warn!(
+                    "WS_HEALTH: WebSocket data is stale ({} seconds since last update, threshold: {}s)",
+                    seconds_since_update,
+                    config_health.market_tick_stale_tolerance_secs
+                );
+
+                // ✅ CRITICAL: Position Management on WebSocket Disconnect (Plan.md)
+                // If configured, close positions when WebSocket is disconnected for too long
+                if config_health.ws_disconnect_close_positions {
+                    if seconds_since_update > config_health.ws_disconnect_timeout_secs {
+                        if let Some(position) = shared_state_health.current_position() {
+                            warn!(
+                                "WS_HEALTH: WebSocket disconnected for {}s (threshold: {}s), closing position {} to prevent trading with stale data",
+                                seconds_since_update,
+                                config_health.ws_disconnect_timeout_secs,
+                                position.position_id
+                            );
+                            
+                            // Send close request
+                            let close_request = crate::types::CloseRequest {
+                                position_id: position.position_id,
+                                reason: format!(
+                                    "WebSocket disconnected for {}s (threshold: {}s)",
+                                    seconds_since_update,
+                                    config_health.ws_disconnect_timeout_secs
+                                ),
+                                ts: chrono::Utc::now(),
+                                partial_close_percentage: None, // Full close
+                            };
+                            
+                            if ordering_close_tx_health.send(close_request).is_err() {
+                                error!("WS_HEALTH: Failed to send close request - ordering channel closed");
+                            }
+                        }
+                    }
+                }
+            } else {
+                // WebSocket is healthy
+                if seconds_since_update < i64::MAX {
+                    log::debug!(
+                        "WS_HEALTH: WebSocket healthy ({}s since last update)",
+                        seconds_since_update
+                    );
+                }
             }
         }
     });

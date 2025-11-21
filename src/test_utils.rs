@@ -43,6 +43,7 @@ impl AlgoConfigBuilder {
                 weak_trend_score_multiplier: 1.15,
                 regime_multiplier_trending: 0.9,
                 regime_multiplier_ranging: 1.15,
+                enable_order_flow: false, // Default: disabled for backtest consistency
             },
         }
     }

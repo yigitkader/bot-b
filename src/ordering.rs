@@ -7,8 +7,7 @@ use log::{info, warn};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use std::fs::OpenOptions;
-use std::io::Write;
+use tokio::io::AsyncWriteExt;
 use chrono::Utc;
 
 pub async fn run_ordering(
@@ -310,22 +309,30 @@ async fn handle_signal(
     let qty = (notional / order_price).abs();
 
     if let Some(rm) = risk_manager {
-        // ✅ CRITICAL FIX: Risk manager expects base quantity (without leverage)
-        // But qty already includes leverage (calculated from notional = size_usdt * leverage)
-        // So we need to pass base quantity: qty / leverage
-        // OR: Risk manager calculates notional = size * entry_price * leverage
-        // Since we want notional = size_usdt * leverage, we need:
-        // size * entry_price * leverage = size_usdt * leverage
-        // size * entry_price = size_usdt
-        // size = size_usdt / entry_price (base quantity without leverage)
+        // ✅ CRITICAL FIX: Risk Manager Quantity Calculation (TrendPlan.md - Critical Warnings)
+        // 
+        // Risk Manager expects: base quantity (without leverage) and calculates:
+        //   notional = base_qty * entry_price * leverage
+        //
+        // We have: size_usdt (position size in USDT, without leverage)
+        // We want: notional = size_usdt * leverage
+        //
+        // Therefore: base_qty * entry_price * leverage = size_usdt * leverage
+        //            base_qty * entry_price = size_usdt
+        //            base_qty = size_usdt / entry_price
+        //
+        // Example: size_usdt = 100 USDT, leverage = 10x, entry_price = 50000
+        //          base_qty = 100 / 50000 = 0.002 BTC
+        //          Risk Manager calculates: notional = 0.002 * 50000 * 10 = 1000 USDT ✓
+        //          This matches: size_usdt * leverage = 100 * 10 = 1000 USDT ✓
         let base_qty = size_usdt / order_price;
         
         let (allowed, reason) = rm
             .can_open_position(
                 &signal.symbol,
                 signal.side,
-                order_price, // Gerçek order price kullan
-                base_qty, // Base quantity (without leverage) for risk manager
+                order_price, // Actual order execution price
+                base_qty,    // Base quantity (without leverage) - Risk Manager will multiply by leverage internally
                 signal.leverage,
             )
             .await;
@@ -686,8 +693,9 @@ async fn handle_close_request(
     }
 }
 
-/// Log paper trading order to file (TrendPlan.md - Action Plan)
+/// Log paper trading order to file (Plan.md - Paper Trading Zorunluluğu)
 /// This function writes virtual orders to a log file instead of sending them to the exchange
+/// Enhanced logging with performance metrics for analysis
 async fn log_paper_trading_order(
     log_file: &str,
     order: &NewOrderRequest,
@@ -700,8 +708,10 @@ async fn log_paper_trading_order(
         Side::Short => "SELL",
     };
     
+    // ✅ ENHANCED: Detailed logging for Paper Trading analysis (Plan.md)
+    // Include order details, timestamp, and metadata for performance analysis
     let log_entry = format!(
-        "[{}] {} ORDER | ID: {} | Symbol: {} | Side: {} | Quantity: {:.8} | ReduceOnly: {} | ClientOrderId: {}\n",
+        "[{}] {} ORDER | ID: {} | Symbol: {} | Side: {} | Quantity: {:.8} | ReduceOnly: {} | ClientOrderId: {} | Timestamp: {}\n",
         timestamp,
         order_type,
         order_id,
@@ -709,7 +719,8 @@ async fn log_paper_trading_order(
         side_str,
         order.quantity,
         order.reduce_only,
-        order.client_order_id.as_ref().map(|s| s.as_str()).unwrap_or("N/A")
+        order.client_order_id.as_ref().map(|s| s.as_str()).unwrap_or("N/A"),
+        timestamp
     );
 
     // Use tokio::fs for async file operations
