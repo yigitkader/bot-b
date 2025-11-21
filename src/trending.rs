@@ -1512,6 +1512,64 @@ fn create_simplified_orderflow(
     Some(orderflow)
 }
 
+fn create_orderflow_from_real_depth(
+    _market_tick: &MarketTick,
+    candles: &[Candle],
+    bid_depth_usd: f64,
+    ask_depth_usd: f64,
+) -> Option<OrderFlowAnalyzer> {
+    if candles.len() < 5 {
+        return None;
+    }
+
+    let mut orderflow = OrderFlowAnalyzer::new(200);
+    let recent_count = candles.len().min(200);
+    let start_idx = candles.len().saturating_sub(recent_count);
+
+    for i in start_idx..candles.len() {
+        let candle = &candles[i];
+        let price = candle.close;
+
+        let bid_volume = bid_depth_usd / price.max(0.0001);
+        let ask_volume = ask_depth_usd / price.max(0.0001);
+
+        let mut bids = Vec::new();
+        let mut asks = Vec::new();
+
+        let bid_levels = 10;
+        let ask_levels = 10;
+        let total_bid_weight: f64 = (1..=bid_levels).map(|i| 1.0 / (i as f64)).sum();
+        let total_ask_weight: f64 = (1..=ask_levels).map(|i| 1.0 / (i as f64)).sum();
+
+        for level in 1..=bid_levels {
+            let weight = (1.0 / (level as f64)) / total_bid_weight;
+            let level_volume = bid_volume * weight;
+            let price_offset = (level as f64) * 0.0001;
+            let bid_price = price * (1.0 - price_offset);
+            bids.push([
+                format!("{:.8}", bid_price),
+                format!("{:.8}", level_volume),
+            ]);
+        }
+
+        for level in 1..=ask_levels {
+            let weight = (1.0 / (level as f64)) / total_ask_weight;
+            let level_volume = ask_volume * weight;
+            let price_offset = (level as f64) * 0.0001;
+            let ask_price = price * (1.0 + price_offset);
+            asks.push([
+                format!("{:.8}", ask_price),
+                format!("{:.8}", level_volume),
+            ]);
+        }
+
+        let depth = DepthSnapshot { bids, asks };
+        orderflow.add_snapshot(&depth);
+    }
+
+    Some(orderflow)
+}
+
 // =======================
 //  Sinyal Motoru
 // =======================
@@ -3609,6 +3667,10 @@ struct LastSignalState {
     last_short_time: Option<chrono::DateTime<Utc>>,
 }
 
+struct MarketTickState {
+    latest_tick: Arc<RwLock<Option<MarketTick>>>,
+}
+
 /// Production için trending modülü - Kline WebSocket stream'ini dinler ve TradeSignal üretir
 ///
 /// Bu fonksiyon:
@@ -3693,17 +3755,37 @@ pub async fn run_trending(
         last_short_time: None,
     };
 
+    let market_tick_state = MarketTickState {
+        latest_tick: Arc::new(RwLock::new(None)),
+    };
+
     info!(
         "TRENDING: started for symbol {} with kline WebSocket stream",
         symbol
     );
 
-    // Kline WebSocket stream task
+    let market_tick_updater = {
+        let mut market_rx = ch.market_rx;
+        let latest_tick = market_tick_state.latest_tick.clone();
+        tokio::spawn(async move {
+            loop {
+                match crate::types::handle_broadcast_recv(market_rx.recv().await) {
+                    Ok(Some(tick)) => {
+                        *latest_tick.write().await = Some(tick);
+                    }
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+
     let kline_stream_symbol = symbol.clone();
     let kline_stream_ws_url = ws_base_url.clone();
     let kline_stream_buffer = candle_buffer.clone();
     let kline_stream_signal_state = Arc::new(RwLock::new(signal_state));
     let kline_stream_signal_tx = ch.signal_tx.clone();
+    let kline_stream_market_tick = market_tick_state.latest_tick.clone();
 
     let kline_task = tokio::spawn(async move {
         run_kline_stream(
@@ -3717,13 +3799,13 @@ pub async fn run_trending(
             params,
             kline_stream_signal_state,
             kline_stream_signal_tx,
-            metrics_cache, // ✅ ADIM 4: Cache'i geçir
+            metrics_cache,
+            kline_stream_market_tick,
         )
         .await;
     });
 
-    // Wait for kline stream task
-    let _ = kline_task.await;
+    let _ = tokio::join!(kline_task, market_tick_updater);
 }
 
 async fn run_kline_stream(
@@ -3737,7 +3819,8 @@ async fn run_kline_stream(
     params: TrendParams,
     signal_state: Arc<RwLock<LastSignalState>>,
     signal_tx: tokio::sync::mpsc::Sender<TradeSignal>,
-    metrics_cache: Option<Arc<crate::metrics_cache::MetricsCache>>, // ✅ ADIM 4: Cache desteği
+    metrics_cache: Option<Arc<crate::metrics_cache::MetricsCache>>,
+    latest_market_tick: Arc<RwLock<Option<MarketTick>>>,
 ) {
     let mut retry_delay = TokioDuration::from_secs(1);
     let ws_url = format!(
@@ -3769,7 +3852,6 @@ async fn run_kline_stream(
                                         }
                                         drop(buffer);
 
-                                        // Sinyal üret (signal gönderme işlemi fonksiyon içinde yapılıyor)
                                         if let Err(err) = generate_signal_from_candle(
                                             &candle,
                                             &candle_buffer,
@@ -3780,7 +3862,8 @@ async fn run_kline_stream(
                                             &params,
                                             signal_state.clone(),
                                             &signal_tx,
-                                            metrics_cache.as_deref(), // ✅ ADIM 4: Cache'i geçir
+                                            metrics_cache.as_deref(),
+                                            latest_market_tick.clone(),
                                         )
                                         .await
                                         {
@@ -3804,7 +3887,6 @@ async fn run_kline_stream(
                                             }
                                             drop(buffer);
 
-                                            // Sinyal üret (signal gönderme işlemi fonksiyon içinde yapılıyor)
                                             if let Err(err) = generate_signal_from_candle(
                                                 &candle,
                                                 &candle_buffer,
@@ -3815,7 +3897,8 @@ async fn run_kline_stream(
                                                 &params,
                                                 signal_state.clone(),
                                                 &signal_tx,
-                                                metrics_cache.as_deref(), // ✅ ADIM 4: Cache'i geçir
+                                                metrics_cache.as_deref(),
+                                                latest_market_tick.clone(),
                                             )
                                             .await
                                             {
@@ -3900,6 +3983,7 @@ async fn generate_signal_from_candle(
     signal_state: Arc<RwLock<LastSignalState>>,
     signal_tx: &tokio::sync::mpsc::Sender<TradeSignal>,
     metrics_cache: Option<&crate::metrics_cache::MetricsCache>,
+    latest_market_tick: Arc<RwLock<Option<MarketTick>>>,
 ) -> Result<Option<TradeSignal>> {
     let buffer = candle_buffer.read().await;
 
@@ -3960,28 +4044,50 @@ async fn generate_signal_from_candle(
         None
     };
 
-    // 4. Market Tick - create from latest candle and context
-    // OBI estimation: Long/Short ratio indicates bid/ask pressure
-    // LSR > 1.0 = more longs = bid pressure = OBI > 1.0
-    let estimated_obi = if latest_ctx.long_short_ratio > 1.0 {
-        Some(latest_ctx.long_short_ratio) // Long dominance = bid pressure
+    let market_tick = if let Some(real_tick) = latest_market_tick.read().await.as_ref() {
+        if real_tick.symbol == symbol && real_tick.ts >= latest_candle.close_time - chrono::Duration::minutes(5) {
+            real_tick.clone()
+        } else {
+            let estimated_obi = if latest_ctx.long_short_ratio > 1.0 {
+                Some(latest_ctx.long_short_ratio)
+            } else {
+                Some(1.0 / latest_ctx.long_short_ratio.max(0.1))
+            };
+            MarketTick {
+                symbol: symbol.to_string(),
+                price: latest_candle.close,
+                bid: latest_candle.close * 0.9999,
+                ask: latest_candle.close * 1.0001,
+                volume: latest_candle.volume,
+                ts: latest_candle.close_time,
+                obi: estimated_obi,
+                funding_rate: Some(latest_ctx.funding_rate),
+                liq_long_cluster: None,
+                liq_short_cluster: None,
+                bid_depth_usd: None,
+                ask_depth_usd: None,
+            }
+        }
     } else {
-        Some(1.0 / latest_ctx.long_short_ratio.max(0.1)) // Short dominance = ask pressure
-    };
-
-    let market_tick = MarketTick {
-        symbol: symbol.to_string(),
-        price: latest_candle.close,
-        bid: latest_candle.close * 0.9999, // Estimate from close
-        ask: latest_candle.close * 1.0001, // Estimate from close
-        volume: latest_candle.volume,
-        ts: latest_candle.close_time,
-        obi: estimated_obi,
-        funding_rate: Some(latest_ctx.funding_rate),
-        liq_long_cluster: None, // Would need real-time liquidation data
-        liq_short_cluster: None,
-        bid_depth_usd: None, // Would need orderbook depth data
-        ask_depth_usd: None,
+        let estimated_obi = if latest_ctx.long_short_ratio > 1.0 {
+            Some(latest_ctx.long_short_ratio)
+        } else {
+            Some(1.0 / latest_ctx.long_short_ratio.max(0.1))
+        };
+        MarketTick {
+            symbol: symbol.to_string(),
+            price: latest_candle.close,
+            bid: latest_candle.close * 0.9999,
+            ask: latest_candle.close * 1.0001,
+            volume: latest_candle.volume,
+            ts: latest_candle.close_time,
+            obi: estimated_obi,
+            funding_rate: Some(latest_ctx.funding_rate),
+            liq_long_cluster: None,
+            liq_short_cluster: None,
+            bid_depth_usd: None,
+            ask_depth_usd: None,
+        }
     };
 
     // 5. Multi-Timeframe Analysis - create from aggregated candles
@@ -3992,8 +4098,12 @@ async fn generate_signal_from_candle(
         None
     };
 
-    // 6. OrderFlow Analyzer - create from estimated bid/ask volumes
-    let orderflow_analyzer = create_simplified_orderflow(&matched_candles, &contexts);
+    // 6. OrderFlow Analyzer - use real depth data from MarketTick if available
+    let orderflow_analyzer = if let (Some(bid_depth), Some(ask_depth)) = (market_tick.bid_depth_usd, market_tick.ask_depth_usd) {
+        create_orderflow_from_real_depth(&market_tick, &matched_candles, bid_depth, ask_depth)
+    } else {
+        create_simplified_orderflow(&matched_candles, &contexts)
+    };
 
     // ✅ CRITICAL FIX: Log component availability for debugging
     log::debug!(
