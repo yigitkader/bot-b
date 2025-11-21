@@ -398,7 +398,6 @@ impl RateLimiter {
 
     /// Acquire weight (1200 weight/minute limit)
     pub async fn acquire_weight(&self, weight: u32) -> anyhow::Result<()> {
-        use anyhow::anyhow;
 
         loop {
             // Check if we need to reset weight window
@@ -1144,4 +1143,14 @@ pub struct AlgoConfig {
 pub struct FuturesClient {
     pub(crate) http: Client,
     pub(crate) base_url: Url,
+}
+
+pub fn handle_broadcast_recv<T>(
+    result: Result<T, tokio::sync::broadcast::error::RecvError>,
+) -> Result<Option<T>, ()> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Ok(None),
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => Err(()),
+    }
 }

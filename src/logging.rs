@@ -1,6 +1,5 @@
 use crate::types::LoggingChannels;
 use log::info;
-use tokio::sync::broadcast;
 
 pub async fn run_logging(ch: LoggingChannels) {
     let mut market_rx = ch.market_rx;
@@ -11,31 +10,30 @@ pub async fn run_logging(ch: LoggingChannels) {
 
     loop {
         tokio::select! {
-            res = market_rx.recv() => match res {
-                Ok(tick) => info!("LOG MarketTick {:?}", tick),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            res = market_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(tick)) => info!("LOG MarketTick {:?}", tick),
+                Ok(None) => continue,
+                Err(_) => break,
             },
-            res = order_rx.recv() => match res {
-                Ok(update) => info!("LOG OrderUpdate {:?}", update),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            res = order_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => info!("LOG OrderUpdate {:?}", update),
+                Ok(None) => continue,
+                Err(_) => break,
             },
-            res = position_rx.recv() => match res {
-                Ok(update) => {
+            res = position_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => {
                     info!("LOG PositionUpdate {:?}", update);
-                    // PnL loglama: PositionUpdate'te realized PnL varsa logla
                     if update.is_closed {
                         info!("LOG PositionClosed: position_id={}", update.position_id);
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                Ok(None) => continue,
+                Err(_) => break,
             },
-            res = balance_rx.recv() => match res {
-                Ok(snapshot) => info!("LOG BalanceSnapshot {:?}", snapshot),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            res = balance_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(snapshot)) => info!("LOG BalanceSnapshot {:?}", snapshot),
+                Ok(None) => continue,
+                Err(_) => break,
             },
             Some(signal) = signal_rx.recv() => {
                 info!(

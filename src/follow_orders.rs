@@ -2,7 +2,6 @@ use crate::types::{CloseRequest, MarketTick, PositionUpdate, Side};
 use crate::types::{FollowChannels, PositionMeta, SharedState};
 use chrono::Utc;
 use log::{info, warn};
-use tokio::sync::broadcast;
 
 pub async fn run_follow_orders(
     ch: FollowChannels,
@@ -23,22 +22,20 @@ pub async fn run_follow_orders(
 
     loop {
         tokio::select! {
-            res = position_update_rx.recv() => match res {
-                Ok(update) => {
-                    // Update equity with unrealized PnL
+            res = position_update_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => {
                     state.update_equity(update.unrealized_pnl);
-                    
                     if update.is_closed {
                         current_position = None;
                     } else {
                         current_position = Some(update);
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                Ok(None) => continue,
+                Err(_) => break,
             },
-            res = market_rx.recv() => match res {
-                Ok(tick) => {
+            res = market_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(tick)) => {
                     if let Some(position) = current_position.as_ref() {
                         let position_meta = state.current_position_meta();
                         if let Some(req) = evaluate_position(
@@ -57,8 +54,8 @@ pub async fn run_follow_orders(
                         }
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                Ok(None) => continue,
+                Err(_) => break,
             }
         }
     }

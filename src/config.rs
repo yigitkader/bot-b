@@ -258,208 +258,99 @@ impl BotConfig {
         .validate()
     }
 
-    /// Validate configuration values and panic with helpful error messages if invalid
-    /// This prevents runtime errors from invalid config values
     fn validate(self) -> Self {
         use std::process;
 
-        // Leverage validation
-        if self.leverage <= 0.0 {
-            eprintln!("ERROR: leverage must be > 0, got: {}", self.leverage);
-            eprintln!("  Fix: Set BOT_LEVERAGE to a positive value (e.g., 10.0)");
-            process::exit(1);
+        macro_rules! validate_positive {
+            ($value:expr, $name:expr, $env_key:expr, $example:expr) => {
+                if $value <= 0.0 {
+                    eprintln!("ERROR: {} must be > 0, got: {}", $name, $value);
+                    eprintln!("  Fix: Set {} to a positive value ({})", $env_key, $example);
+                    process::exit(1);
+                }
+            };
         }
 
-        // Take profit validation
-        if self.tp_percent <= 0.0 {
-            eprintln!("ERROR: tp_percent must be > 0, got: {}", self.tp_percent);
-            eprintln!("  Fix: Set BOT_TP_PERCENT to a positive value (e.g., 1.0 for 1%)");
-            process::exit(1);
-        }
-        if self.tp_percent > 100.0 {
-            eprintln!(
-                "WARNING: tp_percent is very high: {}%, this may be intentional",
-                self.tp_percent
-            );
+        macro_rules! validate_positive_int {
+            ($value:expr, $name:expr, $env_key:expr) => {
+                if $value == 0 {
+                    eprintln!("ERROR: {} must be > 0, got: {}", $name, $value);
+                    eprintln!("  Fix: Set {} to a positive value", $env_key);
+                    process::exit(1);
+                }
+            };
         }
 
-        // Stop loss validation
-        if self.sl_percent <= 0.0 {
-            eprintln!("ERROR: sl_percent must be > 0, got: {}", self.sl_percent);
-            eprintln!("  Fix: Set BOT_SL_PERCENT to a positive value (e.g., 0.5 for 0.5%)");
-            process::exit(1);
+        macro_rules! validate_range {
+            ($value:expr, $name:expr, $min:expr, $max:expr) => {
+                if $value < $min || $value > $max {
+                    eprintln!("ERROR: {} must be between {}-{}, got: {}", $name, $min, $max, $value);
+                    process::exit(1);
+                }
+            };
         }
+
+        macro_rules! validate_greater {
+            ($a:expr, $b:expr, $name_a:expr, $name_b:expr, $env_key:expr) => {
+                if $a <= $b {
+                    eprintln!("ERROR: {} ({}) must be > {} ({}), got: {} <= {}", $name_a, $a, $name_b, $b, $a, $b);
+                    eprintln!("  Fix: Set {} to a value greater than {}", $env_key, $name_b);
+                    process::exit(1);
+                }
+            };
+        }
+
+        macro_rules! warn_if {
+            ($condition:expr, $message:expr, $value:expr) => {
+                if $condition {
+                    eprintln!("WARNING: {} (value: {})", $message, $value);
+                }
+            };
+        }
+
+        validate_positive!(self.leverage, "leverage", "BOT_LEVERAGE", "e.g., 10.0");
+        validate_positive!(self.tp_percent, "tp_percent", "BOT_TP_PERCENT", "e.g., 1.0 for 1%");
+        validate_positive!(self.sl_percent, "sl_percent", "BOT_SL_PERCENT", "e.g., 0.5 for 0.5%");
+        validate_positive!(self.position_size_quote, "position_size_quote", "BOT_POSITION_SIZE_QUOTE", "a positive value");
+        validate_positive_int!(self.ema_fast_period, "ema_fast_period", "BOT_EMA_FAST_PERIOD");
+        validate_positive_int!(self.rsi_period, "rsi_period", "BOT_RSI_PERIOD");
+        validate_positive_int!(self.atr_period, "atr_period", "BOT_ATR_PERIOD");
+        validate_positive!(self.obi_long_min, "obi_long_min", "BOT_OBI_LONG_MIN", "a positive value");
+        validate_positive!(self.obi_short_max, "obi_short_max", "BOT_OBI_SHORT_MAX", "a positive value");
+        validate_positive!(self.min_margin_usd, "min_margin_usd", "BOT_MIN_MARGIN_USD", "a positive value");
+        validate_positive!(self.min_quote_balance_usd, "min_quote_balance_usd", "BOT_MIN_QUOTE_BALANCE_USD", "a positive value");
+        validate_positive!(self.max_position_notional_usd, "max_position_notional_usd", "BOT_MAX_POSITION_NOTIONAL_USD", "a positive value");
+        validate_positive_int!(self.liq_window_secs, "liq_window_secs", "BOT_LIQ_WINDOW_SECS");
+
         if self.sl_percent >= 100.0 {
-            eprintln!(
-                "ERROR: sl_percent >= 100% will cause instant liquidation, got: {}%",
-                self.sl_percent
-            );
+            eprintln!("ERROR: sl_percent >= 100% will cause instant liquidation, got: {}%", self.sl_percent);
             eprintln!("  Fix: Set BOT_SL_PERCENT to a reasonable value (e.g., 0.5-5.0%)");
             process::exit(1);
         }
 
-        // Position size validation
-        if self.position_size_quote <= 0.0 {
-            eprintln!(
-                "ERROR: position_size_quote must be > 0, got: {}",
-                self.position_size_quote
-            );
-            eprintln!("  Fix: Set BOT_POSITION_SIZE_QUOTE to a positive value");
-            process::exit(1);
-        }
+        validate_greater!(self.ema_slow_period, self.ema_fast_period, "ema_slow_period", "ema_fast_period", "BOT_EMA_SLOW_PERIOD");
+        validate_range!(self.rsi_long_min, "rsi_long_min", 0.0, 100.0);
+        validate_range!(self.rsi_short_max, "rsi_short_max", 0.0, 100.0);
 
-        // Period validation
-        if self.ema_fast_period == 0 {
-            eprintln!(
-                "ERROR: ema_fast_period must be > 0, got: {}",
-                self.ema_fast_period
-            );
-            process::exit(1);
-        }
-        if self.ema_slow_period <= self.ema_fast_period {
-            eprintln!(
-                "ERROR: ema_slow_period ({}) must be > ema_fast_period ({}), got: {} <= {}",
-                self.ema_slow_period,
-                self.ema_fast_period,
-                self.ema_slow_period,
-                self.ema_fast_period
-            );
-            eprintln!("  Fix: Set BOT_EMA_SLOW_PERIOD to a value greater than BOT_EMA_FAST_PERIOD");
-            process::exit(1);
-        }
-        if self.rsi_period == 0 {
-            eprintln!("ERROR: rsi_period must be > 0, got: {}", self.rsi_period);
-            process::exit(1);
-        }
-        if self.atr_period == 0 {
-            eprintln!("ERROR: atr_period must be > 0, got: {}", self.atr_period);
-            process::exit(1);
-        }
-
-        // RSI bounds validation
-        if self.rsi_long_min < 0.0 || self.rsi_long_min > 100.0 {
-            eprintln!(
-                "ERROR: rsi_long_min must be between 0-100, got: {}",
-                self.rsi_long_min
-            );
-            process::exit(1);
-        }
-        if self.rsi_short_max < 0.0 || self.rsi_short_max > 100.0 {
-            eprintln!(
-                "ERROR: rsi_short_max must be between 0-100, got: {}",
-                self.rsi_short_max
-            );
-            process::exit(1);
-        }
-        if self.rsi_long_min <= self.rsi_short_max {
-            eprintln!("WARNING: rsi_long_min ({}) should be > rsi_short_max ({}) for proper signal generation", 
-                     self.rsi_long_min, self.rsi_short_max);
-        }
-
-        // OBI validation
-        if self.obi_long_min <= 0.0 {
-            eprintln!(
-                "ERROR: obi_long_min must be > 0, got: {}",
-                self.obi_long_min
-            );
-            process::exit(1);
-        }
-        if self.obi_short_max <= 0.0 {
-            eprintln!(
-                "ERROR: obi_short_max must be > 0, got: {}",
-                self.obi_short_max
-            );
-            process::exit(1);
-        }
-        if self.obi_short_max >= self.obi_long_min {
-            eprintln!("WARNING: obi_short_max ({}) should be < obi_long_min ({}) for proper signal generation", 
-                     self.obi_short_max, self.obi_long_min);
-        }
-
-        // Recv window validation (Binance: max 60000ms, recommended: 2000-3000ms)
         if self.recv_window_ms > 60000 {
-            eprintln!(
-                "ERROR: recv_window_ms exceeds Binance maximum (60000ms), got: {}ms",
-                self.recv_window_ms
-            );
+            eprintln!("ERROR: recv_window_ms exceeds Binance maximum (60000ms), got: {}ms", self.recv_window_ms);
             eprintln!("  Fix: Set BINANCE_RECV_WINDOW_MS to <= 60000");
             process::exit(1);
         }
-        if self.recv_window_ms < 1000 {
-            eprintln!("WARNING: recv_window_ms is very low ({}ms), may cause order rejections due to network latency", 
-                     self.recv_window_ms);
-            eprintln!("  Recommendation: Use 2000-3000ms for security and reliability");
-        }
-        if self.recv_window_ms > 5000 {
-            eprintln!(
-                "WARNING: recv_window_ms is large ({}ms), increases replay attack risk",
-                self.recv_window_ms
-            );
-            eprintln!("  Recommendation: Use 2000-3000ms for better security");
-        }
 
-        // Signal cooldown validation
+        warn_if!(self.tp_percent > 100.0, "tp_percent is very high, this may be intentional", self.tp_percent);
+        warn_if!(self.rsi_long_min <= self.rsi_short_max, "rsi_long_min should be > rsi_short_max for proper signal generation", self.rsi_long_min);
+        warn_if!(self.obi_short_max >= self.obi_long_min, "obi_short_max should be < obi_long_min for proper signal generation", self.obi_short_max);
+        warn_if!(self.recv_window_ms < 1000, "recv_window_ms is very low, may cause order rejections due to network latency. Recommendation: Use 2000-3000ms for security and reliability", self.recv_window_ms);
+        warn_if!(self.recv_window_ms > 5000, "recv_window_ms is large, increases replay attack risk. Recommendation: Use 2000-3000ms for better security", self.recv_window_ms);
+        warn_if!(self.long_min_score == 0, "long_min_score is 0, all signals will pass (may be intentional)", self.long_min_score);
+        warn_if!(self.short_min_score == 0, "short_min_score is 0, all signals will pass (may be intentional)", self.short_min_score);
+        warn_if!(self.liq_window_secs < 5, "liq_window_secs is very low, may cause excessive pruning. Recommendation: Use at least 10 seconds for stable operation", self.liq_window_secs);
+        warn_if!(self.liq_window_secs > 300, format!("liq_window_secs is very high ({} minutes), may miss short-term liquidation clusters. Recommendation: Use 10-60 seconds for optimal detection", self.liq_window_secs / 60), self.liq_window_secs);
+
         if self.signal_cooldown_secs < 0 {
-            eprintln!(
-                "ERROR: signal_cooldown_secs must be >= 0, got: {}",
-                self.signal_cooldown_secs
-            );
+            eprintln!("ERROR: signal_cooldown_secs must be >= 0, got: {}", self.signal_cooldown_secs);
             process::exit(1);
-        }
-
-        // Score validation
-        if self.long_min_score == 0 {
-            eprintln!("WARNING: long_min_score is 0, all signals will pass (may be intentional)");
-        }
-        if self.short_min_score == 0 {
-            eprintln!("WARNING: short_min_score is 0, all signals will pass (may be intentional)");
-        }
-
-        // Margin and balance validation
-        if self.min_margin_usd <= 0.0 {
-            eprintln!(
-                "ERROR: min_margin_usd must be > 0, got: {}",
-                self.min_margin_usd
-            );
-            process::exit(1);
-        }
-        if self.min_quote_balance_usd <= 0.0 {
-            eprintln!(
-                "ERROR: min_quote_balance_usd must be > 0, got: {}",
-                self.min_quote_balance_usd
-            );
-            process::exit(1);
-        }
-        if self.max_position_notional_usd <= 0.0 {
-            eprintln!(
-                "ERROR: max_position_notional_usd must be > 0, got: {}",
-                self.max_position_notional_usd
-            );
-            process::exit(1);
-        }
-
-        // Liquidation window validation
-        if self.liq_window_secs == 0 {
-            eprintln!(
-                "ERROR: liq_window_secs must be > 0, got: {}",
-                self.liq_window_secs
-            );
-            eprintln!(
-                "  Fix: Set BOT_LIQ_WINDOW_SECS to a positive value (recommended: 10-60 seconds)"
-            );
-            process::exit(1);
-        }
-        if self.liq_window_secs < 5 {
-            eprintln!(
-                "WARNING: liq_window_secs is very low ({}s), may cause excessive pruning",
-                self.liq_window_secs
-            );
-            eprintln!("  Recommendation: Use at least 10 seconds for stable operation");
-        }
-        if self.liq_window_secs > 300 {
-            eprintln!("WARNING: liq_window_secs is very high ({}s = {} minutes), may miss short-term liquidation clusters", 
-                     self.liq_window_secs, self.liq_window_secs / 60);
-            eprintln!("  Recommendation: Use 10-60 seconds for optimal detection");
         }
 
         self

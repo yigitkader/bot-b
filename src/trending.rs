@@ -16,6 +16,28 @@ use crate::types::{
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use uuid::Uuid;
 
+fn candle_to_data_item(candle: &Candle) -> DataItem {
+    DataItem::builder()
+        .open(candle.open)
+        .high(candle.high)
+        .low(candle.low)
+        .close(candle.close)
+        .volume(candle.volume)
+        .build()
+        .unwrap()
+}
+
+fn value_to_data_item(value: f64) -> DataItem {
+    DataItem::builder()
+        .close(value)
+        .open(value)
+        .high(value)
+        .low(value)
+        .volume(0.0)
+        .build()
+        .unwrap()
+}
+
 // =======================
 //  Funding Rate Arbitrage (TrendPlan.md SECRET #2)
 // =======================
@@ -98,36 +120,21 @@ impl FundingArbitrage {
         self.next_funding_time = Self::calculate_next_funding_time(timestamp);
     }
 
-    /// 🔥 KRITIK: Funding saatinden öncesi = arbitrage fırsatı
-    /// ✅ FIX: Wider window (60-90 minutes) for better timing and more opportunities
     pub fn is_pre_funding_window(&self, now: DateTime<Utc>) -> bool {
         let time_to_funding = self.next_funding_time.signed_duration_since(now);
-        // ✅ FIX: Extended window: 90 minutes before funding (was 30)
-        // This allows earlier entry and better position sizing
         time_to_funding.num_minutes() <= 90 && time_to_funding.num_minutes() >= 0
     }
     
-    /// ✅ NEW: Check if we're in the optimal pre-funding window (30-60 min before)
-    /// This is the sweet spot for entry
     pub fn is_optimal_pre_funding_window(&self, now: DateTime<Utc>) -> bool {
         let time_to_funding = self.next_funding_time.signed_duration_since(now);
         time_to_funding.num_minutes() <= 60 && time_to_funding.num_minutes() >= 30
     }
     
-    /// ✅ NEW: Check if we're in early pre-funding window (60-90 min before)
-    /// Good for early positioning
     pub fn is_early_pre_funding_window(&self, now: DateTime<Utc>) -> bool {
         let time_to_funding = self.next_funding_time.signed_duration_since(now);
         time_to_funding.num_minutes() <= 90 && time_to_funding.num_minutes() > 60
     }
 
-    /// 🔥 SECRET STRATEGY: Extreme Funding Reversal
-    ///
-    /// Mantık:
-    /// - Funding +0.1% (extreme long crowding) → SHORT pozisyon aç
-    /// - Funding saati geldiğinde long'lar funding ödeyecek
-    /// - Long'lar pozisyon kapatacak → fiyat düşecek
-    /// - Sen SHORT pozisyondaysan → kazanırsın
     pub fn detect_funding_arbitrage(&self, now: DateTime<Utc>) -> Option<FundingArbitrageSignal> {
         if !self.is_pre_funding_window(now) {
             return None;
@@ -139,10 +146,6 @@ impl FundingArbitrage {
 
         let latest_funding = self.funding_history.back()?.funding_rate;
 
-        // ✅ FIX: Lower threshold (0.0005 instead of 0.001) - catch more opportunities
-        // Also check funding trend (increasing/decreasing) for better signals
-        
-        // Calculate funding trend (last 3 funding rates)
         let funding_trend = if self.funding_history.len() >= 3 {
             let recent: Vec<&FundingSnapshot> = self.funding_history.iter().rev().take(3).collect();
             let trend = (recent[0].funding_rate - recent[2].funding_rate).signum();
@@ -151,23 +154,15 @@ impl FundingArbitrage {
             None
         };
 
-        // 🚨 Positive funding = too many longs
-        // ✅ FIX: Lower threshold (0.0005 = 0.05% instead of 0.001 = 0.1%)
-        // Higher threshold (0.001) for stronger signals
         if latest_funding > 0.0005 {
-            // Strategy: Open SHORT before funding time
-            // Expected: Long traders will close → price drops
-            
-            // Boost confidence if funding is increasing (trend confirms)
             let confidence_boost = funding_trend
                 .map(|t| if t > 0.0 { 1.2 } else { 1.0 })
                 .unwrap_or(1.0);
             
-            // Use higher threshold for early window, lower for optimal window
             let threshold = if self.is_optimal_pre_funding_window(now) {
-                0.0003 // Lower threshold in optimal window
+                0.0003
             } else {
-                0.0005 // Standard threshold
+                0.0005
             };
             
             if latest_funding > threshold {
@@ -179,21 +174,15 @@ impl FundingArbitrage {
                 None
             }
         }
-        // 🚨 Negative funding = too many shorts
-        // ✅ FIX: Lower threshold for more opportunities
         else if latest_funding < -0.0005 {
-            // Strategy: Open LONG before funding time
-            
-            // Boost confidence if funding is decreasing (trend confirms)
             let confidence_boost = funding_trend
                 .map(|t| if t < 0.0 { 1.2 } else { 1.0 })
                 .unwrap_or(1.0);
             
-            // Use higher threshold for early window, lower for optimal window
             let threshold = if self.is_optimal_pre_funding_window(now) {
-                -0.0003 // Lower threshold in optimal window
+                -0.0003
             } else {
-                -0.0005 // Standard threshold
+                -0.0005
             };
             
             if latest_funding < threshold {
@@ -209,25 +198,14 @@ impl FundingArbitrage {
         }
     }
 
-    /// 🔥 POST-FUNDING REVERSAL
-    /// Funding ödendikten hemen sonra, pozisyonlar likidasyona gidebilir
-    /// ✅ FIX: Extended window (15 minutes instead of 5) for better opportunity capture
     pub fn detect_post_funding_opportunity(&self, now: DateTime<Utc>) -> Option<PostFundingSignal> {
         let time_since_funding = now.signed_duration_since(self.next_funding_time);
 
-        // ✅ FIX: Extended window: 15 minutes after funding (was 5)
-        // This captures more liquidation cascades
         if time_since_funding.num_minutes() > 0 && time_since_funding.num_minutes() <= 15 {
             if let Some(latest) = self.funding_history.back() {
-                // ✅ FIX: Lower threshold (0.0003 instead of 0.001) for more opportunities
-                // Post-funding opportunities are high-probability, so be more aggressive
                 if latest.funding_rate > 0.0003 {
-                    // High positive funding just paid → long traders hurt
-                    // Some will liquidate → price may cascade down
                     Some(PostFundingSignal::ExpectLongLiquidation)
                 } else if latest.funding_rate < -0.0003 {
-                    // High negative funding just paid → short traders hurt
-                    // Some will liquidate → price may cascade up
                     Some(PostFundingSignal::ExpectShortLiquidation)
                 } else {
                     None
@@ -240,20 +218,16 @@ impl FundingArbitrage {
         }
     }
 
-    /// 🔥 ADVANCED: Funding Rate Trend
-    /// Eğer funding rate sürekli artıyorsa → reversal yakın
     pub fn detect_funding_exhaustion(&self) -> Option<FundingExhaustionSignal> {
         if self.funding_history.len() < 5 {
             return None;
         }
 
-        // Son 5 funding rate
         let recent: Vec<&FundingSnapshot> = self.funding_history.iter().rev().take(5).collect();
         if recent.len() < 5 {
             return None;
         }
 
-        // Trend: sürekli artıyor mu?
         let mut increasing_count = 0;
         let mut decreasing_count = 0;
 
@@ -265,7 +239,6 @@ impl FundingArbitrage {
             }
         }
 
-        // 🚨 4/4 artış = extreme, reversal yakın
         if increasing_count >= 4 {
             Some(FundingExhaustionSignal::ExtremePositive)
         } else if decreasing_count >= 4 {
@@ -350,26 +323,18 @@ impl OrderFlowAnalyzer {
         }
     }
 
-    /// 🔥 SECRET SAUCE: Absorption Detection
-    /// Market maker'lar büyük satış baskısını "absorb" ediyorsa = bullish
-    /// Örnek: Sürekli sell pressure ama fiyat düşmüyor = MM accumulation
-    /// ✅ FIX: Lower threshold and minimum snapshot count for more opportunities
     pub fn detect_absorption(&self) -> Option<AbsorptionSignal> {
-        // ✅ FIX: Lower minimum snapshot count (5 instead of 10) for earlier detection
         if self.snapshots.len() < 5 {
             return None;
         }
 
-        // ✅ FIX: Use more snapshots if available (up to 15 instead of 10)
         let snapshot_count = self.snapshots.len().min(15);
         let recent: Vec<&OrderFlowSnapshot> = self.snapshots.iter().rev().take(snapshot_count).collect();
 
-        // Son snapshot'larda volume imbalance
         let mut buy_volume_total = 0.0;
         let mut sell_volume_total = 0.0;
 
         for snap in recent {
-            // Eğer ask volume > bid volume ama fiyat stable/up = absorption
             if snap.ask_volume > snap.bid_volume {
                 sell_volume_total += snap.ask_volume;
             } else {
@@ -379,25 +344,16 @@ impl OrderFlowAnalyzer {
 
         let imbalance_ratio = sell_volume_total / buy_volume_total.max(1.0);
 
-        // ✅ FIX: Lower threshold (1.3 instead of 1.5) for more opportunities
-        // 🚨 KRITIK: Satış baskısı var ama fiyat düşmüyor
         if imbalance_ratio > 1.3 {
-            // Bu, büyük oyuncuların "absorb" ettiği anlamına gelir
             Some(AbsorptionSignal::Bullish)
         } else if imbalance_ratio < 0.77 {
-            // ✅ FIX: More lenient threshold (0.77 instead of 0.67)
             Some(AbsorptionSignal::Bearish)
         } else {
             None
         }
     }
 
-    /// 🔥 SECRET #2: Spoofing Detection
-    /// Sahte emirler (spoof orders) gerçek market sentiment'ı gizler
-    /// Örnek: Büyük bid wall görünüyor ama sürekli cancel ediliyor
-    /// ✅ FIX: Lower threshold and minimum snapshot count for more opportunities
     pub fn detect_spoofing(&self) -> Option<SpoofingSignal> {
-        // ✅ FIX: Lower minimum snapshot count (10 instead of 20) for earlier detection
         if self.snapshots.len() < 10 {
             return None;
         }
@@ -446,22 +402,14 @@ impl OrderFlowAnalyzer {
         }
     }
 
-    /// 🔥 SECRET #3: Iceberg Order Detection
-    /// Büyük emirler küçük parçalara bölünüp gizleniyor
-    /// Tespit: Aynı fiyatta sürekli yeni emirler beliriyor
-    /// ✅ FIX: Lower threshold and minimum snapshot count for more opportunities
     pub fn detect_iceberg_orders(&self) -> Option<IcebergSignal> {
-        // ✅ FIX: Lower minimum snapshot count (15 instead of 30) for earlier detection
         if self.snapshots.len() < 15 {
             return None;
         }
 
-        // ✅ FIX: Use more snapshots if available (up to 40 instead of 30)
         let snapshot_count = self.snapshots.len().min(40);
         let recent: Vec<&OrderFlowSnapshot> = self.snapshots.iter().rev().take(snapshot_count).collect();
 
-        // Bid volume neredeyse hiç değişmiyor (stable) ama
-        // sürekli yeni emirler geliyor = iceberg
         let bid_volumes: Vec<f64> = recent.iter().map(|s| s.bid_volume).collect();
         let bid_vol_std = calculate_std_dev(&bid_volumes);
         let bid_vol_mean = bid_volumes.iter().sum::<f64>() / bid_volumes.len() as f64;
@@ -472,7 +420,6 @@ impl OrderFlowAnalyzer {
             0.0
         };
 
-        // Ask side CV
         let ask_volumes: Vec<f64> = recent.iter().map(|s| s.ask_volume).collect();
         let ask_vol_std = calculate_std_dev(&ask_volumes);
         let ask_vol_mean = ask_volumes.iter().sum::<f64>() / ask_volumes.len() as f64;
@@ -482,13 +429,9 @@ impl OrderFlowAnalyzer {
             0.0
         };
 
-        // ✅ FIX: Lower CV threshold (0.15 instead of 0.1) and volume threshold ($50k instead of $100k)
-        // Düşük CV (stable volume) = iceberg olabilir
         if bid_cv < 0.15 && bid_vol_mean > 50000.0 {
-            // $50k+ volume (was $100k)
             Some(IcebergSignal::BidSideIceberg)
         } else if ask_cv < 0.15 && ask_vol_mean > 50000.0 {
-            // ✅ NEW: Also detect ask side icebergs
             Some(IcebergSignal::AskSideIceberg)
         } else {
             None
@@ -1248,14 +1191,7 @@ pub fn build_signal_contexts(
     let mut last_lsr: Option<f64> = None;
 
     for c in candles {
-        let di = DataItem::builder()
-            .open(c.open)
-            .high(c.high)
-            .low(c.low)
-            .close(c.close)
-            .volume(c.volume)
-            .build()
-            .unwrap();
+        let di = candle_to_data_item(c);
 
         let ema_f = ema_fast.next(&di);
         let ema_s = ema_slow.next(&di);
@@ -1382,14 +1318,7 @@ fn calculate_indicators_for_candles(candles: &[Candle]) -> Option<SignalContext>
     let mut last_ctx: Option<SignalContext> = None;
 
     for c in candles {
-        let di = DataItem::builder()
-            .open(c.open)
-            .high(c.high)
-            .low(c.low)
-            .close(c.close)
-            .volume(c.volume)
-            .build()
-            .unwrap();
+        let di = candle_to_data_item(c);
 
         let ema_f = ema_fast.next(&di);
         let ema_s = ema_slow.next(&di);
@@ -2313,6 +2242,110 @@ fn generate_signal_enhanced(
     base_signal
 }
 
+fn calculate_long_score(
+    trend: TrendDirection,
+    ctx: &SignalContext,
+    prev_ctx: Option<&SignalContext>,
+    cfg: &AlgoConfig,
+) -> usize {
+    let mut score = 0usize;
+
+    if matches!(trend, TrendDirection::Up) {
+        score += 1;
+        let trend_strength = (ctx.ema_fast - ctx.ema_slow) / ctx.ema_slow;
+        if trend_strength > 0.002 {
+            score += 1;
+        }
+    }
+
+    if ctx.rsi >= cfg.rsi_trend_long_min {
+        score += 1;
+        if let Some(prev) = prev_ctx {
+            if ctx.rsi > prev.rsi {
+                score += 1;
+            }
+        }
+    }
+
+    if ctx.funding_rate <= 0.0001 {
+        score += 1;
+        if ctx.funding_rate < -0.0002 {
+            score += 1;
+        }
+    }
+
+    if ctx.long_short_ratio < 1.0 {
+        score += 1;
+        if ctx.long_short_ratio < 0.7 {
+            score += 1;
+        }
+    }
+
+    if let Some(prev) = prev_ctx {
+        if ctx.open_interest > prev.open_interest {
+            score += 1;
+            let oi_change = (ctx.open_interest - prev.open_interest) / prev.open_interest;
+            if oi_change > 0.02 {
+                score += 1;
+            }
+        }
+    }
+
+    score
+}
+
+fn calculate_short_score(
+    trend: TrendDirection,
+    ctx: &SignalContext,
+    prev_ctx: Option<&SignalContext>,
+    cfg: &AlgoConfig,
+) -> usize {
+    let mut score = 0usize;
+
+    if matches!(trend, TrendDirection::Down) {
+        score += 1;
+        let trend_strength = (ctx.ema_slow - ctx.ema_fast) / ctx.ema_slow;
+        if trend_strength > 0.002 {
+            score += 1;
+        }
+    }
+
+    if ctx.rsi <= cfg.rsi_trend_short_max {
+        score += 1;
+        if let Some(prev) = prev_ctx {
+            if ctx.rsi < prev.rsi {
+                score += 1;
+            }
+        }
+    }
+
+    if ctx.funding_rate >= 0.0001 {
+        score += 1;
+        if ctx.funding_rate > 0.0002 {
+            score += 1;
+        }
+    }
+
+    if ctx.long_short_ratio > 1.0 {
+        score += 1;
+        if ctx.long_short_ratio > 1.3 {
+            score += 1;
+        }
+    }
+
+    if let Some(prev) = prev_ctx {
+        if ctx.open_interest > prev.open_interest {
+            score += 1;
+            let oi_change = (ctx.open_interest - prev.open_interest) / prev.open_interest;
+            if oi_change > 0.02 {
+                score += 1;
+            }
+        }
+    }
+
+    score
+}
+
 /// Tek bir candle için sinyal üretir (internal kullanım)
 /// Production'da `generate_signals` kullanılmalı
 fn generate_signal(
@@ -2342,144 +2375,8 @@ fn generate_signal(
         .map(|p| candle.close < p.ema_fast) // Price EMA fast'ın altında
         .unwrap_or(false);
 
-    let mut long_score = 0usize;
-    let mut short_score = 0usize;
-
-    // ✅ LONG kuralları - TrendPlan.md Fix #4: 0-10 points per side
-    // 1. TREND STRENGTH (0-2 points)
-    if matches!(trend, TrendDirection::Up) {
-        long_score += 1;
-
-        // ✅ Bonus: Strong trend
-        let trend_strength = (ctx.ema_fast - ctx.ema_slow) / ctx.ema_slow;
-        if trend_strength > 0.002 {
-            // %0.2+ separation
-            long_score += 1;
-        }
-    }
-
-    // 2. MOMENTUM CONFLUENCE (0-2 points)
-    if ctx.rsi >= cfg.rsi_trend_long_min {
-        long_score += 1;
-
-        // ✅ Bonus: RSI rising (momentum building)
-        if let Some(prev) = prev_ctx {
-            if ctx.rsi > prev.rsi {
-                long_score += 1;
-            }
-        }
-    }
-
-    // 3. FUNDING EDGE (0-2 points)
-    // Negative/neutral funding = shorts paying longs = bullish
-    if ctx.funding_rate <= 0.0001 {
-        // <= 0.01%
-        long_score += 1;
-
-        // ✅ Bonus: Negative funding (shorts desperate)
-        if ctx.funding_rate < -0.0002 {
-            // < -0.02%
-            long_score += 1;
-        }
-    }
-
-    // 4. CROWD POSITIONING (0-2 points)
-    // We want to be CONTRARIAN to crowd
-    if ctx.long_short_ratio < 1.0 {
-        // More shorts than longs
-        long_score += 1;
-
-        // ✅ Bonus: Extreme short crowding
-        if ctx.long_short_ratio < 0.7 {
-            // 70% shorts
-            long_score += 1;
-        }
-    }
-
-    // 5. OPEN INTEREST CONFIRMATION (0-2 points)
-    if let Some(prev) = prev_ctx {
-        if ctx.open_interest > prev.open_interest {
-            // OI rising = new money entering
-            long_score += 1;
-
-            // ✅ Bonus: Significant OI increase
-            let oi_change = (ctx.open_interest - prev.open_interest) / prev.open_interest;
-            if oi_change > 0.02 {
-                // 2%+ OI increase
-                long_score += 1;
-            }
-        }
-    }
-    // 6) ATR volatility kontrolü: Yüksek volatility'de daha dikkatli ol
-    // ATR rising factor ile birlikte kullanılabilir (gelecekte)
-    // Şimdilik ATR hesaplanıyor ama signal generation'da kullanılmıyor
-    // Not: ATR değeri ctx.atr'de mevcut, ancak şu an için signal scoring'de kullanılmıyor
-
-    // ✅ SHORT kuralları - TrendPlan.md Fix #4: 0-10 points per side
-    // 1. TREND STRENGTH (0-2 points)
-    if matches!(trend, TrendDirection::Down) {
-        short_score += 1;
-
-        // ✅ Bonus: Strong trend
-        let trend_strength = (ctx.ema_slow - ctx.ema_fast) / ctx.ema_slow;
-        if trend_strength > 0.002 {
-            // %0.2+ separation
-            short_score += 1;
-        }
-    }
-
-    // 2. MOMENTUM CONFLUENCE (0-2 points)
-    if ctx.rsi <= cfg.rsi_trend_short_max {
-        short_score += 1;
-
-        // ✅ Bonus: RSI falling (momentum building)
-        if let Some(prev) = prev_ctx {
-            if ctx.rsi < prev.rsi {
-                short_score += 1;
-            }
-        }
-    }
-
-    // 3. FUNDING EDGE (0-2 points)
-    // Positive funding = longs paying shorts = bearish
-    if ctx.funding_rate >= 0.0001 {
-        // >= 0.01%
-        short_score += 1;
-
-        // ✅ Bonus: Extreme positive funding (longs desperate)
-        if ctx.funding_rate > 0.0002 {
-            // > 0.02%
-            short_score += 1;
-        }
-    }
-
-    // 4. CROWD POSITIONING (0-2 points)
-    // We want to be CONTRARIAN to crowd
-    if ctx.long_short_ratio > 1.0 {
-        // More longs than shorts
-        short_score += 1;
-
-        // ✅ Bonus: Extreme long crowding
-        if ctx.long_short_ratio > 1.3 {
-            // 130% longs
-            short_score += 1;
-        }
-    }
-
-    // 5. OPEN INTEREST CONFIRMATION (0-2 points)
-    if let Some(prev) = prev_ctx {
-        if ctx.open_interest > prev.open_interest {
-            // OI rising = new money entering (can be bearish if shorts)
-            short_score += 1;
-
-            // ✅ Bonus: Significant OI increase
-            let oi_change = (ctx.open_interest - prev.open_interest) / prev.open_interest;
-            if oi_change > 0.02 {
-                // 2%+ OI increase
-                short_score += 1;
-            }
-        }
-    }
+    let long_score = calculate_long_score(trend, ctx, prev_ctx, cfg);
+    let short_score = calculate_short_score(trend, ctx, prev_ctx, cfg);
 
     // ✅ ADIM 2: Config.yaml parametrelerini kullan (TrendPlan.md)
     // Trend gücünü hesapla (EMA separation)
@@ -3972,6 +3869,26 @@ fn parse_kline_to_candle(kline: &KlineData) -> Option<Candle> {
     })
 }
 
+async fn fetch_market_metrics(
+    client: &FuturesClient,
+    symbol: &str,
+    futures_period: &str,
+    limit: u32,
+    metrics_cache: Option<&crate::metrics_cache::MetricsCache>,
+) -> Result<(Vec<FundingRate>, Vec<OpenInterestPoint>, Vec<LongShortRatioPoint>)> {
+    if let Some(cache) = metrics_cache {
+        let funding = cache.get_funding_rates(symbol, 100).await?;
+        let oi_hist = cache.get_open_interest_hist(symbol, futures_period, limit).await?;
+        let lsr_hist = cache.get_top_long_short_ratio(symbol, futures_period, limit).await?;
+        Ok((funding, oi_hist, lsr_hist))
+    } else {
+        let funding = client.fetch_funding_rates(symbol, 100).await?;
+        let oi_hist = client.fetch_open_interest_hist(symbol, futures_period, limit).await?;
+        let lsr_hist = client.fetch_top_long_short_ratio(symbol, futures_period, limit).await?;
+        Ok((funding, oi_hist, lsr_hist))
+    }
+}
+
 async fn generate_signal_from_candle(
     candle: &Candle,
     candle_buffer: &Arc<RwLock<Vec<Candle>>>,
@@ -3982,36 +3899,22 @@ async fn generate_signal_from_candle(
     params: &TrendParams,
     signal_state: Arc<RwLock<LastSignalState>>,
     signal_tx: &tokio::sync::mpsc::Sender<TradeSignal>,
-    metrics_cache: Option<&crate::metrics_cache::MetricsCache>, // ✅ ADIM 4: Cache desteği
+    metrics_cache: Option<&crate::metrics_cache::MetricsCache>,
 ) -> Result<Option<TradeSignal>> {
     let buffer = candle_buffer.read().await;
 
     if buffer.len() < params.warmup_min_ticks {
-        return Ok(None); // Henüz yeterli veri yok
+        return Ok(None);
     }
 
-    // ✅ ADIM 4: Cache'ten oku, yoksa REST API'den çek (fallback)
-    let (funding, oi_hist, lsr_hist) = if let Some(cache) = metrics_cache {
-        // Cache'ten oku
-        let funding = cache.get_funding_rates(symbol, 100).await?;
-        let oi_hist = cache
-            .get_open_interest_hist(symbol, futures_period, buffer.len() as u32)
-            .await?;
-        let lsr_hist = cache
-            .get_top_long_short_ratio(symbol, futures_period, buffer.len() as u32)
-            .await?;
-        (funding, oi_hist, lsr_hist)
-    } else {
-        // Fallback: REST API'den çek (cache yoksa)
-        let funding = client.fetch_funding_rates(symbol, 100).await?;
-        let oi_hist = client
-            .fetch_open_interest_hist(symbol, futures_period, buffer.len() as u32)
-            .await?;
-        let lsr_hist = client
-            .fetch_top_long_short_ratio(symbol, futures_period, buffer.len() as u32)
-            .await?;
-        (funding, oi_hist, lsr_hist)
-    };
+    let (funding, oi_hist, lsr_hist) = fetch_market_metrics(
+        client,
+        symbol,
+        futures_period,
+        buffer.len() as u32,
+        metrics_cache,
+    )
+    .await?;
 
     // Signal context'leri oluştur
     let (matched_candles, contexts) = build_signal_contexts(&buffer, &funding, &oi_hist, &lsr_hist);
@@ -4240,17 +4143,8 @@ async fn generate_latest_signal(
     }
     *last_candle_time = Some(latest_candle.close_time);
 
-    // Cooldown kontrolü burada yapılmaz - signal side'ı bilinmeden yapılamaz
-    // Cooldown kontrolü signal üretildikten sonra, side'a göre yapılacak
-
-    // Funding, OI, Long/Short ratio verilerini çek
-    let funding = client.fetch_funding_rates(symbol, 100).await?;
-    let oi_hist = client
-        .fetch_open_interest_hist(symbol, futures_period, kline_limit)
-        .await?;
-    let lsr_hist = client
-        .fetch_top_long_short_ratio(symbol, futures_period, kline_limit)
-        .await?;
+    let (funding, oi_hist, lsr_hist) =
+        fetch_market_metrics(client, symbol, futures_period, kline_limit, None).await?;
 
     // Signal context'leri oluştur (sadece gerçek API verisi olan candle'lar)
     let (matched_candles, contexts) =
@@ -4917,28 +4811,12 @@ fn calculate_macd(candles: &[Candle], current_index: usize) -> f64 {
     
     let start = current_index.saturating_sub(50).max(0);
     for i in start..=current_index {
-        let c = &candles[i];
-        let di = DataItem::builder()
-            .open(c.open)
-            .high(c.high)
-            .low(c.low)
-            .close(c.close)
-            .volume(c.volume)
-            .build()
-            .unwrap();
+        let di = candle_to_data_item(&candles[i]);
         ema12.next(&di);
         ema26.next(&di);
     }
     
-    let c = &candles[current_index];
-    let di = DataItem::builder()
-        .open(c.open)
-        .high(c.high)
-        .low(c.low)
-        .close(c.close)
-        .volume(c.volume)
-        .build()
-        .unwrap();
+    let di = candle_to_data_item(&candles[current_index]);
     
     let ema12_val = ema12.next(&di);
     let ema26_val = ema26.next(&di);
@@ -4964,27 +4842,12 @@ fn calculate_macd_signal(candles: &[Candle], current_index: usize) -> f64 {
     // Calculate EMA9 of MACD
     let mut ema9 = ExponentialMovingAverage::new(9).unwrap();
     for &macd_val in &macd_values {
-        // Use MACD value as close price for EMA calculation
-        let di = DataItem::builder()
-            .close(macd_val)
-            .open(macd_val)
-            .high(macd_val)
-            .low(macd_val)
-            .volume(0.0)
-            .build()
-            .unwrap();
+        let di = value_to_data_item(macd_val);
         ema9.next(&di);
     }
     
     let last_macd = macd_values.last().copied().unwrap_or(0.0);
-    let di = DataItem::builder()
-        .close(last_macd)
-        .open(last_macd)
-        .high(last_macd)
-        .low(last_macd)
-        .volume(0.0)
-        .build()
-        .unwrap();
+    let di = value_to_data_item(last_macd);
     
     ema9.next(&di)
 }
@@ -5058,15 +4921,7 @@ fn calculate_atr_percentile(current_atr: f64, candles: &[Candle], current_index:
     
     let start = current_index.saturating_sub(100).max(0);
     for i in start..=current_index {
-        let c = &candles[i];
-        let di = DataItem::builder()
-            .open(c.open)
-            .high(c.high)
-            .low(c.low)
-            .close(c.close)
-            .volume(c.volume)
-            .build()
-            .unwrap();
+        let di = candle_to_data_item(&candles[i]);
         let atr_val = atr_calc.next(&di);
         atr_values.push(atr_val);
     }
@@ -5180,3 +5035,4 @@ fn calculate_support_resistance(
     
     (support_distance, resistance_distance, support_strength, resistance_strength)
 }
+

@@ -47,6 +47,12 @@ async fn backtest_with_real_binance_data() {
 
         slippage_bps: 3.0, // 5.0 → 3.0 (LIMIT orders ile düşük)
 
+        // Enhanced scoring
+        enable_enhanced_scoring: false,
+        enhanced_score_excellent: 80.0,
+        enhanced_score_good: 65.0,
+        enhanced_score_marginal: 50.0,
+
         // ✅ Regime-aware thresholds
         hft_mode: false,
         base_min_score: 6.5,

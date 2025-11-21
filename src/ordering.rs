@@ -4,7 +4,7 @@ use crate::types::{CloseRequest, PositionMeta, Side, TradeSignal};
 use crate::types::{Connection, NewOrderRequest, OrderingChannels, SharedState};
 use log::{info, warn};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 
 pub async fn run_ordering(
     mut ch: OrderingChannels,
@@ -47,21 +47,20 @@ pub async fn run_ordering(
             Some(request) = ch.close_rx.recv() => {
                 handle_close_request(request, &state, order_lock.clone(), connection.clone()).await;
             },
-            res = order_update_rx.recv() => match res {
-                Ok(update) => state.apply_order_update(&update),
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+            res = order_update_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => state.apply_order_update(&update),
+                Ok(None) => continue,
+                Err(_) => break,
             },
-            res = position_update_rx.recv() => match res {
-                Ok(update) => {
+            res = position_update_rx.recv() => match crate::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => {
                     state.apply_position_update(&update);
-                    // ✅ ADIM 6: Risk manager'a position update'i bildir
                     if let Some(rm) = &risk_manager {
                         rm.update_position(&update).await;
                     }
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                Ok(None) => continue,
+                Err(_) => break,
             }
         }
     }
