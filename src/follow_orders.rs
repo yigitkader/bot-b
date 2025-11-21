@@ -308,17 +308,16 @@ pub async fn run_follow_orders(
                                     position_id: position.position_id,
                                     reason,
                                     ts: Utc::now(),
+                                    partial_close_percentage: None, // Full close
                                 }).await;
                             }
                             PositionDecision::PartialClose { percentage, reason } => {
                                 log::info!("📤 PARTIAL CLOSE {:.0}%: {}", percentage * 100.0, reason);
-                                // Note: Partial close requires modification to CloseRequest
-                                // For now, we'll use full close as fallback
-                                // TODO: Implement partial close support in CloseRequest
                                 let _ = close_tx.send(CloseRequest {
                                     position_id: position.position_id,
-                                    reason: format!("Partial close {}%: {}", percentage * 100.0, reason),
+                                    reason: format!("Partial close {:.0}%: {}", percentage * 100.0, reason),
                                     ts: Utc::now(),
+                                    partial_close_percentage: Some(percentage), // Partial close
                                 }).await;
                             }
                             PositionDecision::Hold => {
@@ -426,6 +425,7 @@ fn evaluate_position(
                             sl_price, position.entry_price
                         ),
                         ts: Utc::now(),
+                        partial_close_percentage: None, // Full close on stop-loss
                     });
                 } else if tp_hit {
                     info!(
@@ -439,6 +439,7 @@ fn evaluate_position(
                             tp_price, position.entry_price
                         ),
                         ts: Utc::now(),
+                        partial_close_percentage: None, // Full close on take-profit
                     });
                 }
             }
@@ -481,6 +482,7 @@ fn evaluate_position(
                 net_roi_pct, roi_pct, position.leverage
             ),
             ts: Utc::now(),
+            partial_close_percentage: None, // Full close on TP/SL
         })
     } else {
         None

@@ -50,6 +50,11 @@ pub struct CloseRequest {
     pub position_id: Uuid,
     pub reason: String,
     pub ts: DateTime<Utc>,
+    /// Partial close percentage (0.0-1.0)
+    /// None = full close (100%)
+    /// Some(0.5) = close 50% of position
+    /// Some(0.25) = close 25% of position
+    pub partial_close_percentage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

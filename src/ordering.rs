@@ -53,7 +53,14 @@ pub async fn run_ordering(
                 ).await;
             },
             Some(request) = ch.close_rx.recv() => {
-                handle_close_request(request, &state, order_lock.clone(), connection.clone()).await;
+                let conn = connection.clone();
+                let state_clone = state.clone();
+                let lock_clone = order_lock.clone();
+                let symbol_cache_clone = symbol_cache.clone();
+                let depth_cache_clone = depth_cache.clone();
+                tokio::spawn(async move {
+                    handle_close_request(request, &state_clone, lock_clone, conn, symbol_cache_clone, depth_cache_clone).await;
+                });
             },
             res = order_update_rx.recv() => match crate::types::handle_broadcast_recv(res) {
                 Ok(Some(update)) => state.apply_order_update(&update),
@@ -433,6 +440,8 @@ async fn handle_close_request(
     state: &SharedState,
     lock: Arc<Mutex<()>>,
     connection: Arc<Connection>,
+    symbol_cache: Option<Arc<cache::SymbolInfoCache>>,
+    depth_cache: Option<Arc<cache::DepthCache>>,
 ) {
     let _guard = lock.lock().await;
 
@@ -487,23 +496,92 @@ async fn handle_close_request(
         return;
     }
 
-    // Fetch symbol info for quantity precision
-    let symbol_info = match connection.fetch_symbol_info(&fresh_position.symbol).await {
-        Ok(info) => info,
-        Err(err) => {
-            warn!(
-                "ORDERING: failed to fetch symbol info for {}: {err:?}, cannot close position {}",
-                fresh_position.symbol, request.position_id
-            );
-            return;
+    // ✅ CRITICAL: Use cached symbol info for fast execution (TrendPlan.md)
+    let symbol_info = if let Some(cache) = &symbol_cache {
+        match cache.get(&fresh_position.symbol).await {
+            Some(cached) => crate::types::SymbolPrecision {
+                step_size: cached.step_size,
+                min_quantity: cached.min_quantity,
+                max_quantity: cached.max_quantity,
+                tick_size: cached.tick_size,
+                max_price: f64::MAX, // Not used in fast execution
+                min_price: 0.0, // Not used in fast execution
+            },
+            None => {
+                // Fallback to API if not in cache
+                match connection.fetch_symbol_info(&fresh_position.symbol).await {
+                    Ok(info) => info,
+                    Err(err) => {
+                        warn!(
+                            "ORDERING: failed to fetch symbol info for {}: {err:?}, cannot close position {}",
+                            fresh_position.symbol, request.position_id
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    } else {
+        // No cache available, use API
+        match connection.fetch_symbol_info(&fresh_position.symbol).await {
+            Ok(info) => info,
+            Err(err) => {
+                warn!(
+                    "ORDERING: failed to fetch symbol info for {}: {err:?}, cannot close position {}",
+                    fresh_position.symbol, request.position_id
+                );
+                return;
+            }
         }
     };
 
     // Use fresh position size from API (ensures we have the latest size)
     let mut qty = fresh_position.size;
 
-    // Round quantity to step size
-    qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+    // ✅ CRITICAL: Handle partial close (TrendPlan.md - Advanced Position Management)
+    if let Some(partial_pct) = request.partial_close_percentage {
+        if partial_pct > 0.0 && partial_pct < 1.0 {
+            // Partial close: reduce quantity by percentage
+            let original_qty = qty;
+            let close_qty = qty * partial_pct;
+            
+            // Round close quantity to step size
+            let rounded_close_qty = Connection::round_to_step_size(close_qty, symbol_info.step_size);
+            
+            // Calculate remaining position after partial close
+            let remaining_qty = original_qty - rounded_close_qty;
+            
+            // If remaining position would be below minimum quantity, do full close instead
+            if remaining_qty < symbol_info.min_quantity {
+                info!(
+                    "ORDERING: Partial close would leave {} (below min {}), converting to full close",
+                    remaining_qty, symbol_info.min_quantity
+                );
+                // Full close: use original quantity and round it
+                qty = Connection::round_to_step_size(original_qty, symbol_info.step_size);
+            } else {
+                // Use rounded close quantity
+                qty = rounded_close_qty;
+                info!(
+                    "ORDERING: Partial close requested: {:.0}% of position (original: {}, close: {}, remaining: {})",
+                    partial_pct * 100.0,
+                    original_qty,
+                    qty,
+                    remaining_qty
+                );
+            }
+        } else if partial_pct >= 1.0 {
+            // >= 100% means full close
+            info!("ORDERING: Partial close percentage >= 100%, treating as full close");
+            qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+        } else {
+            warn!("ORDERING: Invalid partial close percentage: {}, treating as full close", partial_pct);
+            qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+        }
+    } else {
+        // Full close: round quantity to step size
+        qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+    }
 
     // Validate rounded quantity
     if qty < symbol_info.min_quantity {
@@ -537,15 +615,33 @@ async fn handle_close_request(
         client_order_id: Some(format!("close-{}", request.position_id)),
     };
 
-    if let Err(err) = connection.send_order(order).await {
+    // ✅ CRITICAL: Use fast order execution with cached data (TrendPlan.md)
+    let start_time = std::time::Instant::now();
+    let (best_bid, best_ask) = if let Some(cache) = &depth_cache {
+        cache.get_best_prices(&fresh_position.symbol).await.unwrap_or((0.0, 0.0))
+    } else {
+        (0.0, 0.0)
+    };
+
+    let order_result = if symbol_cache.is_some() && depth_cache.is_some() && best_bid > 0.0 && best_ask > 0.0 {
+        // Fast path: use cached data
+        connection.send_order_fast(&order, &symbol_info, best_bid, best_ask).await
+    } else {
+        // Fallback: use regular order execution
+        connection.send_order(order.clone()).await
+    };
+
+    let elapsed_ms = start_time.elapsed().as_millis() as f64;
+
+    if let Err(err) = order_result {
         warn!(
-            "ORDERING: close send_order failed for position {}: {err:?}",
-            request.position_id
+            "ORDERING: close send_order failed for position {}: {err:?} (elapsed: {:.2}ms)",
+            request.position_id, elapsed_ms
         );
     } else {
         info!(
-            "ORDERING: close order submitted for position {} (size: {}, side: {:?})",
-            request.position_id, qty, side
+            "ORDERING: ⚡ FAST CLOSE order submitted for position {} (size: {}, side: {:?}) in {:.2}ms (target: <50ms)",
+            request.position_id, qty, side, elapsed_ms
         );
     }
 }
