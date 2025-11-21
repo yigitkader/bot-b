@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use trading_bot::{
     calculate_advanced_metrics, export_backtest_to_csv, run_backtest,
     symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
+    test_utils::AlgoConfigBuilder,
     types::FileConfig,
     AlgoConfig, BacktestResult,
 };
@@ -144,40 +145,20 @@ async fn main() -> Result<()> {
     println!("Selected {} symbols for backtest", selected_symbols.len());
     println!();
 
-    // AlgoConfig (backtest için)
-    let cfg = AlgoConfig {
-        rsi_trend_long_min: 55.0,
-        rsi_trend_short_max: 45.0,
-        funding_extreme_pos: 0.0005,
-        funding_extreme_neg: -0.0005,
-        lsr_crowded_long: 1.3,
-        lsr_crowded_short: 0.8,
-        long_min_score: 4,
-        short_min_score: 4,
-        fee_bps_round_trip: 8.0,
-        max_holding_bars: 48,
-        slippage_bps: 0.0,
-        min_volume_ratio: 1.5,
-        max_volatility_pct: 2.0,
-        max_price_change_5bars_pct: 3.0,
-        enable_signal_quality_filter: true,
-        // Enhanced Signal Scoring (TrendPlan.md)
-        enable_enhanced_scoring: true, // ✅ FIX: Enhanced scoring açık
-        enhanced_score_excellent: 80.0, // 80-100: Excellent signal
-        enhanced_score_good: 65.0,      // 65-79: Good signal
-        enhanced_score_marginal: 50.0,  // 50-64: Marginal signal
-        atr_stop_loss_multiplier: 3.0,
-        atr_take_profit_multiplier: 4.0,
-        min_holding_bars: 3,
-        // ✅ ADIM 2: Config parametreleri (default değerler)
-        hft_mode: false,
-        base_min_score: 6.5,
-        trend_threshold_hft: 0.5,
-        trend_threshold_normal: 0.6,
-        weak_trend_score_multiplier: 1.15,
-        regime_multiplier_trending: 0.9,
-        regime_multiplier_ranging: 1.15,
-    };
+    // AlgoConfig (backtest için) - Builder pattern kullanarak
+    let cfg = AlgoConfigBuilder::new()
+        .with_rsi_thresholds(55.0, 45.0)
+        .with_funding_thresholds(0.0005, -0.0005)
+        .with_lsr_thresholds(1.3, 0.8)
+        .with_min_scores(4, 4)
+        .with_fees(8.0)
+        .with_holding_bars(3, 48)
+        .with_slippage(0.0)
+        .with_signal_quality(1.5, 2.0, 3.0)
+        .with_enhanced_scoring(true, 70.0, 55.0, 40.0)
+        .with_risk_management(3.0, 4.0)
+        .with_regime_settings(false, 6.5, 0.5, 0.6, 1.15, 0.9, 1.15)
+        .build();
 
     // CSV writer oluştur
     let file_exists = Path::new(&output_file).exists();
@@ -361,38 +342,20 @@ async fn main() -> Result<()> {
         println!("Running optimized backtest with enhanced scoring enabled...");
         println!();
         
-        // ✅ NEW: Optimized config for top 10 coins
-        let optimized_cfg = AlgoConfig {
-            rsi_trend_long_min: 55.0,
-            rsi_trend_short_max: 45.0,
-            funding_extreme_pos: 0.0003, // ✅ More aggressive
-            funding_extreme_neg: -0.0003,
-            lsr_crowded_long: 1.3,
-            lsr_crowded_short: 0.8,
-            long_min_score: 4,
-            short_min_score: 4,
-            fee_bps_round_trip: 8.0,
-            max_holding_bars: 48,
-            slippage_bps: 0.0,
-            min_volume_ratio: 1.5,
-            max_volatility_pct: 2.0,
-            max_price_change_5bars_pct: 3.0,
-            enable_signal_quality_filter: true,
-            enable_enhanced_scoring: true, // ✅ Enhanced scoring enabled
-            enhanced_score_excellent: 75.0, // ✅ Slightly lower for more signals
-            enhanced_score_good: 60.0,
-            enhanced_score_marginal: 45.0,
-            atr_stop_loss_multiplier: 3.0,
-            atr_take_profit_multiplier: 4.0,
-            min_holding_bars: 3,
-            hft_mode: false,
-            base_min_score: 6.5,
-            trend_threshold_hft: 0.5,
-            trend_threshold_normal: 0.6,
-            weak_trend_score_multiplier: 1.15,
-            regime_multiplier_trending: 0.9,
-            regime_multiplier_ranging: 1.15,
-        };
+        // ✅ NEW: Optimized config for top 10 coins - Builder pattern kullanarak
+        let optimized_cfg = AlgoConfigBuilder::new()
+            .with_rsi_thresholds(55.0, 45.0)
+            .with_funding_thresholds(0.0003, -0.0003)
+            .with_lsr_thresholds(1.3, 0.8)
+            .with_min_scores(4, 4)
+            .with_fees(8.0)
+            .with_holding_bars(3, 48)
+            .with_slippage(0.0)
+            .with_signal_quality(1.5, 2.0, 3.0)
+            .with_enhanced_scoring(true, 70.0, 55.0, 40.0)
+            .with_risk_management(3.0, 4.0)
+            .with_regime_settings(false, 6.5, 0.5, 0.6, 1.15, 0.9, 1.15)
+            .build();
         
         // ✅ NEW: Run optimized backtest for top 10
         let optimized_output_file = "backtest_results_top10_optimized.csv";
