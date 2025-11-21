@@ -626,11 +626,50 @@ impl MultiTimeframeAnalysis {
     /// 🔥 ADVANCED: Divergence Detection
     /// Eğer short-term ve long-term aynı yönde değilse → risky trade
     pub fn detect_timeframe_divergence(&self) -> Option<DivergenceType> {
+        // ✅ CRITICAL FIX: Ara katman kontrolü ekle (TrendPlan.md - Action Plan)
+        // Sadece 5m ve 1h karşılaştırmak yerine, aradaki 15m trendi de kontrol et
+        // Eğer 5m UP, 15m DOWN, 1H UP ise bu bir gürültü olabilir
         let short_term = self.timeframes.get(&Timeframe::M5);
+        let mid_term = self.timeframes.get(&Timeframe::M15); // Ara katman
         let long_term = self.timeframes.get(&Timeframe::H1);
 
-        match (short_term, long_term) {
-            (Some(st), Some(lt)) => {
+        match (short_term, mid_term, long_term) {
+            (Some(st), Some(mt), Some(lt)) => {
+                // ✅ FIX: Ara katman kontrolü - eğer orta timeframe ters ise, divergence'ı iptal et
+                // Örnek: 5m UP, 15m DOWN, 1H UP -> Bu bir gürültü, gerçek divergence değil
+                // Bullish divergence: short-term up, long-term down
+                if matches!(st.trend, TrendDirection::Up)
+                    && matches!(lt.trend, TrendDirection::Down)
+                {
+                    // Ara katman kontrolü: Eğer 15m de DOWN ise, bu gerçek bir divergence
+                    // Eğer 15m UP ise, bu bir gürültü (noise) olabilir
+                    if matches!(mt.trend, TrendDirection::Down) {
+                        // 5m UP, 15m DOWN, 1H DOWN -> Gerçek bullish divergence
+                        Some(DivergenceType::BullishDivergence)
+                    } else {
+                        // 5m UP, 15m UP/FLAT, 1H DOWN -> Gürültü, divergence yok
+                        None
+                    }
+                }
+                // Bearish divergence: short-term down, long-term up
+                else if matches!(st.trend, TrendDirection::Down)
+                    && matches!(lt.trend, TrendDirection::Up)
+                {
+                    // Ara katman kontrolü: Eğer 15m de UP ise, bu gerçek bir divergence
+                    // Eğer 15m DOWN ise, bu bir gürültü (noise) olabilir
+                    if matches!(mt.trend, TrendDirection::Up) {
+                        // 5m DOWN, 15m UP, 1H UP -> Gerçek bearish divergence
+                        Some(DivergenceType::BearishDivergence)
+                    } else {
+                        // 5m DOWN, 15m DOWN/FLAT, 1H UP -> Gürültü, divergence yok
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            // Fallback: Eğer M15 yoksa, sadece M5 ve H1'i karşılaştır (eski davranış)
+            (Some(st), None, Some(lt)) => {
                 // Bullish divergence: short-term up, long-term down
                 if matches!(st.trend, TrendDirection::Up)
                     && matches!(lt.trend, TrendDirection::Down)
@@ -2448,6 +2487,9 @@ fn generate_signal_enhanced(
 
     // === 8. ORDER FLOW ANALYSIS CHECK ===
     // Market maker behavior tracking (SECRET #1)
+    // ✅ CRITICAL FIX: Order Flow yokken nötr skorlama (TrendPlan.md - Action Plan)
+    // Eğer Order Flow verisi yoksa (backtest veya depth data eksik), bu bölümü atla
+    // Order Flow skorlaması zaten calculate_microstructure_score'da nötr (0.0) dönecek
     if let Some(of) = orderflow {
         // ✅ FIX: Order flow confirmation - more aggressive usage
         // Market maker behavior is a strong signal, use it proactively
@@ -3078,11 +3120,20 @@ pub fn run_backtest_on_series(
             None
         };
 
-        // OrderFlow Analyzer - DISABLED in backtest (estimated depth is not reliable)
-        // ⚠️ CRITICAL: Order Flow strategies require REAL orderbook depth data
+        // OrderFlow Analyzer - Config kontrolü ile (TrendPlan.md - Action Plan)
+        // ✅ CRITICAL FIX: Backtest ile production tutarlılığı için config kontrolü
+        // Order Flow strategies require REAL orderbook depth data
         // Estimated depth from volume creates over-optimistic backtest results
         // To test Order Flow strategies properly, you need historical tick data with real depth
-        let orderflow_analyzer: Option<OrderFlowAnalyzer> = None; // Disabled in backtest
+        let orderflow_analyzer: Option<OrderFlowAnalyzer> = if cfg.enable_order_flow {
+            // Order Flow enabled in config, but no real depth data in backtest
+            // Return None to maintain consistency with production when depth data is missing
+            log::debug!("TRENDING: Order Flow enabled in config but no real depth data in backtest, using None");
+            None
+        } else {
+            // Order Flow disabled in config (for backtest consistency)
+            None
+        };
 
         // Enhanced signal generation with ALL REAL DATA (including MTF and OrderFlow)
         let sig = generate_signal_enhanced(
@@ -3887,6 +3938,8 @@ pub async fn run_trending(
         enhanced_score_excellent: params.enhanced_score_excellent,
         enhanced_score_good: params.enhanced_score_good,
         enhanced_score_marginal: params.enhanced_score_marginal,
+        // Order Flow Analysis (TrendPlan.md - Action Plan)
+        enable_order_flow: params.enable_order_flow,
     };
 
     let kline_interval = "5m"; // 5 dakikalık kline kullan
@@ -4466,14 +4519,20 @@ async fn generate_signal_from_candle(
     };
 
     // 6. OrderFlow Analyzer - use ONLY real depth data from MarketTick
-    // ✅ CRITICAL: NO estimated/simplified orderflow in production (TrendPlan.md)
-    // If real depth data is not available, skip orderflow analysis
-    let orderflow_analyzer = if let (Some(bid_depth), Some(ask_depth)) = (market_tick.bid_depth_usd, market_tick.ask_depth_usd) {
+    // ✅ CRITICAL FIX: Order Flow uyumsuzluğunu düzelt (TrendPlan.md - Action Plan)
+    // Config'den enable_order_flow kontrolü yap - backtest ile production tutarlılığı için
+    let orderflow_analyzer = if cfg.enable_order_flow {
+        if let (Some(bid_depth), Some(ask_depth)) = (market_tick.bid_depth_usd, market_tick.ask_depth_usd) {
         // Real depth data available - use it
         create_orderflow_from_real_depth(&market_tick, &matched_candles, bid_depth, ask_depth)
     } else {
         // No real depth data - skip orderflow (don't use estimated data)
-        log::debug!("TRENDING: No real depth data available, skipping orderflow analysis");
+            log::debug!("TRENDING: Order Flow enabled but no real depth data available, skipping orderflow analysis");
+            None
+        }
+    } else {
+        // Order Flow disabled in config (for backtest consistency)
+        log::debug!("TRENDING: Order Flow disabled in config (enable_order_flow: false)");
         None
     };
 

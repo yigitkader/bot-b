@@ -148,6 +148,8 @@ pub struct TrendParams {
     pub enhanced_score_excellent: f64,
     pub enhanced_score_good: f64,
     pub enhanced_score_marginal: f64,
+    // Order Flow Analysis (TrendPlan.md - Action Plan)
+    pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
 }
 
 // fallback for warmup default referencing EMA slow period
@@ -289,6 +291,9 @@ pub(crate) struct FileTrending {
     pub enhanced_score_good: Option<f64>,
     #[serde(default)]
     pub enhanced_score_marginal: Option<f64>,
+    // Order Flow Analysis (TrendPlan.md - Action Plan)
+    #[serde(default)]
+    pub enable_order_flow: Option<bool>, // Enable Order Flow analysis (requires real depth data)
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1157,6 +1162,8 @@ pub struct AlgoConfig {
     pub weak_trend_score_multiplier: f64, // Zayıf trend için score multiplier (örn: 1.15)
     pub regime_multiplier_trending: f64,  // Trending regime için threshold multiplier (örn: 0.9)
     pub regime_multiplier_ranging: f64,   // Ranging regime için threshold multiplier (örn: 1.15)
+    // Order Flow Analysis (TrendPlan.md - Action Plan)
+    pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
 }
 
 // =======================

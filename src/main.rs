@@ -508,6 +508,7 @@ async fn main() -> Result<()> {
                 enhanced_score_excellent: trend_params.enhanced_score_excellent,
                 enhanced_score_good: trend_params.enhanced_score_good,
                 enhanced_score_marginal: trend_params.enhanced_score_marginal,
+                enable_order_flow: trend_params.enable_order_flow,
             };
             let kline_interval = "5m";
             let kline_limit = (trend_params.warmup_min_ticks + 10) as u32;

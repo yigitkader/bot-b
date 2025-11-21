@@ -36,6 +36,10 @@ pub struct RiskManager {
     // ✅ CRITICAL FIX: Dynamic correlation tracking (TrendPlan.md - Action Plan)
     // Store price history for last 24 hours to calculate real-time correlation
     price_history: Arc<RwLock<HashMap<String, VecDeque<PricePoint>>>>, // symbol -> price history
+    // ✅ CRITICAL FIX: Correlation cache for performance optimization (TrendPlan.md - Action Plan)
+    // Cache correlation matrix to avoid O(N^2) recalculation on every position check
+    correlation_cache: Arc<RwLock<HashMap<(String, String), (f64, DateTime<Utc>)>>>, // (symbol1, symbol2) -> (correlation, timestamp)
+    last_cache_update: Arc<RwLock<DateTime<Utc>>>, // Last time correlation cache was updated
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +54,8 @@ impl RiskManager {
             limits,
             positions: Arc::new(RwLock::new(HashMap::new())),
             price_history: Arc::new(RwLock::new(HashMap::new())),
+            correlation_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_cache_update: Arc::new(RwLock::new(Utc::now() - ChronoDuration::minutes(2))), // Initialize to 2 minutes ago to trigger first update
         }
     }
 
@@ -160,8 +166,59 @@ impl RiskManager {
         }
 
         // 3. ✅ CRITICAL FIX: Check correlated positions using dynamic Pearson correlation (TrendPlan.md - Action Plan)
-        // Calculate real-time correlation based on last 24 hours of price movements
+        // ✅ PERFORMANCE FIX: Use cached correlation matrix (updated every minute) instead of O(N^2) recalculation
+        // Update cache if it's been more than 1 minute since last update
+        let cache_needs_update = {
+            let last_update = self.last_cache_update.read().await;
+            Utc::now().signed_duration_since(*last_update).num_seconds() >= 60
+        };
+        
+        if cache_needs_update {
+            // Update correlation cache in background (async)
+            let price_history = self.price_history.read().await;
+            let mut cache = self.correlation_cache.write().await;
+            let mut last_update = self.last_cache_update.write().await;
+            
+            // Clear old cache entries (older than 5 minutes)
+            let cutoff = Utc::now() - ChronoDuration::minutes(5);
+            cache.retain(|_, (_, ts)| *ts > cutoff);
+            
+            // Update cache with current positions
+            let position_symbols: Vec<String> = positions.keys().cloned().collect();
+            for sym1 in &position_symbols {
+                for sym2 in &position_symbols {
+                    if sym1 < sym2 {
+                        // Only calculate once per pair (symmetric)
+                        if let Some(corr) = calculate_correlation(sym1, sym2, &price_history) {
+                            cache.insert((sym1.clone(), sym2.clone()), (corr, Utc::now()));
+                        }
+                    }
+                }
+            }
+            
+            *last_update = Utc::now();
+            drop(price_history);
+            drop(cache);
+            drop(last_update);
+        }
+        
+        // Use cached correlation values
+        let cache = self.correlation_cache.read().await;
         let price_history = self.price_history.read().await;
+        
+        // Helper function to get correlation (from cache or calculate on-the-fly)
+        let get_correlation = |sym1: &str, sym2: &str| -> Option<f64> {
+            // Try cache first
+            if sym1 < sym2 {
+                cache.get(&(sym1.to_string(), sym2.to_string()))
+                    .map(|(corr, _)| *corr)
+            } else {
+                cache.get(&(sym2.to_string(), sym1.to_string()))
+                    .map(|(corr, _)| *corr)
+            }
+            // If not in cache, calculate on-the-fly (but this should be rare after cache is populated)
+            .or_else(|| calculate_correlation(sym1, sym2, &price_history))
+        };
         
         // Find correlated positions (same direction and high correlation)
         let correlated_count = positions
@@ -170,9 +227,9 @@ impl RiskManager {
                 if p.side != side {
                     return false; // Different direction, not correlated risk
                 }
-                // Calculate Pearson correlation between symbols
-                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
-                    correlation > 0.7 // High correlation threshold (70%)
+                // Use cached correlation if available, otherwise calculate on-the-fly
+                if let Some(corr) = get_correlation(symbol, &p.symbol) {
+                    corr > 0.7 // High correlation threshold (70%)
                 } else {
                     false // Insufficient data for correlation
                 }
@@ -189,7 +246,7 @@ impl RiskManager {
                                 if p.side != side {
                                     return false;
                                 }
-                                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
+                                if let Some(correlation) = get_correlation(symbol, &p.symbol) {
                                     correlation > 0.7
                                 } else {
                                     false
@@ -219,9 +276,9 @@ impl RiskManager {
                 if p.side != side {
                     return false;
                 }
-                // Calculate Pearson correlation between symbols
-                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
-                    correlation > 0.7 // High correlation threshold (70%)
+                // Use cached correlation if available
+                if let Some(corr) = get_correlation(symbol, &p.symbol) {
+                    corr > 0.7 // High correlation threshold (70%)
                 } else {
                     false // Insufficient data for correlation
                 }
@@ -240,7 +297,7 @@ impl RiskManager {
                                 if p.side != side {
                                     return false;
                                 }
-                                if let Some(correlation) = calculate_correlation(symbol, &p.symbol, &price_history) {
+                                if let Some(correlation) = get_correlation(symbol, &p.symbol) {
                                     correlation > 0.7
                                 } else {
                                     false

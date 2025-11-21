@@ -61,6 +61,8 @@ pub struct BotConfig {
     pub enhanced_score_excellent: f64,
     pub enhanced_score_good: f64,
     pub enhanced_score_marginal: f64,
+    // Order Flow Analysis (TrendPlan.md - Action Plan)
+    pub enable_order_flow: bool, // Enable Order Flow analysis (requires real depth data)
     // Paper Trading Mode (TrendPlan.md - Action Plan)
     pub paper_trading_enabled: bool,
     pub paper_trading_log_file: String, // Path to log file for virtual orders
@@ -257,6 +259,12 @@ impl BotConfig {
                 trending_cfg.and_then(|t| t.enhanced_score_marginal),
                 50.0,
             ),
+            // Order Flow Analysis (TrendPlan.md - Action Plan)
+            enable_order_flow: bool_setting(
+                "BOT_ENABLE_ORDER_FLOW",
+                trending_cfg.and_then(|t| t.enable_order_flow),
+                true, // Default: enabled (can be disabled for backtest consistency)
+            ),
             // Paper Trading Mode (TrendPlan.md - Action Plan)
             paper_trading_enabled: bool_setting(
                 "BOT_PAPER_TRADING_ENABLED",
@@ -404,6 +412,8 @@ impl BotConfig {
             enhanced_score_excellent: self.enhanced_score_excellent,
             enhanced_score_good: self.enhanced_score_good,
             enhanced_score_marginal: self.enhanced_score_marginal,
+            // Order Flow Analysis (TrendPlan.md - Action Plan)
+            enable_order_flow: self.enable_order_flow,
         }
     }
 }
