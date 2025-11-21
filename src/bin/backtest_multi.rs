@@ -11,10 +11,13 @@ use anyhow::Result;
 use chrono::Utc;
 use csv::Writer;
 use dotenvy::dotenv;
+use futures::stream::{self, StreamExt};
 use serde_json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use trading_bot::{
     calculate_advanced_metrics, export_backtest_to_csv, run_backtest,
     symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
@@ -151,33 +154,28 @@ async fn main() -> Result<()> {
     println!("Selected {} symbols for backtest", selected_symbols.len());
     println!();
 
-    // AlgoConfig (backtest için) - Builder pattern kullanarak
+    // ✅ PLAN.MD ADIM 3: KONFİGÜRASYON (Sahtelikten Arındırılmış)
     let cfg = AlgoConfigBuilder::new()
-        .with_rsi_thresholds(55.0, 45.0)
-        .with_funding_thresholds(0.0005, -0.0005)
-        .with_lsr_thresholds(1.3, 0.8)
-        .with_min_scores(4, 4)
-        .with_fees(8.0)
-        .with_holding_bars(3, 48)
-        .with_slippage(0.0)
-        .with_signal_quality(1.5, 2.0, 3.0)
-        .with_enhanced_scoring(true, 70.0, 55.0, 40.0)
-        .with_risk_management(3.0, 4.0)
-        .with_regime_settings(false, 6.5, 0.5, 0.6, 1.15, 0.9, 1.15)
+        .with_enhanced_scoring(true, 75.0, 60.0, 40.0) // Sıkı filtreleme
+        .with_risk_management(2.5, 5.0) // Geniş stop, yüksek kar
+        .with_fees(10.0) // 10 bps komisyon (VIP 0)
+        .with_slippage(5.0) // 5 bps sabit kayma (Simülasyon yok)
         .build();
 
-    // CSV writer oluştur
+    // ✅ PLAN.MD ADIM 3: Paralel çalıştırma (Zaman Kazanımı)
+    // CSV writer oluştur (Arc<Mutex> ile thread-safe)
     let file_exists = Path::new(&output_file).exists();
     let file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&output_file)?;
-
-    let mut wtr = Writer::from_writer(file);
+    let wtr = Arc::new(Mutex::new(Writer::from_writer(file)));
 
     // Header yaz (sadece yeni dosya ise)
-    if !file_exists {
-        wtr.write_record(&[
+    {
+        let mut wtr_guard = wtr.lock().await;
+        wtr_guard.write_record(&[
             "symbol",
             "interval",
             "total_trades",
@@ -201,28 +199,48 @@ async fn main() -> Result<()> {
     let mut error_count = 0;
     let total_start = Utc::now();
     
-    // ✅ NEW: Store all results for top 10 selection
-    let mut all_results: Vec<(String, BacktestResult)> = Vec::new();
+    // ✅ NEW: Store all results for top 10 selection (Arc<Mutex> ile thread-safe)
+    let all_results: Arc<Mutex<Vec<(String, BacktestResult)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Her symbol için backtest çalıştır
-    for (idx, symbol) in selected_symbols.iter().enumerate() {
-        println!(
-            "[{}/{}] Running backtest for {}...",
-            idx + 1,
-            selected_symbols.len(),
-            symbol
-        );
+    // ✅ PLAN.MD ADIM 3: Aynı anda 10 coin işle (API limitlerini zorlamadan maksimum hız)
+    let concurrency = 10;
+    
+    println!("🚀 SEÇİLEN {} COIN İÇİN %100 GERÇEK VERİ TESTİ BAŞLIYOR...", selected_symbols.len());
+    println!("⚡ Paralel işleme: Aynı anda {} coin işlenecek", concurrency);
+    println!();
 
-        match run_backtest(symbol, &interval, &period, limit, &cfg).await {
-            Ok(result) => {
+    let results = stream::iter(selected_symbols)
+        .map(|symbol| {
+            let cfg = cfg.clone();
+            let wtr = wtr.clone();
+            let all_results = all_results.clone();
+            let reports_dir = reports_dir.clone();
+            let interval = interval.clone();
+            let period = period.clone();
+            async move {
+                println!("⏳ Veri İndiriliyor ve İşleniyor: {} (ForceOrders dahil)", symbol);
+                
+                // 1000 Mum = ~3.5 Günlük Veri (Trend analizi için yeterli)
+                // Historical Force Orders da bu süreçte indirilecek
+                let res = run_backtest(&symbol, &interval, &period, limit, &cfg).await;
+                (symbol, res, wtr, all_results, reports_dir, interval)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+    for (symbol, result, wtr_arc, all_results_arc, reports_dir, interval) in results {
+        match result {
+            Ok(res) => {
                 success_count += 1;
                 
                 // ✅ NEW: Calculate advanced metrics
-                let advanced = calculate_advanced_metrics(&result);
+                let advanced = calculate_advanced_metrics(&res);
 
                 // ✅ NEW: Export individual trade CSV
                 let trades_file = reports_dir.join(format!("{}_trades.csv", symbol));
-                if let Err(e) = export_backtest_to_csv(&result, trades_file.to_str().unwrap()) {
+                if let Err(e) = export_backtest_to_csv(&res, trades_file.to_str().unwrap()) {
                     eprintln!("  ⚠️  Failed to export trades CSV for {}: {}", symbol, e);
                 }
 
@@ -230,16 +248,16 @@ async fn main() -> Result<()> {
                 let report = CoinReport {
                     symbol: symbol.clone(),
                     basic_metrics: BasicMetrics {
-                        total_trades: result.total_trades,
-                        win_trades: result.win_trades,
-                        loss_trades: result.loss_trades,
-                        win_rate: result.win_rate,
-                        total_pnl_pct: result.total_pnl_pct,
-                        avg_pnl_pct: result.avg_pnl_pct,
-                        avg_r: result.avg_r,
-                        total_signals: result.total_signals,
-                        long_signals: result.long_signals,
-                        short_signals: result.short_signals,
+                        total_trades: res.total_trades,
+                        win_trades: res.win_trades,
+                        loss_trades: res.loss_trades,
+                        win_rate: res.win_rate,
+                        total_pnl_pct: res.total_pnl_pct,
+                        avg_pnl_pct: res.avg_pnl_pct,
+                        avg_r: res.avg_r,
+                        total_signals: res.total_signals,
+                        long_signals: res.long_signals,
+                        short_signals: res.short_signals,
                     },
                     advanced_metrics: AdvancedMetrics {
                         max_drawdown_pct: advanced.max_drawdown_pct,
@@ -264,46 +282,45 @@ async fn main() -> Result<()> {
                 let row = BacktestRow {
                     symbol: symbol.clone(),
                     interval: interval.clone(),
-                    total_trades: result.total_trades,
-                    win_trades: result.win_trades,
-                    loss_trades: result.loss_trades,
-                    win_rate: result.win_rate,
-                    total_pnl_pct: result.total_pnl_pct,
-                    avg_pnl_pct: result.avg_pnl_pct,
-                    avg_r: result.avg_r,
-                    total_signals: result.total_signals,
-                    long_signals: result.long_signals,
-                    short_signals: result.short_signals,
+                    total_trades: res.total_trades,
+                    win_trades: res.win_trades,
+                    loss_trades: res.loss_trades,
+                    win_rate: res.win_rate,
+                    total_pnl_pct: res.total_pnl_pct,
+                    avg_pnl_pct: res.avg_pnl_pct,
+                    avg_r: res.avg_r,
+                    total_signals: res.total_signals,
+                    long_signals: res.long_signals,
+                    short_signals: res.short_signals,
                     max_drawdown_pct: advanced.max_drawdown_pct,
                     sharpe_ratio: advanced.sharpe_ratio,
                     profit_factor: advanced.profit_factor,
                     timestamp: Utc::now().to_rfc3339(),
                 };
 
+                let mut wtr = wtr_arc.lock().await;
                 wtr.serialize(&row)?;
                 wtr.flush()?;
+                drop(wtr);
                 
                 println!(
-                    "  ✅ {}: {} trades, {:.2}% win rate, {:.4}% total PnL, Sharpe: {:.2}",
-                    symbol,
-                    result.total_trades,
-                    result.win_rate * 100.0,
-                    result.total_pnl_pct * 100.0,
-                    advanced.sharpe_ratio
+                    "✅ {}: PnL: %{:.2} | Sharpe: {:.2} | Trades: {}", 
+                    symbol, res.total_pnl_pct * 100.0, advanced.sharpe_ratio, res.total_trades
                 );
                 
-                // ✅ NEW: Store result for top 10 selection (clone after use)
-                all_results.push((symbol.clone(), result));
+                // ✅ NEW: Store result for top 10 selection (thread-safe)
+                let mut all_results = all_results_arc.lock().await;
+                all_results.push((symbol.clone(), res));
             }
-            Err(err) => {
+            Err(e) => {
                 error_count += 1;
-                eprintln!("  ❌ {}: Backtest failed: {}", symbol, err);
+                eprintln!("❌ {} HATA: {}", symbol, e);
             }
         }
-
-        // Rate limiting: küçük delay
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
+    
+    // Get all_results from Arc<Mutex>
+    let all_results = all_results.lock().await.clone();
 
     let total_duration = Utc::now() - total_start;
 

@@ -917,112 +917,10 @@ impl LiquidationMap {
         self.last_update = Utc::now();
     }
 
-    /// ✅ FALLBACK: Estimate future liquidations using mathematical model (only if real data unavailable)
-    /// Uses funding rate and Long/Short Ratio to estimate average leverage dynamically
-    /// Funding rate > 0.01% (0.0001) typically indicates high leverage usage
-    /// Long/Short Ratio imbalance also indicates leverage concentration
-    /// NOTE: This is LESS accurate than real liquidation data from connection.rs
-    pub fn estimate_future_liquidations(
-        &mut self,
-        current_price: f64,
-        open_interest: f64,
-        long_short_ratio: f64,
-        funding_rate: f64,
-    ) {
-        // Clear previous estimates
-        self.long_liquidations.clear();
-        self.short_liquidations.clear();
-
-        // Long pozisyonların oranı
-        let long_ratio = long_short_ratio / (1.0 + long_short_ratio);
-        let short_ratio = 1.0 - long_ratio;
-
-        let long_oi = open_interest * long_ratio;
-        let short_oi = open_interest * short_ratio;
-
-        // ✅ CRITICAL FIX (Plan.md): More conservative leverage estimation
-        // ⚠️ WARNING: "High funding = high leverage" assumption is NOT always true
-        // This is a mathematical estimate, not real liquidation data
-        // For backtest: Use very conservative estimates to avoid over-optimistic results
-        // For production: Prefer real liquidation data from forceOrder stream
-        let funding_rate_abs = funding_rate.abs();
-        let leverage_factor = if funding_rate_abs > 0.0001 {
-            // ⚠️ CONSERVATIVE: Reduced leverage estimates (was 20x-80x, now 10x-40x)
-            // High funding does NOT always mean high leverage - be conservative
-            // Scale from 10x (low funding) to 40x (high funding) - more conservative
-            10.0 + (funding_rate_abs * 300_000.0).min(30.0) // Reduced from 600k/60 to 300k/30
-        } else {
-            // Low funding = conservative leverage estimate
-            10.0 // Reduced from 20x to 10x
-        };
-
-        // Long/Short imbalance also affects leverage concentration
-        // ⚠️ CONSERVATIVE: Reduced imbalance factor
-        let imbalance_factor = if long_short_ratio > 1.5 || long_short_ratio < 0.67 {
-            // Extreme imbalance = more leverage concentration, but be conservative
-            1.1 // Reduced from 1.2 to 1.1
-        } else {
-            1.0
-        };
-
-        let avg_leverage = leverage_factor * imbalance_factor;
-
-        // ✅ FIX: Use realistic price intervals based on price level
-        // For BTC ($40k): $10 intervals
-        // For altcoins ($0.001): $0.00001 intervals
-        let price_interval = if current_price > 1000.0 {
-            10.0 // Major coins: $10 intervals
-        } else if current_price > 1.0 {
-            0.01 // Mid-range: $0.01 intervals
-        } else {
-            0.00001 // Low-price coins: $0.00001 intervals
-        };
-
-        // ⚠️ CONSERVATIVE: Estimate liquidation prices using average leverage
-        // Distribute OI across multiple price levels (not just one)
-        // Most liquidations happen near current price (1-2% away)
-        // ⚠️ WARNING: This is a mathematical estimate, not real liquidation data
-        // For backtest: These estimates may be over-optimistic
-        // ⚠️ CONSERVATIVE: Reduced OI portions to be more conservative
-        let price_levels = vec![
-            (0.5, 0.2),  // 50% of avg leverage → 20% of OI (was 30%, more conservative)
-            (0.75, 0.3), // 75% of avg leverage → 30% of OI (was 40%, more conservative)
-            (1.0, 0.15), // 100% of avg leverage → 15% of OI (was 25%, more conservative)
-            (1.5, 0.05), // 150% of avg leverage → 5% of OI (unchanged)
-        ];
-
-        // Long liquidation prices (below current price)
-        for (leverage_mult, portion) in &price_levels {
-            let effective_leverage = avg_leverage * leverage_mult;
-            let notional = long_oi * portion;
-
-            // Liquidation price = entry * (1 - 1/leverage)
-            let liq_price = current_price * (1.0 - 1.0 / effective_leverage);
-            let liq_price_rounded = (liq_price / price_interval).round() * price_interval;
-            let liq_price_key = (liq_price_rounded / price_interval) as i64;
-
-            *self
-                .long_liquidations
-                .entry(liq_price_key)
-                .or_insert(0.0) += notional;
-        }
-
-        // Short liquidation prices (above current price)
-        for (leverage_mult, portion) in &price_levels {
-            let effective_leverage = avg_leverage * leverage_mult;
-            let notional = short_oi * portion;
-            let liq_price = current_price * (1.0 + 1.0 / effective_leverage);
-            let liq_price_rounded = (liq_price / price_interval).round() * price_interval;
-            let liq_price_key = (liq_price_rounded / price_interval) as i64;
-
-            *self
-                .short_liquidations
-                .entry(liq_price_key)
-                .or_insert(0.0) += notional;
-        }
-
-        self.last_update = Utc::now();
-    }
+    // ❌ SİLİNDİ (Plan.md ADIM 1): estimate_future_liquidations fonksiyonu kaldırıldı
+    // Bu fonksiyon funding rate ve Long/Short Ratio'ya bakıp "kesin burada likidasyon vardır" diye tahmin yürütüyordu.
+    // Artık sadece gerçek Binance API'den alınan ForceOrder verileri kullanılacak.
+    // Gerçek veri yoksa LiquidationMap boş kalacak ve liquidation stratejileri çalışmayacak.
 
     /// ✅ CRITICAL FIX: Detect "liquidation walls" using dynamic price intervals
     /// Bu wall'lara yaklaştığımızda cascade riski var
@@ -1033,7 +931,7 @@ impl LiquidationMap {
     ) -> Vec<LiquidationWall> {
         let mut walls = Vec::new();
 
-        // ✅ FIX: Use dynamic price interval (same as in estimate_future_liquidations)
+        // ✅ FIX: Use dynamic price interval (same as in update_from_real_liquidation_data)
         let price_interval = if current_price > 1000.0 {
             10.0 // Major coins: $10 intervals
         } else if current_price > 1.0 {
@@ -2041,107 +1939,9 @@ fn create_orderflow_from_real_depth(
     Some(orderflow)
 }
 
-/// ⚠️ CRITICAL WARNING: This function generates SIMULATED depth data for backtest
-/// ⚠️ This is NOT real orderbook data - it's a mathematical estimate based on volume
-/// ⚠️ Backtest results using Order Flow strategies will be MISLEADING/OPTIMISTIC
-/// 
-/// Real Order Flow strategies (Spoofing, Iceberg, Absorption detection) require:
-/// - Real tick-by-tick orderbook snapshots from Binance
-/// - Real depth data (bid/ask levels with actual quantities)
-/// 
-/// This function estimates depth from candle volume, which is NOT sufficient for:
-/// - Detecting real spoofing (fake large orders that disappear)
-/// - Detecting real iceberg orders (hidden large orders)
-/// - Detecting real absorption (large orders being eaten)
-/// 
-/// ⚠️ RECOMMENDATION: 
-/// - For accurate backtest: Download real tick/orderbook data from Binance
-/// - OR: Ignore Order Flow strategy profits in backtest results (they're simulated)
-/// - OR: Disable Order Flow in backtest (set enable_order_flow: false)
-/// 
-/// Based on empirical observations:
-/// - Depth typically 10-50% of daily volume (scaled to candle timeframe)
-/// - OBI imbalance affects bid/ask depth distribution
-/// - Volatility affects depth concentration (high vol = thinner depth)
-/// - Price action (trend) affects depth asymmetry
-fn estimate_realistic_depth(
-    candle: &Candle,
-    ctx: &SignalContext,
-    obi: Option<f64>,
-    candles: &[Candle],
-    current_index: usize,
-) -> (Option<f64>, Option<f64>) {
-    // Base depth estimation: 10-30% of candle volume (USD)
-    let volume_usd = candle.volume * candle.close;
-    
-    // Timeframe scaling: 5m candle = 1/288 of daily volume
-    // Depth is typically 10-30% of candle volume, but varies with market conditions
-    let base_depth_factor = 0.15; // 15% of candle volume as base depth
-    
-    // Volatility adjustment: High volatility = thinner depth (more concentrated)
-    let atr_pct = ctx.atr / candle.close;
-    let volatility_factor = if atr_pct > 0.05 {
-        // High volatility: thinner depth (0.5x)
-        0.5
-    } else if atr_pct > 0.02 {
-        // Medium volatility: normal depth (0.8x)
-        0.8
-    } else {
-        // Low volatility: deeper depth (1.2x)
-        1.2
-    };
-    
-    // Volume trend: Recent volume spikes indicate increased market activity = deeper depth
-    let volume_trend_factor = if current_index >= 20 {
-        let recent_avg = candles[current_index.saturating_sub(19)..=current_index]
-            .iter()
-            .map(|c| c.volume * c.close)
-            .sum::<f64>() / 20.0;
-        let volume_ratio = volume_usd / recent_avg.max(1.0);
-        // Volume spike (>1.5x) = deeper depth
-        volume_ratio.min(2.0).max(0.5)
-    } else {
-        1.0
-    };
-    
-    // Base depth calculation
-    let base_depth = volume_usd * base_depth_factor * volatility_factor * volume_trend_factor;
-    
-    // OBI-based distribution: OBI > 1.0 = more bid depth, OBI < 1.0 = more ask depth
-    let obi_value = obi.unwrap_or(1.0);
-    let bid_ratio = if obi_value > 1.0 {
-        // Long dominance: more bid depth
-        (obi_value / 2.0).min(0.7).max(0.3)
-    } else {
-        // Short dominance: less bid depth
-        (obi_value * 0.5).min(0.7).max(0.3)
-    };
-    let _ask_ratio = 1.0 - bid_ratio; // Used in calculation below
-    
-    // Price action adjustment: Strong trend = asymmetric depth
-    let price_change = (candle.close - candle.open) / candle.open;
-    let trend_factor = price_change.abs();
-    let adjusted_bid_ratio = if price_change > 0.001 {
-        // Uptrend: slightly more ask depth (resistance)
-        bid_ratio * (1.0 - trend_factor.min(0.2))
-    } else if price_change < -0.001 {
-        // Downtrend: slightly more bid depth (support)
-        bid_ratio * (1.0 + trend_factor.abs().min(0.2))
-    } else {
-        bid_ratio
-    };
-    let adjusted_ask_ratio = 1.0 - adjusted_bid_ratio;
-    
-    // Final depth calculation with realistic bounds
-    let bid_depth = base_depth * adjusted_bid_ratio;
-    let ask_depth = base_depth * adjusted_ask_ratio;
-    
-    // Realistic bounds: Minimum $10k, Maximum $10M per side
-    let bid_depth_bounded = bid_depth.max(10_000.0).min(10_000_000.0);
-    let ask_depth_bounded = ask_depth.max(10_000.0).min(10_000_000.0);
-    
-    (Some(bid_depth_bounded), Some(ask_depth_bounded))
-}
+// ❌ SİLİNDİ (Plan.md ADIM 1): estimate_realistic_depth fonksiyonu kaldırıldı
+// Bu fonksiyon sahte emir defteri verisi üretiyordu ve backtest sonuçlarını manipüle ediyordu.
+// Artık sadece gerçek Binance API verileri kullanılacak.
 
 /// ✅ CRITICAL FIX: Build LiquidationMap from historical force orders
 /// This provides REAL liquidation data for backtest instead of mathematical estimates
@@ -3432,19 +3232,10 @@ pub fn run_backtest_on_series(
         Download historical tick data or order book snapshots from Binance for accurate backtesting."
     );
     
+    // ✅ PLAN.MD ADIM 1: Order Flow analizleri devre dışı bırakıldı çünkü gerçek Tick/Depth verisi yok.
     if cfg.enable_order_flow {
         log::warn!(
-            "BACKTEST: ⚠️⚠️⚠️ CRITICAL WARNING: Order Flow enabled but uses SIMULATED depth data. \
-            Current backtest uses estimate_realistic_depth() which generates FAKE orderbook data. \
-            Order Flow strategies (Spoofing, Iceberg, Absorption) will show profits in backtest, \
-            BUT these profits are from SIMULATED data, NOT real orderbook snapshots. \
-            \
-            ⚠️ RECOMMENDATION: \
-            - Ignore Order Flow strategy profits in backtest results (they're misleading) \
-            - OR: Download real tick/orderbook data from Binance for accurate backtest \
-            - OR: Disable Order Flow in backtest (set enable_order_flow: false) \
-            \
-            Real Order Flow requires actual orderbook snapshots with bid/ask levels and quantities."
+            "BACKTEST: Order Flow analizleri devre dışı bırakıldı çünkü gerçek Tick/Depth verisi yok."
         );
     }
     
@@ -3543,118 +3334,11 @@ pub fn run_backtest_on_series(
             // This ensures backtest results are conservative and realistic
         }
 
-        // ✅ CRITICAL FIX: Realistic MarketTick for backtest (minimize production divergence)
-        // Use candle data (high/low/volume) and context (ATR, volatility) to estimate realistic bid/ask and depth
-        
-        // 1. Calculate realistic bid/ask spread from ATR and volatility
-        // ⚠️ CRITICAL RISK: Kriz anlarında spread çok açılır (%0.01 -> %0.5+)
-        // Backtest'te bu durumu simüle etmezsek, canlıda zarara dönebilir
-        let atr_pct = ctx.atr / c.close;
-        
-        // ✅ CRITICAL FIX: Crisis detection - detect extreme volatility spikes
-        // Crisis = volatility spike (ATR > 3% or sudden price movement > 5%)
-        let is_crisis = if i >= 5 {
-            let recent_atrs: Vec<f64> = contexts[i.saturating_sub(4)..=i]
-                .iter()
-                .map(|ctx| ctx.atr / c.close)
-                .collect();
-            let avg_recent_atr = recent_atrs.iter().sum::<f64>() / recent_atrs.len() as f64;
-            
-            // Crisis conditions:
-            // 1. Current ATR > 3% (extreme volatility)
-            // 2. Sudden price movement > 5% in last 5 candles
-            let price_change_5bars = if i >= 5 {
-                (c.close - candles[i - 5].close).abs() / candles[i - 5].close
-            } else {
-                0.0
-            };
-            
-            atr_pct > 0.03 || price_change_5bars > 0.05
-        } else {
-            atr_pct > 0.03 // High volatility alone indicates crisis
-        };
-        
-        // ✅ CRITICAL FIX: Crisis spread multiplier (10x-50x normal spread)
-        // Normal markets: 0.01% (1 bps) spread
-        // Crisis markets: 0.1%-0.5% (10-50 bps) spread
-        let volatility_factor = if is_crisis {
-            // Crisis: spread opens dramatically (10x-50x)
-            // Use ATR to determine crisis severity
-            let crisis_severity = (atr_pct / 0.03).min(5.0); // Cap at 5x
-            10.0 + (crisis_severity * 8.0) // 10x to 50x multiplier
-        } else {
-            // Normal: 0.5x to 5x based on volatility
-            (atr_pct * 100.0).clamp(0.5, 5.0)
-        };
-        
-        // Base spread: 0.01% (1 bps) for calm markets
-        // Crisis: 0.1%-0.5% (10-50 bps) spread
-        let base_spread_pct = 0.0001 * volatility_factor; // 0.01% to 0.5% based on volatility/crisis
-        let spread_half = c.close * base_spread_pct / 2.0;
-        
-        // 2. Estimate bid/ask from candle range and close price
-        // Use high/low range to estimate realistic bid/ask positioning
-        let candle_range = c.high - c.low;
-        let range_pct = if c.close > 0.0 { candle_range / c.close } else { 0.0 };
-        
-        // If close is near high, more ask pressure (sellers), if near low, more bid pressure (buyers)
-        let close_position = if candle_range > 0.0 {
-            (c.close - c.low) / candle_range // 0.0 = at low (bid pressure), 1.0 = at high (ask pressure)
-        } else {
-            0.5 // Balanced
-        };
-        
-        // Adjust spread based on close position in range
-        let spread_adjustment = if close_position > 0.6 {
-            // Close near high = more ask pressure = wider spread upward
-            1.2
-        } else if close_position < 0.4 {
-            // Close near low = more bid pressure = wider spread downward
-            1.2
-        } else {
-            1.0 // Balanced
-        };
-        
-        let final_spread_half = spread_half * spread_adjustment;
-        let bid = c.close - final_spread_half;
-        let ask = c.close + final_spread_half;
-        
-        // 3. Calculate OBI from Long/Short Ratio (more realistic)
-        // LSR > 1.0 = more longs = bid pressure = OBI > 1.0
-        let obi = if ctx.long_short_ratio > 1.0 {
-            // Long dominance: OBI scales with LSR but capped at realistic range
-            Some((ctx.long_short_ratio).min(3.0).max(0.5)) // 0.5 to 3.0 range
-        } else {
-            // Short dominance: inverse relationship
-            Some((1.0 / ctx.long_short_ratio.max(0.1)).min(3.0).max(0.5))
-        };
-        
-        // 4. ⚠️ CRITICAL WARNING: Order Flow depth estimation for backtest
-        // ⚠️ This uses SIMULATED depth data (estimate_realistic_depth) - NOT real orderbook data
-        // ⚠️ Backtest results with Order Flow strategies will be MISLEADING/OPTIMISTIC
-        // ⚠️ Real Order Flow requires actual tick/orderbook snapshots from Binance
-        // ⚠️ Recommendation: Disable Order Flow in backtest OR ignore Order Flow profits in results
-        let (bid_depth_usd, ask_depth_usd) = if cfg.enable_order_flow {
-            // ⚠️ WARNING: This is simulated data, not real orderbook depth
-            estimate_realistic_depth(c, ctx, obi, candles, i)
-        } else {
-            (None, None)
-        };
-
-        let market_tick = MarketTick {
-            symbol: symbol.to_string(),
-            price: c.close,
-            bid: bid.max(c.low * 0.9999).min(c.high * 0.9999), // Ensure bid is within candle range
-            ask: ask.max(c.low * 1.0001).min(c.high * 1.0001), // Ensure ask is within candle range
-            volume: c.volume,
-            ts: c.close_time,
-            obi,
-            funding_rate: Some(ctx.funding_rate), // Real data
-            liq_long_cluster: None, // Not available in backtest
-            liq_short_cluster: None,
-            bid_depth_usd,
-            ask_depth_usd,
-        };
+        // ✅ PLAN.MD ADIM 1: Backtest sırasında gerçek anlık derinlik (depth) verimiz olmadığı için
+        // MarketTick'i None veya boş geçiyoruz. Bu sayede OrderFlow ve Slippage
+        // analizleri sahte verilerle çalışmayacak.
+        // ❌ SİLİNDİ: estimate_realistic_depth ve sahte MarketTick üretimi kaldırıldı
+        let market_tick = None;
 
         // ✅ CRITICAL FIX: Create MTF and OrderFlow analysis in backtest (same as production)
         // Multi-Timeframe Analysis - create from candles up to current index
@@ -3665,24 +3349,10 @@ pub fn run_backtest_on_series(
             None
         };
 
-        // OrderFlow Analyzer - ⚠️ CRITICAL WARNING: Uses SIMULATED depth data in backtest
-        // ⚠️ Order Flow strategies (Spoofing, Iceberg, Absorption) will show profits in backtest
-        // ⚠️ BUT these profits are from SIMULATED data, not real orderbook snapshots
-        // ⚠️ Real Order Flow requires actual tick/orderbook data from Binance
-        // ⚠️ Recommendation: Ignore Order Flow strategy profits in backtest results
-        let orderflow_analyzer: Option<OrderFlowAnalyzer> = if cfg.enable_order_flow {
-            if let (Some(bid_depth), Some(ask_depth)) = (bid_depth_usd, ask_depth_usd) {
-                // ⚠️ WARNING: Using SIMULATED depth data (estimate_realistic_depth)
-                // This is NOT real orderbook data - backtest results will be optimistic
-                create_orderflow_from_real_depth(&market_tick, &candles[..=i], bid_depth, ask_depth)
-            } else {
-                // Depth estimation failed - skip Order Flow
-                None
-            }
-        } else {
-            // Order Flow disabled in config
-            None
-        };
+        // ✅ PLAN.MD ADIM 1: OrderFlow Analyzer - Backtest'te sahte veri kullanılmıyor
+        // Backtest sırasında gerçek anlık derinlik (depth) verimiz olmadığı için
+        // OrderFlow analizleri devre dışı bırakıldı. Bu sayede sahte verilerle çalışmayacak.
+        let orderflow_analyzer: Option<OrderFlowAnalyzer> = None; // ❌ SİLİNDİ: estimate_realistic_depth kaldırıldı
 
         // Enhanced signal generation with ALL REAL DATA (including MTF, OrderFlow, and LiquidationMap)
         // ✅ CRITICAL FIX: All strategies now enabled in backtest with realistic data
@@ -3711,7 +3381,7 @@ pub fn run_backtest_on_series(
             orderflow_analyzer.as_ref(), // ✅ OrderFlow enabled in backtest with realistic depth
             liquidation_map_for_signal, // ✅ ACTION PLAN FIX: Only pass if real data available
             volume_profile.as_ref(), // GERÇEK VERİ: Candle verilerinden
-            Some(&market_tick), // GERÇEK VERİ: Candle + Context'ten oluşturuldu
+            market_tick.as_ref(), // ✅ PLAN.MD ADIM 1: None (sahte veri üretimi kaldırıldı)
         );
 
         // Count signals
