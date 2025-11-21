@@ -14,7 +14,7 @@ use trading_bot::{
     symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
     test_utils::AlgoConfigBuilder,
     types::FileConfig,
-    AlgoConfig, BacktestResult,
+    BacktestResult,
 };
 
 #[derive(Debug, serde::Serialize)]
