@@ -202,8 +202,11 @@ async fn main() -> Result<()> {
     // ✅ NEW: Store all results for top 10 selection (Arc<Mutex> ile thread-safe)
     let all_results: Arc<Mutex<Vec<(String, BacktestResult)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // ✅ PLAN.MD ADIM 3: Aynı anda 10 coin işle (API limitlerini zorlamadan maksimum hız)
-    let concurrency = 10;
+    // ✅ PLAN.MD ADIM 3: Paralel işleme (Zaman Kazanımı)
+    // 100 coin için 1 saat hedefi: Her coin ortalama 30sn sürerse, seri işlem 50dk sürer.
+    // Ancak ForceOrders verisi indirmek yavaştır.
+    // Eşzamanlı 20 işlem ile ağ bekleme süresini minimize ediyoruz.
+    let concurrency = 20; 
     
     println!("🚀 SEÇİLEN {} COIN İÇİN %100 GERÇEK VERİ TESTİ BAŞLIYOR...", selected_symbols.len());
     println!("⚡ Paralel işleme: Aynı anda {} coin işlenecek", concurrency);

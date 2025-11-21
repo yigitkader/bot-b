@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
-use rand::SeedableRng;
 use reqwest::{Client, Url};
 use ta::indicators::{AverageTrueRange, ExponentialMovingAverage, RelativeStrengthIndex};
 use ta::{DataItem, Next};
@@ -3221,35 +3220,16 @@ pub fn run_backtest_on_series(
 ) -> BacktestResult {
     assert_eq!(candles.len(), contexts.len());
 
-    // ✅ ACTION PLAN FIX: Backtest requires real tick/orderbook data for accurate results
-    // ⚠️ CRITICAL WARNING: Order Flow and Liquidation strategies require REAL data
-    // Kline (candlestick) data alone is NOT sufficient for these strategies
-    // You need to download historical tick data or order book snapshots from Binance
-    log::warn!(
-        "BACKTEST: ⚠️ ACTION PLAN WARNING: \
-        Order Flow and Liquidation strategies require REAL tick/orderbook data. \
-        Kline (candlestick) data alone is NOT sufficient. \
-        Download historical tick data or order book snapshots from Binance for accurate backtesting."
-    );
+    // Order Flow Backtest'te devre dışı (Gerçek Tick verisi olmadığı için)
+    let enable_order_flow_simulation = false; 
+
+    // Liquidation Stratejisi Kontrolü
+    let has_real_liquidation_data = historical_force_orders.map(|v| !v.is_empty()).unwrap_or(false);
     
-    // ✅ PLAN.MD ADIM 1: Order Flow analizleri devre dışı bırakıldı çünkü gerçek Tick/Depth verisi yok.
-    if cfg.enable_order_flow {
-        log::warn!(
-            "BACKTEST: Order Flow analizleri devre dışı bırakıldı çünkü gerçek Tick/Depth verisi yok."
-        );
-    }
-    
-    if historical_force_orders.is_some() {
-        log::info!(
-            "BACKTEST: ✅ Historical liquidation data available. \
-            Liquidation cascade strategies will be tested with REAL forceOrder data."
-        );
+    if has_real_liquidation_data {
+        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi (ForceOrders) mevcut. Strateji aktif.", symbol);
     } else {
-        log::warn!(
-            "BACKTEST: ⚠️ No historical liquidation data available. \
-            Liquidation strategies DISABLED (estimate_future_liquidations is unreliable). \
-            To test liquidation strategies, download historical forceOrder data from Binance."
-        );
+        log::warn!("BACKTEST: ⚠️ {} için Liquidation verisi YOK. Bu strateji pas geçilecek.", symbol);
     }
 
     let mut trades: Vec<Trade> = Vec::new();
@@ -3266,9 +3246,6 @@ pub fn run_backtest_on_series(
     let mut total_signals = 0usize;
     let mut long_signals = 0usize;
     let mut short_signals = 0usize;
-
-    // Deterministic RNG seed for reproducible results
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
     // Funding arbitrage tracker
     let mut funding_arbitrage = FundingArbitrage::new();
@@ -3309,29 +3286,14 @@ pub fn run_backtest_on_series(
         // Update funding arbitrage tracker
         funding_arbitrage.update_funding(ctx.funding_rate, c.close_time);
 
-        // ✅ CRITICAL FIX: Update LiquidationMap with current price and OI
-        // ⚠️ ACTION PLAN FIX: Only use REAL liquidation data from historical force orders
-        // DO NOT use estimate_future_liquidations - it's a mathematical assumption that may deviate from reality
-        if historical_force_orders.is_some() {
-            // Real liquidation data already loaded in liquidation_map
-            // Update with current price and OI for accurate wall detection
+        // Liquidation Map Güncelleme (Sadece gerçek veri varsa)
+        if has_real_liquidation_data {
             liquidation_map.update_from_real_liquidation_data(
                 c.close,
                 ctx.open_interest,
-                None, // liq_long_cluster not available in backtest
-                None, // liq_short_cluster not available in backtest
+                None, // Backtest'te anlık cluster verisi yok, sadece map kullanıyoruz
+                None,
             );
-        } else {
-            // ⚠️ CRITICAL: No historical liquidation data available
-            // Liquidation strategies will NOT work without real forceOrder data
-            // This is intentional - we don't want to trade on mathematical estimates
-            log::warn!(
-                "BACKTEST: ⚠️ No historical liquidation data available. \
-                Liquidation strategies DISABLED (estimate_future_liquidations is unreliable). \
-                To test liquidation strategies, provide historical forceOrder data."
-            );
-            // Do NOT call estimate_future_liquidations - leave liquidation_map empty
-            // This ensures backtest results are conservative and realistic
         }
 
         // ✅ PLAN.MD ADIM 1: Backtest sırasında gerçek anlık derinlik (depth) verimiz olmadığı için
@@ -3354,17 +3316,10 @@ pub fn run_backtest_on_series(
         // OrderFlow analizleri devre dışı bırakıldı. Bu sayede sahte verilerle çalışmayacak.
         let orderflow_analyzer: Option<OrderFlowAnalyzer> = None; // ❌ SİLİNDİ: estimate_realistic_depth kaldırıldı
 
-        // Enhanced signal generation with ALL REAL DATA (including MTF, OrderFlow, and LiquidationMap)
-        // ✅ CRITICAL FIX: All strategies now enabled in backtest with realistic data
-        // ✅ ACTION PLAN FIX (Plan.md): Only pass LiquidationMap if it has REAL data
-        // Backtest'te historical_force_orders yoksa liquidation_map boş - None geçmeliyiz
-        // Plan.md: "LiquidationMap stratejisini canlı veri (forceOrder stream) olmadan sinyal üretimine dahil etmeyin"
-        let liquidation_map_for_signal = if historical_force_orders.is_some() && 
-            (!liquidation_map.long_liquidations.is_empty() || !liquidation_map.short_liquidations.is_empty()) {
-            // Real liquidation data available - use it
+        // Liquidation Map'i sinyal üreticisine sadece gerçek veri varsa gönder
+        let liquidation_map_ref = if has_real_liquidation_data {
             Some(&liquidation_map)
         } else {
-            // No real liquidation data - don't use LiquidationMap strategy
             None
         };
         
@@ -3377,11 +3332,11 @@ pub fn run_backtest_on_series(
             contexts,
             i,
             Some(&funding_arbitrage),
-            mtf_analysis.as_ref(), // ✅ MTF enabled in backtest
-            orderflow_analyzer.as_ref(), // ✅ OrderFlow enabled in backtest with realistic depth
-            liquidation_map_for_signal, // ✅ ACTION PLAN FIX: Only pass if real data available
-            volume_profile.as_ref(), // GERÇEK VERİ: Candle verilerinden
-            market_tick.as_ref(), // ✅ PLAN.MD ADIM 1: None (sahte veri üretimi kaldırıldı)
+            mtf_analysis.as_ref(),
+            None, // OrderFlow backtestte kapalı
+            liquidation_map_ref,
+            volume_profile.as_ref(),
+            None, // MarketTick backtestte yok
         );
 
         // Count signals
@@ -3397,104 +3352,38 @@ pub fn run_backtest_on_series(
             SignalSide::Flat => {}
         }
 
-        // === REALISTIC EXECUTION WITH DELAY (ACTION PLAN FIX) ===
-        // ⚠️ ACTION PLAN FIX: Add artificial delay to simulate real-world execution latency
-        // Signal generated at close → executed 1-2 seconds later (not immediately at next open)
-        // This simulates network delay, order processing, and API latency
+        // POZİSYON İŞLEME (Deterministik Slippage ile)
         if !matches!(sig.side, SignalSide::Flat) && matches!(pos_side, PositionSide::Flat) {
             if i + 1 < candles.len() {
-                let entry_candle = &candles[i + 1]; // Next candle
+                let entry_candle = &candles[i + 1]; // Bir sonraki mumun açılışında işlem
                 
-                // ✅ ACTION PLAN FIX: Simulate execution delay (1-2 seconds)
-                // In real trading, there's latency between signal generation and order execution
-                // Use a price that's slightly after the signal (interpolated within the next candle)
-                let execution_delay_seconds = if cfg.hft_mode {
-                    1.0 // HFT: 1 second delay (optimistic)
-                } else {
-                    2.0 // Normal: 2 second delay (realistic)
-                };
-                
-                // Calculate candle duration (typically 5 minutes = 300 seconds for 5m candles)
-                let candle_duration_secs = (entry_candle.close_time - entry_candle.open_time).num_seconds().max(1);
-                let delay_ratio = (execution_delay_seconds / candle_duration_secs as f64).min(0.5); // Cap at 50% of candle
-                
-                // Interpolate price between open and close based on delay
-                // Assumes linear price movement within the candle (conservative estimate)
-                let price_movement = entry_candle.close - entry_candle.open;
-                let delayed_price = entry_candle.open + (price_movement * delay_ratio);
-                
-                // Use delayed price instead of immediate open price
-                let effective_entry_price = delayed_price;
+                // Fiyat: Mum açılış fiyatı
+                let raw_entry_price = entry_candle.open;
 
-                // ✅ REALISTIC SLIPPAGE (TrendPlan.md Fix #2)
-                // ⚠️ CRITICAL RISK: HFT modunda latency hesaba katılmamış
-                // Kriz anlarında slippage çok artar (0.05% -> 0.5%+)
-                // ✅ CRITICAL FIX: Enhanced slippage simulation with HFT latency and crisis detection
+                // SOMUT SLIPPAGE HESABI (Rastgelelik Yok)
+                // 1. Baz Slippage: Config'den gelir (örn: 0.05%)
+                // 2. Volatilite Cezası: ATR / Fiyat oranı yüksekse slippage artar.
                 let atr_pct = ctx.atr / c.close;
                 
-                // Crisis detection (same as spread calculation)
-                let is_crisis = if i >= 5 {
-                    let price_change_5bars = (c.close - candles[i - 5].close).abs() / candles[i - 5].close;
-                    atr_pct > 0.03 || price_change_5bars > 0.05
-                } else {
-                    atr_pct > 0.03
-                };
+                // Volatilite çarpanı: Eğer ATR %1'in üzerindeyse slippage lineer artar.
+                // Örn: ATR %2 ise çarpan 2.0 olur. Max çarpan 5.0.
+                let volatility_penalty = (atr_pct * 100.0).max(1.0).min(5.0);
                 
-                // ✅ CRITICAL FIX: HFT latency simulation
-                // HFT mode: Lower latency = better fills = less slippage (0.5x-1x)
-                // Normal mode: Higher latency = worse fills = more slippage (1x-2x)
-                let latency_multiplier = if cfg.hft_mode {
-                    // HFT: Fast execution, minimal latency impact
-                    0.7 // 30% less slippage due to fast execution
-                } else {
-                    // Normal: Network delay, order processing, API latency
-                    1.3 // 30% more slippage due to slower execution
-                };
-                
-                // ✅ CRITICAL FIX: Crisis slippage multiplier (10x-20x normal slippage)
-                // Normal markets: 0.05% slippage
-                // Crisis markets: 0.5%-1% slippage
-                let volatility_multiplier = if is_crisis {
-                    // Crisis: slippage increases dramatically (10x-20x)
-                    let crisis_severity = (atr_pct / 0.03).min(2.0); // Cap at 2x
-                    10.0 + (crisis_severity * 10.0) // 10x to 20x multiplier
-                } else {
-                    // Normal: 1x-3x based on volatility
-                    (atr_pct * 100.0).clamp(1.0, 3.0)
-                };
-                
-                // ✅ CRITICAL FIX: Spread and slippage correlation
-                // Wide spread = more slippage (market makers widen spreads during volatility)
-                // Use the spread calculated earlier (base_spread_pct from market_tick calculation)
-                let spread_pct = (ask - bid) / c.close; // Calculate from bid/ask
-                let spread_multiplier = if spread_pct > 0.001 {
-                    // Spread > 0.1% (10 bps) = add extra slippage
-                    1.0 + ((spread_pct - 0.0001) * 100.0).min(1.0) // Up to 2x additional slippage
-                } else {
-                    1.0
-                };
-                
-                // Final slippage calculation
-                let mut dynamic_slippage_frac = base_slippage_frac 
-                    * volatility_multiplier 
-                    * latency_multiplier 
-                    * spread_multiplier;
-                
-                // Cap slippage at realistic maximum (1% even in extreme crisis)
-                dynamic_slippage_frac = dynamic_slippage_frac.min(0.01);
+                // Final Slippage Oranı
+                let final_slippage_frac = base_slippage_frac * volatility_penalty;
 
                 match sig.side {
                     SignalSide::Long => {
                         pos_side = PositionSide::Long;
-                        // ✅ ACTION PLAN FIX: Use delayed price + slippage (not immediate open)
-                        pos_entry_price = effective_entry_price * (1.0 + dynamic_slippage_frac);
+                        // Long girerken fiyat yukarı kayar (daha pahalı alırız)
+                        pos_entry_price = raw_entry_price * (1.0 + final_slippage_frac);
                         pos_entry_time = entry_candle.open_time;
                         pos_entry_index = i + 1;
                     }
                     SignalSide::Short => {
                         pos_side = PositionSide::Short;
-                        // ✅ ACTION PLAN FIX: Use delayed price + slippage (not immediate open)
-                        pos_entry_price = effective_entry_price * (1.0 - dynamic_slippage_frac);
+                        // Short girerken fiyat aşağı kayar (daha ucuza satarız)
+                        pos_entry_price = raw_entry_price * (1.0 - final_slippage_frac);
                         pos_entry_time = entry_candle.open_time;
                         pos_entry_index = i + 1;
                     }
@@ -3570,62 +3459,25 @@ pub fn run_backtest_on_series(
                     (holding_bars >= min_holding_bars && next_c.high >= take_profit_price);
 
                 if should_close {
-                    // ✅ CRITICAL FIX: Use same enhanced slippage calculation for exit
-                    let atr_pct = ctx.atr / c.close;
-                    
-                    // Crisis detection
-                    let is_crisis = if i >= 5 {
-                        let price_change_5bars = (c.close - candles[i - 5].close).abs() / candles[i - 5].close;
-                        atr_pct > 0.03 || price_change_5bars > 0.05
-                    } else {
-                        atr_pct > 0.03
-                    };
-                    
-                    // HFT latency multiplier
-                    let latency_multiplier = if cfg.hft_mode {
-                        0.7 // HFT: 30% less slippage
-                    } else {
-                        1.3 // Normal: 30% more slippage
-                    };
-                    
-                    // Crisis slippage multiplier
-                    let volatility_multiplier = if is_crisis {
-                        let crisis_severity = (atr_pct / 0.03).min(2.0);
-                        10.0 + (crisis_severity * 10.0) // 10x to 20x
-                    } else {
-                        (atr_pct * 100.0).clamp(1.0, 3.0)
-                    };
-                    
-                    // Spread correlation - recalculate spread for exit slippage
-                    let exit_atr_pct = ctx.atr / c.close;
-                    let exit_is_crisis = if i >= 5 {
-                        let price_change_5bars = (c.close - candles[i - 5].close).abs() / candles[i - 5].close;
-                        exit_atr_pct > 0.03 || price_change_5bars > 0.05
-                    } else {
-                        exit_atr_pct > 0.03
-                    };
-                    let exit_volatility_factor = if exit_is_crisis {
-                        let crisis_severity = (exit_atr_pct / 0.03).min(5.0);
-                        10.0 + (crisis_severity * 8.0) // 10x to 50x
-                    } else {
-                        (exit_atr_pct * 100.0).clamp(0.5, 5.0)
-                    };
-                    let exit_spread_pct = 0.0001 * exit_volatility_factor;
-                    let spread_multiplier = if exit_spread_pct > 0.001 {
-                        1.0 + ((exit_spread_pct - 0.0001) * 100.0).min(1.0)
-                    } else {
-                        1.0
-                    };
-                    
-                    let mut dynamic_slippage_frac = base_slippage_frac 
-                        * volatility_multiplier 
-                        * latency_multiplier 
-                        * spread_multiplier;
-                    dynamic_slippage_frac = dynamic_slippage_frac.min(0.01);
+                    // Çıkışta da aynı deterministik slippage mantığı
+                    let exit_volatility = ((ctx.atr / next_c.close) * 100.0).max(1.0).min(5.0);
+                    let exit_slippage = base_slippage_frac * exit_volatility;
 
-                    let exit_price = next_c.open * (1.0 - dynamic_slippage_frac);
-                    let raw_pnl = (exit_price - pos_entry_price) / pos_entry_price;
-                    let pnl_pct = raw_pnl - fee_frac;
+                    // Çıkış fiyatını belirle (SL/TP durumunda limit fiyattan değil, tetiklenen fiyattan kayma ile)
+                    let sl_hit = next_c.low <= final_stop_price;
+                    let tp_hit = next_c.high >= take_profit_price;
+                    let raw_exit_price = if sl_hit { 
+                        final_stop_price // Stop patladıysa oradan çıkarız (trailing stop dahil)
+                    } else if tp_hit {
+                        take_profit_price // TP vurduysa oradan çıkarız
+                    } else {
+                        next_c.open // Reversal/Timeout ise o anki fiyattan
+                    };
+
+                    // Long kapatırken (satış) fiyat aşağı kayar
+                    let exit_price = raw_exit_price * (1.0 - exit_slippage);
+                    
+                    let pnl_pct = ((exit_price - pos_entry_price) / pos_entry_price) - fee_frac;
                     let win = pnl_pct > 0.0;
 
                     trades.push(Trade {
@@ -3696,62 +3548,23 @@ pub fn run_backtest_on_series(
                     (holding_bars >= min_holding_bars && next_c.low <= take_profit_price);
 
                 if should_close {
-                    // ✅ CRITICAL FIX: Use same enhanced slippage calculation for exit
-                    let atr_pct = ctx.atr / c.close;
-                    
-                    // Crisis detection
-                    let is_crisis = if i >= 5 {
-                        let price_change_5bars = (c.close - candles[i - 5].close).abs() / candles[i - 5].close;
-                        atr_pct > 0.03 || price_change_5bars > 0.05
-                    } else {
-                        atr_pct > 0.03
-                    };
-                    
-                    // HFT latency multiplier
-                    let latency_multiplier = if cfg.hft_mode {
-                        0.7 // HFT: 30% less slippage
-                    } else {
-                        1.3 // Normal: 30% more slippage
-                    };
-                    
-                    // Crisis slippage multiplier
-                    let volatility_multiplier = if is_crisis {
-                        let crisis_severity = (atr_pct / 0.03).min(2.0);
-                        10.0 + (crisis_severity * 10.0) // 10x to 20x
-                    } else {
-                        (atr_pct * 100.0).clamp(1.0, 3.0)
-                    };
-                    
-                    // Spread correlation - recalculate spread for exit slippage
-                    let exit_atr_pct = ctx.atr / c.close;
-                    let exit_is_crisis = if i >= 5 {
-                        let price_change_5bars = (c.close - candles[i - 5].close).abs() / candles[i - 5].close;
-                        exit_atr_pct > 0.03 || price_change_5bars > 0.05
-                    } else {
-                        exit_atr_pct > 0.03
-                    };
-                    let exit_volatility_factor = if exit_is_crisis {
-                        let crisis_severity = (exit_atr_pct / 0.03).min(5.0);
-                        10.0 + (crisis_severity * 8.0) // 10x to 50x
-                    } else {
-                        (exit_atr_pct * 100.0).clamp(0.5, 5.0)
-                    };
-                    let exit_spread_pct = 0.0001 * exit_volatility_factor;
-                    let spread_multiplier = if exit_spread_pct > 0.001 {
-                        1.0 + ((exit_spread_pct - 0.0001) * 100.0).min(1.0)
-                    } else {
-                        1.0
-                    };
-                    
-                    let mut dynamic_slippage_frac = base_slippage_frac 
-                        * volatility_multiplier 
-                        * latency_multiplier 
-                        * spread_multiplier;
-                    dynamic_slippage_frac = dynamic_slippage_frac.min(0.01);
+                    let exit_volatility = ((ctx.atr / next_c.close) * 100.0).max(1.0).min(5.0);
+                    let exit_slippage = base_slippage_frac * exit_volatility;
 
-                    let exit_price = next_c.open * (1.0 + dynamic_slippage_frac);
-                    let raw_pnl = (pos_entry_price - exit_price) / pos_entry_price;
-                    let pnl_pct = raw_pnl - fee_frac;
+                    let sl_hit = next_c.high >= final_stop_price;
+                    let tp_hit = next_c.low <= take_profit_price;
+                    let raw_exit_price = if sl_hit { 
+                        final_stop_price 
+                    } else if tp_hit {
+                        take_profit_price 
+                    } else {
+                        next_c.open 
+                    };
+
+                    // Short kapatırken (alış) fiyat yukarı kayar
+                    let exit_price = raw_exit_price * (1.0 + exit_slippage);
+                    
+                    let pnl_pct = ((pos_entry_price - exit_price) / pos_entry_price) - fee_frac;
                     let win = pnl_pct > 0.0;
 
                     trades.push(Trade {
