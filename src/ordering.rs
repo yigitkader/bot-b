@@ -307,12 +307,22 @@ async fn handle_signal(
     let qty = (notional / order_price).abs();
 
     if let Some(rm) = risk_manager {
+        // ✅ CRITICAL FIX: Risk manager expects base quantity (without leverage)
+        // But qty already includes leverage (calculated from notional = size_usdt * leverage)
+        // So we need to pass base quantity: qty / leverage
+        // OR: Risk manager calculates notional = size * entry_price * leverage
+        // Since we want notional = size_usdt * leverage, we need:
+        // size * entry_price * leverage = size_usdt * leverage
+        // size * entry_price = size_usdt
+        // size = size_usdt / entry_price (base quantity without leverage)
+        let base_qty = size_usdt / order_price;
+        
         let (allowed, reason) = rm
             .can_open_position(
                 &signal.symbol,
                 signal.side,
                 order_price, // Gerçek order price kullan
-                qty,
+                base_qty, // Base quantity (without leverage) for risk manager
                 signal.leverage,
             )
             .await;

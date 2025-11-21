@@ -3085,15 +3085,17 @@ pub fn run_backtest_on_series(
                 // ✅ ADAPTIVE STOP LOSS (TrendPlan.md Fix #4)
                 // Market volatile ise → wider stop
                 // Market calm ise → tighter stop
-                let volatility_regime = if ctx.atr / c.close > 0.02 {
+                // ✅ CRITICAL FIX: ATR normalization - use percentage instead of absolute value
+                let atr_pct = ctx.atr / c.close;
+                let volatility_regime = if atr_pct > 0.02 {
                     1.5 // High volatility → 1.5x wider stop
                 } else {
                     1.0 // Normal volatility
                 };
 
                 let dynamic_sl_multiplier = cfg.atr_stop_loss_multiplier * volatility_regime;
-                let stop_loss_price =
-                    pos_entry_price * (1.0 - dynamic_sl_multiplier * ctx.atr / pos_entry_price);
+                let stop_loss_distance = atr_pct * dynamic_sl_multiplier;
+                let stop_loss_price = pos_entry_price * (1.0 - stop_loss_distance);
 
                 // ✅ TRAILING STOP LOGIC (TrendPlan.md Fix #4)
                 let current_pnl_pct = (c.close - pos_entry_price) / pos_entry_price;
@@ -3115,8 +3117,10 @@ pub fn run_backtest_on_series(
                     cfg.atr_take_profit_multiplier
                 };
 
-                let take_profit_price =
-                    pos_entry_price * (1.0 + dynamic_tp_multiplier * ctx.atr / pos_entry_price);
+                // ✅ CRITICAL FIX: ATR normalization - use percentage instead of absolute value
+                let atr_pct = ctx.atr / c.close;
+                let take_profit_distance = atr_pct * dynamic_tp_multiplier;
+                let take_profit_price = pos_entry_price * (1.0 + take_profit_distance);
 
                 // Exit conditions
                 let min_holding_bars = cfg.min_holding_bars;
@@ -3152,15 +3156,17 @@ pub fn run_backtest_on_series(
                 let holding_bars = i.saturating_sub(pos_entry_index);
 
                 // ✅ ADAPTIVE STOP LOSS (TrendPlan.md Fix #4)
-                let volatility_regime = if ctx.atr / c.close > 0.02 {
+                // ✅ CRITICAL FIX: ATR normalization - use percentage instead of absolute value
+                let atr_pct = ctx.atr / c.close;
+                let volatility_regime = if atr_pct > 0.02 {
                     1.5 // High volatility → 1.5x wider stop
                 } else {
                     1.0 // Normal volatility
                 };
 
                 let dynamic_sl_multiplier = cfg.atr_stop_loss_multiplier * volatility_regime;
-                let stop_loss_price =
-                    pos_entry_price * (1.0 + dynamic_sl_multiplier * ctx.atr / pos_entry_price);
+                let stop_loss_distance = atr_pct * dynamic_sl_multiplier;
+                let stop_loss_price = pos_entry_price * (1.0 + stop_loss_distance);
 
                 // ✅ TRAILING STOP LOGIC (TrendPlan.md Fix #4)
                 let current_pnl_pct = (pos_entry_price - c.close) / pos_entry_price;
@@ -3181,8 +3187,10 @@ pub fn run_backtest_on_series(
                     cfg.atr_take_profit_multiplier
                 };
 
-                let take_profit_price =
-                    pos_entry_price * (1.0 - dynamic_tp_multiplier * ctx.atr / pos_entry_price);
+                // ✅ CRITICAL FIX: ATR normalization - use percentage instead of absolute value
+                let atr_pct = ctx.atr / c.close;
+                let take_profit_distance = atr_pct * dynamic_tp_multiplier;
+                let take_profit_price = pos_entry_price * (1.0 - take_profit_distance);
 
                 // Exit conditions
                 let min_holding_bars = cfg.min_holding_bars;
@@ -3676,6 +3684,65 @@ struct LastSignalState {
     last_short_time: Option<chrono::DateTime<Utc>>,
 }
 
+/// ✅ CRITICAL FIX: Atomic cooldown check-and-set helper function
+/// Prevents race conditions by atomically checking and setting cooldown
+/// Returns true if cooldown passed and was set, false if cooldown is still active
+async fn try_emit_signal(
+    signal_state: &Arc<RwLock<LastSignalState>>,
+    side: Side,
+    cooldown_duration: chrono::Duration,
+) -> bool {
+    let mut state = signal_state.write().await;
+    let now = Utc::now();
+    
+    let last_time = match side {
+        Side::Long => state.last_long_time,
+        Side::Short => state.last_short_time,
+    };
+    
+    if let Some(last) = last_time {
+        if now - last < cooldown_duration {
+            return false;
+        }
+    }
+    
+    // Atomik olarak set et
+    match side {
+        Side::Long => state.last_long_time = Some(now),
+        Side::Short => state.last_short_time = Some(now),
+    }
+    true
+}
+
+/// ✅ CRITICAL FIX: Atomic cooldown check-and-set helper function (for mutable reference)
+/// Prevents race conditions by atomically checking and setting cooldown
+/// Returns true if cooldown passed and was set, false if cooldown is still active
+fn try_emit_signal_mut(
+    signal_state: &mut LastSignalState,
+    side: Side,
+    cooldown_duration: chrono::Duration,
+) -> bool {
+    let now = Utc::now();
+    
+    let last_time = match side {
+        Side::Long => signal_state.last_long_time,
+        Side::Short => signal_state.last_short_time,
+    };
+    
+    if let Some(last) = last_time {
+        if now - last < cooldown_duration {
+            return false;
+        }
+    }
+    
+    // Atomik olarak set et
+    match side {
+        Side::Long => signal_state.last_long_time = Some(now),
+        Side::Short => signal_state.last_short_time = Some(now),
+    }
+    true
+}
+
 struct MarketTickState {
     latest_tick: Arc<RwLock<Option<MarketTick>>>,
 }
@@ -4134,46 +4201,11 @@ async fn generate_signal_from_candle(
             };
 
             // ✅ CRITICAL FIX: Atomic cooldown check-and-set to prevent race conditions
-            // Use write lock to atomically check and set cooldown
             let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
-            let now = Utc::now();
             
-            // Atomic check-and-set: acquire write lock, check cooldown, and set if valid
-            let cooldown_passed = {
-                let mut state = signal_state.write().await;
-                
-                // Check cooldown
-                let can_send = match side {
-                    Side::Long => {
-                        if let Some(last_time) = state.last_long_time {
-                            now - last_time >= cooldown_duration
-                        } else {
-                            true // No previous signal, can send
-                        }
-                    }
-                    Side::Short => {
-                        if let Some(last_time) = state.last_short_time {
-                            now - last_time >= cooldown_duration
-                        } else {
-                            true // No previous signal, can send
-                        }
-                    }
-                };
-                
-                if can_send {
-                    // Set cooldown immediately (before sending signal) to prevent race condition
-                    match side {
-                        Side::Long => state.last_long_time = Some(now),
-                        Side::Short => state.last_short_time = Some(now),
-                    }
-                    true
-                } else {
-                    false // Cooldown still active
-                }
-            };
-            
-            // If cooldown check failed, return early
-            if !cooldown_passed {
+            // Use helper function for atomic operation
+            if !try_emit_signal(&signal_state, side, cooldown_duration).await {
+                // Cooldown still active, return early
                 return Ok(None);
             }
 
@@ -4297,46 +4329,11 @@ async fn generate_latest_signal(
 
             // ✅ CRITICAL FIX: Atomic cooldown check-and-set to prevent race conditions
             // Note: generate_latest_signal uses &mut signal_state (not Arc<RwLock>)
-            // So we can directly modify it without lock, but still need atomic check-and-set
             let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
-            let now = Utc::now();
-
-            // Atomic check-and-set: check cooldown and set if valid
-            let cooldown_passed = match side {
-                Side::Long => {
-                    if let Some(last_time) = signal_state.last_long_time {
-                        if now - last_time < cooldown_duration {
-                            false // Cooldown still active
-                        } else {
-                            // Cooldown passed, set it immediately
-                            signal_state.last_long_time = Some(now);
-                            true
-                        }
-                    } else {
-                        // No previous signal, can send and set cooldown
-                        signal_state.last_long_time = Some(now);
-                        true
-                    }
-                }
-                Side::Short => {
-                    if let Some(last_time) = signal_state.last_short_time {
-                        if now - last_time < cooldown_duration {
-                            false // Cooldown still active
-                        } else {
-                            // Cooldown passed, set it immediately
-                            signal_state.last_short_time = Some(now);
-                            true
-                        }
-                    } else {
-                        // No previous signal, can send and set cooldown
-                        signal_state.last_short_time = Some(now);
-                        true
-                    }
-                }
-            };
-
-            // If cooldown check failed, return early
-            if !cooldown_passed {
+            
+            // Use helper function for atomic operation
+            if !try_emit_signal_mut(signal_state, side, cooldown_duration) {
+                // Cooldown still active, return early
                 return Ok(None);
             }
 
@@ -4907,9 +4904,12 @@ pub fn build_enhanced_signal_context(
                 // Use a high spread value to indicate missing/invalid data (will result in penalty)
                 1000.0 // Very high spread = penalty in risk scoring
             };
-            let obi = tick.obi.unwrap_or(1.0); // If OBI not available, assume balanced (1.0 = neutral)
-            let bid_depth = tick.bid_depth_usd.unwrap_or(0.0); // If depth not available, use 0
-            let ask_depth = tick.ask_depth_usd.unwrap_or(0.0);
+            // ✅ CRITICAL FIX: No fallback values - use None/penalty values instead of 0
+            // If depth/OBI not available, use penalty values that result in zero score contribution
+            // (not false positives or false negatives)
+            let obi = tick.obi.unwrap_or(1.0); // 1.0 = neutral (no bonus/penalty)
+            let bid_depth = tick.bid_depth_usd.unwrap_or(0.0); // 0.0 = penalty (will result in zero score)
+            let ask_depth = tick.ask_depth_usd.unwrap_or(0.0); // 0.0 = penalty (will result in zero score)
             (spread, obi, bid_depth, ask_depth)
         } else {
             // ❌ CRITICAL: No market tick - this should not happen in production
