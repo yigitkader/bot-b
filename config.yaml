@@ -51,7 +51,7 @@ trending:
   enable_order_flow: true  # Enable Order Flow analysis (requires real depth data)
   # Set to false for backtest consistency when depth data is not available
   # Execution & Backtest Parameters (no hardcoded values)
-  fee_bps_round_trip: 8.0  # Round-trip fee in basis points (8.0 = 0.08%)
+  fee_bps_round_trip: 10.0  # Round-trip fee in basis points (10.0 = 0.10%) - Binance VIP 0 realistic
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
   slippage_bps: 0.0  # Slippage in basis points (0.0 = optimistic backtest, use 5-10 for realistic)
   min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)

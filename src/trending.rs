@@ -935,23 +935,27 @@ impl LiquidationMap {
         let long_oi = open_interest * long_ratio;
         let short_oi = open_interest * short_ratio;
 
-        // ✅ CRITICAL FIX: Dynamic leverage estimation based on REAL market data
-        // High funding rate (>0.01%) = more leverage usage (funding arbitrage attracts high leverage)
-        // Extreme Long/Short Ratio (>1.5 or <0.67) = leverage concentration
+        // ✅ CRITICAL FIX (Plan.md): More conservative leverage estimation
+        // ⚠️ WARNING: "High funding = high leverage" assumption is NOT always true
+        // This is a mathematical estimate, not real liquidation data
+        // For backtest: Use very conservative estimates to avoid over-optimistic results
+        // For production: Prefer real liquidation data from forceOrder stream
         let funding_rate_abs = funding_rate.abs();
         let leverage_factor = if funding_rate_abs > 0.0001 {
-            // High funding = high leverage usage
-            // Scale from 20x (low funding) to 80x (high funding)
-            20.0 + (funding_rate_abs * 600_000.0).min(60.0)
+            // ⚠️ CONSERVATIVE: Reduced leverage estimates (was 20x-80x, now 10x-40x)
+            // High funding does NOT always mean high leverage - be conservative
+            // Scale from 10x (low funding) to 40x (high funding) - more conservative
+            10.0 + (funding_rate_abs * 300_000.0).min(30.0) // Reduced from 600k/60 to 300k/30
         } else {
-            // Low funding = moderate leverage
-            20.0
+            // Low funding = conservative leverage estimate
+            10.0 // Reduced from 20x to 10x
         };
 
         // Long/Short imbalance also affects leverage concentration
+        // ⚠️ CONSERVATIVE: Reduced imbalance factor
         let imbalance_factor = if long_short_ratio > 1.5 || long_short_ratio < 0.67 {
-            // Extreme imbalance = more leverage concentration
-            1.2
+            // Extreme imbalance = more leverage concentration, but be conservative
+            1.1 // Reduced from 1.2 to 1.1
         } else {
             1.0
         };
@@ -969,14 +973,17 @@ impl LiquidationMap {
             0.00001 // Low-price coins: $0.00001 intervals
         };
 
-        // Estimate liquidation prices using average leverage
+        // ⚠️ CONSERVATIVE: Estimate liquidation prices using average leverage
         // Distribute OI across multiple price levels (not just one)
         // Most liquidations happen near current price (1-2% away)
+        // ⚠️ WARNING: This is a mathematical estimate, not real liquidation data
+        // For backtest: These estimates may be over-optimistic
+        // ⚠️ CONSERVATIVE: Reduced OI portions to be more conservative
         let price_levels = vec![
-            (0.5, 0.3),  // 50% of avg leverage → 30% of OI (conservative traders)
-            (0.75, 0.4), // 75% of avg leverage → 40% of OI (moderate traders)
-            (1.0, 0.25), // 100% of avg leverage → 25% of OI (aggressive traders)
-            (1.5, 0.05), // 150% of avg leverage → 5% of OI (very aggressive)
+            (0.5, 0.2),  // 50% of avg leverage → 20% of OI (was 30%, more conservative)
+            (0.75, 0.3), // 75% of avg leverage → 30% of OI (was 40%, more conservative)
+            (1.0, 0.15), // 100% of avg leverage → 15% of OI (was 25%, more conservative)
+            (1.5, 0.05), // 150% of avg leverage → 5% of OI (unchanged)
         ];
 
         // Long liquidation prices (below current price)
@@ -3122,8 +3129,18 @@ pub fn run_backtest_on_series(
     // Funding arbitrage tracker
     let mut funding_arbitrage = FundingArbitrage::new();
 
-    // Liquidation Map - GERÇEK VERİ: Open Interest ve Long/Short Ratio kullanıyor
-    let mut liquidation_map = LiquidationMap::new();
+    // ⚠️ CRITICAL FIX (Plan.md): Liquidation Map DISABLED in backtest
+    // estimate_future_liquidations is a mathematical estimate, not real liquidation data
+    // "High funding = high leverage" assumption is NOT always true
+    // Backtest results should NOT include liquidation_map profits to avoid over-optimistic results
+    // For production: Use real liquidation data from forceOrder stream (liq_long_cluster, liq_short_cluster)
+    // let mut liquidation_map = LiquidationMap::new(); // DISABLED in backtest
+    log::warn!(
+        "BACKTEST: ⚠️ Liquidation Map DISABLED in backtest. \
+        estimate_future_liquidations is a mathematical estimate (not real data). \
+        Backtest results will NOT include liquidation cascade signals. \
+        For realistic testing, use real liquidation data from forceOrder stream in production."
+    );
 
     // Volume Profile - GERÇEK VERİ: Candle verilerinden hesaplanıyor
     let volume_profile = if candles.len() >= 50 {
@@ -3142,13 +3159,8 @@ pub fn run_backtest_on_series(
         // Update funding arbitrage tracker
         funding_arbitrage.update_funding(ctx.funding_rate, c.close_time);
 
-        // Update liquidation map - GERÇEK VERİ kullanıyor
-        liquidation_map.estimate_future_liquidations(
-            c.close,
-            ctx.open_interest,
-            ctx.long_short_ratio,
-            ctx.funding_rate,
-        );
+        // ⚠️ DISABLED: Liquidation map update (Plan.md - backtest'te tahmini veri kullanmayın)
+        // liquidation_map.estimate_future_liquidations(...) // DISABLED
 
         // ✅ CRITICAL FIX: Realistic MarketTick for backtest (minimize production divergence)
         // Use candle data (high/low/volume) and context (ATR, volatility) to estimate realistic bid/ask and depth
@@ -3256,6 +3268,7 @@ pub fn run_backtest_on_series(
         };
 
         // Enhanced signal generation with ALL REAL DATA (including MTF and OrderFlow)
+        // ⚠️ CRITICAL (Plan.md): Liquidation Map DISABLED in backtest (mathematical estimate, not real data)
         let sig = generate_signal_enhanced(
             c,
             ctx,
@@ -3266,8 +3279,8 @@ pub fn run_backtest_on_series(
             i,
             Some(&funding_arbitrage),
             mtf_analysis.as_ref(), // ✅ MTF enabled in backtest
-            orderflow_analyzer.as_ref(), // ✅ OrderFlow enabled in backtest
-            Some(&liquidation_map), // GERÇEK VERİ: Open Interest + Long/Short Ratio
+            orderflow_analyzer.as_ref(), // ✅ OrderFlow enabled in backtest (but None due to no depth data)
+            None, // ⚠️ DISABLED: Liquidation Map (Plan.md - backtest'te tahmini veri kullanmayın)
             volume_profile.as_ref(), // GERÇEK VERİ: Candle verilerinden
             Some(&market_tick), // GERÇEK VERİ: Candle + Context'ten oluşturuldu
         );
