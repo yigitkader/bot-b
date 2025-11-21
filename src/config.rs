@@ -422,6 +422,18 @@ impl BotConfig {
         warn_if!(self.liq_window_secs < 5, "liq_window_secs is very low, may cause excessive pruning. Recommendation: Use at least 10 seconds for stable operation", self.liq_window_secs);
         warn_if!(self.liq_window_secs > 300, format!("liq_window_secs is very high ({} minutes), may miss short-term liquidation clusters. Recommendation: Use 10-60 seconds for optimal detection", self.liq_window_secs / 60), self.liq_window_secs);
 
+        // ✅ FIX: Fee validation (TrendPlan.md - Action Plan)
+        // HFT modu çok sık işlem açar. Binance Futures taker komisyonu (yaklaşık %0.04 - %0.05) kârı eritir.
+        // fee_bps_round_trip mutlaka 8.0 (0.08%) veya üzeri tutulmalı.
+        if self.hft_mode {
+            if self.fee_bps_round_trip < 8.0 {
+                eprintln!("WARNING: HFT mode enabled but fee_bps_round_trip ({}) is below recommended 8.0 (0.08%)", self.fee_bps_round_trip);
+                eprintln!("  HFT mode opens many trades. Binance Futures taker commission (~0.04-0.05%) will eat profits.");
+                eprintln!("  Recommendation: Set fee_bps_round_trip to at least 8.0 for realistic backtest results.");
+            }
+        }
+        warn_if!(self.fee_bps_round_trip < 5.0, "fee_bps_round_trip is very low, may cause over-optimistic backtest results. Recommendation: Use at least 8.0 (0.08%) for realistic results", self.fee_bps_round_trip);
+
         if self.signal_cooldown_secs < 0 {
             eprintln!("ERROR: signal_cooldown_secs must be >= 0, got: {}", self.signal_cooldown_secs);
             process::exit(1);

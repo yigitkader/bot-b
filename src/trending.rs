@@ -582,7 +582,10 @@ impl MultiTimeframeAnalysis {
 
     /// 🔥 CRITICAL: Calculate confluence score
     /// Eğer multiple timeframe'ler aynı direction'daysa → high confidence
-    pub fn calculate_confluence(&self, direction: SignalSide) -> f64 {
+    /// ✅ FIX: Dynamic weights based on volatility (TrendPlan.md - Action Plan)
+    /// Yüksek volatilitede uzun vadeli (H1, H4) timeframe'lerin ağırlığını artır
+    /// Çünkü yüksek volatilitede M1 ve M5 çok fazla fake sinyal üretir
+    pub fn calculate_confluence(&self, direction: SignalSide, atr_pct: Option<f64>) -> f64 {
         if self.timeframes.is_empty() {
             return 0.0;
         }
@@ -590,8 +593,8 @@ impl MultiTimeframeAnalysis {
         let mut confluence_score = 0.0;
         let mut total_weight = 0.0;
 
-        // Timeframe weights (longer = more important)
-        let weights = vec![
+        // Base timeframe weights (longer = more important)
+        let base_weights = vec![
             (Timeframe::M1, 0.1),
             (Timeframe::M5, 0.2),
             (Timeframe::M15, 0.25),
@@ -599,7 +602,38 @@ impl MultiTimeframeAnalysis {
             (Timeframe::H4, 0.15),
         ];
 
-        for (tf, weight) in weights {
+        // ✅ FIX: Dynamic weight adjustment based on volatility
+        // High volatility (ATR > 2%) → increase long-term TF weights, decrease short-term
+        // Low volatility (ATR < 1%) → use base weights
+        let volatility_multiplier = if let Some(atr) = atr_pct {
+            if atr > 0.02 {
+                // High volatility: reduce M1/M5, increase H1/H4
+                vec![
+                    (Timeframe::M1, 0.05),   // Reduced from 0.1
+                    (Timeframe::M5, 0.1),    // Reduced from 0.2
+                    (Timeframe::M15, 0.25), // Same
+                    (Timeframe::H1, 0.4),   // Increased from 0.3
+                    (Timeframe::H4, 0.2),   // Increased from 0.15
+                ]
+            } else if atr < 0.01 {
+                // Low volatility: can use more short-term signals
+                vec![
+                    (Timeframe::M1, 0.15),  // Increased from 0.1
+                    (Timeframe::M5, 0.25),  // Increased from 0.2
+                    (Timeframe::M15, 0.25), // Same
+                    (Timeframe::H1, 0.25),  // Reduced from 0.3
+                    (Timeframe::H4, 0.1),   // Reduced from 0.15
+                ]
+            } else {
+                // Normal volatility: use base weights
+                base_weights.clone()
+            }
+        } else {
+            // No ATR data: use base weights
+            base_weights.clone()
+        };
+
+        for (tf, weight) in volatility_multiplier {
             if let Some(signal) = self.timeframes.get(&tf) {
                 total_weight += weight;
 
@@ -2341,7 +2375,9 @@ fn generate_signal_enhanced(
         }
 
         // Check confluence score (risk management - filter low quality signals)
-        let confluence = mtf_analysis.calculate_confluence(base_signal.side);
+        // ✅ FIX: Pass ATR percentage for dynamic timeframe weights (TrendPlan.md)
+        let atr_pct = Some(ctx.atr / candle.close);
+        let confluence = mtf_analysis.calculate_confluence(base_signal.side, atr_pct);
 
         // 🚨 Low confluence = cancel signal (risk management)
         if confluence < 0.4 {
@@ -2497,15 +2533,33 @@ fn generate_signal_enhanced(
             match (base_signal.side, absorption) {
                 (SignalSide::Long, AbsorptionSignal::Bullish) => {
                     // ✅ Strong confirmation: Our signal + MM accumulation
+                    log::info!(
+                        "ORDER_FLOW: Absorption LONG confirmation (symbol: {}, price: {:.8}, absorption: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        absorption
+                    );
                     // Bu durumda signal güvenilirliği çok yüksek - return immediately
                     return base_signal;
                 }
                 (SignalSide::Short, AbsorptionSignal::Bearish) => {
                     // ✅ Strong confirmation - return immediately
+                    log::info!(
+                        "ORDER_FLOW: Absorption SHORT confirmation (symbol: {}, price: {:.8}, absorption: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        absorption
+                    );
                     return base_signal;
                 }
                 (SignalSide::Flat, AbsorptionSignal::Bullish) => {
                     // ✅ NEW: If flat but MM accumulating, generate LONG signal
+                    log::info!(
+                        "ORDER_FLOW: Absorption LONG signal generated (symbol: {}, price: {:.8}, absorption: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        absorption
+                    );
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -2515,6 +2569,12 @@ fn generate_signal_enhanced(
                 }
                 (SignalSide::Flat, AbsorptionSignal::Bearish) => {
                     // ✅ NEW: If flat but MM distributing, generate SHORT signal
+                    log::info!(
+                        "ORDER_FLOW: Absorption SHORT signal generated (symbol: {}, price: {:.8}, absorption: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        absorption
+                    );
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -2524,6 +2584,12 @@ fn generate_signal_enhanced(
                 }
                 (SignalSide::Long, AbsorptionSignal::Bearish) => {
                     // ⚠️ Conflict: Cancel signal
+                    log::info!(
+                        "ORDER_FLOW: Absorption conflict - LONG cancelled (symbol: {}, price: {:.8}, absorption: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        absorption
+                    );
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -2533,6 +2599,12 @@ fn generate_signal_enhanced(
                 }
                 (SignalSide::Short, AbsorptionSignal::Bullish) => {
                     // ⚠️ Conflict: Cancel signal
+                    log::info!(
+                        "ORDER_FLOW: Absorption conflict - SHORT cancelled (symbol: {}, price: {:.8}, absorption: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        absorption
+                    );
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -2544,7 +2616,15 @@ fn generate_signal_enhanced(
         }
 
         // Spoofing detection: Cancel signals during manipulation
-        if of.detect_spoofing().is_some() {
+        if let Some(spoofing) = of.detect_spoofing() {
+            // ✅ FIX: Log Order Flow signal for paper trading analysis (TrendPlan.md)
+            // Paper trading modunda detect_spoofing başarı oranını izlemek için log
+            log::info!(
+                "ORDER_FLOW: Spoofing detected - signal cancelled (symbol: {}, price: {:.8}, spoofing: {:?})",
+                market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                candle.close,
+                spoofing
+            );
             return Signal {
                 time: candle.close_time,
                 price: candle.close,
@@ -2556,19 +2636,39 @@ fn generate_signal_enhanced(
         // ✅ FIX: Iceberg detection - more aggressive usage
         // Iceberg orders indicate large players, follow their direction
         if let Some(iceberg) = of.detect_iceberg_orders() {
+            // ✅ FIX: Log Order Flow signal for paper trading analysis (TrendPlan.md)
+            // Paper trading modunda detect_iceberg_orders başarı oranını izlemek için log
             match (base_signal.side, iceberg) {
                 (SignalSide::Long, IcebergSignal::BidSideIceberg) => {
                     // 🚀 Big player is buying with us = strong confirmation
+                    log::info!(
+                        "ORDER_FLOW: Iceberg LONG confirmation (symbol: {}, price: {:.8}, iceberg: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        iceberg
+                    );
                     // Return signal immediately (high confidence)
                     return base_signal;
                 }
                 (SignalSide::Short, IcebergSignal::AskSideIceberg) => {
                     // 🚀 Big player is selling with us = strong confirmation
+                    log::info!(
+                        "ORDER_FLOW: Iceberg SHORT confirmation (symbol: {}, price: {:.8}, iceberg: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        iceberg
+                    );
                     // Return signal immediately (high confidence)
                     return base_signal;
                 }
                 (SignalSide::Flat, IcebergSignal::BidSideIceberg) => {
                     // ✅ NEW: If flat but big player buying, generate LONG signal
+                    log::info!(
+                        "ORDER_FLOW: Iceberg LONG signal generated (symbol: {}, price: {:.8}, iceberg: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        iceberg
+                    );
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -2578,6 +2678,12 @@ fn generate_signal_enhanced(
                 }
                 (SignalSide::Flat, IcebergSignal::AskSideIceberg) => {
                     // ✅ NEW: If flat but big player selling, generate SHORT signal
+                    log::info!(
+                        "ORDER_FLOW: Iceberg SHORT signal generated (symbol: {}, price: {:.8}, iceberg: {:?})",
+                        market_tick.map(|mt| mt.symbol.as_str()).unwrap_or("unknown"),
+                        candle.close,
+                        iceberg
+                    );
                     return Signal {
                         time: candle.close_time,
                         price: candle.close,
@@ -2981,6 +3087,20 @@ pub fn run_backtest_on_series(
 ) -> BacktestResult {
     assert_eq!(candles.len(), contexts.len());
 
+    // ⚠️ KRİTİK UYARI: Order Flow Backtest Limitation (TrendPlan.md)
+    // Backtest'te Order Flow stratejileri (Spoofing, Iceberg, Absorption) ÇALIŞMAYACAK
+    // çünkü gerçek orderbook depth verisi (bid_depth_usd, ask_depth_usd) yok.
+    // Backtest sonuçları Order Flow'un potansiyel başarısını yansıtmayacak.
+    // Gerçek test için borsadan "Historical Tick Data" (Level 2 data) indirip parse etmeniz gerekir.
+    if cfg.enable_order_flow {
+        log::warn!(
+            "BACKTEST: ⚠️ Order Flow enabled but NO REAL DEPTH DATA available. \
+            Order Flow strategies (Spoofing, Iceberg, Absorption) will NOT work in backtest. \
+            Backtest results will NOT reflect Order Flow potential. \
+            For real testing, download Historical Tick Data (Level 2) from exchange."
+        );
+    }
+
     let mut trades: Vec<Trade> = Vec::new();
 
     let mut pos_side = PositionSide::Flat;
@@ -3248,6 +3368,11 @@ pub fn run_backtest_on_series(
                 let take_profit_price = pos_entry_price * (1.0 + take_profit_distance);
 
                 // Exit conditions
+                // ✅ KRİTİK: Intra-bar High/Low Ambiguity Handling (TrendPlan.md)
+                // Aynı mum içinde hem Stop Loss hem de Take Profit'e dokunursa,
+                // || operatörü nedeniyle soldaki (Stop Loss) önce kontrol edilir.
+                // Bu KÖTÜMSER (Conservative) yaklaşım doğru ve güvenlidir.
+                // Gerçek hayatta belki önce TP'ye vurdu ama backtest'te SL kabul edilir (güvenli).
                 let min_holding_bars = cfg.min_holding_bars;
                 let should_close = matches!(sig.side, SignalSide::Short) ||  // Reversal signal
                     holding_bars >= cfg.max_holding_bars ||   // Max time
@@ -3318,6 +3443,10 @@ pub fn run_backtest_on_series(
                 let take_profit_price = pos_entry_price * (1.0 - take_profit_distance);
 
                 // Exit conditions
+                // ✅ KRİTİK: Intra-bar High/Low Ambiguity Handling (TrendPlan.md)
+                // Aynı mum içinde hem Stop Loss hem de Take Profit'e dokunursa,
+                // || operatörü nedeniyle soldaki (Stop Loss) önce kontrol edilir.
+                // Bu KÖTÜMSER (Conservative) yaklaşım doğru ve güvenlidir.
                 let min_holding_bars = cfg.min_holding_bars;
                 let should_close = matches!(sig.side, SignalSide::Long) ||  // Reversal signal
                     holding_bars >= cfg.max_holding_bars ||   // Max time
@@ -4489,7 +4618,15 @@ async fn generate_signal_from_candle(
         );
     } else {
         // Real data unavailable - fallback to mathematical estimate (LESS accurate)
-        log::debug!("TRENDING: Real liquidation data unavailable, using mathematical estimate (fallback)");
+        // ⚠️ KRİTİK UYARI: estimate_future_liquidations tamamen matematiksel bir varsayım
+        // (Funding rate yüksekse kaldıraç yüksektir varsayımı).
+        // Bu tahmin bazen piyasa gerçeklerinden sapabilir.
+        log::warn!(
+            "TRENDING: ⚠️ Real liquidation data unavailable, using mathematical estimate (FALLBACK). \
+            This is LESS accurate than real liquidation data. \
+            Mathematical model assumes: high funding rate = high leverage. \
+            This assumption may deviate from market reality."
+        );
         for (candle, ctx) in matched_candles.iter().zip(contexts.iter()) {
             liquidation_map.estimate_future_liquidations(
                 candle.close,

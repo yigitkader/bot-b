@@ -42,6 +42,56 @@ impl MetricsCache {
         *cached = symbols;
     }
 
+    /// ✅ FIX: Pre-warm cache for new symbols (TrendPlan.md - Action Plan)
+    /// SymbolScanner yeni coinler bulup rotasyon yaptığında,
+    /// MetricsCache'in o yeni coinler için hemen veri çekmesi (pre-warm) gerekir.
+    /// Bu, ilk API çağrısında cache miss olmasını önler.
+    pub async fn pre_warm_symbols(&self, symbols: &[String]) -> Result<()> {
+        let existing_symbols = self.symbols.read().await.clone();
+        let new_symbols: Vec<String> = symbols
+            .iter()
+            .filter(|s| !existing_symbols.contains(s))
+            .cloned()
+            .collect();
+
+        if new_symbols.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "METRICS_CACHE: Pre-warming {} new symbols: {:?}",
+            new_symbols.len(),
+            new_symbols
+        );
+
+        let mut success_count = 0;
+        let mut error_count = 0;
+
+        for symbol in &new_symbols {
+            match self.update_symbol_metrics(symbol).await {
+                Ok(_) => success_count += 1,
+                Err(err) => {
+                    error_count += 1;
+                    warn!("METRICS_CACHE: Failed to pre-warm {}: {}", symbol, err);
+                }
+            }
+
+            // Small delay to avoid rate limiting
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        info!(
+            "METRICS_CACHE: Pre-warm completed: {} success, {} errors",
+            success_count, error_count
+        );
+
+        // Update tracked symbols list
+        let mut tracked = self.symbols.write().await;
+        tracked.extend(new_symbols);
+
+        Ok(())
+    }
+
     /// Get latest metrics for a symbol
     pub async fn get_metrics(&self, symbol: &str) -> Option<LatestMetrics> {
         let cache = self.cache.read().await;
