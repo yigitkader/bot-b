@@ -573,7 +573,7 @@ async fn main() -> Result<()> {
         .with_enhanced_scoring(true, 70.0, 55.0, 40.0)
         .with_risk_management(2.5, 4.0)
         .with_fees(13.0) // ✅ Plan.md: 13 bps (Komisyon + Slippage)
-        .with_slippage(5.0) // Deterministik slippage
+        .with_slippage(7.0) // ✅ Plan.md: Gerçekçi slippage: %0.07 (Normal volatilite). Gerçek piyasada botun emri ile borsa eşleşmesi arasında milisaniyeler geçer ve fiyat kayar.
         .build();
 
     // CSV writer oluştur (Arc<Mutex> ile thread-safe)
@@ -874,7 +874,7 @@ async fn main() -> Result<()> {
     // Bu sayede overfitting'i önleriz ve stratejinin gerçek performansını görürüz
     let enable_walk_forward = std::env::var("WALK_FORWARD").unwrap_or_else(|_| "true".to_string()) == "true";
     
-    if enable_walk_forward && all_results.len() >= 10 && limit >= 200 {
+    if enable_walk_forward && all_results_clone.len() >= 10 && limit >= 200 {
         // ✅ Plan.md: Walk-Forward Analysis Implementation
         println!("===== WALK-FORWARD ANALYSIS (Overfitting Önleme) =====");
         println!("🚀 FAZ 1: Eğitim Verisi ile Tarama (İlk {} mumdan {} mum)...", limit, limit / 2);
@@ -893,7 +893,7 @@ async fn main() -> Result<()> {
         
         println!("📊 Training Phase: İlk {} mum (eski veri) ile backtest çalıştırılıyor...", training_limit);
         println!("   (Son {} mumdan önceki {} mum - Plan.md)", limit, training_limit);
-        for (symbol, _) in all_results.iter().take(50) { // İlk 50 coin ile training (hız için)
+        for (symbol, _) in all_results_clone.iter().take(50) { // İlk 50 coin ile training (hız için)
             match run_backtest_with_slice(
                 symbol, 
                 &interval, 
@@ -904,7 +904,7 @@ async fn main() -> Result<()> {
                 &cfg
             ).await {
                 Ok(result) => {
-                    training_results.push((symbol.clone(), result));
+                    training_results.push((symbol.to_string(), result));
                 }
                 Err(_) => {
                     // Skip errors in training phase
@@ -1030,18 +1030,18 @@ async fn main() -> Result<()> {
     //   - Run first backtest with limit=144, select Top 10
     //   - Run second backtest with limit=144 but different time period (out-of-sample)
     //   - Compare results - if test period fails, strategy is overfitted
-    if all_results.len() >= 10 {
+    if all_results_clone.len() >= 10 {
         println!("===== TOP 10 COIN IDENTIFICATION =====");
         println!("⚠️  OVERFITTING WARNING: Top 10 selection based on PAST performance only.");
         println!("⚠️  These coins performed well in historical backtest - future may differ.");
         println!();
-        all_results.sort_by(|a, b| {
+        all_results_clone.sort_by(|a, b| {
             b.1.total_pnl_pct
                 .partial_cmp(&a.1.total_pnl_pct)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         
-        let top_10: Vec<String> = all_results
+        let top_10: Vec<String> = all_results_clone
             .iter()
             .take(10)
             .map(|(symbol, result)| {

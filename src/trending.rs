@@ -3239,13 +3239,17 @@ pub fn run_backtest_on_series(
     } 
 
     // Liquidation Stratejisi Kontrolü
+    // ✅ Plan.md: Veri Yoksa İşlem Yok - Backtest'in sonuçlarının "somut" olması için
+    // eksik veride stratejinin devre dışı kaldığını loglarda net görmelisin.
     let has_real_liquidation_data = historical_force_orders.map(|v| !v.is_empty()).unwrap_or(false);
     
     if has_real_liquidation_data {
         log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut. Cascade stratejisi AKTİF.", symbol);
     } else {
-        // Bu uyarıyı daha görünür yapalım
-        println!("  ⚠️  [{}] UYARI: Gerçek Liquidation verisi yok! Cascade stratejisi backtestte devre dışı.", symbol);
+        // ✅ Plan.md: Bu uyarıyı daha görünür yapalım
+        eprintln!("  ⚠️  [{}] UYARI: Gerçek Liquidation verisi yok! Cascade stratejisi backtestte devre dışı.", symbol);
+        eprintln!("  ⚠️  [{}] NOT: Backtest sonuçları gerçek liquidation verisi olmadan hesaplanıyor.", symbol);
+        eprintln!("  ⚠️  [{}] NOT: Sonuçlar daha konservatif (kötümser) olabilir.", symbol);
         log::warn!("BACKTEST: ⚠️ {} için Liquidation verisi EKSİK. Cascade stratejisi PASİF (Skor düşebilir).", symbol);
     }
 
