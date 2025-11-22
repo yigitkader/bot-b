@@ -302,6 +302,7 @@ pub fn run_portfolio_backtest(
                                 Some(&analyzers.liquidation_map),
                                 analyzers.volume_profile.as_ref(),
                                 None, // MarketTick backtestte yok
+                                true, // ✅ BACKTEST MODE: Only use reliable strategies
                             );
 
                             // Signal'i PositionSide'a çevir

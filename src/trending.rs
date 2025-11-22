@@ -2206,6 +2206,15 @@ pub fn classify_trend(ctx: &SignalContext) -> TrendDirection {
 /// Enhanced signal generation with quality filtering (TrendPlan.md önerileri)
 /// Volume confirmation, volatility filter, price action check
 /// Funding arbitrage integration
+/// 
+/// # Backtest Mode
+/// When `is_backtest=true`, only reliable strategies are used:
+/// - ✅ Base Signal (EMA/RSI/ATR)
+/// - ✅ Funding Arbitrage
+/// - ✅ Volume Profile
+/// - ✅ Support/Resistance
+/// - ❌ Order Flow (disabled - requires real-time depth data)
+/// - ❌ Liquidation Cascade (disabled - requires real-time forceOrder stream)
 pub fn generate_signal_enhanced(
     candle: &Candle,
     ctx: &SignalContext,
@@ -2220,30 +2229,50 @@ pub fn generate_signal_enhanced(
     liquidation_map: Option<&LiquidationMap>,
     volume_profile: Option<&VolumeProfile>,
     market_tick: Option<&MarketTick>,
+    is_backtest: bool, // ✅ NEW: Explicit backtest mode flag
 ) -> Signal {
     // 🎯 KRİTİK STRATEJİLER: En güvenilir ve karlı stratejiler önce kontrol edilmeli
     // Bu stratejiler base signal'den bağımsız çalışır ve yüksek doğruluk oranına sahiptir
     
-    // ✅ CRITICAL FIX: Log component availability for debugging
-    log::trace!(
-        "TRENDING: generate_signal_enhanced components - funding_arbitrage: {}, mtf: {}, orderflow: {}, \
-         liquidation_map: {}, volume_profile: {}, market_tick: {}",
-        if funding_arbitrage.is_some() { "✅" } else { "❌" },
-        if mtf.is_some() { "✅" } else { "❌" },
-        if orderflow.is_some() { "✅" } else { "❌" },
-        if liquidation_map.is_some() { "✅" } else { "❌" },
-        if volume_profile.is_some() { "✅" } else { "❌" },
-        if market_tick.is_some() { "✅" } else { "❌" }
-    );
+    // ✅ BACKTEST MODE: Log which strategies are active/inactive
+    if is_backtest {
+        log::debug!(
+            "BACKTEST: Strategy availability - funding_arbitrage: {}, mtf: {}, orderflow: {} (DISABLED), \
+             liquidation_map: {} (DISABLED in backtest), volume_profile: {}, market_tick: {}",
+            if funding_arbitrage.is_some() { "✅" } else { "❌" },
+            if mtf.is_some() { "✅" } else { "❌" },
+            "❌",
+            if liquidation_map.is_some() { "⚠️" } else { "❌" },
+            if volume_profile.is_some() { "✅" } else { "❌" },
+            "❌"
+        );
+    } else {
+        // ✅ CRITICAL FIX: Log component availability for debugging (production mode)
+        log::trace!(
+            "TRENDING: generate_signal_enhanced components - funding_arbitrage: {}, mtf: {}, orderflow: {}, \
+             liquidation_map: {}, volume_profile: {}, market_tick: {}",
+            if funding_arbitrage.is_some() { "✅" } else { "❌" },
+            if mtf.is_some() { "✅" } else { "❌" },
+            if orderflow.is_some() { "✅" } else { "❌" },
+            if liquidation_map.is_some() { "✅" } else { "❌" },
+            if volume_profile.is_some() { "✅" } else { "❌" },
+            if market_tick.is_some() { "✅" } else { "❌" }
+        );
+    }
     
     // === PRIORITY #1: LIQUIDATION CASCADE (En Güvenilir - %90 Doğruluk) ===
-    // ⚠️ CRITICAL RISK: Liquidation Map historical force orders kullanıyor (geçmiş veri)
-    // Gelecekteki liquidasyonları tahmin etmek zor - daha konservatif yaklaşım gerekli
-    // ✅ CRITICAL FIX: Use higher confidence threshold to avoid false signals
-    // ✅ ACTION PLAN FIX (Plan.md): ONLY use LiquidationMap when REAL forceOrder data is available
-    // DO NOT use mathematical estimates (estimate_future_liquidations) - it's unreliable
-    // Real data: market_tick.liq_long_cluster and liq_short_cluster from WebSocket forceOrder stream
-    if let (Some(liq_map), Some(tick)) = (liquidation_map, market_tick) {
+    // ⚠️ BACKTEST MODE: Liquidation Cascade is DISABLED in backtest
+    // Reason: Requires real-time forceOrder stream data (liq_long_cluster/liq_short_cluster)
+    // Historical force orders are not sufficient for reliable cascade detection
+    // ✅ ACTION PLAN: Only use Liquidation Cascade in production with real-time WebSocket data
+    if !is_backtest {
+        // ⚠️ CRITICAL RISK: Liquidation Map historical force orders kullanıyor (geçmiş veri)
+        // Gelecekteki liquidasyonları tahmin etmek zor - daha konservatif yaklaşım gerekli
+        // ✅ CRITICAL FIX: Use higher confidence threshold to avoid false signals
+        // ✅ ACTION PLAN FIX (Plan.md): ONLY use LiquidationMap when REAL forceOrder data is available
+        // DO NOT use mathematical estimates (estimate_future_liquidations) - it's unreliable
+        // Real data: market_tick.liq_long_cluster and liq_short_cluster from WebSocket forceOrder stream
+        if let (Some(liq_map), Some(tick)) = (liquidation_map, market_tick) {
         // ✅ CRITICAL: Check if we have REAL liquidation data (not mathematical estimates)
         // Plan.md: "LiquidationMap stratejisini canlı veri (forceOrder stream) olmadan sinyal üretimine dahil etmeyin"
         // Real data indicators: liq_long_cluster and liq_short_cluster from WebSocket
@@ -2348,6 +2377,12 @@ pub fn generate_signal_enhanced(
                 }
             }
             }
+        }
+        }
+    } else {
+        // Backtest mode: Liquidation Cascade is disabled
+        if is_backtest {
+            log::debug!("BACKTEST: Liquidation Cascade strategy DISABLED (requires real-time forceOrder stream data)");
         }
     }
     
@@ -2843,6 +2878,9 @@ pub fn generate_signal_enhanced(
 
     // === 8. ORDER FLOW ANALYSIS CHECK ===
     // Market maker behavior tracking (SECRET #1)
+    // ⚠️ BACKTEST MODE: Order Flow is DISABLED in backtest
+    // Reason: Requires real-time depth data (orderbook snapshots) which is not available in historical data
+    // ✅ ACTION PLAN: Only use Order Flow in production with real-time WebSocket depth data
     // ✅ CRITICAL FIX: Order Flow yokken nötr skorlama (TrendPlan.md - Action Plan)
     // Eğer Order Flow verisi yoksa (backtest veya depth data eksik), bu bölümü atla
     // Order Flow skorlaması zaten calculate_microstructure_score'da nötr (0.0) dönecek
@@ -2853,7 +2891,8 @@ pub fn generate_signal_enhanced(
     // This means backtest results will differ from production when Order Flow is enabled in config.
     // Production will have additional signals from Absorption, Spoofing, and Iceberg detection
     // that are completely missing in backtest.
-    if let Some(of) = orderflow {
+    if !is_backtest {
+        if let Some(of) = orderflow {
         // ✅ FIX: Order flow confirmation - more aggressive usage
         // Market maker behavior is a strong signal, use it proactively
         if let Some(absorption) = of.detect_absorption() {
@@ -3039,6 +3078,12 @@ pub fn generate_signal_enhanced(
                     };
                 }
             }
+        }
+        }
+    } else {
+        // Backtest mode: Order Flow is disabled
+        if is_backtest {
+            log::debug!("BACKTEST: Order Flow strategy DISABLED (requires real-time depth data)");
         }
     }
 
@@ -3449,19 +3494,34 @@ pub fn run_backtest_on_series(
         );
     } 
 
+    // ✅ BACKTEST MODE: Strategy Summary
+    // Backtest'te sadece güvenilir stratejiler kullanılır:
+    // ✅ Base Signal (EMA/RSI/ATR) - ENABLED
+    // ✅ Funding Arbitrage - ENABLED
+    // ✅ Volume Profile - ENABLED
+    // ✅ Support/Resistance - ENABLED
+    // ❌ Order Flow - DISABLED (requires real-time depth data)
+    // ❌ Liquidation Cascade - DISABLED (requires real-time forceOrder stream)
+    eprintln!("  📊 [{}] BACKTEST MODE: Sadece güvenilir stratejiler aktif", symbol);
+    eprintln!("  ✅ [{}] Base Signal (EMA/RSI/ATR) - AKTİF", symbol);
+    eprintln!("  ✅ [{}] Funding Arbitrage - AKTİF", symbol);
+    eprintln!("  ✅ [{}] Volume Profile - AKTİF", symbol);
+    eprintln!("  ✅ [{}] Support/Resistance - AKTİF", symbol);
+    eprintln!("  ❌ [{}] Order Flow - DEVRE DIŞI (gerçek zamanlı depth verisi gerekli)", symbol);
+    eprintln!("  ❌ [{}] Liquidation Cascade - DEVRE DIŞI (gerçek zamanlı forceOrder stream gerekli)", symbol);
+    log::info!("BACKTEST: {} - Strategy configuration: Base Signal ✅, Funding Arbitrage ✅, Volume Profile ✅, Support/Resistance ✅, Order Flow ❌, Liquidation Cascade ❌", symbol);
+    
     // Liquidation Stratejisi Kontrolü
     // ✅ Plan.md: Veri Yoksa İşlem Yok - Backtest'in sonuçlarının "somut" olması için
     // eksik veride stratejinin devre dışı kaldığını loglarda net görmelisin.
     let has_real_liquidation_data = historical_force_orders.map(|v| !v.is_empty()).unwrap_or(false);
     
     if has_real_liquidation_data {
-        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut. Cascade stratejisi AKTİF.", symbol);
+        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut (ancak Cascade stratejisi backtest'te devre dışı).", symbol);
     } else {
         // ✅ Plan.md: Bu uyarıyı daha görünür yapalım
-        eprintln!("  ⚠️  [{}] UYARI: Gerçek Liquidation verisi yok! Cascade stratejisi backtestte devre dışı.", symbol);
-        eprintln!("  ⚠️  [{}] NOT: Backtest sonuçları gerçek liquidation verisi olmadan hesaplanıyor.", symbol);
-        eprintln!("  ⚠️  [{}] NOT: Sonuçlar daha konservatif (kötümser) olabilir.", symbol);
-        log::warn!("BACKTEST: ⚠️ {} için Liquidation verisi EKSİK. Cascade stratejisi PASİF (Skor düşebilir).", symbol);
+        eprintln!("  ⚠️  [{}] NOT: Gerçek Liquidation verisi yok (Cascade zaten backtest'te devre dışı).", symbol);
+        log::debug!("BACKTEST: {} için Liquidation verisi EKSİK (Cascade stratejisi zaten backtest'te devre dışı).", symbol);
     }
 
     let mut trades: Vec<Trade> = Vec::new();
@@ -3568,6 +3628,7 @@ pub fn run_backtest_on_series(
             liquidation_map_ref,
             volume_profile.as_ref(),
             None, // MarketTick backtestte yok
+            true, // ✅ BACKTEST MODE: Only use reliable strategies
         );
 
         // Count signals
@@ -5183,6 +5244,7 @@ async fn generate_signal_from_candle(
         Some(&liquidation_map), // ✅ FIX: Liquidation map enabled
         volume_profile.as_ref(), // ✅ FIX: Volume profile enabled
         Some(&market_tick), // ✅ FIX: Market tick enabled
+        false, // ✅ PRODUCTION MODE: All strategies enabled
     );
 
     // Eğer sinyal Flat değilse, TradeSignal'e dönüştür
