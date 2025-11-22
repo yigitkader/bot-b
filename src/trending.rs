@@ -3222,8 +3222,21 @@ pub fn run_backtest_on_series(
 ) -> BacktestResult {
     assert_eq!(candles.len(), contexts.len());
 
-    // Order Flow Backtest'te devre dışı (Gerçek Tick verisi olmadığı için)
-    let enable_order_flow_simulation = false; 
+    // ✅ CRITICAL FIX: Order Flow Backtest'te devre dışı (Plan.md - Order Flow ve Likidasyon Verisi Tutarsızlığı)
+    // PROBLEM: Backtest modunda, Binance API'den geçmişe dönük anlık (tick-by-tick) Order Book verisi çekilemez.
+    // OrderFlowAnalyzer (spoofing, iceberg tespiti) backtest'te devre dışı kalmak zorundadır.
+    // SOLUTION: Config'den enable_order_flow okunur ama backtest'te MUTLAKA false olarak override edilir.
+    // Bu, backtest ile production tutarlılığını sağlar ve gerçekçi sonuçlar verir.
+    // Backtest'te MUTLAKA false (Plan.md) - Order Flow analizi yapılmaz
+    let _enable_order_flow_simulation = false; // Backtest'te MUTLAKA false (Plan.md)
+    
+    // Log warning if config has enable_order_flow=true (will be ignored in backtest)
+    if cfg.enable_order_flow {
+        log::warn!(
+            "BACKTEST: ⚠️ Config has enable_order_flow=true, but Order Flow is DISABLED in backtest \
+            (no real-time tick data available). Backtest results will NOT include Order Flow analysis."
+        );
+    } 
 
     // Liquidation Stratejisi Kontrolü
     let has_real_liquidation_data = historical_force_orders.map(|v| !v.is_empty()).unwrap_or(false);

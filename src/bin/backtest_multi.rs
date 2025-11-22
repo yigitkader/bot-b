@@ -12,6 +12,9 @@ use chrono::Utc;
 use csv::Writer;
 use dotenvy::dotenv;
 use futures::stream::{self, StreamExt};
+use rand::seq::SliceRandom;
+use rand::Rng;
+use rand::thread_rng;
 use serde_json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -138,21 +141,38 @@ async fn main() -> Result<()> {
     let all_symbols = scanner.discover_symbols().await?;
 
     println!(
-        "Discovered {} symbols, selecting top {}...",
+        "Discovered {} symbols, selecting {} for backtest...",
         all_symbols.len(),
         max_symbols
     );
 
-    // Top N symbol'ü seç (scoring yaparak)
-    let metrics = scanner.fetch_ticker_24hr(&all_symbols).await?;
-    let scores = scanner.score_symbols(&metrics);
-    let selected_symbols: Vec<String> = scores
+    // ✅ CRITICAL FIX: Selection Bias (Look-ahead Bias) - Plan.md
+    // PROBLEM: Selecting top gainers based on CURRENT 24h performance creates look-ahead bias.
+    // A coin that's currently a "Top Gainer" likely just had a big move in the last 24-48 hours.
+    // Testing it on past 4 days will show the bot "caught" that move, but in reality,
+    // you couldn't have known to select that coin BEFORE the move happened.
+    //
+    // SOLUTION: Use random selection or fixed pool (e.g., Top 50 Market Cap) instead of
+    // selecting based on current performance metrics.
+    //
+    // Option 1: Random selection (unbiased, realistic)
+    // Option 2: Fixed pool (e.g., first N symbols alphabetically or by market cap)
+    //
+    // We'll use random selection to avoid look-ahead bias:
+    let mut rng = thread_rng();
+    let mut shuffled_symbols = all_symbols;
+    shuffled_symbols.shuffle(&mut rng);
+    
+    let selected_symbols: Vec<String> = shuffled_symbols
         .into_iter()
         .take(max_symbols)
-        .map(|s| s.symbol)
         .collect();
 
-    println!("Selected {} symbols for backtest", selected_symbols.len());
+    println!(
+        "✅ Selected {} symbols using RANDOM selection (avoiding look-ahead bias)",
+        selected_symbols.len()
+    );
+    println!("⚠️  NOTE: Random selection ensures backtest results are realistic and not biased by current top gainers.");
     println!();
 
     // ✅ Plan.md: Pro Ayarlar - Yüksek kalite sinyaller, gerçekçi komisyon ve slippage
@@ -222,6 +242,15 @@ async fn main() -> Result<()> {
             let interval = interval.clone();
             let period = period.clone();
             async move {
+                // ✅ CRITICAL FIX: Rate Limit Protection - Plan.md
+                // PROBLEM: 100 coin x (Kline + Funding + OI + LSR + ForceOrder) calls
+                // can cause Binance IP ban if all requests hit at the same time.
+                //
+                // SOLUTION: Add random delay before each coin processing to spread out requests.
+                // This prevents all requests from hitting the API simultaneously.
+                let delay_ms = Rng::gen_range(&mut thread_rng(), 0..500); // 0-500ms random delay
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                
                 println!("⏳ Veri İndiriliyor ve İşleniyor: {} (ForceOrders dahil)", symbol);
                 
                 // 1000 Mum = ~3.5 Günlük Veri (Trend analizi için yeterli)

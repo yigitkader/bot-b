@@ -23,7 +23,7 @@ max_margin_usd: 100.0
 margin_strategy: "balance_based"
 min_quote_balance_usd: 20.0
 
-leverage: 10  # ✅ ACTION PLAN: Safe mode - 10x leverage. Conservative approach for profitability. If algorithm is successful, it will profit with lower leverage.
+leverage: 5  # ✅ Plan.md: Güvenli Kaldıraç - Başlangıç için 10x riskli olabilir, 5x ile başlayıp sistem oturdukça artırın.
 
 price_tick: 0.001
 qty_step: 0.001
@@ -36,13 +36,13 @@ trending:
   ema_slow_period: 55
   rsi_period: 14
   atr_period: 14
-  warmup_min_ticks: 70
+  warmup_min_ticks: 200  # ✅ Plan.md: EMA 55 ve diğer indikatörlerin oturması için en az 200 mum gerekli.
   min_spread_bps: 0.01
   max_spread_bps: 200.0
   signal_cooldown_seconds: 12
   hft_mode: false  # ✅ FIX: Disabled HFT mode. HFT requires co-location (physical proximity to Binance servers). With home internet or standard VPS, latency causes losses. Use trend_threshold_normal strategy instead.
   require_volume_confirmation: false
-  base_min_score: 6.5
+  base_min_score: 7.0  # ✅ Plan.md: Eşiği yükseltin (kaliteli sinyal > çok sinyal)
   trend_threshold_hft: 0.5
   trend_threshold_normal: 0.6
   weak_trend_score_multiplier: 1.15
@@ -64,7 +64,9 @@ trending:
   enable_order_flow: false
   # Execution & Backtest Parameters (Plan.md - Zero Simulation)
   # ✅ Plan.md: Fee & Slippage (GERÇEKÇİ) - Deterministik, rastgelelik yok
-  fee_bps_round_trip: 8.0  # ✅ Plan.md: %0.08 (Binance Taker standart) - VIP0 realistic
+  # Round trip (Giriş + Çıkış) = 0.05 * 2 = 0.1% = 10 bps
+  # Slippage payı ile birlikte bunu artırın.
+  fee_bps_round_trip: 12.0  # ✅ Plan.md: Gerçekçi komisyon (Binance Futures Taker Fee ~0.04% - 0.05%)
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
   # ✅ Plan.md: Slippage - Rastgele değil, ATR bazlı deterministik hesaplama
   slippage_bps: 5.0  # ✅ Plan.md: Baz slippage: %0.05 (Normal volatilite). Volatilitede ATR ile çarpılacak.
@@ -95,14 +97,14 @@ risk:
   liq_window_secs: 30
   # Risk Management - Correlation & Portfolio Limits
   correlation_threshold: 0.7  # High correlation threshold (0.7 = 70%)
-  max_correlated_positions: 5  # Max correlated positions in same direction
+  max_correlated_positions: 3  # ✅ Plan.md: Aynı anda korele (örn: BTC ve ETH) sadece 3 pozisyona izin ver.
   max_correlated_notional_pct: 0.5  # Max % of total notional in correlated positions (0.5 = 50%)
   max_position_per_symbol_pct: 0.3  # Max % of total notional per symbol (0.3 = 30%)
   correlation_cache_update_interval_secs: 600  # ✅ FIX: Increased from 60s to 600s (10 minutes). Reduces CPU load when tracking 100+ coins. Correlation doesn't change rapidly.
   correlation_cache_retention_minutes: 10  # ✅ FIX: Increased from 5 to 10 minutes. Longer retention reduces recalculation overhead.
   max_daily_drawdown_pct: 0.05  # Max daily drawdown (0.05 = 5%)
   max_weekly_drawdown_pct: 0.10  # Max weekly drawdown (0.10 = 10%)
-  risk_per_trade_pct: 0.01  # Risk per trade as % of equity (0.01 = 1%)
+  risk_per_trade_pct: 0.02  # ✅ Plan.md: Sermayenin %2'si riske atılsın.
   # ✅ ACTION PLAN: WebSocket Disconnection Strategy
   # If WebSocket disconnects for more than timeout_secs, close all positions for safety
   # This prevents trading with stale data which can cause significant losses
