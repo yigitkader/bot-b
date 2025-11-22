@@ -16,7 +16,14 @@ use crate::types::{
     PositionSide, Side, Signal, SignalContext, SignalSide, Trade, TrendDirection,
     EnhancedSignalContext,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use crate::trending::multi_timeframe::{Timeframe, TimeframeSignal, MultiTimeframeAnalysis, DivergenceType};
+use crate::trending::strategies::{
+    FundingArbitrage, FundingArbitrageSignal, FundingExhaustionSignal, PostFundingSignal,
+    OrderFlowAnalyzer, AbsorptionSignal, IcebergSignal,
+    LiquidationMap, CascadeDirection,
+    VolumeProfile,
+};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 fn candle_to_data_item(candle: &Candle) -> DataItem {
@@ -41,1268 +48,7 @@ fn value_to_data_item(value: f64) -> DataItem {
         .unwrap()
 }
 
-// =======================
-//  Funding Rate Arbitrage (TrendPlan.md SECRET #2)
-// =======================
 
-#[derive(Debug, Clone)]
-struct FundingSnapshot {
-    timestamp: DateTime<Utc>,
-    funding_rate: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct FundingArbitrage {
-    funding_history: VecDeque<FundingSnapshot>,
-    next_funding_time: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-pub enum FundingArbitrageSignal {
-    PreFundingShort {
-        expected_pnl_bps: i32,
-        time_to_funding: chrono::Duration,
-    },
-    PreFundingLong {
-        expected_pnl_bps: i32,
-        time_to_funding: chrono::Duration,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PostFundingSignal {
-    ExpectLongLiquidation,
-    ExpectShortLiquidation,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum FundingExhaustionSignal {
-    ExtremePositive, // Funding çok yükseldi, reversal yakın
-    ExtremeNegative, // Funding çok düştü, reversal yakın
-}
-
-impl FundingArbitrage {
-    pub fn new() -> Self {
-        Self {
-            funding_history: VecDeque::new(),
-            next_funding_time: Self::calculate_next_funding_time(Utc::now()),
-        }
-    }
-
-    /// Funding her 8 saatte bir: 00:00, 08:00, 16:00 UTC
-    fn calculate_next_funding_time(now: DateTime<Utc>) -> DateTime<Utc> {
-        let hour = now.hour();
-        let next_hour = match hour {
-            0..=7 => 8,
-            8..=15 => 16,
-            16..=23 => 0,
-            _ => 0,
-        };
-
-        if next_hour == 0 {
-            now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc() + chrono::Duration::days(1)
-        } else {
-            now.date_naive()
-                .and_hms_opt(next_hour, 0, 0)
-                .unwrap()
-                .and_utc()
-        }
-    }
-
-    /// Funding history'yi güncelle
-    pub fn update_funding(&mut self, funding_rate: f64, timestamp: DateTime<Utc>) {
-        self.funding_history.push_back(FundingSnapshot {
-            timestamp,
-            funding_rate,
-        });
-        // Son 10 funding'i tut
-        if self.funding_history.len() > 10 {
-            self.funding_history.pop_front();
-        }
-        // Next funding time'ı güncelle
-        self.next_funding_time = Self::calculate_next_funding_time(timestamp);
-    }
-
-    pub fn is_pre_funding_window(&self, now: DateTime<Utc>) -> bool {
-        let time_to_funding = self.next_funding_time.signed_duration_since(now);
-        time_to_funding.num_minutes() <= 90 && time_to_funding.num_minutes() >= 0
-    }
-    
-    pub fn is_optimal_pre_funding_window(&self, now: DateTime<Utc>) -> bool {
-        let time_to_funding = self.next_funding_time.signed_duration_since(now);
-        time_to_funding.num_minutes() <= 60 && time_to_funding.num_minutes() >= 30
-    }
-    
-    pub fn is_early_pre_funding_window(&self, now: DateTime<Utc>) -> bool {
-        let time_to_funding = self.next_funding_time.signed_duration_since(now);
-        time_to_funding.num_minutes() <= 90 && time_to_funding.num_minutes() > 60
-    }
-
-    /// ✅ CRITICAL FIX: Detect funding arbitrage with price movement check
-    /// Checks if price has already moved in expected direction (market efficiency)
-    /// Only signals arbitrage if price hasn't moved yet or moved in opposite direction
-    /// 
-    /// # Parameters
-    /// - `now`: Current time
-    /// - `current_price`: Current price
-    /// - `price_history`: Price history in chronological order (oldest first)
-    ///   ⚠️ CRITICAL: Must be sorted by timestamp ascending for find() to work correctly
-    pub fn detect_funding_arbitrage(
-        &self,
-        now: DateTime<Utc>,
-        current_price: f64,
-        price_history: &[(DateTime<Utc>, f64)], // (timestamp, price) pairs - MUST be chronological (oldest first)
-    ) -> Option<FundingArbitrageSignal> {
-        if !self.is_pre_funding_window(now) {
-            return None;
-        }
-
-        if self.funding_history.is_empty() {
-            return None;
-        }
-
-        let latest_funding = self.funding_history.back()?.funding_rate;
-
-        // ✅ FIX: Check if price has already moved in expected direction
-        // Pre-funding window başlangıcından (90 dakika önce) itibaren fiyat hareketini kontrol et
-        let pre_funding_start = self.next_funding_time - chrono::Duration::minutes(90);
-        let price_at_window_start = price_history
-            .iter()
-            .find(|(ts, _)| *ts >= pre_funding_start)
-            .map(|(_, price)| *price);
-
-        // Eğer pre-funding window başlangıcından itibaren fiyat verisi yoksa, skip et
-        let price_movement_pct = if let Some(start_price) = price_at_window_start {
-            if start_price > 0.0 {
-                (current_price - start_price) / start_price
-            } else {
-                0.0
-            }
-        } else {
-            // Fiyat verisi yoksa, arbitraj fırsatını değerlendir (conservative approach)
-            0.0
-        };
-
-        let funding_trend = if self.funding_history.len() >= 3 {
-            let recent: Vec<&FundingSnapshot> = self.funding_history.iter().rev().take(3).collect();
-            let trend = (recent[0].funding_rate - recent[2].funding_rate).signum();
-            Some(trend)
-        } else {
-            None
-        };
-
-        // ✅ FIX: Positive funding → expect price to rise → SHORT before funding
-        // If price already rose >0.3%, arbitrage is already priced in
-        if latest_funding > 0.0005 {
-            // Check if price already moved up (arbitrage priced in)
-            if price_movement_pct > 0.003 {
-                // Price already rose >0.3%, arbitrage opportunity missed
-                log::debug!(
-                    "TRENDING: Funding arbitrage SHORT skipped - price already moved {:.2}% (arbitrage priced in)",
-                    price_movement_pct * 100.0
-                );
-                return None;
-            }
-
-            let confidence_boost = funding_trend
-                .map(|t| if t > 0.0 { 1.2 } else { 1.0 })
-                .unwrap_or(1.0);
-            
-            // ✅ FIX: Adjust expected PNL based on price movement
-            // If price moved down, arbitrage is more attractive (counter-trend)
-            let price_adjustment = if price_movement_pct < -0.001 {
-                1.2 // Price moved down, more attractive
-            } else if price_movement_pct > 0.001 {
-                0.7 // Price moved up slightly, less attractive
-            } else {
-                1.0 // No significant movement
-            };
-            
-            let threshold = if self.is_optimal_pre_funding_window(now) {
-                0.0003
-            } else {
-                0.0005
-            };
-            
-            if latest_funding > threshold {
-                let adjusted_pnl = (latest_funding * confidence_boost * price_adjustment) * 10000.0;
-                Some(FundingArbitrageSignal::PreFundingShort {
-                    expected_pnl_bps: adjusted_pnl as i32,
-                    time_to_funding: self.next_funding_time.signed_duration_since(now),
-                })
-            } else {
-                None
-            }
-        }
-        // ✅ FIX: Negative funding → expect price to fall → LONG before funding
-        // If price already fell >0.3%, arbitrage is already priced in
-        else if latest_funding < -0.0005 {
-            // Check if price already moved down (arbitrage priced in)
-            if price_movement_pct < -0.003 {
-                // Price already fell >0.3%, arbitrage opportunity missed
-                log::debug!(
-                    "TRENDING: Funding arbitrage LONG skipped - price already moved {:.2}% (arbitrage priced in)",
-                    price_movement_pct * 100.0
-                );
-                return None;
-            }
-
-            let confidence_boost = funding_trend
-                .map(|t| if t < 0.0 { 1.2 } else { 1.0 })
-                .unwrap_or(1.0);
-            
-            // ✅ FIX: Adjust expected PNL based on price movement
-            // If price moved up, arbitrage is more attractive (counter-trend)
-            let price_adjustment = if price_movement_pct > 0.001 {
-                1.2 // Price moved up, more attractive
-            } else if price_movement_pct < -0.001 {
-                0.7 // Price moved down slightly, less attractive
-            } else {
-                1.0 // No significant movement
-            };
-            
-            let threshold = if self.is_optimal_pre_funding_window(now) {
-                -0.0003
-            } else {
-                -0.0005
-            };
-            
-            if latest_funding < threshold {
-                let adjusted_pnl = (latest_funding.abs() * confidence_boost * price_adjustment) * 10000.0;
-                Some(FundingArbitrageSignal::PreFundingLong {
-                    expected_pnl_bps: adjusted_pnl as i32,
-                    time_to_funding: self.next_funding_time.signed_duration_since(now),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    pub fn detect_post_funding_opportunity(&self, now: DateTime<Utc>) -> Option<PostFundingSignal> {
-        let time_since_funding = now.signed_duration_since(self.next_funding_time);
-
-        if time_since_funding.num_minutes() > 0 && time_since_funding.num_minutes() <= 15 {
-            if let Some(latest) = self.funding_history.back() {
-                if latest.funding_rate > 0.0003 {
-                    Some(PostFundingSignal::ExpectLongLiquidation)
-                } else if latest.funding_rate < -0.0003 {
-                    Some(PostFundingSignal::ExpectShortLiquidation)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    pub fn detect_funding_exhaustion(&self) -> Option<FundingExhaustionSignal> {
-        if self.funding_history.len() < 5 {
-            return None;
-        }
-
-        let recent: Vec<&FundingSnapshot> = self.funding_history.iter().rev().take(5).collect();
-        if recent.len() < 5 {
-            return None;
-        }
-
-        let mut increasing_count = 0;
-        let mut decreasing_count = 0;
-
-        for i in 1..recent.len() {
-            if recent[i].funding_rate > recent[i - 1].funding_rate {
-                increasing_count += 1;
-            } else {
-                decreasing_count += 1;
-            }
-        }
-
-        if increasing_count >= 4 {
-            Some(FundingExhaustionSignal::ExtremePositive)
-        } else if decreasing_count >= 4 {
-            Some(FundingExhaustionSignal::ExtremeNegative)
-        } else {
-            None
-        }
-    }
-}
-
-// =======================
-//  Order Flow Analysis (TrendPlan.md SECRET #1)
-// =======================
-
-#[derive(Debug, Clone)]
-struct OrderFlowSnapshot {
-    timestamp: DateTime<Utc>,
-    bid_volume: f64,
-    ask_volume: f64,
-    bid_count: usize,
-    ask_count: usize,
-}
-
-#[derive(Debug)]
-pub struct OrderFlowAnalyzer {
-    snapshots: VecDeque<OrderFlowSnapshot>,
-    window_size: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum AbsorptionSignal {
-    Bullish, // Market maker accumulating
-    Bearish, // Market maker distributing
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum SpoofingSignal {
-    BidSideSpoofing, // Fake buy orders
-    AskSideSpoofing, // Fake sell orders
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum IcebergSignal {
-    BidSideIceberg, // Hidden buy orders
-    AskSideIceberg, // Hidden sell orders
-}
-
-impl OrderFlowAnalyzer {
-    pub fn new(window_size: usize) -> Self {
-        Self {
-            snapshots: VecDeque::with_capacity(window_size),
-            window_size,
-        }
-    }
-
-    /// CRITICAL: Orderbook'tan "hidden liquidity" tespiti
-    /// Market maker'lar küçük emirlerle büyük pozisyon oluşturur
-    pub fn add_snapshot(&mut self, depth: &DepthSnapshot) {
-        let bid_volume: f64 = depth
-            .bids
-            .iter()
-            .filter_map(|lvl| lvl[1].parse::<f64>().ok())
-            .sum();
-
-        let ask_volume: f64 = depth
-            .asks
-            .iter()
-            .filter_map(|lvl| lvl[1].parse::<f64>().ok())
-            .sum();
-
-        let snapshot = OrderFlowSnapshot {
-            timestamp: Utc::now(),
-            bid_volume,
-            ask_volume,
-            bid_count: depth.bids.len(),
-            ask_count: depth.asks.len(),
-        };
-
-        self.snapshots.push_back(snapshot);
-        if self.snapshots.len() > self.window_size {
-            self.snapshots.pop_front();
-        }
-    }
-
-    pub fn detect_absorption(&self) -> Option<AbsorptionSignal> {
-        if self.snapshots.len() < 5 {
-            return None;
-        }
-
-        let snapshot_count = self.snapshots.len().min(15);
-        let recent: Vec<&OrderFlowSnapshot> = self.snapshots.iter().rev().take(snapshot_count).collect();
-
-        let mut buy_volume_total = 0.0;
-        let mut sell_volume_total = 0.0;
-
-        for snap in recent {
-            if snap.ask_volume > snap.bid_volume {
-                sell_volume_total += snap.ask_volume;
-            } else {
-                buy_volume_total += snap.bid_volume;
-            }
-        }
-
-        let imbalance_ratio = sell_volume_total / buy_volume_total.max(1.0);
-
-        if imbalance_ratio > 1.3 {
-            Some(AbsorptionSignal::Bullish)
-        } else if imbalance_ratio < 0.77 {
-            Some(AbsorptionSignal::Bearish)
-        } else {
-            None
-        }
-    }
-
-    pub fn detect_spoofing(&self) -> Option<SpoofingSignal> {
-        if self.snapshots.len() < 10 {
-            return None;
-        }
-
-        // ✅ FIX: Use more snapshots if available (up to 25 instead of 20)
-        let snapshot_count = self.snapshots.len().min(25);
-        let recent: Vec<&OrderFlowSnapshot> = self.snapshots.iter().rev().take(snapshot_count).collect();
-
-        // Order count'lar stable ama volume çok volatil = spoofing
-        let avg_bid_count: f64 =
-            recent.iter().map(|s| s.bid_count as f64).sum::<f64>() / recent.len() as f64;
-
-        let avg_ask_count: f64 =
-            recent.iter().map(|s| s.ask_count as f64).sum::<f64>() / recent.len() as f64;
-
-        // Volume volatility
-        let bid_volumes: Vec<f64> = recent.iter().map(|s| s.bid_volume).collect();
-        let bid_vol_std = calculate_std_dev(&bid_volumes);
-        let bid_vol_mean = bid_volumes.iter().sum::<f64>() / bid_volumes.len() as f64;
-
-        // Coefficient of variation (CV)
-        let bid_cv = if bid_vol_mean > 0.0 {
-            bid_vol_std / bid_vol_mean
-        } else {
-            0.0
-        };
-
-        // Ask side CV
-        let ask_volumes: Vec<f64> = recent.iter().map(|s| s.ask_volume).collect();
-        let ask_vol_std = calculate_std_dev(&ask_volumes);
-        let ask_vol_mean = ask_volumes.iter().sum::<f64>() / ask_volumes.len() as f64;
-        let ask_cv = if ask_vol_mean > 0.0 {
-            ask_vol_std / ask_vol_mean
-        } else {
-            0.0
-        };
-
-        // ✅ FIX: Lower threshold (0.4 instead of 0.5) and count (10 instead of 15) for more opportunities
-        // 🚨 Yüksek CV + stable count = spoofing
-        if bid_cv > 0.4 && avg_bid_count > 10.0 {
-            Some(SpoofingSignal::BidSideSpoofing)
-        } else if ask_cv > 0.4 && avg_ask_count > 10.0 {
-            Some(SpoofingSignal::AskSideSpoofing)
-        } else {
-            None
-        }
-    }
-
-    pub fn detect_iceberg_orders(&self) -> Option<IcebergSignal> {
-        if self.snapshots.len() < 15 {
-            return None;
-        }
-
-        let snapshot_count = self.snapshots.len().min(40);
-        let recent: Vec<&OrderFlowSnapshot> = self.snapshots.iter().rev().take(snapshot_count).collect();
-
-        let bid_volumes: Vec<f64> = recent.iter().map(|s| s.bid_volume).collect();
-        let bid_vol_std = calculate_std_dev(&bid_volumes);
-        let bid_vol_mean = bid_volumes.iter().sum::<f64>() / bid_volumes.len() as f64;
-
-        let bid_cv = if bid_vol_mean > 0.0 {
-            bid_vol_std / bid_vol_mean
-        } else {
-            0.0
-        };
-
-        let ask_volumes: Vec<f64> = recent.iter().map(|s| s.ask_volume).collect();
-        let ask_vol_std = calculate_std_dev(&ask_volumes);
-        let ask_vol_mean = ask_volumes.iter().sum::<f64>() / ask_volumes.len() as f64;
-        let ask_cv = if ask_vol_mean > 0.0 {
-            ask_vol_std / ask_vol_mean
-        } else {
-            0.0
-        };
-
-        if bid_cv < 0.15 && bid_vol_mean > 50000.0 {
-            Some(IcebergSignal::BidSideIceberg)
-        } else if ask_cv < 0.15 && ask_vol_mean > 50000.0 {
-            Some(IcebergSignal::AskSideIceberg)
-        } else {
-            None
-        }
-    }
-}
-
-fn calculate_std_dev(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
-    variance.sqrt()
-}
-
-// =======================
-//  Multi-Timeframe Confluence (TrendPlan.md SECRET #4)
-// =======================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Timeframe {
-    M1,  // 1 minute
-    M5,  // 5 minutes (main timeframe)
-    M15, // 15 minutes
-    H1,  // 1 hour
-    H4,  // 4 hours
-}
-
-#[derive(Debug, Clone)]
-pub struct TimeframeSignal {
-    pub trend: TrendDirection,
-    pub rsi: f64,
-    pub ema_fast: f64,
-    pub ema_slow: f64,
-    pub strength: f64, // 0.0-1.0
-}
-
-#[derive(Debug, Clone)]
-pub struct MultiTimeframeAnalysis {
-    timeframes: HashMap<Timeframe, TimeframeSignal>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum DivergenceType {
-    BullishDivergence, // Short-term bullish, long-term bearish (risky long)
-    BearishDivergence, // Short-term bearish, long-term bullish (risky short)
-}
-
-#[derive(Debug, Clone)]
-pub struct AlignedSignal {
-    pub side: SignalSide,
-    pub alignment_pct: f64, // 0.0-1.0 (how many TFs agree)
-    pub strength: f64,      // Average strength across TFs
-    pub participating_timeframes: usize,
-}
-
-impl MultiTimeframeAnalysis {
-    pub fn new() -> Self {
-        Self {
-            timeframes: HashMap::new(),
-        }
-    }
-
-    /// Add timeframe signal
-    pub fn add_timeframe(&mut self, tf: Timeframe, signal: TimeframeSignal) {
-        self.timeframes.insert(tf, signal);
-    }
-
-    /// Get timeframe signal
-    pub fn get_timeframe(&self, tf: Timeframe) -> Option<&TimeframeSignal> {
-        self.timeframes.get(&tf)
-    }
-
-    /// 🔥 CRITICAL: Calculate confluence score
-    /// Eğer multiple timeframe'ler aynı direction'daysa → high confidence
-    /// ✅ FIX: Dynamic weights based on volatility (TrendPlan.md - Action Plan)
-    /// Yüksek volatilitede uzun vadeli (H1, H4) timeframe'lerin ağırlığını artır
-    /// Çünkü yüksek volatilitede M1 ve M5 çok fazla fake sinyal üretir
-    pub fn calculate_confluence(&self, direction: SignalSide, atr_pct: Option<f64>) -> f64 {
-        if self.timeframes.is_empty() {
-            return 0.0;
-        }
-
-        let mut confluence_score = 0.0;
-        let mut total_weight = 0.0;
-
-        // Base timeframe weights (longer = more important)
-        // ✅ FIX: M1 (1-minute) timeframe removed or heavily reduced - too noisy for crypto
-        // 1-minute charts produce too many false signals in crypto markets
-        // 5m and 15m combination is more stable and reliable
-        let base_weights = vec![
-            (Timeframe::M1, 0.0),   // ✅ FIX: Reduced to 0.0 - 1m timeframe too noisy for crypto
-            (Timeframe::M5, 0.25),  // Increased from 0.2 to compensate for M1 removal
-            (Timeframe::M15, 0.3),  // Increased from 0.25 - more reliable than M1
-            (Timeframe::H1, 0.3),
-            (Timeframe::H4, 0.15),
-        ];
-
-        // ✅ FIX: Dynamic weight adjustment based on volatility
-        // High volatility (ATR > 2%) → increase long-term TF weights, decrease short-term
-        // Low volatility (ATR < 1%) → use base weights
-        let volatility_multiplier = if let Some(atr) = atr_pct {
-            if atr > 0.02 {
-                // High volatility: reduce short-term, increase H1/H4
-                // ✅ FIX: M1 removed (0.0) - too noisy in high volatility
-                vec![
-                    (Timeframe::M1, 0.0),   // ✅ FIX: Removed - too noisy
-                    (Timeframe::M5, 0.15),   // Reduced from 0.1 (was 0.2 in base)
-                    (Timeframe::M15, 0.25), // Same
-                    (Timeframe::H1, 0.4),   // Increased from 0.3
-                    (Timeframe::H4, 0.2),   // Increased from 0.15
-                ]
-            } else if atr < 0.01 {
-                // Low volatility: can use more short-term signals (but still avoid M1)
-                // ✅ FIX: M1 still removed even in low volatility - 1m charts are unreliable
-                vec![
-                    (Timeframe::M1, 0.0),   // ✅ FIX: Removed - too noisy even in low vol
-                    (Timeframe::M5, 0.3),   // Increased from 0.25 to compensate
-                    (Timeframe::M15, 0.3),  // Increased from 0.25
-                    (Timeframe::H1, 0.25),  // Reduced from 0.3
-                    (Timeframe::H4, 0.15),  // Slightly increased from 0.1
-                ]
-            } else {
-                // Normal volatility: use base weights
-                base_weights.clone()
-            }
-        } else {
-            // No ATR data: use base weights
-            base_weights.clone()
-        };
-
-        for (tf, weight) in volatility_multiplier {
-            if let Some(signal) = self.timeframes.get(&tf) {
-                total_weight += weight;
-
-                // Check if this timeframe agrees with direction
-                let agrees = match direction {
-                    SignalSide::Long => matches!(signal.trend, TrendDirection::Up),
-                    SignalSide::Short => matches!(signal.trend, TrendDirection::Down),
-                    SignalSide::Flat => false,
-                };
-
-                if agrees {
-                    confluence_score += weight * signal.strength;
-                }
-            }
-        }
-
-        if total_weight > 0.0 {
-            confluence_score / total_weight
-        } else {
-            0.0
-        }
-    }
-
-    /// 🔥 ADVANCED: Divergence Detection
-    /// Eğer short-term ve long-term aynı yönde değilse → risky trade
-    pub fn detect_timeframe_divergence(&self) -> Option<DivergenceType> {
-        // ✅ CRITICAL FIX: Ara katman kontrolü ekle (TrendPlan.md - Action Plan)
-        // Sadece 5m ve 1h karşılaştırmak yerine, aradaki 15m trendi de kontrol et
-        // Eğer 5m UP, 15m DOWN, 1H UP ise bu bir gürültü olabilir
-        let short_term = self.timeframes.get(&Timeframe::M5);
-        let mid_term = self.timeframes.get(&Timeframe::M15); // Ara katman
-        let long_term = self.timeframes.get(&Timeframe::H1);
-
-        match (short_term, mid_term, long_term) {
-            (Some(st), Some(mt), Some(lt)) => {
-                // ✅ FIX: Ara katman kontrolü - eğer orta timeframe ters ise, divergence'ı iptal et
-                // Örnek: 5m UP, 15m DOWN, 1H UP -> Bu bir gürültü, gerçek divergence değil
-                // Bullish divergence: short-term up, long-term down
-                if matches!(st.trend, TrendDirection::Up)
-                    && matches!(lt.trend, TrendDirection::Down)
-                {
-                    // Ara katman kontrolü: Eğer 15m de DOWN ise, bu gerçek bir divergence
-                    // Eğer 15m UP ise, bu bir gürültü (noise) olabilir
-                    if matches!(mt.trend, TrendDirection::Down) {
-                        // 5m UP, 15m DOWN, 1H DOWN -> Gerçek bullish divergence
-                        Some(DivergenceType::BullishDivergence)
-                    } else {
-                        // 5m UP, 15m UP/FLAT, 1H DOWN -> Gürültü, divergence yok
-                        None
-                    }
-                }
-                // Bearish divergence: short-term down, long-term up
-                else if matches!(st.trend, TrendDirection::Down)
-                    && matches!(lt.trend, TrendDirection::Up)
-                {
-                    // Ara katman kontrolü: Eğer 15m de UP ise, bu gerçek bir divergence
-                    // Eğer 15m DOWN ise, bu bir gürültü (noise) olabilir
-                    if matches!(mt.trend, TrendDirection::Up) {
-                        // 5m DOWN, 15m UP, 1H UP -> Gerçek bearish divergence
-                        Some(DivergenceType::BearishDivergence)
-                    } else {
-                        // 5m DOWN, 15m DOWN/FLAT, 1H UP -> Gürültü, divergence yok
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            // Fallback: Eğer M15 yoksa, sadece M5 ve H1'i karşılaştır (eski davranış)
-            (Some(st), None, Some(lt)) => {
-                // Bullish divergence: short-term up, long-term down
-                if matches!(st.trend, TrendDirection::Up)
-                    && matches!(lt.trend, TrendDirection::Down)
-                {
-                    Some(DivergenceType::BullishDivergence)
-                }
-                // Bearish divergence: short-term down, long-term up
-                else if matches!(st.trend, TrendDirection::Down)
-                    && matches!(lt.trend, TrendDirection::Up)
-                {
-                    Some(DivergenceType::BearishDivergence)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// 🔥 SECRET STRATEGY: "Trend Alignment"
-    /// En güvenilir tradeler: Tüm timeframe'ler aligned
-    pub fn generate_aligned_signal(&self) -> Option<AlignedSignal> {
-        // Check if we have at least 3 timeframes
-        if self.timeframes.len() < 3 {
-            return None;
-        }
-
-        // Count bullish and bearish timeframes
-        let mut bullish_count = 0;
-        let mut bearish_count = 0;
-        let mut total_strength = 0.0;
-
-        for signal in self.timeframes.values() {
-            match signal.trend {
-                TrendDirection::Up => {
-                    bullish_count += 1;
-                    total_strength += signal.strength;
-                }
-                TrendDirection::Down => {
-                    bearish_count += 1;
-                    total_strength += signal.strength;
-                }
-                TrendDirection::Flat => {}
-            }
-        }
-
-        let total_count = bullish_count + bearish_count;
-        if total_count == 0 {
-            return None;
-        }
-
-        // 🚨 ALIGNMENT THRESHOLD: 80%+ agreement
-        let alignment_pct = if bullish_count > bearish_count {
-            bullish_count as f64 / total_count as f64
-        } else {
-            bearish_count as f64 / total_count as f64
-        };
-
-        if alignment_pct >= 0.8 {
-            let avg_strength = total_strength / total_count as f64;
-
-            if bullish_count > bearish_count {
-                Some(AlignedSignal {
-                    side: SignalSide::Long,
-                    alignment_pct,
-                    strength: avg_strength,
-                    participating_timeframes: bullish_count,
-                })
-            } else {
-                Some(AlignedSignal {
-                    side: SignalSide::Short,
-                    alignment_pct,
-                    strength: avg_strength,
-                    participating_timeframes: bearish_count,
-                })
-            }
-        } else {
-            None
-        }
-    }
-}
-
-// =======================
-//  Liquidation Cascade Prediction (TrendPlan.md SECRET #3)
-// =======================
-
-#[derive(Debug, Clone)]
-pub struct LiquidationMap {
-    /// Key: Price level, Value: Liquidation notional (USD)
-    pub long_liquidations: BTreeMap<i64, f64>, // LONG pozisyonlar bu fiyatta liquidate
-    pub short_liquidations: BTreeMap<i64, f64>, // SHORT pozisyonlar bu fiyatta liquidate
-    pub last_update: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LiquidationWall {
-    pub price: f64,
-    pub notional: f64, // Total USD to be liquidated
-    pub direction: CascadeDirection,
-    pub distance_pct: f64, // Distance from current price (%)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum CascadeDirection {
-    Downward, // Long liquidations trigger downward cascade
-    Upward,   // Short liquidations trigger upward cascade
-}
-
-#[derive(Debug, Clone)]
-pub struct CascadeSignal {
-    pub side: Side,
-    pub entry_price: f64,
-    pub target_price: f64,
-    pub expected_pnl_pct: f64,
-    pub wall_notional: f64,
-    pub confidence: f64, // 0.0-1.0
-}
-
-impl LiquidationMap {
-    pub fn new() -> Self {
-        Self {
-            long_liquidations: BTreeMap::new(),
-            short_liquidations: BTreeMap::new(),
-            last_update: Utc::now(),
-        }
-    }
-
-    /// ✅ CRITICAL FIX (A): Use REAL liquidation data from connection.rs (LiqState) as PRIMARY source
-    /// MarketTick contains liq_long_cluster and liq_short_cluster from real-time forceOrder stream
-    /// These are normalized ratios (notional / OI) from actual liquidations in the last N seconds
-    /// This is ALWAYS more accurate than mathematical estimates
-    pub fn update_from_real_liquidation_data(
-        &mut self,
-        current_price: f64,
-        open_interest: f64,
-        liq_long_cluster: Option<f64>,
-        liq_short_cluster: Option<f64>,
-    ) {
-        // Clear previous estimates
-        self.long_liquidations.clear();
-        self.short_liquidations.clear();
-
-        // ✅ CRITICAL: Use real liquidation data if available
-        // liq_long_cluster and liq_short_cluster are ratios (notional / OI) from LiqState
-        // Convert to absolute notional values for liquidation map
-        
-        // Calculate price interval for clustering
-        let price_interval = if current_price > 1000.0 {
-            10.0 // Major coins: $10 intervals
-        } else if current_price > 1.0 {
-            0.01 // Mid-range: $0.01 intervals
-        } else {
-            0.00001 // Low-price coins: $0.00001 intervals
-        };
-
-        // Long liquidations (below current price)
-        if let Some(long_ratio) = liq_long_cluster {
-            if long_ratio > 0.0 && open_interest > 0.0 {
-                let long_notional = open_interest * long_ratio;
-                // Distribute across price levels near current price (1-2% below)
-                let price_levels = vec![
-                    (0.98, 0.4),  // 2% below: 40% of liquidations
-                    (0.99, 0.35), // 1% below: 35% of liquidations
-                    (0.995, 0.25), // 0.5% below: 25% of liquidations
-                ];
-                
-                for (price_mult, portion) in &price_levels {
-                    let liq_price = current_price * price_mult;
-                    let liq_price_rounded = (liq_price / price_interval).round() * price_interval;
-                    let liq_price_key = (liq_price_rounded / price_interval) as i64;
-                    let notional = long_notional * portion;
-                    
-                    *self
-                        .long_liquidations
-                        .entry(liq_price_key)
-                        .or_insert(0.0) += notional;
-                }
-            }
-        }
-
-        // Short liquidations (above current price)
-        if let Some(short_ratio) = liq_short_cluster {
-            if short_ratio > 0.0 && open_interest > 0.0 {
-                let short_notional = open_interest * short_ratio;
-                // Distribute across price levels near current price (1-2% above)
-                let price_levels = vec![
-                    (1.02, 0.4),  // 2% above: 40% of liquidations
-                    (1.01, 0.35), // 1% above: 35% of liquidations
-                    (1.005, 0.25), // 0.5% above: 25% of liquidations
-                ];
-                
-                for (price_mult, portion) in &price_levels {
-                    let liq_price = current_price * price_mult;
-                    let liq_price_rounded = (liq_price / price_interval).round() * price_interval;
-                    let liq_price_key = (liq_price_rounded / price_interval) as i64;
-                    let notional = short_notional * portion;
-                    
-                    *self
-                        .short_liquidations
-                        .entry(liq_price_key)
-                        .or_insert(0.0) += notional;
-                }
-            }
-        }
-
-        self.last_update = Utc::now();
-    }
-
-    // ❌ SİLİNDİ (Plan.md ADIM 1): estimate_future_liquidations fonksiyonu kaldırıldı
-    // Bu fonksiyon funding rate ve Long/Short Ratio'ya bakıp "kesin burada likidasyon vardır" diye tahmin yürütüyordu.
-    // Artık sadece gerçek Binance API'den alınan ForceOrder verileri kullanılacak.
-    // Gerçek veri yoksa LiquidationMap boş kalacak ve liquidation stratejileri çalışmayacak.
-
-    /// ✅ Plan.md: Basit cascade kontrolü - sadece gerçek liquidation verisiyle çalışır
-    /// Backtest için optimize edilmiş basit versiyon
-    pub fn check_cascade(&self, current_price: f64) -> Option<CascadeSignal> {
-        let interval = if current_price > 1000.0 { 10.0 } else { 0.01 };
-        let key = (current_price / interval).round() as i64;
-        
-        // Yakın bir Long Wall var mı? (Aşağıda)
-        let downside_risk: f64 = self.long_liquidations.range(..key).rev().take(5).map(|(_, v)| *v).sum();
-        // Yakın bir Short Wall var mı? (Yukarıda)
-        let upside_risk: f64 = self.short_liquidations.range(key..).take(5).map(|(_, v)| *v).sum();
-
-        // Threshold: $500k gerçek likidasyon (düşük tuttum çünkü veri az olabilir)
-        if downside_risk > 500_000.0 {
-             // Fiyat düşerken longlar patlıyor -> SHORT fırsatı
-             return Some(CascadeSignal { 
-                 side: Side::Short, 
-                 entry_price: current_price, 
-                 target_price: current_price * 0.98,
-                 expected_pnl_pct: 0.02,
-                 wall_notional: downside_risk,
-                 confidence: 0.7,
-             });
-        }
-        if upside_risk > 500_000.0 {
-             // Fiyat çıkarken shortlar patlıyor -> LONG fırsatı
-             return Some(CascadeSignal { 
-                 side: Side::Long, 
-                 entry_price: current_price, 
-                 target_price: current_price * 1.02,
-                 expected_pnl_pct: 0.02,
-                 wall_notional: upside_risk,
-                 confidence: 0.7,
-             });
-        }
-        None
-    }
-
-    /// ✅ CRITICAL FIX: Detect "liquidation walls" using dynamic price intervals
-    /// Bu wall'lara yaklaştığımızda cascade riski var
-    pub fn detect_liquidation_walls(
-        &self,
-        current_price: f64,
-        threshold_usd: f64, // Minimum liquidation = wall
-    ) -> Vec<LiquidationWall> {
-        let mut walls = Vec::new();
-
-        // ✅ FIX: Use dynamic price interval (same as in update_from_real_liquidation_data)
-        let price_interval = if current_price > 1000.0 {
-            10.0 // Major coins: $10 intervals
-        } else if current_price > 1.0 {
-            0.01 // Mid-range: $0.01 intervals
-        } else {
-            0.00001 // Low-price coins: $0.00001 intervals
-        };
-
-        let current_price_key = ((current_price / price_interval).round() * price_interval / price_interval) as i64;
-
-        // Downside walls (long liquidations)
-        for (price_key, notional) in &self.long_liquidations {
-            if *notional > threshold_usd && *price_key < current_price_key {
-                let price = *price_key as f64 * price_interval;
-                let distance_pct = (current_price - price) / current_price * 100.0;
-
-                walls.push(LiquidationWall {
-                    price,
-                    notional: *notional,
-                    direction: CascadeDirection::Downward,
-                    distance_pct,
-                });
-            }
-        }
-
-        // Upside walls (short liquidations)
-        for (price_key, notional) in &self.short_liquidations {
-            if *notional > threshold_usd && *price_key > current_price_key {
-                let price = *price_key as f64 * price_interval;
-                let distance_pct = (price - current_price) / current_price * 100.0;
-
-                walls.push(LiquidationWall {
-                    price,
-                    notional: *notional,
-                    direction: CascadeDirection::Upward,
-                    distance_pct,
-                });
-            }
-        }
-
-        // Sort by proximity
-        walls.sort_by(|a, b| a.distance_pct.partial_cmp(&b.distance_pct).unwrap());
-        walls
-    }
-
-    /// 🔥 CASCADE STRATEGY
-    /// Fiyat liquidation wall'a yaklaştığında:
-    /// 1. Wall'un 0.5% öncesinde pozisyon aç (cascade direction)
-    /// 2. Wall tetiklenince cascade ile birlikte kazan
-    /// 3. Wall'dan %1 sonra kapat (cascade bitti)
-    /// ✅ FIX: More aggressive thresholds for better signal generation
-    pub fn generate_cascade_signal(
-        &self,
-        current_price: f64,
-        current_tick: &MarketTick,
-    ) -> Option<CascadeSignal> {
-        // ✅ FIX: Lower threshold ($2M instead of $5M) - catch more opportunities
-        let walls = self.detect_liquidation_walls(current_price, 2_000_000.0); // $2M threshold
-
-        if walls.is_empty() {
-            return None;
-        }
-
-        let nearest_wall = &walls[0];
-
-        // ✅ FIX: Wider trigger range (0.2%-1.5% instead of 0.3%-0.8%) - catch earlier
-        if nearest_wall.distance_pct >= 0.2 && nearest_wall.distance_pct <= 1.5 {
-            let confidence = calculate_cascade_confidence(nearest_wall, current_tick);
-
-            match nearest_wall.direction {
-                CascadeDirection::Downward => {
-                    // Long liquidations ahead → open SHORT
-                    Some(CascadeSignal {
-                        side: Side::Short,
-                        entry_price: current_price,
-                        target_price: nearest_wall.price,
-                        expected_pnl_pct: nearest_wall.distance_pct,
-                        wall_notional: nearest_wall.notional,
-                        confidence,
-                    })
-                }
-                CascadeDirection::Upward => {
-                    // Short liquidations ahead → open LONG
-                    Some(CascadeSignal {
-                        side: Side::Long,
-                        entry_price: current_price,
-                        target_price: nearest_wall.price,
-                        expected_pnl_pct: nearest_wall.distance_pct,
-                        wall_notional: nearest_wall.notional,
-                        confidence,
-                    })
-                }
-            }
-        } else {
-            None
-        }
-    }
-}
-
-/// Cascade confidence based on:
-/// - Wall size (bigger = more reliable)
-/// - Funding rate (extreme funding = more likely)
-/// - OBI (order book imbalance confirms direction)
-/// ✅ FIX: More aggressive confidence calculation for better signal generation
-fn calculate_cascade_confidence(wall: &LiquidationWall, tick: &MarketTick) -> f64 {
-    let mut confidence = 0.0;
-
-    // ✅ FIX: Lower threshold for wall size ($20M instead of $50M) - more sensitive
-    // Wall size factor (0.0-0.4)
-    let wall_factor = (wall.notional / 20_000_000.0).min(1.0) * 0.4; // $20M+ = max
-    confidence += wall_factor;
-
-    // ✅ FIX: Lower funding threshold (0.0003 instead of 0.0005) - catch more opportunities
-    // Funding rate confirmation (0.0-0.3)
-    if let Some(funding) = tick.funding_rate {
-        let funding_factor = match wall.direction {
-            CascadeDirection::Downward => {
-                // Long cascade: positive funding confirms
-                if funding > 0.0003 {
-                    0.3
-                } else if funding > 0.0001 {
-                    0.15 // Partial confirmation
-                } else {
-                    0.0
-                }
-            }
-            CascadeDirection::Upward => {
-                // Short cascade: negative funding confirms
-                if funding < -0.0003 {
-                    0.3
-                } else if funding < -0.0001 {
-                    0.15 // Partial confirmation
-                } else {
-                    0.0
-                }
-            }
-        };
-        confidence += funding_factor;
-    }
-
-    // ✅ FIX: More lenient OBI thresholds - catch more opportunities
-    // OBI confirmation (0.0-0.3)
-    if let Some(obi) = tick.obi {
-        let obi_factor = match wall.direction {
-            CascadeDirection::Downward => {
-                // Downward: ask pressure (OBI < 1.0)
-                if obi < 0.9 {
-                    0.3
-                } else if obi < 0.95 {
-                    0.15 // Partial confirmation
-                } else {
-                    0.0
-                }
-            }
-            CascadeDirection::Upward => {
-                // Upward: bid pressure (OBI > 1.0)
-                if obi > 1.1 {
-                    0.3
-                } else if obi > 1.05 {
-                    0.15 // Partial confirmation
-                } else {
-                    0.0
-                }
-            }
-        };
-        confidence += obi_factor;
-    }
-
-    // ✅ FIX: Add base confidence for any wall > $2M (minimum viable wall)
-    if wall.notional > 2_000_000.0 {
-        confidence += 0.1; // Base confidence boost
-    }
-
-    confidence.min(1.0)
-}
-
-// =======================
-//  Volume Profile (VPVR) - BONUS SECRET
-// =======================
-
-#[derive(Debug, Clone)]
-pub struct VolumeProfile {
-    pub profile: HashMap<i64, f64>, // Key: Price level (rounded), Value: Volume
-}
-
-impl VolumeProfile {
-    /// ✅ CRITICAL FIX: Realistic volume profile from candle data (not uniform distribution)
-    /// Uses candle structure (high, low, open, close) to estimate where volume was traded
-    /// - Bullish candles (close > open): More volume in upper half
-    /// - Bearish candles (close < open): More volume in lower half
-    /// - Close position in range: More volume near close price
-    /// - Wicks: Some volume at extremes (high/low)
-    pub fn calculate_volume_profile(candles: &[Candle]) -> Self {
-        let mut profile: HashMap<i64, f64> = HashMap::new();
-
-        for candle in candles {
-            if candle.high <= candle.low || candle.volume <= 0.0 {
-                continue; // Skip invalid candles
-            }
-
-            // ✅ FIX: Dynamic price interval based on price level
-            let price_interval = if candle.close > 1000.0 {
-                10.0 // Major coins: $10 intervals
-            } else if candle.close > 1.0 {
-                0.01 // Mid-range: $0.01 intervals
-            } else {
-                0.00001 // Low-price coins: $0.00001 intervals
-            };
-
-            let range = candle.high - candle.low;
-            if range <= 0.0 {
-                continue;
-            }
-
-            // Calculate where close is in the range (0.0 = at low, 1.0 = at high)
-            let close_position = (candle.close - candle.low) / range;
-            
-            // Calculate body position (where most volume trades)
-            let body_low = candle.open.min(candle.close);
-            let body_high = candle.open.max(candle.close);
-            let body_low_position = (body_low - candle.low) / range;
-            let body_high_position = (body_high - candle.low) / range;
-
-            // Volume distribution strategy:
-            // 1. Body gets 60% of volume (where most trading happens)
-            // 2. Close area gets 20% (final price discovery)
-            // 3. Wicks get 10% each (extreme price exploration)
-            let body_volume = candle.volume * 0.6;
-            let close_volume = candle.volume * 0.2;
-            let upper_wick_volume = candle.volume * 0.1;
-            let lower_wick_volume = candle.volume * 0.1;
-
-            // Distribute volume across price levels (20 levels for better granularity)
-            let price_levels = 20;
-            let level_size = range / price_levels as f64;
-
-            for i in 0..price_levels {
-                let level_low = candle.low + level_size * i as f64;
-                let level_high = candle.low + level_size * (i + 1) as f64;
-                let level_center = (level_low + level_high) / 2.0;
-                let level_position = (level_center - candle.low) / range;
-
-                let mut volume_at_level = 0.0;
-
-                // 1. Body volume (60%): More volume in body area
-                if level_position >= body_low_position && level_position <= body_high_position {
-                    // Volume is higher in the middle of body
-                    let body_center = (body_low_position + body_high_position) / 2.0;
-                    let distance_from_body_center = (level_position - body_center).abs();
-                    let body_weight = 1.0 - (distance_from_body_center / (body_high_position - body_low_position).max(0.1));
-                    volume_at_level += body_volume * body_weight.max(0.3) / price_levels as f64;
-                }
-
-                // 2. Close volume (20%): More volume near close price
-                let distance_from_close = (level_position - close_position).abs();
-                if distance_from_close < 0.15 { // Within 15% of range from close
-                    let close_weight = 1.0 - (distance_from_close / 0.15);
-                    volume_at_level += close_volume * close_weight;
-                }
-
-                // 3. Upper wick volume (10%): Volume at high (if upper wick exists)
-                if candle.high > body_high && level_position > body_high_position {
-                    let wick_size = (candle.high - body_high) / range;
-                    if wick_size > 0.05 { // Significant upper wick (>5% of range)
-                        let wick_position = (level_position - body_high_position) / wick_size;
-                        if wick_position >= 0.0 && wick_position <= 1.0 {
-                            // More volume at the top of wick (rejection)
-                            let wick_weight = 1.0 - wick_position * 0.5; // Decrease towards body
-                            volume_at_level += upper_wick_volume * wick_weight / (price_levels as f64 * wick_size.max(0.1));
-                        }
-                    }
-                }
-
-                // 4. Lower wick volume (10%): Volume at low (if lower wick exists)
-                if candle.low < body_low && level_position < body_low_position {
-                    let wick_size = (body_low - candle.low) / range;
-                    if wick_size > 0.05 { // Significant lower wick (>5% of range)
-                        let wick_position = (body_low_position - level_position) / wick_size;
-                        if wick_position >= 0.0 && wick_position <= 1.0 {
-                            // More volume at the bottom of wick (rejection)
-                            let wick_weight = 1.0 - wick_position * 0.5; // Decrease towards body
-                            volume_at_level += lower_wick_volume * wick_weight / (price_levels as f64 * wick_size.max(0.1));
-                        }
-                    }
-                }
-
-                // Round price to interval and add to profile
-                let price_rounded = (level_center / price_interval).round() * price_interval;
-                let price_key = (price_rounded / price_interval) as i64;
-
-                *profile.entry(price_key).or_insert(0.0) += volume_at_level;
-            }
-        }
-
-        VolumeProfile { profile }
-    }
-
-    /// POC (Point of Control): En yüksek volume olan fiyat = en güçlü support/resistance
-    pub fn find_poc(&self) -> Option<(i64, f64)> {
-        self.profile
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(price, volume)| (*price, *volume))
-    }
-
-    /// Check if price is near POC (strong support/resistance)
-    /// ✅ FIX: Use dynamic price interval for accurate distance calculation
-    pub fn is_near_poc(&self, price: f64, threshold_pct: f64) -> bool {
-        if let Some((poc_price_key, _)) = self.find_poc() {
-            // Determine price interval from price level
-            let price_interval = if price > 1000.0 {
-                10.0
-            } else if price > 1.0 {
-                0.01
-            } else {
-                0.00001
-            };
-            let poc_price = poc_price_key as f64 * price_interval;
-            let distance_pct = ((price - poc_price) / price).abs() * 100.0;
-            distance_pct <= threshold_pct
-        } else {
-            false
-        }
-    }
-}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1313,9 +59,8 @@ impl FuturesClient {
             .build()
             .unwrap();
 
-        let base_url = Url::parse("https://fapi.binance.com").unwrap(); // USDS-M futures
+        let base_url = Url::parse("https://fapi.binance.com").unwrap();
         
-        // ✅ FIX: Load credentials from config (for authenticated endpoints like forceOrders)
         let file_cfg = crate::types::FileConfig::load("config.yaml").unwrap_or_default();
         let binance_cfg = file_cfg.binance.as_ref();
         
@@ -1574,11 +319,10 @@ impl FuturesClient {
         Ok(points)
     }
 
-    /// ✅ CRITICAL FIX: Fetch historical force orders (liquidation data) for backtest
-    /// This provides REAL liquidation data instead of mathematical estimates
-    /// Binance API: /fapi/v1/forceOrders (REQUIRES authentication)
-    /// 
-    /// ⚠️ IMPORTANT: This endpoint requires API key/secret. If not configured, returns empty vector.
+    /// Fetch historical force orders (liquidation data) for backtest.
+    /// Provides real liquidation data instead of mathematical estimates.
+    /// Binance API: /fapi/v1/forceOrders (REQUIRES authentication).
+    /// Returns empty vector if API key/secret not configured.
     pub async fn fetch_historical_force_orders(
         &self,
         symbol: &str,
@@ -1588,7 +332,6 @@ impl FuturesClient {
     ) -> Result<Vec<crate::types::ForceOrderRecord>> {
         use crate::types::ForceOrderRecord;
         
-        // ✅ FIX: Check if authentication is available
         if self.api_key.is_none() || self.api_secret.is_none() {
             log::warn!(
                 "FUTURES_CLIENT: ⚠️ API key/secret not configured. Cannot fetch force orders for {}. \
@@ -1626,8 +369,6 @@ impl FuturesClient {
         let status = res.status();
         if !status.is_success() {
             let error_text = res.text().await.unwrap_or_default();
-            // ✅ Plan.md: Sessizce boş dön (veri yoksa strateji çalışmaz)
-            // But log the error for debugging
             log::debug!(
                 "FUTURES_CLIENT: Force orders API error for {}: {} (status: {})",
                 symbol,
@@ -1648,6 +389,15 @@ impl FuturesClient {
 
 fn ts_ms_to_utc(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).expect("invalid timestamp millis")
+}
+
+fn calculate_std_dev(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+    variance.sqrt()
 }
 
 fn nearest_value_by_time<'a, T, F>(
@@ -2154,39 +904,8 @@ fn create_orderflow_from_real_depth(
     Some(orderflow)
 }
 
-// ❌ SİLİNDİ (Plan.md ADIM 1): estimate_realistic_depth fonksiyonu kaldırıldı
-// Bu fonksiyon sahte emir defteri verisi üretiyordu ve backtest sonuçlarını manipüle ediyordu.
-// Artık sadece gerçek Binance API verileri kullanılacak.
 
-/// ✅ Plan.md: Build LiquidationMap from historical force orders (Sadece Gerçek ForceOrders ile çalışır)
-/// This provides REAL liquidation data for backtest instead of mathematical estimates
-pub fn build_liquidation_map_from_force_orders(
-    force_orders: &[crate::types::ForceOrderRecord],
-    current_price: f64,
-    _open_interest: f64, // Not used in Plan.md version, kept for compatibility
-) -> LiquidationMap {
-    let mut map = LiquidationMap::new();
-    let interval = if current_price > 1000.0 { 10.0 } else { 0.01 };
-
-    for order in force_orders {
-        // ✅ Plan.md: Basit parsing - sadece orig_qty ve price kullan
-        let qty = order.orig_qty.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        let price = order.price.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
-        if qty <= 0.0 || price <= 0.0 { continue; }
-
-        let notional = qty * price;
-        let key = (price / interval).round() as i64;
-
-        match order.side.as_str() {
-            "SELL" => *map.long_liquidations.entry(key).or_insert(0.0) += notional,
-            "BUY" => *map.short_liquidations.entry(key).or_insert(0.0) += notional,
-            _ => {}
-        }
-    }
-    
-    map.last_update = Utc::now();
-    map
-}
+use crate::trending::strategies::build_liquidation_map_from_force_orders;
 
 // =======================
 //  Sinyal Motoru
@@ -2234,62 +953,41 @@ pub fn generate_signal_enhanced(
     // 🎯 KRİTİK STRATEJİLER: En güvenilir ve karlı stratejiler önce kontrol edilmeli
     // Bu stratejiler base signal'den bağımsız çalışır ve yüksek doğruluk oranına sahiptir
     
-    // ✅ BACKTEST MODE: Log which strategies are active/inactive
     if is_backtest {
         log::debug!(
             "BACKTEST: Strategy availability - funding_arbitrage: {}, mtf: {}, orderflow: {} (DISABLED), \
              liquidation_map: {} (DISABLED in backtest), volume_profile: {}, market_tick: {}",
-            if funding_arbitrage.is_some() { "✅" } else { "❌" },
-            if mtf.is_some() { "✅" } else { "❌" },
-            "❌",
-            if liquidation_map.is_some() { "⚠️" } else { "❌" },
-            if volume_profile.is_some() { "✅" } else { "❌" },
-            "❌"
+            if funding_arbitrage.is_some() { "OK" } else { "NO" },
+            if mtf.is_some() { "OK" } else { "NO" },
+            "NO",
+            if liquidation_map.is_some() { "WARN" } else { "NO" },
+            if volume_profile.is_some() { "OK" } else { "NO" },
+            "NO"
         );
     } else {
-        // ✅ CRITICAL FIX: Log component availability for debugging (production mode)
         log::trace!(
             "TRENDING: generate_signal_enhanced components - funding_arbitrage: {}, mtf: {}, orderflow: {}, \
              liquidation_map: {}, volume_profile: {}, market_tick: {}",
-            if funding_arbitrage.is_some() { "✅" } else { "❌" },
-            if mtf.is_some() { "✅" } else { "❌" },
-            if orderflow.is_some() { "✅" } else { "❌" },
-            if liquidation_map.is_some() { "✅" } else { "❌" },
-            if volume_profile.is_some() { "✅" } else { "❌" },
-            if market_tick.is_some() { "✅" } else { "❌" }
+            if funding_arbitrage.is_some() { "OK" } else { "NO" },
+            if mtf.is_some() { "OK" } else { "NO" },
+            if orderflow.is_some() { "OK" } else { "NO" },
+            if liquidation_map.is_some() { "OK" } else { "NO" },
+            if volume_profile.is_some() { "OK" } else { "NO" },
+            if market_tick.is_some() { "OK" } else { "NO" }
         );
     }
     
-    // === PRIORITY #1: LIQUIDATION CASCADE (En Güvenilir - %90 Doğruluk) ===
-    // ⚠️ BACKTEST MODE: Liquidation Cascade is DISABLED in backtest
-    // Reason: Requires real-time forceOrder stream data (liq_long_cluster/liq_short_cluster)
-    // Historical force orders are not sufficient for reliable cascade detection
-    // ✅ ACTION PLAN: Only use Liquidation Cascade in production with real-time WebSocket data
     if !is_backtest {
-        // ⚠️ CRITICAL RISK: Liquidation Map historical force orders kullanıyor (geçmiş veri)
-        // Gelecekteki liquidasyonları tahmin etmek zor - daha konservatif yaklaşım gerekli
-        // ✅ CRITICAL FIX: Use higher confidence threshold to avoid false signals
-        // ✅ ACTION PLAN FIX (Plan.md): ONLY use LiquidationMap when REAL forceOrder data is available
-        // DO NOT use mathematical estimates (estimate_future_liquidations) - it's unreliable
-        // Real data: market_tick.liq_long_cluster and liq_short_cluster from WebSocket forceOrder stream
         if let (Some(liq_map), Some(tick)) = (liquidation_map, market_tick) {
-        // ✅ CRITICAL: Check if we have REAL liquidation data (not mathematical estimates)
-        // Plan.md: "LiquidationMap stratejisini canlı veri (forceOrder stream) olmadan sinyal üretimine dahil etmeyin"
-        // Real data indicators: liq_long_cluster and liq_short_cluster from WebSocket
         let has_real_liquidation_data = tick.liq_long_cluster.is_some() || tick.liq_short_cluster.is_some();
         
         if !has_real_liquidation_data {
-            // ⚠️ ACTION PLAN FIX: No real liquidation data - skip LiquidationMap strategy
-            // estimate_future_liquidations is unreliable - don't trade on mathematical assumptions
             log::debug!(
-                "TRENDING: ⚠️ LiquidationMap strategy SKIPPED - no real forceOrder data (liq_long_cluster/liq_short_cluster). \
+                "TRENDING: LiquidationMap strategy SKIPPED - no real forceOrder data (liq_long_cluster/liq_short_cluster). \
                 Only trade when real liquidation data is available from WebSocket stream."
             );
         } else {
             if let Some(cascade_sig) = liq_map.generate_cascade_signal(candle.close, tick) {
-            // ✅ CRITICAL FIX: Higher confidence threshold (0.5 instead of 0.35) for safety
-            // Historical liquidation data is not perfect - need higher confidence
-            // Real-time liquidation data (from WebSocket) is more reliable
             if cascade_sig.confidence > 0.5 {
                 log::debug!(
                     "TRENDING: Liquidation cascade signal detected - side: {:?}, confidence: {:.2}",
@@ -2530,7 +1228,7 @@ pub fn generate_signal_enhanced(
     }
     
     // Önce base signal'i üret (kritik stratejiler yoksa)
-    let mut base_signal = generate_signal(candle, ctx, prev_ctx, cfg);
+    let base_signal = generate_signal(candle, ctx, prev_ctx, cfg);
 
     // Eğer signal quality filtering aktif değilse, direkt döndür
     if !cfg.enable_signal_quality_filter {
@@ -2690,7 +1388,7 @@ pub fn generate_signal_enhanced(
     // This section only handles funding exhaustion (risk management)
     if let Some(fa) = funding_arbitrage {
         // Funding exhaustion check (risk management)
-        if let Some(exhaustion) = fa.detect_funding_exhaustion() {
+        if let Some(_exhaustion) = fa.detect_funding_exhaustion() {
             // Will be checked against base signal later (after base signal is generated)
         }
     }
@@ -3280,22 +1978,18 @@ fn generate_signal(
     let trend = classify_trend(ctx);
 
     // OI değişim yönü (son veri varsa)
-    let oi_change_up = prev_ctx
+    let _oi_change_up = prev_ctx
         .map(|p| ctx.open_interest > p.open_interest)
         .unwrap_or(false);
 
-    // Crowding
-    let crowded_long = ctx.long_short_ratio >= cfg.lsr_crowded_long;
+    let _crowded_long = ctx.long_short_ratio >= cfg.lsr_crowded_long;
     let _crowded_short = ctx.long_short_ratio <= cfg.lsr_crowded_short;
 
-    // 🔥 CRITICAL FIX: Price Action Confirmation
-    // Trend yukarı ama price düşüyorsa = reversal riski, LONG signal üretme
-    // Trend aşağı ama price yükseliyorsa = reversal riski, SHORT signal üretme
-    let price_action_bullish = prev_ctx
-        .map(|p| candle.close > p.ema_fast) // Price EMA fast'ın üstünde
+    let _price_action_bullish = prev_ctx
+        .map(|p| candle.close > p.ema_fast)
         .unwrap_or(false);
-    let price_action_bearish = prev_ctx
-        .map(|p| candle.close < p.ema_fast) // Price EMA fast'ın altında
+    let _price_action_bearish = prev_ctx
+        .map(|p| candle.close < p.ema_fast)
         .unwrap_or(false);
 
     let long_score = calculate_long_score(trend, ctx, prev_ctx, cfg);
@@ -3314,7 +2008,7 @@ fn generate_signal(
     let is_weak_trend = trend_strength.abs() > 0.0005 && trend_strength.abs() <= 0.001; // %0.05-0.1 = weak trend
 
     // Base threshold seçimi (HFT mode vs normal)
-    let base_threshold = if cfg.hft_mode {
+    let _base_threshold = if cfg.hft_mode {
         cfg.trend_threshold_hft
     } else {
         cfg.trend_threshold_normal
@@ -3591,7 +2285,7 @@ pub fn run_backtest_on_series(
         // MarketTick'i None veya boş geçiyoruz. Bu sayede OrderFlow ve Slippage
         // analizleri sahte verilerle çalışmayacak.
         // ❌ SİLİNDİ: estimate_realistic_depth ve sahte MarketTick üretimi kaldırıldı
-        let market_tick: Option<MarketTick> = None;
+        let _market_tick: Option<MarketTick> = None;
 
         // ✅ CRITICAL FIX: Create MTF and OrderFlow analysis in backtest (same as production)
         // Multi-Timeframe Analysis - create from candles up to current index
@@ -3605,7 +2299,7 @@ pub fn run_backtest_on_series(
         // ✅ PLAN.MD ADIM 1: OrderFlow Analyzer - Backtest'te sahte veri kullanılmıyor
         // Backtest sırasında gerçek anlık derinlik (depth) verimiz olmadığı için
         // OrderFlow analizleri devre dışı bırakıldı. Bu sayede sahte verilerle çalışmayacak.
-        let orderflow_analyzer: Option<OrderFlowAnalyzer> = None; // ❌ SİLİNDİ: estimate_realistic_depth kaldırıldı
+        let _orderflow_analyzer: Option<OrderFlowAnalyzer> = None;
 
         // Liquidation Map'i sinyal üreticisine sadece gerçek veri varsa gönder
         let liquidation_map_ref = if has_real_liquidation_data {
@@ -4452,31 +3146,6 @@ async fn try_emit_signal(
 /// ✅ CRITICAL FIX: Atomic cooldown check-and-set helper function (for mutable reference)
 /// Prevents race conditions by atomically checking and setting cooldown
 /// Returns true if cooldown passed and was set, false if cooldown is still active
-fn try_emit_signal_mut(
-    signal_state: &mut LastSignalState,
-    side: Side,
-    cooldown_duration: chrono::Duration,
-) -> bool {
-    let now = Utc::now();
-    
-    let last_time = match side {
-        Side::Long => signal_state.last_long_time,
-        Side::Short => signal_state.last_short_time,
-    };
-    
-    if let Some(last) = last_time {
-        if now - last < cooldown_duration {
-            return false;
-        }
-    }
-    
-    // Atomik olarak set et
-    match side {
-        Side::Long => signal_state.last_long_time = Some(now),
-        Side::Short => signal_state.last_short_time = Some(now),
-    }
-    true
-}
 
 struct MarketTickState {
     latest_tick: Arc<RwLock<Option<MarketTick>>>,
@@ -4645,7 +3314,7 @@ pub async fn run_combined_kline_stream(
     symbols: Vec<String>,
     kline_interval: &str,
     futures_period: &str,
-    ws_base_url: String,
+    _ws_base_url: String,
     // Symbol -> (candle_buffer, signal_state, signal_tx, latest_market_tick, client, cfg, params, metrics_cache)
     symbol_handlers: Arc<RwLock<HashMap<String, SymbolHandler>>>,
 ) {
@@ -5303,140 +3972,6 @@ async fn generate_signal_from_candle(
                         Side::Short => state.last_short_time = Some(retry_time),
                     }
                     warn!("TRENDING: failed to send signal: {}, 5s retry window set", err);
-                    warn!("TRENDING: failed to send signal: {err}, cooldown reset");
-                    Ok(None)
-                }
-            }
-        }
-        SignalSide::Flat => Ok(None),
-    }
-}
-
-/// En son kline verilerini çekip sinyal üretir
-async fn generate_latest_signal(
-    client: &FuturesClient,
-    symbol: &str,
-    kline_interval: &str,
-    futures_period: &str,
-    kline_limit: u32,
-    cfg: &AlgoConfig,
-    params: &TrendParams,
-    signal_state: &mut LastSignalState,
-    last_candle_time: &mut Option<chrono::DateTime<Utc>>,
-    signal_tx: &tokio::sync::mpsc::Sender<TradeSignal>,
-) -> Result<Option<TradeSignal>> {
-    // Kline verilerini çek
-    let candles = match client
-        .fetch_klines(symbol, kline_interval, kline_limit)
-        .await
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!("TRENDING: failed to fetch klines: {err:?}");
-            return Ok(None);
-        }
-    };
-
-    if candles.is_empty() {
-        return Ok(None);
-    }
-
-    // Son candle'ın zamanını kontrol et (duplicate API call koruması)
-    // Interval 5 dakika olsa bile, clock drift veya API timing farklılıkları
-    // nedeniyle aynı candle tekrar gelebilir
-    let latest_candle = &candles[candles.len() - 1];
-    if let Some(last_time) = last_candle_time {
-        // Eğer aynı candle ise (close_time değişmemiş), yeni sinyal üretme
-        // Bu sayede gereksiz API çağrıları ve sinyal üretimi önlenir
-        if latest_candle.close_time <= *last_time {
-            return Ok(None);
-        }
-    }
-    *last_candle_time = Some(latest_candle.close_time);
-
-    let (funding, oi_hist, lsr_hist) =
-        fetch_market_metrics(client, symbol, futures_period, kline_limit, None).await?;
-
-    // Signal context'leri oluştur (sadece gerçek API verisi olan candle'lar)
-    let (matched_candles, contexts) =
-        build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
-
-    if contexts.len() < params.warmup_min_ticks {
-        // Henüz yeterli veri yok
-        return Ok(None);
-    }
-
-    // En son eşleşen candle ve context'i kullan
-    let latest_matched_candle = &matched_candles[matched_candles.len() - 1];
-    let latest_ctx = &contexts[contexts.len() - 1];
-    let prev_ctx = if contexts.len() > 1 {
-        Some(&contexts[contexts.len() - 2])
-    } else {
-        None
-    };
-
-    let signal = generate_signal(latest_matched_candle, latest_ctx, prev_ctx, cfg);
-
-    // Eğer sinyal Flat değilse, TradeSignal'e dönüştür
-    match signal.side {
-        SignalSide::Long | SignalSide::Short => {
-            let side = match signal.side {
-                SignalSide::Long => Side::Long,
-                SignalSide::Short => Side::Short,
-                SignalSide::Flat => unreachable!(),
-            };
-
-            // ✅ CRITICAL FIX: Atomic cooldown check-and-set to prevent race conditions
-            // Note: generate_latest_signal uses &mut signal_state (not Arc<RwLock>)
-            let cooldown_duration = chrono::Duration::seconds(params.signal_cooldown_secs);
-            
-            // Use helper function for atomic operation
-            if !try_emit_signal_mut(signal_state, side, cooldown_duration) {
-                // Cooldown still active, return early
-                return Ok(None);
-            }
-
-            // ⚠️ Production Execution Note:
-            // Signal price is the candle close price, but actual execution happens later:
-            // 1. Signal → event bus (mpsc channel, ~1-10ms delay)
-            // 2. Ordering module: risk checks, symbol info fetch (~50-200ms)
-            // 3. API call and order fill (~100-500ms)
-            // 4. Real slippage at market price (varies with volatility)
-            // Total delay: typically 200-1000ms, can be more during high volatility
-            // This is why backtest results may be optimistic compared to production
-            let trade_signal = TradeSignal {
-                id: Uuid::new_v4(),
-                symbol: symbol.to_string(),
-                side,
-                entry_price: signal.price, // Candle close price (actual fill may differ due to slippage)
-                leverage: params.leverage,
-                size_usdt: params.position_size_quote,
-                ts: signal.time,
-                atr_value: Some(latest_ctx.atr),
-            };
-
-            // Signal'i gönder (cooldown already set, so no race condition)
-            match signal_tx.send(trade_signal.clone()).await {
-                Ok(_) => {
-                    info!(
-                        "TRENDING: generated {} signal for {} at price {:.2}",
-                        match side {
-                            Side::Long => "LONG",
-                            Side::Short => "SHORT",
-                        },
-                        symbol,
-                        signal.price
-                    );
-
-                    Ok(Some(trade_signal))
-                }
-                Err(err) => {
-                    // Signal gönderilemedi, cooldown'u geri al (reset)
-                    // This is rare but can happen if channel is closed
-                    match side {
-                        Side::Long => signal_state.last_long_time = None,
-                        Side::Short => signal_state.last_short_time = None,
-                    }
                     warn!("TRENDING: failed to send signal: {err}, cooldown reset");
                     Ok(None)
                 }

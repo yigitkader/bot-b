@@ -25,10 +25,10 @@ struct ActivePosition {
 }
 
 struct PartialExit {
-    exit_time: DateTime<Utc>,
-    exit_price: f64,
-    size: f64,
-    profit_pct: f64,
+    _exit_time: DateTime<Utc>,
+    _exit_price: f64,
+    _size: f64,
+    _profit_pct: f64,
 }
 
 #[derive(Debug)]
@@ -144,10 +144,10 @@ impl AdvancedPositionManager {
         if profit_pct >= 1.5 && pos.partial_exits.is_empty() {
             log::info!("💰 PARTIAL EXIT #1: 50% @ +1.5% profit");
             pos.partial_exits.push(PartialExit {
-                exit_time: Utc::now(),
-                exit_price: current_price,
-                size: pos.size * 0.5,
-                profit_pct: 1.5,
+                _exit_time: Utc::now(),
+                _exit_price: current_price,
+                _size: pos.size * 0.5,
+                _profit_pct: 1.5,
             });
             pos.size *= 0.5; // Reduce remaining position
             
@@ -161,10 +161,10 @@ impl AdvancedPositionManager {
         if profit_pct >= 2.0 && pos.partial_exits.len() == 1 {
             log::info!("💰 PARTIAL EXIT #2: 25% @ +2.0% profit");
             pos.partial_exits.push(PartialExit {
-                exit_time: Utc::now(),
-                exit_price: current_price,
-                size: pos.size * 0.5,
-                profit_pct: 2.0,
+                _exit_time: Utc::now(),
+                _exit_price: current_price,
+                _size: pos.size * 0.5,
+                _profit_pct: 2.0,
             });
             pos.size *= 0.5;
             

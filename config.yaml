@@ -175,5 +175,5 @@ dynamic_symbol_selection:
 # Test bot with real market data but virtual money before going live
 # Run for 1 week and analyze logs/paper_trading_orders.log for slippage and latency effects
 paper_trading:
-  enabled: true  # ✅ ACTION PLAN: Enabled for paper trading mode (virtual orders, real data). Test for 1 week before going live.
+  enabled: true  # ✅ ACTION PLAN: Enabled for paper trading mode (virtual orders, real data).
   log_file: "logs/paper_trading_orders.log"  # Log file for virtual orders (analyze slippage/latency)

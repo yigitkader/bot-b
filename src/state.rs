@@ -1,10 +1,18 @@
 use crate::types::{
-    BalanceSnapshot, BalanceStore, EquityState, OrderState, OrderUpdate, PositionMeta,
-    PositionState, PositionUpdate, SharedState,
+    events::{BalanceSnapshot, OrderUpdate, PositionUpdate},
+    state::{BalanceStore, EquityState, OrderState, PositionMeta, PositionState, SharedState},
 };
 use chrono::Datelike;
 use log::warn;
 use std::sync::{Arc, Mutex};
+
+macro_rules! with_lock {
+    ($lock:expr, |$state:ident| $body:block) => {
+        if let Ok(mut $state) = $lock.lock() {
+            $body
+        }
+    };
+}
 
 impl SharedState {
     pub fn new() -> Self {
@@ -34,15 +42,15 @@ impl SharedState {
     // --- POSITION STATE ---
 
     pub fn set_pending_position_meta(&self, symbol: &str, meta: PositionMeta) {
-        if let Ok(mut state) = self.position_state.lock() {
+        with_lock!(self.position_state, |state| {
             state.pending_meta.insert(symbol.to_string(), meta);
-        }
+        });
     }
 
     pub fn clear_pending_position_meta(&self, symbol: &str) {
-        if let Ok(mut state) = self.position_state.lock() {
+        with_lock!(self.position_state, |state| {
             state.pending_meta.remove(symbol);
-        }
+        });
     }
 
     pub fn current_position_meta(&self, symbol: &str) -> Option<PositionMeta> {
@@ -78,27 +86,26 @@ impl SharedState {
     // --- ORDER STATE ---
 
     pub fn set_open_order(&self, symbol: &str, open: bool) {
-        if let Ok(mut state) = self.order_state.lock() {
+        with_lock!(self.order_state, |state| {
             if open {
                 state.open_orders.insert(symbol.to_string());
             } else {
                 state.open_orders.remove(symbol);
-                // Order kapandıysa sent_at bilgisini de temizle
                 state.order_sent_at.remove(symbol);
             }
-        }
+        });
     }
 
     pub fn mark_order_sent(&self, symbol: &str) {
-        if let Ok(mut state) = self.order_state.lock() {
+        with_lock!(self.order_state, |state| {
             state.order_sent_at.insert(symbol.to_string(), chrono::Utc::now());
-        }
+        });
     }
 
     pub fn clear_order_sent(&self, symbol: &str) {
-        if let Ok(mut state) = self.order_state.lock() {
+        with_lock!(self.order_state, |state| {
             state.order_sent_at.remove(symbol);
-        }
+        });
     }
 
     pub fn check_order_timeout(&self, timeout_secs: u64) -> Vec<String> {
@@ -123,10 +130,9 @@ impl SharedState {
     }
 
     pub fn apply_balance_snapshot(&self, snap: &BalanceSnapshot) {
-        if let Ok(mut balance) = self.balance.lock() {
+        with_lock!(self.balance, |balance| {
             match snap.asset.as_str() {
                 "USDT" => {
-                    // Check for stale updates
                     if let Some(last_ts) = balance.last_usdt_update {
                         if snap.ts < last_ts {
                             warn!(
@@ -140,7 +146,6 @@ impl SharedState {
                     balance.last_usdt_update = Some(snap.ts);
                 }
                 "USDC" => {
-                    // Check for stale updates
                     if let Some(last_ts) = balance.last_usdc_update {
                         if snap.ts < last_ts {
                             warn!(
@@ -155,29 +160,24 @@ impl SharedState {
                 }
                 _ => {}
             }
-        }
+        });
     }
 
     pub fn apply_position_update(&self, update: &PositionUpdate) {
-        if let Ok(mut state) = self.position_state.lock() {
+        with_lock!(self.position_state, |state| {
             let symbol = &update.symbol;
 
-            // Check for stale updates
             if let Some(last) = state.active_positions.get(symbol) {
                 if update.ts < last.ts {
-                    // Eski veri, yoksay
                     return;
                 }
             }
 
             if update.is_closed {
-                // Pozisyon kapandı: State'den temizle
                 state.active_positions.remove(symbol);
                 state.active_meta.remove(symbol);
                 state.pending_meta.remove(symbol);
             } else {
-                // Yeni veya güncel pozisyon
-                // Eğer pending meta varsa, active'e taşı
                 if !state.active_positions.contains_key(symbol) {
                     if let Some(meta) = state.pending_meta.remove(symbol) {
                         state.active_meta.insert(symbol.clone(), meta);
@@ -185,14 +185,13 @@ impl SharedState {
                 }
                 state.active_positions.insert(symbol.clone(), update.clone());
             }
-        }
+        });
     }
 
     pub fn apply_order_update(&self, update: &OrderUpdate) {
-        if let Ok(mut state) = self.order_state.lock() {
+        with_lock!(self.order_state, |state| {
             let symbol = &update.symbol;
             
-            // Stale check
             if let Some(last) = state.last_orders.get(symbol) {
                 if update.ts < last.ts { return; }
             }
@@ -211,7 +210,7 @@ impl SharedState {
                 state.order_sent_at.remove(symbol);
             }
             state.last_orders.insert(symbol.clone(), update.clone());
-        }
+        });
     }
 
     /// Get quote balance (USDT + USDC) in USD
@@ -235,7 +234,7 @@ impl SharedState {
         let balance = self.get_quote_balance();
         let equity = balance + unrealized_pnl;
 
-        if let Ok(mut eq_state) = self.equity_state.lock() {
+        with_lock!(self.equity_state, |eq_state| {
             let now = Utc::now();
             if now >= eq_state.daily_reset_time + chrono::Duration::days(1) {
                 eq_state.daily_peak = equity;
@@ -251,7 +250,7 @@ impl SharedState {
             if equity > eq_state.peak_equity { eq_state.peak_equity = equity; }
             if equity > eq_state.daily_peak { eq_state.daily_peak = equity; }
             if equity > eq_state.weekly_peak { eq_state.weekly_peak = equity; }
-        }
+        });
     }
 
     /// Get current equity
@@ -264,26 +263,29 @@ impl SharedState {
 
     // Diğer getter metodları (get_equity, get_drawdown_pct vs) aynı kalabilir.
     pub fn get_drawdown_pct(&self) -> f64 {
-        if let Ok(eq_state) = self.equity_state.lock() {
-            if eq_state.peak_equity > 0.0 {
-                (eq_state.peak_equity - eq_state.current_equity) / eq_state.peak_equity
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
+        self.equity_state
+            .lock()
+            .map(|eq_state| {
+                if eq_state.peak_equity > 0.0 {
+                    (eq_state.peak_equity - eq_state.current_equity) / eq_state.peak_equity
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0)
     }
     
     pub fn get_daily_drawdown_pct(&self) -> f64 {
-        if let Ok(eq) = self.equity_state.lock() {
-            if eq.daily_peak > 0.0 { (eq.daily_peak - eq.current_equity) / eq.daily_peak } else { 0.0 }
-        } else { 0.0 }
+        self.equity_state
+            .lock()
+            .map(|eq| if eq.daily_peak > 0.0 { (eq.daily_peak - eq.current_equity) / eq.daily_peak } else { 0.0 })
+            .unwrap_or(0.0)
     }
     
     pub fn get_weekly_drawdown_pct(&self) -> f64 {
-        if let Ok(eq) = self.equity_state.lock() {
-            if eq.weekly_peak > 0.0 { (eq.weekly_peak - eq.current_equity) / eq.weekly_peak } else { 0.0 }
-        } else { 0.0 }
+        self.equity_state
+            .lock()
+            .map(|eq| if eq.weekly_peak > 0.0 { (eq.weekly_peak - eq.current_equity) / eq.weekly_peak } else { 0.0 })
+            .unwrap_or(0.0)
     }
 }

@@ -30,7 +30,7 @@ struct SymbolAnalyzers {
 /// Portfolio Backtest için pozisyon bilgisi
 #[derive(Debug, Clone)]
 struct PortfolioPosition {
-    symbol: String,
+    _symbol: String,
     side: PositionSide,
     entry_price: f64,
     entry_time: DateTime<Utc>,
@@ -99,7 +99,7 @@ pub fn run_portfolio_backtest(
     let mut all_trades: Vec<Trade> = Vec::new();
     let mut symbol_trades: HashMap<String, Vec<Trade>> = HashMap::new();
     let mut risk_limit_rejections = 0;
-    let mut correlation_warnings = 0;
+    let correlation_warnings = 0;
     let mut total_notional_peak = 0.0;
 
     // 3. Her symbol için analiz objelerini oluştur (FundingArbitrage, LiquidationMap, VolumeProfile)
@@ -341,7 +341,7 @@ pub fn run_portfolio_backtest(
 
                     // Pozisyon aç
                     let position = PortfolioPosition {
-                        symbol: symbol.clone(),
+                        _symbol: symbol.clone(),
                         side,
                         entry_price: candle.close,
                         entry_time: candle.close_time,

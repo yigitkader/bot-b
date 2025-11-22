@@ -225,8 +225,16 @@ async fn handle_signal(
                     "ORDERING: symbol {} not in cache, fetching from API (cache miss)",
                     signal.symbol
                 );
-                match connection.fetch_symbol_info(&signal.symbol).await {
-                    Ok(info) => info,
+                use crate::connection::rest;
+                match rest::fetch_symbol_info(&connection, &signal.symbol).await {
+                    Ok(info) => crate::types::SymbolPrecision {
+                        step_size: info.step_size,
+                        min_quantity: info.min_quantity,
+                        max_quantity: info.max_quantity,
+                        tick_size: info.tick_size,
+                        min_price: info.min_price,
+                        max_price: info.max_price,
+                    },
                     Err(err) => {
                         warn!(
                             "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
@@ -240,8 +248,16 @@ async fn handle_signal(
         }
     } else {
         // Fallback: fetch from API if cache not available
-        match connection.fetch_symbol_info(&signal.symbol).await {
-            Ok(info) => info,
+        use crate::connection::rest;
+        match rest::fetch_symbol_info(&connection, &signal.symbol).await {
+            Ok(info) => crate::types::SymbolPrecision {
+                step_size: info.step_size,
+                min_quantity: info.min_quantity,
+                max_quantity: info.max_quantity,
+                tick_size: info.tick_size,
+                min_price: info.min_price,
+                max_price: info.max_price,
+            },
             Err(err) => {
                 warn!(
                     "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
@@ -354,7 +370,8 @@ async fn handle_signal(
     }
 
     // Round quantity to step size
-    let mut qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+    use crate::connection::rest;
+    let mut qty = rest::round_to_step_size(qty, symbol_info.step_size);
 
     // Final check: verify rounded quantity with actual order price doesn't exceed notional limits
     let final_notional = qty * order_price;
@@ -365,7 +382,7 @@ async fn handle_signal(
         );
         // Reduce quantity to stay within notional limit
         let max_qty = config.max_position_notional_usd / order_price;
-        qty = Connection::round_to_step_size(max_qty, symbol_info.step_size);
+        qty = rest::round_to_step_size(max_qty, symbol_info.step_size);
 
         if qty < symbol_info.min_quantity {
             warn!(
@@ -439,7 +456,8 @@ async fn handle_signal(
                 .await
         } else {
             // Fallback: use regular order execution
-            connection.send_order(order.clone()).await
+            use crate::connection::rest;
+            rest::send_order(&connection, order.clone()).await
         };
 
         if let Err(err) = order_result {
@@ -494,7 +512,7 @@ async fn handle_close_request(
     };
 
     // API'den pozisyonu çek (Double Check)
-    let fresh_position = match connection.fetch_position(&symbol).await {
+    let fresh_position = match rest::fetch_position(&connection, &symbol).await {
         Ok(Some(pos)) => pos,
         Ok(None) => {
             warn!(
@@ -522,41 +540,32 @@ async fn handle_close_request(
     }
 
     // ✅ CRITICAL: Use cached symbol info for fast execution (TrendPlan.md)
-    let symbol_info = if let Some(cache) = &symbol_cache {
-        match cache.get(&fresh_position.symbol).await {
-            Some(cached) => crate::types::SymbolPrecision {
-                step_size: cached.step_size,
-                min_quantity: cached.min_quantity,
-                max_quantity: cached.max_quantity,
-                tick_size: cached.tick_size,
-                max_price: f64::MAX, // Not used in fast execution
-                min_price: 0.0, // Not used in fast execution
-            },
-            None => {
-                // Fallback to API if not in cache
-                match connection.fetch_symbol_info(&fresh_position.symbol).await {
-                    Ok(info) => info,
-                    Err(err) => {
-                        warn!(
-                            "ORDERING: failed to fetch symbol info for {}: {err:?}, cannot close position {}",
-                            fresh_position.symbol, request.position_id
-                        );
-                        return;
+    use crate::connection::rest;
+    let symbol_info = match rest::fetch_symbol_info(&connection, &fresh_position.symbol).await {
+        Ok(info) => {
+            if let Some(cache) = &symbol_cache {
+                if let Some(cached) = cache.get(&fresh_position.symbol).await {
+                    crate::types::SymbolPrecision {
+                        step_size: cached.step_size,
+                        min_quantity: cached.min_quantity,
+                        max_quantity: cached.max_quantity,
+                        tick_size: cached.tick_size,
+                        max_price: f64::MAX,
+                        min_price: 0.0,
                     }
+                } else {
+                    info
                 }
+            } else {
+                info
             }
         }
-    } else {
-        // No cache available, use API
-        match connection.fetch_symbol_info(&fresh_position.symbol).await {
-            Ok(info) => info,
-            Err(err) => {
-                warn!(
-                    "ORDERING: failed to fetch symbol info for {}: {err:?}, cannot close position {}",
-                    fresh_position.symbol, request.position_id
-                );
-                return;
-            }
+        Err(err) => {
+            warn!(
+                "ORDERING: failed to fetch symbol info for {}: {err:?}, cannot close position {}",
+                fresh_position.symbol, request.position_id
+            );
+            return;
         }
     };
 
@@ -571,7 +580,7 @@ async fn handle_close_request(
             let close_qty = qty * partial_pct;
             
             // Round close quantity to step size
-            let rounded_close_qty = Connection::round_to_step_size(close_qty, symbol_info.step_size);
+            let rounded_close_qty = rest::round_to_step_size(close_qty, symbol_info.step_size);
             
             // Calculate remaining position after partial close
             let remaining_qty = original_qty - rounded_close_qty;
@@ -583,7 +592,7 @@ async fn handle_close_request(
                     remaining_qty, symbol_info.min_quantity
                 );
                 // Full close: use original quantity and round it
-                qty = Connection::round_to_step_size(original_qty, symbol_info.step_size);
+                qty = rest::round_to_step_size(original_qty, symbol_info.step_size);
             } else {
                 // Use rounded close quantity
                 qty = rounded_close_qty;
@@ -598,14 +607,15 @@ async fn handle_close_request(
         } else if partial_pct >= 1.0 {
             // >= 100% means full close
             info!("ORDERING: Partial close percentage >= 100%, treating as full close");
-            qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+            qty = rest::round_to_step_size(qty, symbol_info.step_size);
         } else {
             warn!("ORDERING: Invalid partial close percentage: {}, treating as full close", partial_pct);
-            qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+            qty = rest::round_to_step_size(qty, symbol_info.step_size);
         }
     } else {
         // Full close: round quantity to step size
-        qty = Connection::round_to_step_size(qty, symbol_info.step_size);
+        use crate::connection::rest;
+        qty = rest::round_to_step_size(qty, symbol_info.step_size);
     }
 
     // Validate rounded quantity
@@ -663,10 +673,12 @@ async fn handle_close_request(
 
         let order_result = if symbol_cache.is_some() && depth_cache.is_some() && best_bid > 0.0 && best_ask > 0.0 {
             // Fast path: use cached data
-            connection.send_order_fast(&order, &symbol_info, best_bid, best_ask).await
+            use crate::connection::rest;
+            rest::send_order_fast(&connection, &order, &symbol_info, best_bid, best_ask).await
         } else {
             // Fallback: use regular order execution
-            connection.send_order(order.clone()).await
+            use crate::connection::rest;
+            rest::send_order(&connection, order.clone()).await
         };
 
         if let Err(err) = order_result {
@@ -693,10 +705,7 @@ async fn log_paper_trading_order(
     order_id: impl std::fmt::Display,
 ) -> Result<(), std::io::Error> {
     let timestamp = Utc::now().to_rfc3339();
-    let side_str = match order.side {
-        Side::Long => "BUY",
-        Side::Short => "SELL",
-    };
+    let side_str = order.side.to_binance_str();
     
     // ✅ ENHANCED: Detailed logging for Paper Trading analysis (Plan.md)
     // Include order details, timestamp, and metadata for performance analysis

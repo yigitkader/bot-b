@@ -14,7 +14,6 @@ use csv::Writer;
 use dotenvy::dotenv;
 use futures::stream::{self, StreamExt};
 use rand::seq::SliceRandom;
-use rand::Rng;
 use rand::thread_rng;
 use serde_json;
 use std::fs::{File, OpenOptions};
@@ -23,12 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use trading_bot::{
-    calculate_advanced_metrics, export_backtest_to_csv, run_backtest,
+    calculate_advanced_metrics, export_backtest_to_csv,
     symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
     test_utils::AlgoConfigBuilder,
     trending::{build_signal_contexts, run_backtest_on_series},
-    types::{FileConfig, Candle, FuturesClient, FileRisk},
-    portfolio_backtest::{PortfolioBacktestResult, PortfolioCandleData, run_portfolio_backtest},
+    types::{FileConfig, Candle, FuturesClient},
+    portfolio_backtest::{PortfolioCandleData, run_portfolio_backtest},
     risk_manager::RiskLimits,
     BacktestResult,
 };
@@ -275,8 +274,6 @@ async fn get_cached_force_orders(
     end_time: Option<chrono::DateTime<Utc>>,
     limit: u32,
 ) -> Result<String> {
-    use trading_bot::types::ForceOrderRecord;
-    
     let cache_dir = Path::new("data_cache");
     if !cache_dir.exists() {
         std::fs::create_dir_all(cache_dir)

@@ -1,4 +1,5 @@
 pub mod balance;
+pub mod initialization;
 pub mod cache;
 pub mod config;
 pub mod connection;
@@ -12,8 +13,10 @@ pub mod risk_manager;
 pub mod slippage;
 pub mod state;
 pub mod symbol_scanner;
+pub mod tasks;
 pub mod test_utils;
 pub mod trending;
+pub mod trending_tasks;
 pub mod types;
 
 pub use cache::{DepthCache, SymbolInfoCache};
