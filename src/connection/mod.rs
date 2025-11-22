@@ -4,8 +4,7 @@ pub mod websocket;
 use crate::config::BotConfig;
 use crate::types::{
     api::{DepthState, LiqState},
-    connection::{Connection, RateLimiter},
-    events::{ConnectionChannels, MarketTick},
+    {Connection, RateLimiter, ConnectionChannels, MarketTick},
 };
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -104,12 +103,12 @@ impl Connection {
         rest::fetch_snapshot(self).await
     }
 
-    pub async fn fetch_balance(&self) -> Result<Vec<crate::types::events::BalanceSnapshot>> {
+    pub async fn fetch_balance(&self) -> Result<Vec<crate::types::BalanceSnapshot>> {
         use crate::connection::rest;
         rest::fetch_balance(self).await
     }
 
-    pub async fn fetch_position(&self, symbol: &str) -> Result<Option<crate::types::events::PositionUpdate>> {
+    pub async fn fetch_position(&self, symbol: &str) -> Result<Option<crate::types::PositionUpdate>> {
         use crate::connection::rest;
         rest::fetch_position(self, symbol).await
     }

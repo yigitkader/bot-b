@@ -1,6 +1,6 @@
 use crate::types::{
-    events::{BalanceSnapshot, OrderUpdate, PositionUpdate},
-    state::{BalanceStore, EquityState, OrderState, PositionMeta, PositionState, SharedState},
+    BalanceSnapshot, OrderUpdate, PositionUpdate,
+    BalanceStore, EquityState, OrderState, PositionMeta, PositionState, SharedState,
 };
 use chrono::Datelike;
 use log::warn;
@@ -287,5 +287,24 @@ impl SharedState {
             .lock()
             .map(|eq| if eq.weekly_peak > 0.0 { (eq.weekly_peak - eq.current_equity) / eq.weekly_peak } else { 0.0 })
             .unwrap_or(0.0)
+    }
+}
+
+pub async fn run_balance(ch: crate::types::BalanceChannels, state: SharedState) {
+    use log::{info, warn};
+    
+    let mut balance_rx = ch.balance_tx.subscribe();
+
+    info!("BALANCE: started - listening to ACCOUNT_UPDATE WebSocket events");
+
+    loop {
+        match crate::types::handle_broadcast_recv(balance_rx.recv().await) {
+            Ok(Some(snapshot)) => state.apply_balance_snapshot(&snapshot),
+            Ok(None) => {}
+            Err(_) => {
+                warn!("BALANCE: balance_tx channel closed");
+                break;
+            }
+        }
     }
 }

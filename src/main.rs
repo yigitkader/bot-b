@@ -4,15 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
 use trading_bot::{
-    balance,
     config::BotConfig,
     follow_orders, initialization,
-    logging,
     ordering,
     run_slippage_tracker,
+    state,
     tasks::{TaskInfo, TaskManager},
-    trending, trending_tasks,
+    trending,
     EventBus, SlippageTracker,
+    types::{LoggingChannels, Side},
 };
 
 #[tokio::main]
@@ -149,16 +149,69 @@ async fn main() -> Result<()> {
         let ch = balance_ch;
         let state = shared_state.clone();
         task_manager.spawn("balance", async move {
-            balance::run_balance(ch, state).await;
+            state::run_balance(ch, state).await;
         });
     }
 
     {
         let ch = logging_ch;
         task_manager.spawn("logging", async move {
-            logging::run_logging(ch).await;
+            run_logging(ch).await;
         });
     }
+
+async fn run_logging(ch: LoggingChannels) {
+    use log::info;
+    let mut market_rx = ch.market_rx;
+    let mut order_rx = ch.order_update_rx;
+    let mut position_rx = ch.position_update_rx;
+    let mut balance_rx = ch.balance_rx;
+    let mut signal_rx = ch.signal_rx;
+
+    loop {
+        tokio::select! {
+            res = market_rx.recv() => match trading_bot::types::handle_broadcast_recv(res) {
+                Ok(Some(tick)) => info!("LOG MarketTick {:?}", tick),
+                Ok(None) => continue,
+                Err(_) => break,
+            },
+            res = order_rx.recv() => match trading_bot::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => info!("LOG OrderUpdate {:?}", update),
+                Ok(None) => continue,
+                Err(_) => break,
+            },
+            res = position_rx.recv() => match trading_bot::types::handle_broadcast_recv(res) {
+                Ok(Some(update)) => {
+                    info!("LOG PositionUpdate {:?}", update);
+                    if update.is_closed {
+                        info!("LOG PositionClosed: position_id={}", update.position_id);
+                    }
+                },
+                Ok(None) => continue,
+                Err(_) => break,
+            },
+            res = balance_rx.recv() => match trading_bot::types::handle_broadcast_recv(res) {
+                Ok(Some(snapshot)) => info!("LOG BalanceSnapshot {:?}", snapshot),
+                Ok(None) => continue,
+                Err(_) => break,
+            },
+            Some(signal) = signal_rx.recv() => {
+                info!(
+                    "LOG TradeSignal: {} {} @ {:.2} (size={:.2} USDT, leverage={}x, atr={:?})",
+                    signal.symbol,
+                    match signal.side {
+                        Side::Long => "LONG",
+                        Side::Short => "SHORT",
+                    },
+                    signal.entry_price,
+                    signal.size_usdt,
+                    signal.leverage,
+                    signal.atr_value
+                );
+            }
+        }
+    }
+}
 
 
     let initial_symbols = if scanner.config.enabled {
@@ -234,7 +287,7 @@ async fn main() -> Result<()> {
         // Initialize handlers for each symbol
         for symbol in initial_symbols.iter() {
             let client = trading_bot::types::FuturesClient::new();
-            let cfg = trending_tasks::create_algo_config_from_trend_params(&trend_params);
+            let cfg = trending::create_algo_config_from_trend_params(&trend_params);
             let kline_interval = "5m";
             let kline_limit = (trend_params.warmup_min_ticks + 10) as u32;
             
@@ -314,7 +367,7 @@ async fn main() -> Result<()> {
         // Use individual streams for <3 symbols (backward compatibility)
         info!("TRENDING: Using individual streams for {} symbols", initial_symbols.len());
         for symbol in initial_symbols.iter() {
-            trending_tasks::spawn_trending_task(
+            trending::spawn_trending_task(
                 symbol.clone(),
                 &bus,
                 &trend_params,
@@ -377,7 +430,7 @@ async fn main() -> Result<()> {
 
                         // Spawn new trending tasks for added symbols
                         for new_symbol in &event.new_symbols {
-                            trending_tasks::spawn_trending_task(
+                            trending::spawn_trending_task(
                                 new_symbol.clone(),
                                 &bus_clone,
                                 &trend_params_clone,

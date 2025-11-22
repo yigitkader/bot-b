@@ -3,9 +3,9 @@ use crate::types::{
         ExchangeInfoResponse, ForceOrderRecord, LeverageBracketResponse, OpenInterestResponse,
         PositionRiskResponse, PremiumIndex, DepthSnapshot, FuturesBalance,
     },
-    connection::Connection,
+    Connection,
     core::{NewOrderRequest, Side, SymbolPrecision},
-    events::{BalanceSnapshot, MarketTick, PositionUpdate},
+    {BalanceSnapshot, MarketTick, PositionUpdate},
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -666,7 +666,7 @@ pub(crate) fn ensure_credentials(conn: &Connection) -> Result<()> {
 }
 
 pub async fn fetch_snapshot(conn: &Connection) -> Result<MarketTick> {
-    use crate::types::events::MarketTick;
+    use crate::types::MarketTick;
     let premium = fetch_premium_index(conn).await?;
     let (symbol, price, funding_rate, ts) = premium.into_parts()?;
     let obi = fetch_depth_obi(conn).await?;

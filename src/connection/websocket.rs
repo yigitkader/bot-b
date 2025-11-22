@@ -1,7 +1,7 @@
 use crate::types::{
     api::{DepthEvent, DepthState, ForceOrderStreamEvent, ForceOrderStreamOrder, ForceOrderStreamWrapper, LiqState, MarkPriceEvent, OpenInterestEvent},
-    connection::Connection,
-    events::{ConnectionChannels, MarketTick},
+    Connection,
+    {ConnectionChannels, MarketTick},
 };
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};

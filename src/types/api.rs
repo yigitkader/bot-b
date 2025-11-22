@@ -340,9 +340,9 @@ impl PremiumIndex {
 }
 
 impl OrderTradeUpdate {
-    pub(crate) fn into_order_update(self) -> crate::types::events::OrderUpdate {
+    pub(crate) fn into_order_update(self) -> crate::types::OrderUpdate {
         use crate::types::core::{OrderStatus, Side};
-        use crate::types::events::OrderUpdate;
+        use crate::types::OrderUpdate;
         use chrono::Utc;
         use uuid::Uuid;
 
@@ -373,8 +373,8 @@ impl OrderTradeUpdate {
 }
 
 impl AccountBalance {
-    pub(crate) fn to_balance_snapshot(&self) -> Option<crate::types::events::BalanceSnapshot> {
-        use crate::types::events::BalanceSnapshot;
+    pub(crate) fn to_balance_snapshot(&self) -> Option<crate::types::BalanceSnapshot> {
+        use crate::types::BalanceSnapshot;
         use chrono::Utc;
         let free = self.wallet_balance.parse().ok()?;
         Some(BalanceSnapshot {
@@ -386,9 +386,9 @@ impl AccountBalance {
 }
 
 impl AccountPosition {
-    pub(crate) fn to_position_update(&self, leverage: f64) -> Option<crate::types::events::PositionUpdate> {
+    pub(crate) fn to_position_update(&self, leverage: f64) -> Option<crate::types::PositionUpdate> {
         use crate::types::core::Side;
-        use crate::types::events::PositionUpdate;
+        use crate::types::PositionUpdate;
         use chrono::Utc;
         let size = self.position_amount.parse::<f64>().ok()?;
         let entry = self.entry_price.parse::<f64>().ok().unwrap_or(0.0);

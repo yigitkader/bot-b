@@ -1,11 +1,8 @@
-pub mod balance;
 pub mod initialization;
 pub mod cache;
 pub mod config;
 pub mod connection;
-pub mod event_bus;
 pub mod follow_orders;
-pub mod logging;
 pub mod metrics_cache;
 pub mod ordering;
 pub mod portfolio_backtest;
@@ -16,7 +13,6 @@ pub mod symbol_scanner;
 pub mod tasks;
 pub mod test_utils;
 pub mod trending;
-pub mod trending_tasks;
 pub mod types;
 
 pub use cache::{DepthCache, SymbolInfoCache};
