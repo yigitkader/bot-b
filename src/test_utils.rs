@@ -22,7 +22,7 @@ impl AlgoConfigBuilder {
                 lsr_crowded_short: 0.8,
                 long_min_score: 4,
                 short_min_score: 4,
-                fee_bps_round_trip: 8.0,
+                fee_bps_round_trip: 13.0, // ✅ Plan.md: Gerçekçi komisyon (10 bps + slippage = 13 bps)
                 max_holding_bars: 48,
                 slippage_bps: 0.0,
                 min_volume_ratio: 1.5,
@@ -477,7 +477,7 @@ pub fn create_test_config() -> AlgoConfig {
         .with_funding_thresholds(0.0003, -0.0003)
         .with_lsr_thresholds(1.2, 0.85)
         .with_min_scores(5, 5)
-        .with_fees(12.0)
+        .with_fees(13.0)  // ✅ Plan.md: Gerçekçi komisyon (10 bps + slippage = 13 bps)
         .with_holding_bars(2, 60)
         .with_slippage(3.0)
         .with_signal_quality(0.3, 4.0, 10.0)
@@ -491,7 +491,7 @@ pub fn create_conservative_config() -> AlgoConfig {
         .with_funding_thresholds(0.0005, -0.0005)
         .with_lsr_thresholds(1.3, 0.8)
         .with_min_scores(6, 6)
-        .with_fees(8.0)
+        .with_fees(13.0) // ✅ Plan.md: Gerçekçi komisyon (10 bps + slippage = 13 bps)
         .with_holding_bars(3, 48)
         .with_slippage(0.0)
         .with_signal_quality(1.5, 2.0, 3.0)
@@ -505,7 +505,7 @@ pub fn create_aggressive_config() -> AlgoConfig {
         .with_funding_thresholds(0.0002, -0.0002)
         .with_lsr_thresholds(1.15, 0.85)
         .with_min_scores(4, 4)
-        .with_fees(12.0)
+        .with_fees(13.0)  // ✅ Plan.md: Gerçekçi komisyon (10 bps + slippage = 13 bps)
         .with_holding_bars(1, 72)
         .with_slippage(5.0)
         .with_signal_quality(0.2, 5.0, 15.0)

@@ -7,7 +7,7 @@
 // - Always use Walk-Forward Analysis and Out-of-Sample Testing
 // - Past performance does NOT guarantee future results
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use csv::Writer;
 use dotenvy::dotenv;
@@ -25,7 +25,8 @@ use trading_bot::{
     calculate_advanced_metrics, export_backtest_to_csv, run_backtest,
     symbol_scanner::{SymbolScanner, SymbolSelectionConfig},
     test_utils::AlgoConfigBuilder,
-    types::FileConfig,
+    trending::{build_signal_contexts, run_backtest_on_series},
+    types::{FileConfig, Candle, FuturesClient},
     BacktestResult,
 };
 
@@ -83,6 +84,237 @@ struct AdvancedMetrics {
     recovery_factor: f64,
     avg_trade_duration_hours: f64,
     kelly_criterion: f64,
+}
+
+// ✅ Plan.md: Disk Caching - Klines ve Force Orders için cache mekanizması
+// Bu sayede 2. çalıştırmada 100 coin saniyeler içinde test edilir
+async fn get_cached_klines(
+    client: &FuturesClient,
+    symbol: &str,
+    interval: &str,
+    limit: u32,
+) -> Result<Vec<Candle>> {
+    let cache_dir = Path::new("data_cache");
+    if !cache_dir.exists() {
+        std::fs::create_dir_all(cache_dir)
+            .context("Failed to create cache directory")?;
+    }
+    let filename = cache_dir.join(format!("{}_{}_{}.json", symbol, interval, limit));
+
+    if filename.exists() {
+        // Cache'den oku
+        let data = std::fs::read_to_string(&filename)
+            .context(format!("Failed to read cache file: {:?}", filename))?;
+        let candles: Vec<Candle> = serde_json::from_str(&data)
+            .context(format!("Failed to parse cache file: {:?}", filename))?;
+        println!("  📦 Cache hit: {} ({} candles)", symbol, candles.len());
+        return Ok(candles);
+    }
+
+    // API'den çek
+    println!("  ⬇️  Fetching from API: {}...", symbol);
+    let candles = client
+        .fetch_klines(symbol, interval, limit)
+        .await
+        .context(format!("Failed to fetch klines for {}", symbol))?;
+    
+    // Cache'e yaz
+    let json = serde_json::to_string_pretty(&candles)
+        .context("Failed to serialize candles")?;
+    std::fs::write(&filename, json)
+        .context(format!("Failed to write cache file: {:?}", filename))?;
+    
+    Ok(candles)
+}
+
+// ✅ Plan.md: Force Orders için cache mekanizması
+// Force Orders API çağrısı çok ağır (weight: 20+), cache ile hızlandırıyoruz
+async fn get_cached_force_orders(
+    client: &FuturesClient,
+    symbol: &str,
+    start_time: Option<chrono::DateTime<Utc>>,
+    end_time: Option<chrono::DateTime<Utc>>,
+    limit: u32,
+) -> Result<String> {
+    use trading_bot::types::ForceOrderRecord;
+    
+    let cache_dir = Path::new("data_cache");
+    if !cache_dir.exists() {
+        std::fs::create_dir_all(cache_dir)
+            .context("Failed to create cache directory")?;
+    }
+    
+    // Cache key: symbol + time range + limit
+    let cache_key = format!(
+        "{}_{}_{}_{}_force_orders.json",
+        symbol,
+        start_time.map(|t| t.timestamp()).unwrap_or(0),
+        end_time.map(|t| t.timestamp()).unwrap_or(0),
+        limit
+    );
+    let filename = cache_dir.join(cache_key);
+
+    if filename.exists() {
+        // Cache'den oku
+        let data = std::fs::read_to_string(&filename)
+            .context(format!("Failed to read cache file: {:?}", filename))?;
+        println!("  📦 Cache hit (ForceOrders): {} ({} bytes)", symbol, data.len());
+        return Ok(data);
+    }
+
+    // API'den çek
+    println!("  ⬇️  Fetching ForceOrders from API: {}...", symbol);
+    let force_orders = client
+        .fetch_historical_force_orders(symbol, start_time, end_time, limit)
+        .await
+        .context(format!("Failed to fetch force orders for {}", symbol))?;
+    
+    // JSON string olarak cache'e yaz
+    let json = serde_json::to_string_pretty(&force_orders)
+        .context("Failed to serialize force orders")?;
+    std::fs::write(&filename, &json)
+        .context(format!("Failed to write cache file: {:?}", filename))?;
+    
+    Ok(json)
+}
+
+// ✅ Plan.md: Cache'li run_backtest wrapper
+// run_backtest fonksiyonunu cache kullanacak şekilde wrap ediyoruz
+async fn run_backtest_with_cache(
+    symbol: &str,
+    interval: &str,
+    period: &str,
+    limit: u32,
+    cfg: &trading_bot::AlgoConfig,
+) -> Result<BacktestResult> {
+    use trading_bot::types::{FuturesClient, FundingRate, OpenInterestPoint, LongShortRatioPoint};
+    use trading_bot::trending::{build_signal_contexts, run_backtest_on_series};
+    
+    let client = FuturesClient::new();
+    
+    // ✅ Plan.md: Cache'li klines çekimi
+    let candles = get_cached_klines(&client, symbol, interval, limit).await?;
+    
+    // Diğer verileri çek (bunlar da cache'lenebilir ama şimdilik sadece klines ve force orders)
+    let funding = client.fetch_funding_rates(symbol, 100).await?;
+    let oi_hist = client
+        .fetch_open_interest_hist(symbol, period, limit)
+        .await?;
+    let lsr_hist = client
+        .fetch_top_long_short_ratio(symbol, period, limit)
+        .await?;
+
+    // ✅ Plan.md: Cache'li force orders çekimi
+    let start_time = candles.first().map(|c| c.open_time);
+    let end_time = candles.last().map(|c| c.close_time);
+    let force_orders_json = get_cached_force_orders(&client, symbol, start_time, end_time, 500)
+        .await
+        .unwrap_or_default(); // Sessizce boş dön (veri yoksa strateji çalışmaz)
+    
+    // JSON'dan deserialize et (run_backtest_on_series için)
+    use trading_bot::types::ForceOrderRecord;
+    let force_orders: Vec<ForceOrderRecord> = if force_orders_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(force_orders_json.as_str())
+            .unwrap_or_default()
+    };
+
+    let (matched_candles, contexts) =
+        build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
+    
+    Ok(run_backtest_on_series(
+        symbol,
+        &matched_candles,
+        &contexts,
+        cfg,
+        if force_orders.is_empty() {
+            None
+        } else {
+            Some(&force_orders)
+        },
+    ))
+}
+
+// ✅ Plan.md: Walk-Forward için candle slice fonksiyonu
+// Tüm veriyi çekip, belirli bir aralığı (slice) kullanarak backtest yapar
+async fn run_backtest_with_slice(
+    symbol: &str,
+    interval: &str,
+    period: &str,
+    total_limit: u32, // Tüm veri limiti
+    skip_first: usize, // İlk N mum'u atla (training için eski veri)
+    take_count: usize, // Sonraki N mum'u al (training veya testing için)
+    cfg: &trading_bot::AlgoConfig,
+) -> Result<BacktestResult> {
+    use trading_bot::types::FuturesClient;
+    use trading_bot::trending::{build_signal_contexts, run_backtest_on_series};
+    
+    let client = FuturesClient::new();
+    
+    // ✅ Plan.md: Tüm veriyi cache'den çek
+    let all_candles = get_cached_klines(&client, symbol, interval, total_limit).await?;
+    
+    // Slice yap: skip_first'ten başla, take_count kadar al
+    if skip_first >= all_candles.len() || take_count == 0 {
+        return Ok(BacktestResult {
+            trades: Vec::new(),
+            total_trades: 0,
+            win_trades: 0,
+            loss_trades: 0,
+            win_rate: 0.0,
+            total_pnl_pct: 0.0,
+            avg_pnl_pct: 0.0,
+            avg_r: 0.0,
+            total_signals: 0,
+            long_signals: 0,
+            short_signals: 0,
+        });
+    }
+    
+    let end_idx = (skip_first + take_count).min(all_candles.len());
+    let candles_slice = &all_candles[skip_first..end_idx];
+    
+    // Slice için time range
+    let start_time = candles_slice.first().map(|c| c.open_time);
+    let end_time = candles_slice.last().map(|c| c.close_time);
+    
+    // Diğer verileri çek (aynı time range için)
+    let funding = client.fetch_funding_rates(symbol, 100).await?;
+    let oi_hist = client
+        .fetch_open_interest_hist(symbol, period, candles_slice.len() as u32)
+        .await?;
+    let lsr_hist = client
+        .fetch_top_long_short_ratio(symbol, period, candles_slice.len() as u32)
+        .await?;
+
+    // Force orders (slice time range için)
+    let force_orders_json = get_cached_force_orders(&client, symbol, start_time, end_time, 500)
+        .await
+        .unwrap_or_default();
+    
+    use trading_bot::types::ForceOrderRecord;
+    let force_orders: Vec<ForceOrderRecord> = if force_orders_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(force_orders_json.as_str())
+            .unwrap_or_default()
+    };
+
+    let (matched_candles, contexts) =
+        build_signal_contexts(candles_slice, &funding, &oi_hist, &lsr_hist);
+    
+    Ok(run_backtest_on_series(
+        symbol,
+        &matched_candles,
+        &contexts,
+        cfg,
+        if force_orders.is_empty() {
+            None
+        } else {
+            Some(&force_orders)
+        },
+    ))
 }
 
 #[tokio::main]
@@ -179,7 +411,7 @@ async fn main() -> Result<()> {
     let cfg = AlgoConfigBuilder::new()
         .with_enhanced_scoring(true, 75.0, 60.0, 45.0) // Yüksek kalite sinyaller
         .with_risk_management(2.5, 4.0) // ATR x 2.5 Stop, ATR x 4.0 TP
-        .with_fees(8.0) // 0.08% komisyon (VIP0 + BNB indirimi gibi gerçekçi)
+        .with_fees(13.0) // ✅ Plan.md: Gerçekçi komisyon (Binance Futures Taker Fee ~0.05% * 2 = 0.10% = 10 bps, slippage dahil 13 bps)
         .with_slippage(5.0) // 0.05% baz kayma (Deterministik - rastgelelik yok)
         .build();
 
@@ -254,8 +486,8 @@ async fn main() -> Result<()> {
                 println!("⏳ Veri İndiriliyor ve İşleniyor: {} (ForceOrders dahil)", symbol);
                 
                 // 1000 Mum = ~3.5 Günlük Veri (Trend analizi için yeterli)
-                // Historical Force Orders da bu süreçte indirilecek
-                let res = run_backtest(&symbol, &interval, &period, limit, &cfg).await;
+                // ✅ Plan.md: Cache'li backtest kullan (API limitlerini önler)
+                let res = run_backtest_with_cache(&symbol, &interval, &period, limit, &cfg).await;
                 (symbol, res, wtr, all_results, reports_dir, interval)
             }
         })
@@ -383,7 +615,140 @@ async fn main() -> Result<()> {
     );
     println!();
 
-    // ✅ NEW: Identify Top 10 coins by total PnL
+    // ✅ Plan.md: Walk-Forward Analysis (Aşırı Uyum Önleme)
+    // Veriyi ikiye böl: Training (ilk yarı) ve Testing (ikinci yarı - görmediği veri)
+    // Bu sayede overfitting'i önleriz ve stratejinin gerçek performansını görürüz
+    let enable_walk_forward = std::env::var("WALK_FORWARD").unwrap_or_else(|_| "true".to_string()) == "true";
+    
+    if enable_walk_forward && all_results.len() >= 10 && limit >= 200 {
+        // ✅ Plan.md: Walk-Forward Analysis Implementation
+        println!("===== WALK-FORWARD ANALYSIS (Overfitting Önleme) =====");
+        println!("🚀 FAZ 1: Eğitim Verisi ile Tarama (İlk {} mumdan {} mum)...", limit, limit / 2);
+        println!("⚠️  NOT: Walk-Forward analizi için veri yeterli olmalı (limit >= 200)");
+        println!();
+        
+        // ✅ Plan.md: Walk-Forward Analysis - Doğru implementasyon
+        // Training: İlk yarı (eski veri) - "Son {} mumdan önceki {} mum"
+        // Testing: İkinci yarı (yeni veri) - "Son {} mum"
+        let training_limit = (limit / 2) as usize;
+        let testing_limit = (limit / 2) as usize;
+        
+        // Training phase: İlk yarı (eski veri) ile backtest
+        // Plan.md: "Son {} mumdan önceki {} mum" = skip_first=0, take=training_limit
+        let mut training_results: Vec<(String, BacktestResult)> = Vec::new();
+        
+        println!("📊 Training Phase: İlk {} mum (eski veri) ile backtest çalıştırılıyor...", training_limit);
+        println!("   (Son {} mumdan önceki {} mum - Plan.md)", limit, training_limit);
+        for (symbol, _) in all_results.iter().take(50) { // İlk 50 coin ile training (hız için)
+            match run_backtest_with_slice(
+                symbol, 
+                &interval, 
+                &period, 
+                limit, // Tüm veri
+                0, // İlk 0 mum'u atla (baştan başla)
+                training_limit, // İlk yarıyı al
+                &cfg
+            ).await {
+                Ok(result) => {
+                    training_results.push((symbol.clone(), result));
+                }
+                Err(_) => {
+                    // Skip errors in training phase
+                }
+            }
+        }
+        
+        // Select Top 10 from training results
+        training_results.sort_by(|a, b| {
+            b.1.total_pnl_pct
+                .partial_cmp(&a.1.total_pnl_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        let top_10_training: Vec<String> = training_results
+            .iter()
+            .take(10)
+            .map(|(symbol, result)| {
+                println!(
+                    "  📈 Training: {}: {:.4}% PnL, {:.2}% win rate, {} trades",
+                    symbol,
+                    result.total_pnl_pct * 100.0,
+                    result.win_rate * 100.0,
+                    result.total_trades
+                );
+                symbol.clone()
+            })
+            .collect();
+        
+        println!();
+        println!("🚀 FAZ 2: Test Verisi ile Doğrulama (Son {} mum - Görmediği veri)...", testing_limit);
+        println!("⚠️  Seçilen Top 10 coin, görmediği ikinci yarı veri ile test edilecek.");
+        println!();
+        
+        // ✅ Plan.md: Testing phase: İkinci yarı (yeni veri) ile backtest (out-of-sample)
+        // Plan.md: "Son {} mum" = skip_first=training_limit, take=testing_limit
+        let mut testing_results: Vec<(String, BacktestResult)> = Vec::new();
+        
+        for symbol in &top_10_training {
+            match run_backtest_with_slice(
+                symbol,
+                &interval,
+                &period,
+                limit, // Tüm veri
+                training_limit, // İlk yarıyı atla (eski veriyi skip et)
+                testing_limit, // İkinci yarıyı al (yeni veri)
+                &cfg
+            ).await {
+                Ok(result) => {
+                    let result_clone = BacktestResult {
+                        trades: result.trades.clone(),
+                        total_trades: result.total_trades,
+                        win_trades: result.win_trades,
+                        loss_trades: result.loss_trades,
+                        win_rate: result.win_rate,
+                        total_pnl_pct: result.total_pnl_pct,
+                        avg_pnl_pct: result.avg_pnl_pct,
+                        avg_r: result.avg_r,
+                        total_signals: result.total_signals,
+                        long_signals: result.long_signals,
+                        short_signals: result.short_signals,
+                    };
+                    testing_results.push((symbol.clone(), result_clone));
+                    println!(
+                        "  ✅ Test: {}: {:.4}% PnL, {:.2}% win rate, {} trades",
+                        symbol,
+                        result.total_pnl_pct * 100.0,
+                        result.win_rate * 100.0,
+                        result.total_trades
+                    );
+                }
+                Err(err) => {
+                    eprintln!("  ❌ Test: {} failed: {}", symbol, err);
+                }
+            }
+        }
+        
+        // Compare training vs testing results
+        println!();
+        println!("===== WALK-FORWARD SONUÇLARI =====");
+        let training_avg_pnl: f64 = training_results.iter().take(10).map(|(_, r)| r.total_pnl_pct).sum::<f64>() / 10.0;
+        let testing_avg_pnl: f64 = testing_results.iter().map(|(_, r)| r.total_pnl_pct).sum::<f64>() / testing_results.len().max(1) as f64;
+        
+        println!("📊 Training Phase (İlk yarı) Ortalama PnL: {:.4}%", training_avg_pnl * 100.0);
+        println!("📊 Testing Phase (İkinci yarı) Ortalama PnL: {:.4}%", testing_avg_pnl * 100.0);
+        
+        if testing_avg_pnl > 0.0 && testing_avg_pnl >= training_avg_pnl * 0.5 {
+            println!("✅ WALK-FORWARD VALIDATION: Strateji doğrulandı! Test fazı da karlı.");
+        } else if testing_avg_pnl < 0.0 {
+            println!("❌ WALK-FORWARD WARNING: Test fazı zararlı! Strateji overfitted olabilir.");
+            println!("⚠️  Bu stratejiyi canlıda kullanmadan önce daha fazla test yapın.");
+        } else {
+            println!("⚠️  WALK-FORWARD CAUTION: Test fazı performansı düşük. Strateji overfitted olabilir.");
+        }
+        println!();
+    }
+    
+    // ✅ NEW: Identify Top 10 coins by total PnL (Original method - still available)
     // ⚠️⚠️⚠️ CRITICAL OVERFITTING WARNING ⚠️⚠️⚠️
     // This "Top 10 Coin Optimization" has HIGH overfitting risk:
     // 1. Coins are selected based on PAST performance (historical backtest results)
@@ -458,7 +823,7 @@ async fn main() -> Result<()> {
             .with_funding_thresholds(0.0003, -0.0003)
             .with_lsr_thresholds(1.3, 0.8)
             .with_min_scores(4, 4)
-            .with_fees(8.0)
+            .with_fees(13.0)  // ✅ Plan.md: Gerçekçi komisyon (10 bps + slippage = 13 bps)
             .with_holding_bars(3, 48)
             .with_slippage(0.0)
             .with_signal_quality(1.5, 2.0, 3.0)
@@ -506,7 +871,7 @@ async fn main() -> Result<()> {
                 symbol
             );
             
-            match run_backtest(symbol, &interval, &period, limit, &optimized_cfg).await {
+            match run_backtest_with_cache(symbol, &interval, &period, limit, &optimized_cfg).await {
                 Ok(result) => {
                     let advanced = calculate_advanced_metrics(&result);
                     

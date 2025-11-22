@@ -545,8 +545,8 @@ pub(crate) struct DepthEvent {
     pub asks: Vec<[String; 2]>,
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct ForceOrderRecord {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForceOrderRecord {
     #[serde(rename = "side")]
     pub side: String,
     #[serde(rename = "avgPrice")]
@@ -918,7 +918,7 @@ pub struct PositionMeta {
 
 // KlineRaw removed - using serde_json::Value for flexible parsing
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candle {
     pub open_time: DateTime<Utc>,
     pub close_time: DateTime<Utc>,

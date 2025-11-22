@@ -3242,9 +3242,9 @@ pub fn run_backtest_on_series(
     let has_real_liquidation_data = historical_force_orders.map(|v| !v.is_empty()).unwrap_or(false);
     
     if has_real_liquidation_data {
-        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut. Strateji aktif.", symbol);
+        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut. Cascade stratejisi AKTİF.", symbol);
     } else {
-        log::debug!("BACKTEST: ℹ️ {} için Liquidation verisi YOK. Tahmin yapılmayacak.", symbol);
+        log::warn!("BACKTEST: ⚠️ {} için Liquidation verisi EKSİK. Cascade stratejisi PASİF (Skor düşebilir).", symbol);
     }
 
     let mut trades: Vec<Trade> = Vec::new();
