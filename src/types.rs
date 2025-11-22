@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -238,7 +238,7 @@ pub(crate) struct FileDynamicSymbolSelection {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-pub(crate) struct FileRisk {
+pub struct FileRisk {
     #[serde(default)]
     pub use_isolated_margin: Option<bool>,
     #[serde(default)]
@@ -875,17 +875,18 @@ pub struct BalanceStore {
 
 #[derive(Debug, Default, Clone)]
 pub struct OrderState {
-    pub has_open_order: bool,
-    pub last_order: Option<OrderUpdate>,
-    pub order_sent_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Global flag yerine sembol bazlı takip
+    pub open_orders: HashSet<String>, // Hangi sembollerde açık emir var?
+    pub last_orders: HashMap<String, OrderUpdate>, // Sembol -> Son Emir
+    pub order_sent_at: HashMap<String, chrono::DateTime<chrono::Utc>>, // Sembol -> Gönderilme Zamanı
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct PositionState {
-    pub has_open_position: bool,
-    pub last_position: Option<PositionUpdate>,
-    pub pending_meta: Option<PositionMeta>,
-    pub active_meta: Option<PositionMeta>,
+    // Global flag yerine sembol bazlı takip
+    pub active_positions: HashMap<String, PositionUpdate>, // Sembol -> Aktif Pozisyon
+    pub pending_meta: HashMap<String, PositionMeta>, // Sembol -> Bekleyen Meta (ATR vb.)
+    pub active_meta: HashMap<String, PositionMeta>, // Sembol -> Aktif Meta
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1116,7 +1117,7 @@ pub struct Trade {
     pub win: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BacktestResult {
     pub trades: Vec<Trade>,
     pub total_trades: usize,

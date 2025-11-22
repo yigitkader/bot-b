@@ -29,13 +29,11 @@ pub async fn run_ordering(
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            // ✅ FIX: Reduced timeout from 30s to 10s for post_only orders
-            // In fast markets, 30 seconds is too long - market can reverse significantly
-            // If order doesn't fill within 10s, cancel and re-evaluate (better than waiting)
-            // post_only orders should fill quickly or not at all
-            if state_for_timeout.check_order_timeout(10) {
-                warn!("ORDERING: order timeout detected - no OrderUpdate received within 10s, resetting state");
-                state_for_timeout.set_open_order(false);
+            // Sembol bazlı timeout kontrolü
+            let timed_out_symbols = state_for_timeout.check_order_timeout(10);
+            for symbol in timed_out_symbols {
+                warn!("ORDERING: Order timeout for {}, resetting state", symbol);
+                state_for_timeout.set_open_order(&symbol, false);
             }
         }
     });
@@ -98,10 +96,13 @@ async fn handle_signal(
     symbol_cache: Option<Arc<cache::SymbolInfoCache>>,
     depth_cache: Option<Arc<cache::DepthCache>>,
 ) {
-    if state.has_open_position() || state.has_open_order() {
+    // 1. Sembol bazlı kontrol
+    if state.has_open_position(&signal.symbol) || state.has_open_order(&signal.symbol) {
+        // Bu sembolde zaten işlem var, YENİ SİNYALİ REDDET.
+        // Ancak diğer semboller etkilenmez.
         warn!(
-            "ORDERING: active position/order detected, ignoring signal {}",
-            signal.id
+            "ORDERING: active position/order detected for {}, ignoring signal {}",
+            signal.symbol, signal.id
         );
         return;
     }
@@ -201,7 +202,7 @@ async fn handle_signal(
     }
 
     let _guard = lock.lock().await;
-    state.set_open_order(true);
+    state.set_open_order(&signal.symbol, true);
 
     let start_time = Instant::now();
 
@@ -231,7 +232,7 @@ async fn handle_signal(
                             "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
                             signal.symbol, signal.id
                         );
-                        state.set_open_order(false);
+                        state.set_open_order(&signal.symbol, false);
                         return;
                     }
                 }
@@ -246,7 +247,7 @@ async fn handle_signal(
                     "ORDERING: failed to fetch symbol info for {}: {err:?}, ignoring signal {}",
                     signal.symbol, signal.id
                 );
-                state.set_open_order(false);
+                state.set_open_order(&signal.symbol, false);
                 return;
             }
         }
@@ -345,7 +346,7 @@ async fn handle_signal(
                 "ORDERING: risk manager blocked signal {}: {}",
                 signal.id, reason
             );
-            state.set_open_order(false);
+            state.set_open_order(&signal.symbol, false);
             return;
         }
     }
@@ -355,7 +356,7 @@ async fn handle_signal(
             "ORDERING: invalid quantity computed from signal {} (size={}, leverage={}, order_price={})",
             signal.id, signal.size_usdt, signal.leverage, order_price
         );
-        state.set_open_order(false);
+        state.set_open_order(&signal.symbol, false);
         return;
     }
 
@@ -378,33 +379,33 @@ async fn handle_signal(
                 "ORDERING: reduced quantity {} below minimum {} for symbol {}, ignoring signal {}",
                 qty, symbol_info.min_quantity, signal.symbol, signal.id
             );
-            state.set_open_order(false);
+            state.set_open_order(&signal.symbol, false);
             return;
         }
     }
 
     // Check minimum quantity after rounding
     if qty < symbol_info.min_quantity {
-        warn!(
-            "ORDERING: quantity {} too small after rounding (min: {}, step_size: {}) for symbol {}, ignoring signal {}",
-            qty, symbol_info.min_quantity, symbol_info.step_size, signal.symbol, signal.id
-        );
-        state.set_open_order(false);
-        return;
-    }
+            warn!(
+                "ORDERING: quantity {} too small after rounding (min: {}, step_size: {}) for symbol {}, ignoring signal {}",
+                qty, symbol_info.min_quantity, symbol_info.step_size, signal.symbol, signal.id
+            );
+            state.set_open_order(&signal.symbol, false);
+            return;
+        }
 
-    // Check maximum quantity
-    if qty > symbol_info.max_quantity {
-        warn!(
-            "ORDERING: quantity {} exceeds maximum {} for symbol {}, ignoring signal {}",
-            qty, symbol_info.max_quantity, signal.symbol, signal.id
-        );
-        state.set_open_order(false);
-        state.clear_pending_position_meta();
-        return;
-    }
+        // Check maximum quantity
+        if qty > symbol_info.max_quantity {
+            warn!(
+                "ORDERING: quantity {} exceeds maximum {} for symbol {}, ignoring signal {}",
+                qty, symbol_info.max_quantity, signal.symbol, signal.id
+            );
+            state.set_open_order(&signal.symbol, false);
+            state.clear_pending_position_meta(&signal.symbol);
+            return;
+        }
 
-    state.set_pending_position_meta(PositionMeta {
+    state.set_pending_position_meta(&signal.symbol, PositionMeta {
         atr_at_entry: signal.atr_value,
     });
 
@@ -419,7 +420,7 @@ async fn handle_signal(
     // CRITICAL: Mark order as sent BEFORE API call to prevent race condition
     // If OrderUpdate arrives very quickly (WebSocket), order_sent_at must already be set
     // Otherwise timeout check will fail incorrectly
-    state.mark_order_sent();
+    state.mark_order_sent(&signal.symbol);
 
     let config = connection.config();
     let elapsed_ms = start_time.elapsed().as_millis() as f64;
@@ -454,10 +455,10 @@ async fn handle_signal(
                 elapsed_ms
             );
             // Order failed - reset state immediately
-            state.set_open_order(false);
+            state.set_open_order(&signal.symbol, false);
             // Clear timestamp since order was not actually sent
-            state.clear_order_sent();
-            state.clear_pending_position_meta();
+            state.clear_order_sent(&signal.symbol);
+            state.clear_pending_position_meta(&signal.symbol);
         } else {
             info!(
                 "ORDERING: ⚡ FAST ORDER submitted {} in {:.2}ms (target: <50ms)",
@@ -483,31 +484,24 @@ async fn handle_close_request(
 ) {
     let _guard = lock.lock().await;
 
-    // Get current position from state (for position_id verification)
-    let state_position = match state.current_position() {
-        Some(pos) => pos,
+    // Position ID'den sembolü bul
+    let symbol = {
+        let pos_state = state.position_state.lock().unwrap();
+        pos_state.active_positions.values()
+            .find(|p| p.position_id == request.position_id)
+            .map(|p| p.symbol.clone())
+    };
+
+    let symbol = match symbol {
+        Some(s) => s,
         None => {
-            warn!(
-                "ORDERING: no position found in state for close request {}",
-                request.position_id
-            );
+            warn!("ORDERING: Close request for unknown position ID {}", request.position_id);
             return;
         }
     };
 
-    // Verify position ID matches
-    if state_position.position_id != request.position_id {
-        warn!(
-            "ORDERING: position ID mismatch: expected {}, got {}",
-            request.position_id, state_position.position_id
-        );
-        return;
-    }
-
-    // Always fetch fresh position from API to get accurate leverage information
-    // WebSocket ACCOUNT_UPDATE events don't include leverage, so we need API data
-    // for correct PnL calculations (follow_orders.rs uses leverage)
-    let fresh_position = match connection.fetch_position(&state_position.symbol).await {
+    // API'den pozisyonu çek (Double Check)
+    let fresh_position = match connection.fetch_position(&symbol).await {
         Ok(Some(pos)) => pos,
         Ok(None) => {
             warn!(

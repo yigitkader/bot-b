@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     // This task updates price history from market ticks to enable real-time correlation calculation
     {
         let risk_manager_for_price = risk_manager.clone();
-        let market_rx = bus.market_receiver();
+        let mut market_rx = bus.market_receiver();
         let price_update_handle = tokio::spawn(async move {
             loop {
                 match market_rx.recv().await {
@@ -466,6 +466,9 @@ async fn main() -> Result<()> {
     // Threshold: 3+ symbols = use combined stream, <3 symbols = use individual streams
     let use_combined_stream = initial_symbols.len() >= 3;
     
+    // Create task_infos_arc outside if/else so it's available for rotation supervisor
+    let task_infos_arc = Arc::new(tokio::sync::Mutex::new(task_infos.clone()));
+    
     if use_combined_stream {
         info!("TRENDING: Using Combined Stream for {} symbols (reduces {} WebSocket connections to 1)", 
               initial_symbols.len(), initial_symbols.len());
@@ -539,12 +542,12 @@ async fn main() -> Result<()> {
             let signal_tx = bus.trending_channels().signal_tx.clone();
             
             // Create market tick updater for this symbol
-            let market_rx = bus.market_receiver();
+            let mut market_rx = bus.market_receiver();
             let latest_tick_clone = latest_market_tick.clone();
             let symbol_clone = symbol.clone();
             tokio::spawn(async move {
                 loop {
-                    match crate::types::handle_broadcast_recv(market_rx.recv().await) {
+                    match trading_bot::types::handle_broadcast_recv(market_rx.recv().await) {
                         Ok(Some(tick)) => {
                             if tick.symbol == symbol_clone {
                                 *latest_tick_clone.write().await = Some(tick);
@@ -570,12 +573,13 @@ async fn main() -> Result<()> {
         }
         
         // Spawn combined stream task
+        let ws_base_url_for_stream = ws_base_url.clone();
         let combined_stream_handle = tokio::spawn(async move {
             trending::run_combined_kline_stream(
                 initial_symbols.clone(),
                 "5m",
                 "5m",
-                ws_base_url,
+                ws_base_url_for_stream,
                 symbol_handlers,
             ).await;
         });
@@ -583,10 +587,13 @@ async fn main() -> Result<()> {
             name: "combined_kline_stream".to_string(),
             handle: Arc::new(tokio::sync::Mutex::new(Some(combined_stream_handle))),
         });
+        // Update task_infos_arc from task_infos
+        {
+            *task_infos_arc.lock().await = task_infos.clone();
+        }
     } else {
         // Use individual streams for <3 symbols (backward compatibility)
         info!("TRENDING: Using individual streams for {} symbols", initial_symbols.len());
-        let task_infos_arc = Arc::new(tokio::sync::Mutex::new(task_infos.clone()));
         for symbol in initial_symbols.iter() {
             spawn_trending_task(
                 symbol.clone(),
@@ -729,9 +736,10 @@ async fn main() -> Result<()> {
 
     // ✅ CRITICAL: WebSocket Health Monitoring Task (Plan.md - Veri Akışı Sağlamlığı)
     // Monitor WebSocket connection health and handle disconnections
+    // Extract close_tx before follow_ch is moved
+    let ordering_close_tx_health = bus.follow_channels().close_tx.clone();
     let connection_health = connection.clone();
     let shared_state_health = shared_state.clone();
-    let ordering_close_tx_health = ordering_ch.close_tx.clone();
     let config_health = config.clone();
     let ws_health_task = tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(10)); // Check every 10 seconds
@@ -751,28 +759,32 @@ async fn main() -> Result<()> {
                 // If configured, close positions when WebSocket is disconnected for too long
                 if config_health.ws_disconnect_close_positions {
                     if seconds_since_update > config_health.ws_disconnect_timeout_secs {
-                        if let Some(position) = shared_state_health.current_position() {
+                        // Close all active positions (multi-asset support)
+                        let active_positions = shared_state_health.get_all_active_positions();
+                        if !active_positions.is_empty() {
                             warn!(
-                                "WS_HEALTH: WebSocket disconnected for {}s (threshold: {}s), closing position {} to prevent trading with stale data",
+                                "WS_HEALTH: WebSocket disconnected for {}s (threshold: {}s), closing {} position(s) to prevent trading with stale data",
                                 seconds_since_update,
                                 config_health.ws_disconnect_timeout_secs,
-                                position.position_id
+                                active_positions.len()
                             );
                             
-                            // Send close request
-                            let close_request = crate::types::CloseRequest {
-                                position_id: position.position_id,
-                                reason: format!(
-                                    "WebSocket disconnected for {}s (threshold: {}s)",
-                                    seconds_since_update,
-                                    config_health.ws_disconnect_timeout_secs
-                                ),
-                                ts: chrono::Utc::now(),
-                                partial_close_percentage: None, // Full close
-                            };
-                            
-                            if ordering_close_tx_health.send(close_request).is_err() {
-                                error!("WS_HEALTH: Failed to send close request - ordering channel closed");
+                            for position in active_positions {
+                                // Send close request for each position
+                                let close_request = trading_bot::types::CloseRequest {
+                                    position_id: position.position_id,
+                                    reason: format!(
+                                        "WebSocket disconnected for {}s (threshold: {}s)",
+                                        seconds_since_update,
+                                        config_health.ws_disconnect_timeout_secs
+                                    ),
+                                    ts: chrono::Utc::now(),
+                                    partial_close_percentage: None, // Full close
+                                };
+                                
+                                if ordering_close_tx_health.send(close_request).await.is_err() {
+                                    error!("WS_HEALTH: Failed to send close request for position {} - ordering channel closed", position.position_id);
+                                }
                             }
                         }
                     }

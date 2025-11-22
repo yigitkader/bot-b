@@ -259,25 +259,34 @@ pub async fn run_follow_orders(
         close_tx,
     } = ch;
 
-    let mut current_position: Option<PositionUpdate> = None;
+    // Tekil değişken yerine HashMap kullanıyoruz
+    // Symbol -> PositionUpdate
+    let mut active_positions_map: HashMap<String, PositionUpdate> = HashMap::new();
     let mut position_manager = AdvancedPositionManager::new();
-    let mut current_atr = 0.0;
+    
+    // Her sembol için son bilinen ATR (optimize etmek için)
+    let mut symbol_atrs: HashMap<String, f64> = HashMap::new();
 
     loop {
         tokio::select! {
             res = position_update_rx.recv() => match crate::types::handle_broadcast_recv(res) {
                 Ok(Some(update)) => {
                     state.update_equity(update.unrealized_pnl);
+                    
                     if update.is_closed {
                         position_manager.close_position(&update.position_id);
-                        current_position = None;
+                        active_positions_map.remove(&update.symbol);
+                        symbol_atrs.remove(&update.symbol);
                     } else {
-                        // New position opened - initialize in manager
-                        if current_position.is_none() {
-                            let position_meta = state.current_position_meta();
+                        // Yeni veya güncellenen pozisyon
+                        let is_new = !active_positions_map.contains_key(&update.symbol);
+                        
+                        if is_new {
+                            let position_meta = state.current_position_meta(&update.symbol);
                             let atr = position_meta
                                 .and_then(|m| m.atr_at_entry)
-                                .unwrap_or(0.01);
+                                .unwrap_or(0.01); // Fallback
+                            
                             position_manager.open_position(
                                 update.position_id,
                                 update.entry_price,
@@ -286,9 +295,10 @@ pub async fn run_follow_orders(
                                 update.leverage,
                                 atr,
                             );
-                            current_atr = atr;
+                            symbol_atrs.insert(update.symbol.clone(), atr);
                         }
-                        current_position = Some(update);
+                        
+                        active_positions_map.insert(update.symbol.clone(), update);
                     }
                 },
                 Ok(None) => continue,
@@ -296,17 +306,13 @@ pub async fn run_follow_orders(
             },
             res = market_rx.recv() => match crate::types::handle_broadcast_recv(res) {
                 Ok(Some(tick)) => {
-                    if let Some(position) = current_position.as_ref() {
-                        let position_meta = state.current_position_meta();
+                    // Sadece tick gelen sembol için kontrol yap (Verimlilik!)
+                    if let Some(position) = active_positions_map.get(&tick.symbol) {
                         
-                        // Update ATR from tick or use cached value
-                        if let Some(meta) = &position_meta {
-                            if let Some(atr) = meta.atr_at_entry {
-                                current_atr = atr;
-                            }
-                        }
+                        // ATR bilgisini al
+                        let current_atr = *symbol_atrs.get(&tick.symbol).unwrap_or(&0.01);
 
-                        // Use advanced position manager for evaluation
+                        // Position Manager ile değerlendir
                         let decision = position_manager.evaluate(
                             &position.position_id,
                             tick.price,
@@ -315,25 +321,26 @@ pub async fn run_follow_orders(
 
                         match decision {
                             PositionDecision::FullClose { reason } => {
-                                log::info!("📤 FULL CLOSE: {}", reason);
+                                log::info!("📤 FULL CLOSE ({}): {}", tick.symbol, reason);
                                 let _ = close_tx.send(CloseRequest {
                                     position_id: position.position_id,
                                     reason,
                                     ts: Utc::now(),
-                                    partial_close_percentage: None, // Full close
+                                    partial_close_percentage: None,
                                 }).await;
                             }
                             PositionDecision::PartialClose { percentage, reason } => {
-                                log::info!("📤 PARTIAL CLOSE {:.0}%: {}", percentage * 100.0, reason);
+                                log::info!("📤 PARTIAL CLOSE ({}) {:.0}%: {}", tick.symbol, percentage * 100.0, reason);
                                 let _ = close_tx.send(CloseRequest {
                                     position_id: position.position_id,
-                                    reason: format!("Partial close {:.0}%: {}", percentage * 100.0, reason),
+                                    reason: format!("Partial: {}", reason),
                                     ts: Utc::now(),
-                                    partial_close_percentage: Some(percentage), // Partial close
+                                    partial_close_percentage: Some(percentage),
                                 }).await;
                             }
                             PositionDecision::Hold => {
-                                // Continue holding - also check legacy TP/SL as fallback
+                                // Legacy TP/SL kontrolü (Yedek güvenlik)
+                                let position_meta = state.current_position_meta(&tick.symbol);
                                 if let Some(req) = evaluate_position(
                                     position,
                                     &tick,
@@ -344,9 +351,7 @@ pub async fn run_follow_orders(
                                     atr_sl_multiplier,
                                     atr_tp_multiplier,
                                 ) {
-                                    if let Err(err) = close_tx.send(req).await {
-                                        info!("FOLLOW_ORDERS: failed to send close request: {err}");
-                                    }
+                                    let _ = close_tx.send(req).await;
                                 }
                             }
                             PositionDecision::NoPosition => {}

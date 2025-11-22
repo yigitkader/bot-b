@@ -96,10 +96,11 @@ async fn main() -> Result<()> {
     // Environment variable'lardan veya default değerlerden al
     let interval = std::env::var("INTERVAL").unwrap_or_else(|_| "5m".to_string());
     let period = std::env::var("PERIOD").unwrap_or_else(|_| "5m".to_string());
+    // ✅ Plan.md: 4 Günlük veri (trend oluşumu için yeterli)
     let limit: u32 = std::env::var("LIMIT")
-        .unwrap_or_else(|_| "288".to_string())
+        .unwrap_or_else(|_| "1152".to_string())
         .parse()
-        .unwrap_or(288); // 288 * 5m = son 24 saat
+        .unwrap_or(288 * 4); // 1152 * 5m = 4 günlük veri
 
     let max_symbols: usize = std::env::var("MAX_SYMBOLS")
         .unwrap_or_else(|_| "100".to_string())
@@ -115,13 +116,13 @@ async fn main() -> Result<()> {
     
     println!("Reports directory: {:?}", reports_dir);
 
-    println!("===== MULTI-SYMBOL BACKTEST BAŞLIYOR =====");
+    println!("===== PRO MULTI-COIN BACKTEST =====");
     println!("Interval    : {}", interval);
     println!("Period      : {}", period);
     println!(
-        "Limit       : {} (son {} saat @{})",
+        "Limit       : {} ({} günlük veri @{})",
         limit,
-        limit as f64 * 5.0 / 60.0,
+        limit as f64 * 5.0 / 60.0 / 24.0,
         interval
     );
     println!("Max symbols : {}", max_symbols);
@@ -154,17 +155,17 @@ async fn main() -> Result<()> {
     println!("Selected {} symbols for backtest", selected_symbols.len());
     println!();
 
-    // ✅ PLAN.MD ADIM 3: KONFİGÜRASYON (Sahtelikten Arındırılmış)
+    // ✅ Plan.md: Pro Ayarlar - Yüksek kalite sinyaller, gerçekçi komisyon ve slippage
     let cfg = AlgoConfigBuilder::new()
-        .with_enhanced_scoring(true, 75.0, 60.0, 40.0) // Sıkı filtreleme
-        .with_risk_management(2.5, 5.0) // Geniş stop, yüksek kar
-        .with_fees(10.0) // 10 bps komisyon (VIP 0)
-        .with_slippage(5.0) // 5 bps sabit kayma (Simülasyon yok)
+        .with_enhanced_scoring(true, 75.0, 60.0, 45.0) // Yüksek kalite sinyaller
+        .with_risk_management(2.5, 4.0) // ATR x 2.5 Stop, ATR x 4.0 TP
+        .with_fees(8.0) // 0.08% komisyon (VIP0 + BNB indirimi gibi gerçekçi)
+        .with_slippage(5.0) // 0.05% baz kayma (Deterministik - rastgelelik yok)
         .build();
 
     // ✅ PLAN.MD ADIM 3: Paralel çalıştırma (Zaman Kazanımı)
     // CSV writer oluştur (Arc<Mutex> ile thread-safe)
-    let file_exists = Path::new(&output_file).exists();
+    let _file_exists = Path::new(&output_file).exists();
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -202,14 +203,14 @@ async fn main() -> Result<()> {
     // ✅ NEW: Store all results for top 10 selection (Arc<Mutex> ile thread-safe)
     let all_results: Arc<Mutex<Vec<(String, BacktestResult)>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // ✅ PLAN.MD ADIM 3: Paralel işleme (Zaman Kazanımı)
-    // 100 coin için 1 saat hedefi: Her coin ortalama 30sn sürerse, seri işlem 50dk sürer.
-    // Ancak ForceOrders verisi indirmek yavaştır.
-    // Eşzamanlı 20 işlem ile ağ bekleme süresini minimize ediyoruz.
-    let concurrency = 20; 
+    // ✅ Plan.md: Akıllı Paralel İşleme
+    // Binance API ağırlık limitlerine (Weight Limit) takılmadan maksimum hızı almak için
+    // buffer_unordered ayarlandı. 100 coin'i ~3-5 dakikada tarayacak kapasitede.
+    // 10-15 concurrency güvenli ve hızlıdır. (100 coin ~ 3-5 dakika sürer)
+    let concurrency = 12; 
     
-    println!("🚀 SEÇİLEN {} COIN İÇİN %100 GERÇEK VERİ TESTİ BAŞLIYOR...", selected_symbols.len());
-    println!("⚡ Paralel işleme: Aynı anda {} coin işlenecek", concurrency);
+    println!("✅ Selected {} coins for rigorous backtesting.", selected_symbols.len());
+    println!("🚀 Starting parallel execution (Concurrency: {})...", concurrency);
     println!();
 
     let results = stream::iter(selected_symbols)
@@ -233,10 +234,20 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .await;
 
+    // ✅ Plan.md: Sonuçları işleme ve kaydetme
+    let mut total_pnl_sum = 0.0;
+    let mut profitable_coins = 0;
+
     for (symbol, result, wtr_arc, all_results_arc, reports_dir, interval) in results {
         match result {
             Ok(res) => {
                 success_count += 1;
+                
+                // ✅ Plan.md: Toplam PnL ve karlı coin sayısını hesapla
+                total_pnl_sum += res.total_pnl_pct;
+                if res.total_pnl_pct > 0.0 {
+                    profitable_coins += 1;
+                }
                 
                 // ✅ NEW: Calculate advanced metrics
                 let advanced = calculate_advanced_metrics(&res);
@@ -323,16 +334,20 @@ async fn main() -> Result<()> {
     }
     
     // Get all_results from Arc<Mutex>
-    let all_results = all_results.lock().await.clone();
+    let all_results = all_results.lock().await;
+    let mut all_results = all_results.clone();
 
     let total_duration = Utc::now() - total_start;
 
     println!();
-    println!("===== MULTI-SYMBOL BACKTEST TAMAMLANDI =====");
+    println!("===== SONUÇ RAPORU =====");
+    println!("⏱️  Toplam Süre: {} saniye", total_duration.num_seconds());
+    println!("💰 Toplam Portföy PnL (Eşit Ağırlıklı): %{:.2}", total_pnl_sum * 100.0);
+    println!("🏆 Karlı Coin Sayısı: {} / {}", profitable_coins, max_symbols);
+    println!("📄 Rapor Dosyası: {}", output_file);
+    println!();
     println!("Success      : {}", success_count);
     println!("Errors       : {}", error_count);
-    println!("Total time   : {:?}", total_duration);
-    println!("Output file  : {}", output_file);
     println!(
         "Bitiş        : {}",
         Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
@@ -467,7 +482,7 @@ async fn main() -> Result<()> {
                     let advanced = calculate_advanced_metrics(&result);
                     
                     let row = BacktestRow {
-                        symbol: symbol.clone(),
+                        symbol: symbol.to_string(),
                         interval: interval.clone(),
                         total_trades: result.total_trades,
                         win_trades: result.win_trades,
@@ -497,7 +512,7 @@ async fn main() -> Result<()> {
                         advanced.sharpe_ratio
                     );
                     
-                    optimized_results.push((symbol.clone(), result));
+                    optimized_results.push((symbol.to_string(), result));
                 }
                 Err(err) => {
                     eprintln!("  ❌ {}: Optimized backtest failed: {}", symbol, err);

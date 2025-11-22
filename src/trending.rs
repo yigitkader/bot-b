@@ -2073,7 +2073,7 @@ fn generate_signal_enhanced(
                 Only trade when real liquidation data is available from WebSocket stream."
             );
         } else {
-        if let Some(cascade_sig) = liq_map.generate_cascade_signal(candle.close, tick) {
+            if let Some(cascade_sig) = liq_map.generate_cascade_signal(candle.close, tick) {
             // ✅ CRITICAL FIX: Higher confidence threshold (0.5 instead of 0.35) for safety
             // Historical liquidation data is not perfect - need higher confidence
             // Real-time liquidation data (from WebSocket) is more reliable
@@ -2162,6 +2162,7 @@ fn generate_signal_enhanced(
                 if nearest_wall.distance_pct < 0.15 {
                     // Will be checked against base signal later
                 }
+            }
             }
         }
     }
@@ -3194,8 +3195,9 @@ pub fn generate_signals(
 ///
 /// - Immediate execution: Signal at candle `i` close → executed at candle `i+1` open (1 bar delay max)
 /// - No random 1-2 bar delay that allows market to move against us
-/// - Dynamic slippage: Base slippage (0.05%) multiplied by volatility (ATR-based) and random factor (1.0-3.0x)
+/// - ✅ DETERMINISTIC Slippage: Base slippage (config) multiplied by volatility (ATR-based). NO RANDOMNESS.
 /// - High volatility periods: slippage can reach 0.1-0.5% (production reality)
+/// - ✅ Plan.md: Rastgelelik tamamen kaldırıldı. Aynı veri → Aynı sonuç (Deterministik Backtest)
 ///
 /// # Production Execution (Realistic)
 ///
@@ -3227,9 +3229,9 @@ pub fn run_backtest_on_series(
     let has_real_liquidation_data = historical_force_orders.map(|v| !v.is_empty()).unwrap_or(false);
     
     if has_real_liquidation_data {
-        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi (ForceOrders) mevcut. Strateji aktif.", symbol);
+        log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut. Strateji aktif.", symbol);
     } else {
-        log::warn!("BACKTEST: ⚠️ {} için Liquidation verisi YOK. Bu strateji pas geçilecek.", symbol);
+        log::debug!("BACKTEST: ℹ️ {} için Liquidation verisi YOK. Tahmin yapılmayacak.", symbol);
     }
 
     let mut trades: Vec<Trade> = Vec::new();
@@ -3286,21 +3288,20 @@ pub fn run_backtest_on_series(
         // Update funding arbitrage tracker
         funding_arbitrage.update_funding(ctx.funding_rate, c.close_time);
 
-        // Liquidation Map Güncelleme (Sadece gerçek veri varsa)
-        if has_real_liquidation_data {
-            liquidation_map.update_from_real_liquidation_data(
-                c.close,
-                ctx.open_interest,
-                None, // Backtest'te anlık cluster verisi yok, sadece map kullanıyoruz
-                None,
-            );
-        }
+        // ✅ Plan.md: Liquidation Map Güncelleme (Varsa)
+        // Not: Backtest'te anlık WebSocket kümesi (cluster) verisi olmadığı için
+        // sadece map (duvarlar) üzerinden analiz yapılır.
+        // update_from_real_liquidation_data SADECE canlıda kullanılır.
+        // Backtest'te historical force orders'dan oluşturulan map sabit kalır.
+        // if has_real_liquidation_data {
+        //     // Backtest'te map güncellemesi yapılmaz - historical data zaten map'te
+        // }
 
         // ✅ PLAN.MD ADIM 1: Backtest sırasında gerçek anlık derinlik (depth) verimiz olmadığı için
         // MarketTick'i None veya boş geçiyoruz. Bu sayede OrderFlow ve Slippage
         // analizleri sahte verilerle çalışmayacak.
         // ❌ SİLİNDİ: estimate_realistic_depth ve sahte MarketTick üretimi kaldırıldı
-        let market_tick = None;
+        let market_tick: Option<MarketTick> = None;
 
         // ✅ CRITICAL FIX: Create MTF and OrderFlow analysis in backtest (same as production)
         // Multi-Timeframe Analysis - create from candles up to current index
@@ -4077,7 +4078,7 @@ pub fn print_advanced_report(result: &AdvancedBacktestResult) {
 //  Production Trending Runner
 // =======================
 
-use crate::types::{KlineData, KlineEvent, CombinedStreamEvent, TradeSignal, TrendParams, TrendingChannels};
+use crate::types::{KlineData, KlineEvent, TradeSignal, TrendParams, TrendingChannels};
 use futures::StreamExt;
 use log::{info, warn};
 use std::sync::Arc;
@@ -4087,7 +4088,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Her side için ayrı cooldown tracking (trend reversal'ları kaçırmamak için)
 /// LONG ve SHORT sinyalleri birbirini bloklamaz
-pub(crate) struct LastSignalState {
+pub struct LastSignalState {
     pub last_long_time: Option<chrono::DateTime<Utc>>,
     pub last_short_time: Option<chrono::DateTime<Utc>>,
 }
@@ -4490,7 +4491,7 @@ pub async fn run_combined_kline_stream(
 
 /// Symbol handler structure for combined stream
 /// Each symbol has its own candle buffer, signal state, and generation logic
-pub(crate) struct SymbolHandler {
+pub struct SymbolHandler {
     pub candle_buffer: Arc<RwLock<Vec<Candle>>>,
     pub signal_state: Arc<RwLock<LastSignalState>>,
     pub signal_tx: tokio::sync::mpsc::Sender<TradeSignal>,
@@ -4678,7 +4679,7 @@ async fn fetch_market_metrics(
 }
 
 async fn generate_signal_from_candle(
-    candle: &Candle,
+    _candle: &Candle,
     candle_buffer: &Arc<RwLock<Vec<Candle>>>,
     client: &FuturesClient,
     symbol: &str,
