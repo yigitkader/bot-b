@@ -1243,6 +1243,9 @@ pub struct AlgoConfig {
 pub struct FuturesClient {
     pub(crate) http: Client,
     pub(crate) base_url: Url,
+    pub(crate) api_key: Option<String>,
+    pub(crate) api_secret: Option<String>,
+    pub(crate) recv_window_ms: u64,
 }
 
 pub fn handle_broadcast_recv<T>(

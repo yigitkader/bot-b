@@ -46,28 +46,35 @@ impl MetricsCache {
     /// SymbolScanner yeni coinler bulup rotasyon yaptığında,
     /// MetricsCache'in o yeni coinler için hemen veri çekmesi (pre-warm) gerekir.
     /// Bu, ilk API çağrısında cache miss olmasını önler.
+    /// 
+    /// ⚠️ CRITICAL FIX: Check cache, not just tracked symbols list
+    /// Cache'de olmayan symbol'leri warmup et (ilk warmup için tüm symbol'ler warmup edilir)
     pub async fn pre_warm_symbols(&self, symbols: &[String]) -> Result<()> {
-        let existing_symbols = self.symbols.read().await.clone();
-        let new_symbols: Vec<String> = symbols
+        // ✅ FIX: Check cache instead of tracked symbols list
+        // Cache'de olmayan symbol'leri warmup et
+        let cache = self.cache.read().await;
+        let symbols_to_warmup: Vec<String> = symbols
             .iter()
-            .filter(|s| !existing_symbols.contains(s))
+            .filter(|s| !cache.contains_key(*s))
             .cloned()
             .collect();
+        drop(cache);
 
-        if new_symbols.is_empty() {
+        if symbols_to_warmup.is_empty() {
+            info!("METRICS_CACHE: All symbols already in cache, skipping warmup");
             return Ok(());
         }
 
         info!(
-            "METRICS_CACHE: Pre-warming {} new symbols: {:?}",
-            new_symbols.len(),
-            new_symbols
+            "METRICS_CACHE: Pre-warming {} symbols (not in cache): {:?}",
+            symbols_to_warmup.len(),
+            symbols_to_warmup
         );
 
         let mut success_count = 0;
         let mut error_count = 0;
 
-        for symbol in &new_symbols {
+        for symbol in &symbols_to_warmup {
             match self.update_symbol_metrics(symbol).await {
                 Ok(_) => success_count += 1,
                 Err(err) => {
@@ -85,9 +92,14 @@ impl MetricsCache {
             success_count, error_count
         );
 
-        // Update tracked symbols list
+        // ✅ FIX: Update tracked symbols list (if not already set)
+        // set_symbols() zaten çağrılmış olabilir, bu yüzden sadece eksik olanları ekle
         let mut tracked = self.symbols.write().await;
-        tracked.extend(new_symbols);
+        for symbol in &symbols_to_warmup {
+            if !tracked.contains(symbol) {
+                tracked.push(symbol.clone());
+            }
+        }
 
         Ok(())
     }

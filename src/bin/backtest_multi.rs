@@ -136,14 +136,21 @@ async fn fetch_and_cache_data(
             
             println!("  ⬇️  [{}] ForceOrders (Ağır Veri) İndiriliyor...", symbol);
             
-            // Hata olursa backtest durmasın, boş liste dönsün
+            // ✅ FIX: Force Orders endpoint requires authentication
+            // If API key/secret not configured, will return empty (with warning in logs)
             let force_orders = match client.fetch_historical_force_orders(
                 symbol, 
                 Some(first.open_time), 
                 Some(last.close_time), 
                 1000 
             ).await {
-                Ok(data) => data,
+                Ok(data) => {
+                    if data.is_empty() {
+                        // Check if this is due to missing auth (warning already logged in fetch_historical_force_orders)
+                        eprintln!("  ⚠️  [{}] ForceOrder verisi boş (API key/secret kontrol edin)", symbol);
+                    }
+                    data
+                },
                 Err(e) => {
                     eprintln!("  ⚠️  [{}] ForceOrder hatası (atlanıyor): {}", symbol, e);
                     Vec::new()
@@ -405,39 +412,38 @@ async fn run_backtest_with_slice(
     let start_time = candles_slice.first().map(|c| c.open_time);
     let end_time = candles_slice.last().map(|c| c.close_time);
     
-    // ✅ KRİTİK FIX (Plan.md): Funding/OI/LSR verilerini SADECE slice time range için filtrele
+    // ✅ KRİTİK FIX (Plan.md): Funding/OI/LSR verilerini ZAMAN ARALIKINA GÖRE çek
+    // API'den tüm veriyi çekip filtrelemek yerine, doğrudan zaman aralığı ile çek
     // Bu, gelecek bilgisinin geçmişe sızmasını önler (Look-Ahead Bias önleme)
-    use chrono::{DateTime, Utc};
-    let all_funding = client.fetch_funding_rates(symbol, 500).await?;
-    let funding: Vec<_> = all_funding.into_iter()
-        .filter(|f| {
-            let ts = DateTime::<Utc>::from_timestamp_millis(f.funding_time);
-            match (ts, start_time, end_time) {
-                (Some(t), Some(s), Some(e)) => t >= s && t <= e,
-                _ => false
-            }
-        })
-        .collect();
+    // 
+    // ÖNCEKİ SORUN: fetch_funding_rates(symbol, 500) son 500 kaydı döndürüyordu,
+    // slice'ın zaman aralığı ile uyumlu olmayabilirdi (gelecek veri içerebilirdi)
+    //
+    // ÇÖZÜM: Zaman aralığı parametreleri ile API'den doğrudan ilgili veriyi çek
     
-    let all_oi = client.fetch_open_interest_hist(symbol, period, total_limit).await?;
-    let oi_hist: Vec<_> = all_oi.into_iter()
-        .filter(|o| {
-            match (start_time, end_time) {
-                (Some(s), Some(e)) => o.timestamp >= s && o.timestamp <= e,
-                _ => false
-            }
-        })
-        .collect();
+    // Funding rates için limit hesapla: slice süresine göre yeterli sayıda funding event
+    // Funding her 8 saatte bir, slice için yeterli limit hesapla
+    let funding_limit = if let (Some(start), Some(end)) = (start_time, end_time) {
+        let duration_hours = (end - start).num_hours().max(0) as u32;
+        // Her 8 saatte bir funding + buffer
+        (duration_hours / 8 + 10).min(1000) // Max 1000, min yeterli sayı
+    } else {
+        500 // Fallback
+    };
     
-    let all_lsr = client.fetch_top_long_short_ratio(symbol, period, total_limit).await?;
-    let lsr_hist: Vec<_> = all_lsr.into_iter()
-        .filter(|l| {
-            match (start_time, end_time) {
-                (Some(s), Some(e)) => l.timestamp >= s && l.timestamp <= e,
-                _ => false
-            }
-        })
-        .collect();
+    let funding = client
+        .fetch_funding_rates_with_range(symbol, funding_limit, start_time, end_time)
+        .await?;
+    
+    // OI ve LSR için limit: slice'daki candle sayısına göre
+    let oi_limit = candles_slice.len().min(total_limit as usize) as u32;
+    let oi_hist = client
+        .fetch_open_interest_hist_with_range(symbol, period, oi_limit, start_time, end_time)
+        .await?;
+    
+    let lsr_hist = client
+        .fetch_top_long_short_ratio_with_range(symbol, period, oi_limit, start_time, end_time)
+        .await?;
 
     // Force orders (slice time range için)
     let force_orders_json = get_cached_force_orders(&client, symbol, start_time, end_time, 500)
@@ -563,6 +569,22 @@ async fn main() -> Result<()> {
     // ✅ Plan.md: FAZ 1 - Veri İndirme ve Önbellekleme (Rate Limit Korumalı)
     println!("\n⬇️  FAZ 1: VERİ İNDİRME (Güvenli Mod - Max 3 Paralel)");
     println!("   Binance API limitlerine saygı duyuluyor...");
+    
+    // ✅ FIX: Check if authentication is configured for force orders
+    // Note: FuturesClient::new() will load from config.yaml or env vars
+    let has_auth = std::env::var("BINANCE_API_KEY").is_ok() 
+        && std::env::var("BINANCE_API_SECRET").is_ok();
+    
+    if !has_auth {
+        println!("⚠️  NOT: Force Orders (liquidation) verisi için authentication gerekli.");
+        println!("⚠️  Config: config.yaml -> binance -> api_key ve secret_key");
+        println!("⚠️  Veya: BINANCE_API_KEY ve BINANCE_API_SECRET environment variables");
+        println!("⚠️  Authentication yoksa Force Orders verisi çekilemeyecek (boş dönecek).");
+        println!();
+    } else {
+        println!("✅ Binance API authentication yapılandırılmış (env vars) - Force Orders verisi çekilebilir.");
+        println!();
+    }
     
     let client = FuturesClient::new();
     // ✅ DÜZELTME 2: Semaphore ayarı
@@ -817,6 +839,19 @@ async fn main() -> Result<()> {
     println!("📉 En Yüksek Max Drawdown: %{:.2}", max_portfolio_drawdown * 100.0);
     println!("📂 Detaylı Rapor: {}", output_file);
     println!("════════════════════════════════════════");
+    
+    // ⚠️ CRITICAL WARNING: Order Flow impact on backtest results
+    if cfg.enable_order_flow {
+        println!();
+        println!("⚠️  ⚠️  ⚠️  KRİTİK UYARI  ⚠️  ⚠️  ⚠️");
+        println!("⚠️  Config'de Order Flow AKTİF ama backtest'te DEVRE DIŞI!");
+        println!("⚠️  Backtest sonuçları production performansını YANSITMAYACAK.");
+        println!("⚠️  Production'da Order Flow sinyalleri (Absorption, Spoofing, Iceberg) üretilecek.");
+        println!("⚠️  Backtest'te bu sinyaller hiç üretilmedi (gerçek zamanlı veri yok).");
+        println!("⚠️  Production performansı backtest'ten DAHA İYİ olabilir.");
+        println!("⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️  ⚠️");
+    }
+    
     println!();
     // ✅ Plan.md: Portfolio Backtest Seçeneği
     let enable_portfolio_backtest = std::env::var("PORTFOLIO_BACKTEST")

@@ -184,9 +184,11 @@ async fn main() -> Result<()> {
     {
         let ch = follow_ch;
         let state = shared_state.clone();
-        // Round-trip commission: 2x taker fee (entry + exit)
-        // Default: 0.08% (2x 0.04% taker fee)
-        let commission_pct = 0.08;
+        // ✅ FIX: Use config fee_bps_round_trip instead of hardcoded value
+        // Convert from basis points (bps) to percentage
+        // Example: 13.0 bps = 0.13% (matches backtest_multi.rs)
+        // fee_bps_round_trip is in basis points (e.g., 13.0 = 13 bps = 0.13%)
+        let commission_pct = config.trend_params().fee_bps_round_trip / 100.0;
         // ATR multipliers for dynamic TP/SL (matched with backtest exits)
         let atr_sl_multiplier = config.atr_sl_multiplier;
         let atr_tp_multiplier = config.atr_tp_multiplier;
@@ -386,7 +388,17 @@ async fn main() -> Result<()> {
     symbol_cache.warmup(&initial_symbols, &connection).await;
     info!("CACHE: Symbol info cache warmup complete");
 
-    // Cache update task
+    // ✅ FIX: Warm up metrics cache BEFORE starting update task
+    // This prevents API calls during the first few minutes while cache is empty
+    // set_symbols() only sets the list, it doesn't fill the cache
+    info!("CACHE: Warming up metrics cache...");
+    if let Err(err) = metrics_cache.pre_warm_symbols(&initial_symbols).await {
+        warn!("CACHE: Metrics cache warmup failed: {} (will continue with empty cache)", err);
+    } else {
+        info!("CACHE: Metrics cache warmup complete");
+    }
+
+    // Cache update task (starts AFTER warmup is complete)
     let cache_for_update = metrics_cache.clone();
     let cache_update_handle = tokio::spawn(async move {
         cache_for_update.run_update_task().await;

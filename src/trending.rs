@@ -5,6 +5,10 @@ use chrono::{DateTime, Timelike, Utc};
 use reqwest::{Client, Url};
 use ta::indicators::{AverageTrueRange, ExponentialMovingAverage, RelativeStrengthIndex};
 use ta::{DataItem, Next};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use hex;
+use serde_urlencoded;
 
 use crate::types::{
     AdvancedBacktestResult, AlgoConfig, BacktestResult, Candle, DepthSnapshot, FundingRate,
@@ -137,11 +141,17 @@ impl FundingArbitrage {
     /// ✅ CRITICAL FIX: Detect funding arbitrage with price movement check
     /// Checks if price has already moved in expected direction (market efficiency)
     /// Only signals arbitrage if price hasn't moved yet or moved in opposite direction
+    /// 
+    /// # Parameters
+    /// - `now`: Current time
+    /// - `current_price`: Current price
+    /// - `price_history`: Price history in chronological order (oldest first)
+    ///   ⚠️ CRITICAL: Must be sorted by timestamp ascending for find() to work correctly
     pub fn detect_funding_arbitrage(
         &self,
         now: DateTime<Utc>,
         current_price: f64,
-        price_history: &[(DateTime<Utc>, f64)], // (timestamp, price) pairs
+        price_history: &[(DateTime<Utc>, f64)], // (timestamp, price) pairs - MUST be chronological (oldest first)
     ) -> Option<FundingArbitrageSignal> {
         if !self.is_pre_funding_window(now) {
             return None;
@@ -1294,6 +1304,8 @@ impl VolumeProfile {
     }
 }
 
+type HmacSha256 = Hmac<Sha256>;
+
 impl FuturesClient {
     pub fn new() -> Self {
         let http = Client::builder()
@@ -1302,7 +1314,50 @@ impl FuturesClient {
             .unwrap();
 
         let base_url = Url::parse("https://fapi.binance.com").unwrap(); // USDS-M futures
-        Self { http, base_url }
+        
+        // ✅ FIX: Load credentials from config (for authenticated endpoints like forceOrders)
+        let file_cfg = crate::types::FileConfig::load("config.yaml").unwrap_or_default();
+        let binance_cfg = file_cfg.binance.as_ref();
+        
+        let api_key = binance_cfg
+            .and_then(|b| b.api_key.clone())
+            .or_else(|| std::env::var("BINANCE_API_KEY").ok())
+            .filter(|k| !k.is_empty());
+        
+        let api_secret = binance_cfg
+            .and_then(|b| b.secret_key.clone())
+            .or_else(|| std::env::var("BINANCE_API_SECRET").ok())
+            .filter(|s| !s.is_empty());
+        
+        let recv_window_ms = binance_cfg
+            .and_then(|b| b.recv_window_ms)
+            .unwrap_or(5000);
+        
+        Self {
+            http,
+            base_url,
+            api_key,
+            api_secret,
+            recv_window_ms,
+        }
+    }
+    
+    /// Sign parameters for authenticated requests (same logic as connection.rs)
+    fn sign_params(&self, mut params: Vec<(String, String)>) -> Result<String> {
+        let api_secret = self.api_secret.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("API secret required for signed requests"))?;
+        
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        params.push(("timestamp".into(), timestamp.to_string()));
+        if self.recv_window_ms > 0 {
+            params.push(("recvWindow".into(), self.recv_window_ms.to_string()));
+        }
+        let query = serde_urlencoded::to_string(&params)?;
+        let mut mac = HmacSha256::new_from_slice(api_secret.as_bytes())
+            .map_err(|err| anyhow::anyhow!("failed to init signer: {err}"))?;
+        mac.update(query.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+        Ok(format!("{query}&signature={signature}"))
     }
 
     pub async fn fetch_klines(
@@ -1350,11 +1405,36 @@ impl FuturesClient {
         Ok(candles)
     }
 
-    pub async fn fetch_funding_rates(&self, symbol: &str, limit: u32) -> Result<Vec<FundingRate>> {
+    pub async fn fetch_funding_rates(
+        &self,
+        symbol: &str,
+        limit: u32,
+    ) -> Result<Vec<FundingRate>> {
+        self.fetch_funding_rates_with_range(symbol, limit, None, None).await
+    }
+
+    /// Fetch funding rates with optional time range (prevents look-ahead bias in walk-forward analysis)
+    pub async fn fetch_funding_rates_with_range(
+        &self,
+        symbol: &str,
+        limit: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+    ) -> Result<Vec<FundingRate>> {
         let mut url = self.base_url.join("/fapi/v1/fundingRate")?;
         url.query_pairs_mut()
             .append_pair("symbol", symbol)
             .append_pair("limit", &limit.to_string());
+        
+        // ✅ FIX: Add time range parameters to prevent look-ahead bias
+        if let Some(start) = start_time {
+            url.query_pairs_mut()
+                .append_pair("startTime", &start.timestamp_millis().to_string());
+        }
+        if let Some(end) = end_time {
+            url.query_pairs_mut()
+                .append_pair("endTime", &end.timestamp_millis().to_string());
+        }
 
         let res = self.http.get(url).send().await?;
         if !res.status().is_success() {
@@ -1386,11 +1466,33 @@ impl FuturesClient {
         period: &str,
         limit: u32,
     ) -> Result<Vec<OpenInterestPoint>> {
+        self.fetch_open_interest_hist_with_range(symbol, period, limit, None, None).await
+    }
+
+    /// Fetch open interest history with optional time range (prevents look-ahead bias in walk-forward analysis)
+    pub async fn fetch_open_interest_hist_with_range(
+        &self,
+        symbol: &str,
+        period: &str,
+        limit: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+    ) -> Result<Vec<OpenInterestPoint>> {
         let mut url = self.base_url.join("/futures/data/openInterestHist")?;
         url.query_pairs_mut()
             .append_pair("symbol", symbol)
             .append_pair("period", period)
             .append_pair("limit", &limit.to_string());
+        
+        // ✅ FIX: Add time range parameters to prevent look-ahead bias
+        if let Some(start) = start_time {
+            url.query_pairs_mut()
+                .append_pair("startTime", &start.timestamp_millis().to_string());
+        }
+        if let Some(end) = end_time {
+            url.query_pairs_mut()
+                .append_pair("endTime", &end.timestamp_millis().to_string());
+        }
 
         let res = self.http.get(url).send().await?;
         if !res.status().is_success() {
@@ -1415,6 +1517,18 @@ impl FuturesClient {
         period: &str,
         limit: u32,
     ) -> Result<Vec<LongShortRatioPoint>> {
+        self.fetch_top_long_short_ratio_with_range(symbol, period, limit, None, None).await
+    }
+
+    /// Fetch top long/short ratio with optional time range (prevents look-ahead bias in walk-forward analysis)
+    pub async fn fetch_top_long_short_ratio_with_range(
+        &self,
+        symbol: &str,
+        period: &str,
+        limit: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+    ) -> Result<Vec<LongShortRatioPoint>> {
         let mut url = self
             .base_url
             .join("/futures/data/topLongShortAccountRatio")?;
@@ -1422,6 +1536,16 @@ impl FuturesClient {
             .append_pair("symbol", symbol)
             .append_pair("period", period)
             .append_pair("limit", &limit.to_string());
+        
+        // ✅ FIX: Add time range parameters to prevent look-ahead bias
+        if let Some(start) = start_time {
+            url.query_pairs_mut()
+                .append_pair("startTime", &start.timestamp_millis().to_string());
+        }
+        if let Some(end) = end_time {
+            url.query_pairs_mut()
+                .append_pair("endTime", &end.timestamp_millis().to_string());
+        }
 
         let res = self.http.get(url).send().await?;
         if !res.status().is_success() {
@@ -1452,7 +1576,9 @@ impl FuturesClient {
 
     /// ✅ CRITICAL FIX: Fetch historical force orders (liquidation data) for backtest
     /// This provides REAL liquidation data instead of mathematical estimates
-    /// Binance API: /fapi/v1/forceOrders (requires authentication, but we can use public endpoint with symbol filter)
+    /// Binance API: /fapi/v1/forceOrders (REQUIRES authentication)
+    /// 
+    /// ⚠️ IMPORTANT: This endpoint requires API key/secret. If not configured, returns empty vector.
     pub async fn fetch_historical_force_orders(
         &self,
         symbol: &str,
@@ -1462,25 +1588,52 @@ impl FuturesClient {
     ) -> Result<Vec<crate::types::ForceOrderRecord>> {
         use crate::types::ForceOrderRecord;
         
-        let mut url = self.base_url.join("/fapi/v1/forceOrders")?;
-        url.query_pairs_mut()
-            .append_pair("symbol", symbol)
-            .append_pair("autoCloseType", "LIQUIDATION")
-            .append_pair("limit", &limit.to_string());
+        // ✅ FIX: Check if authentication is available
+        if self.api_key.is_none() || self.api_secret.is_none() {
+            log::warn!(
+                "FUTURES_CLIENT: ⚠️ API key/secret not configured. Cannot fetch force orders for {}. \
+                Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables or config.yaml",
+                symbol
+            );
+            return Ok(Vec::new());
+        }
+        
+        // Build query parameters
+        let mut params = vec![
+            ("symbol".to_string(), symbol.to_string()),
+            ("autoCloseType".to_string(), "LIQUIDATION".to_string()),
+            ("limit".to_string(), limit.to_string()),
+        ];
         
         if let Some(start) = start_time {
-            url.query_pairs_mut()
-                .append_pair("startTime", &start.timestamp_millis().to_string());
+            params.push(("startTime".to_string(), start.timestamp_millis().to_string()));
         }
         if let Some(end) = end_time {
-            url.query_pairs_mut()
-                .append_pair("endTime", &end.timestamp_millis().to_string());
+            params.push(("endTime".to_string(), end.timestamp_millis().to_string()));
         }
-
-        let res = self.http.get(url).send().await?;
-        if !res.status().is_success() {
+        
+        // ✅ FIX: Sign the request (authentication required)
+        let query = self.sign_params(params)?;
+        let url = format!("{}/fapi/v1/forceOrders?{}", self.base_url, query);
+        
+        let res = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", self.api_key.as_ref().unwrap())
+            .send()
+            .await?;
+        
+        let status = res.status();
+        if !status.is_success() {
+            let error_text = res.text().await.unwrap_or_default();
             // ✅ Plan.md: Sessizce boş dön (veri yoksa strateji çalışmaz)
-            // Backtest'te gerçek liquidation verisi yoksa, strateji devre dışı kalacak
+            // But log the error for debugging
+            log::debug!(
+                "FUTURES_CLIENT: Force orders API error for {}: {} (status: {})",
+                symbol,
+                error_text,
+                status
+            );
             return Ok(Vec::new());
         }
 
@@ -1630,7 +1783,18 @@ pub fn build_signal_contexts(
 
 /// Aggregate 1-minute candles into higher timeframes
 /// Simple approach: group consecutive candles into time windows
-fn aggregate_candles(candles: &[Candle], minutes: usize) -> Vec<Candle> {
+/// Aggregate lower timeframe candles into higher timeframe candles
+/// 
+/// ⚠️ REPAINTING RISK PREVENTION:
+/// - Only includes completed aggregated candles (those whose close_time <= max_time)
+/// - The last aggregated candle is excluded if it's not yet complete (to prevent repainting)
+/// - This ensures backtest uses only data that would have been available at that point in time
+/// 
+/// # Parameters
+/// - `candles`: Lower timeframe candles to aggregate
+/// - `minutes`: Number of minutes for the higher timeframe (e.g., 5 for 5-minute candles)
+/// - `max_time`: Maximum time to consider (only aggregated candles with close_time <= max_time are included)
+fn aggregate_candles(candles: &[Candle], minutes: usize, max_time: DateTime<Utc>) -> Vec<Candle> {
     if candles.is_empty() {
         return Vec::new();
     }
@@ -1641,6 +1805,13 @@ fn aggregate_candles(candles: &[Candle], minutes: usize) -> Vec<Candle> {
     while i < candles.len() {
         let start_time = candles[i].open_time;
         let end_time = start_time + chrono::Duration::minutes(minutes as i64);
+        
+        // ✅ FIX: Only include aggregated candles that are complete (close_time <= max_time)
+        // This prevents repainting by excluding incomplete candles
+        if end_time > max_time {
+            // This aggregated candle is not yet complete - stop here
+            break;
+        }
         
         let mut agg_candle = Candle {
             open_time: start_time,
@@ -1711,9 +1882,12 @@ fn calculate_indicators_for_candles(candles: &[Candle]) -> Option<SignalContext>
 /// Detects base timeframe from candle intervals and aggregates accordingly
 /// Production uses 5m candles, backtest may use 1m or 5m
 /// 
-/// ⚠️ REPAINTING RISK WARNING:
-/// This function aggregates lower timeframe candles to create higher timeframes.
-/// The aggregated indicators (EMA, RSI) may not match exactly with real higher timeframe data
+/// ⚠️ REPAINTING RISK PREVENTION:
+/// - `aggregate_candles` function now excludes incomplete aggregated candles
+/// - Only completed higher timeframe candles are used for indicator calculation
+/// - This ensures backtest uses only data that would have been available at that point in time
+/// 
+/// ⚠️ NOTE: Aggregated indicators (EMA, RSI) may not match exactly with real higher timeframe data
 /// from the exchange. This is a trade-off for backtest efficiency.
 /// 
 /// For production: Consider fetching real higher timeframe data from exchange API
@@ -1768,7 +1942,9 @@ pub fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> M
 
             // 5-minute: Aggregate 1m candles (5x)
             if candles.len() >= 50 {
-                let candles_5m = aggregate_candles(candles, 5);
+                // ✅ FIX: Use last candle's close_time as max_time to prevent repainting
+                let max_time = candles.last().map(|c| c.close_time).unwrap_or_else(|| Utc::now());
+                let candles_5m = aggregate_candles(candles, 5, max_time);
                 if let Some(ctx_5m) = calculate_indicators_for_candles(&candles_5m) {
                     let trend_5m = classify_trend(&ctx_5m);
                     let strength_5m = (ctx_5m.rsi / 100.0).min(1.0).max(0.0);
@@ -1787,7 +1963,9 @@ pub fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> M
 
             // 15-minute: Aggregate 1m candles (15x)
             if candles.len() >= 165 {
-                let candles_15m = aggregate_candles(candles, 15);
+                // ✅ FIX: Use last candle's close_time as max_time to prevent repainting
+                let max_time = candles.last().map(|c| c.close_time).unwrap_or_else(|| Utc::now());
+                let candles_15m = aggregate_candles(candles, 15, max_time);
                 if let Some(ctx_15m) = calculate_indicators_for_candles(&candles_15m) {
                     let trend_15m = classify_trend(&ctx_15m);
                     let strength_15m = (ctx_15m.rsi / 100.0).min(1.0).max(0.0);
@@ -1806,7 +1984,9 @@ pub fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> M
 
             // 1-hour: Aggregate 1m candles (60x)
             if candles.len() >= 660 {
-                let candles_1h = aggregate_candles(candles, 60);
+                // ✅ FIX: Use last candle's close_time as max_time to prevent repainting
+                let max_time = candles.last().map(|c| c.close_time).unwrap_or_else(|| Utc::now());
+                let candles_1h = aggregate_candles(candles, 60, max_time);
                 if let Some(ctx_1h) = calculate_indicators_for_candles(&candles_1h) {
                     let trend_1h = classify_trend(&ctx_1h);
                     let strength_1h = (ctx_1h.rsi / 100.0).min(1.0).max(0.0);
@@ -1853,7 +2033,9 @@ pub fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> M
 
             // 15-minute: Aggregate 5m candles (3x)
             if candles.len() >= 33 {
-                let candles_15m = aggregate_candles(candles, 3);
+                // ✅ FIX: Use last candle's close_time as max_time to prevent repainting
+                let max_time = candles.last().map(|c| c.close_time).unwrap_or_else(|| Utc::now());
+                let candles_15m = aggregate_candles(candles, 3, max_time);
                 if let Some(ctx_15m) = calculate_indicators_for_candles(&candles_15m) {
                     let trend_15m = classify_trend(&ctx_15m);
                     let strength_15m = (ctx_15m.rsi / 100.0).min(1.0).max(0.0);
@@ -1872,7 +2054,9 @@ pub fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> M
 
             // 1-hour: Aggregate 5m candles (12x)
             if candles.len() >= 132 {
-                let candles_1h = aggregate_candles(candles, 12);
+                // ✅ FIX: Use last candle's close_time as max_time to prevent repainting
+                let max_time = candles.last().map(|c| c.close_time).unwrap_or_else(|| Utc::now());
+                let candles_1h = aggregate_candles(candles, 12, max_time);
                 if let Some(ctx_1h) = calculate_indicators_for_candles(&candles_1h) {
                     let trend_1h = classify_trend(&ctx_1h);
                     let strength_1h = (ctx_1h.rsi / 100.0).min(1.0).max(0.0);
@@ -2182,12 +2366,15 @@ pub fn generate_signal_enhanced(
         if fa.is_pre_funding_window(candle.close_time) {
             // ✅ FIX: Build price history from candles for price movement check
             // Use last 100 candles (enough to cover 90-minute pre-funding window)
-            let price_history: Vec<(DateTime<Utc>, f64)> = candles
-                .iter()
-                .rev()
-                .take(100)
-                .map(|c| (c.close_time, c.close))
-                .collect();
+            // ⚠️ CRITICAL FIX: Price history must be in chronological order (oldest first)
+            // for find() to correctly locate the first price after pre_funding_start
+            let price_history: Vec<(DateTime<Utc>, f64)> = {
+                let start_idx = candles.len().saturating_sub(100);
+                candles[start_idx..]
+                    .iter()
+                    .map(|c| (c.close_time, c.close))
+                    .collect()
+            };
             
             if let Some(arb_signal) = fa.detect_funding_arbitrage(
                 candle.close_time,
@@ -2659,6 +2846,13 @@ pub fn generate_signal_enhanced(
     // ✅ CRITICAL FIX: Order Flow yokken nötr skorlama (TrendPlan.md - Action Plan)
     // Eğer Order Flow verisi yoksa (backtest veya depth data eksik), bu bölümü atla
     // Order Flow skorlaması zaten calculate_microstructure_score'da nötr (0.0) dönecek
+    //
+    // ⚠️ CRITICAL WARNING: Order Flow signals are HIGH PRIORITY and can generate signals
+    // that immediately return (bypassing other signal generation logic).
+    // In backtest, Order Flow is ALWAYS None, so these high-priority signals are NEVER generated.
+    // This means backtest results will differ from production when Order Flow is enabled in config.
+    // Production will have additional signals from Absorption, Spoofing, and Iceberg detection
+    // that are completely missing in backtest.
     if let Some(of) = orderflow {
         // ✅ FIX: Order flow confirmation - more aggressive usage
         // Market maker behavior is a strong signal, use it proactively
@@ -3230,11 +3424,28 @@ pub fn run_backtest_on_series(
     // Backtest'te MUTLAKA false (Plan.md) - Order Flow analizi yapılmaz
     let _enable_order_flow_simulation = false; // Backtest'te MUTLAKA false (Plan.md)
     
-    // Log warning if config has enable_order_flow=true (will be ignored in backtest)
+    // ⚠️ CRITICAL: Order Flow is ALWAYS disabled in backtest (no real-time tick data)
+    // This creates a significant difference between backtest and production when Order Flow is enabled
+    // Order Flow signals (Absorption, Spoofing, Iceberg) are high-priority and can generate signals
+    // that are completely missing in backtest, making backtest results underestimate production performance
     if cfg.enable_order_flow {
+        eprintln!(
+            "  ⚠️  [{}] KRİTİK UYARI: Order Flow backtest'te DEVRE DIŞI (gerçek zamanlı veri yok)",
+            symbol
+        );
+        eprintln!(
+            "  ⚠️  [{}] NOT: Backtest sonuçları production performansını YANSITMAYACAK",
+            symbol
+        );
+        eprintln!(
+            "  ⚠️  [{}] NOT: Production'da Order Flow sinyalleri üretilecek, backtest'te YOK",
+            symbol
+        );
         log::warn!(
-            "BACKTEST: ⚠️ Config has enable_order_flow=true, but Order Flow is DISABLED in backtest \
-            (no real-time tick data available). Backtest results will NOT include Order Flow analysis."
+            "BACKTEST: ⚠️ CRITICAL - Config has enable_order_flow=true, but Order Flow is DISABLED in backtest \
+            (no real-time tick data available). Backtest results will NOT match production performance. \
+            Production will generate additional high-priority signals from Order Flow analysis \
+            (Absorption, Spoofing, Iceberg) that are completely missing in backtest."
         );
     } 
 
@@ -3381,15 +3592,22 @@ pub fn run_backtest_on_series(
                 let raw_entry_price = entry_candle.open;
 
                 // SOMUT SLIPPAGE HESABI (Rastgelelik Yok)
-                // 1. Baz Slippage: Config'den gelir (örn: 0.05%)
+                // 1. Baz Slippage: Config'den gelir (örn: 7 bps = 0.0007)
                 // 2. Volatilite Cezası: ATR / Fiyat oranı yüksekse slippage artar.
-                let atr_pct = ctx.atr / c.close;
+                let atr_pct = ctx.atr / c.close;  // ATR as percentage (e.g., 0.02 = 2%)
                 
-                // Volatilite çarpanı: Eğer ATR %1'in üzerindeyse slippage lineer artar.
-                // Örn: ATR %2 ise çarpan 2.0 olur. Max çarpan 5.0.
-                let volatility_penalty = (atr_pct * 100.0).max(1.0).min(5.0);
+                // ✅ FIX: Volatility penalty calculation
+                // ATR %1 = 1.0x multiplier, ATR %2 = 2.0x multiplier, max 5.0x
+                // ÖNCEKİ SORUN: atr_pct * 100.0 yapılıyordu, bu ATR %2 iken 200.0 yapıyordu
+                // (ama min(5.0) ile sınırlandırılmış, yani her zaman 5.0 oluyordu)
+                // ÇÖZÜM: atr_pct zaten percentage (0.02 = 2%), bu yüzden 100 ile çarpmaya gerek yok
+                // ATR %1'i referans alarak: penalty = atr_pct / 0.01 (ATR %1 = 1.0x, ATR %2 = 2.0x)
+                let volatility_penalty = (atr_pct / 0.01).max(1.0).min(5.0);
                 
                 // Final Slippage Oranı
+                // Örnek: base_slippage_bps = 7.0 → base_slippage_frac = 0.0007
+                // ATR %2 → volatility_penalty = 2.0
+                // final_slippage_frac = 0.0007 * 2.0 = 0.0014 (14 bps) ✅
                 let final_slippage_frac = base_slippage_frac * volatility_penalty;
 
                 match sig.side {
@@ -3480,10 +3698,11 @@ pub fn run_backtest_on_series(
 
                 if should_close {
                     // ✅ FIX (Plan.md): Exit slippage'da da AYNI formül kullanılmalı (tutarlılık)
-                    // Entry'de: atr_pct = ctx.atr / c.close, volatility_penalty = (atr_pct * 100.0).max(1.0).min(5.0)
+                    // Entry'de: atr_pct = ctx.atr / c.close, volatility_penalty = (atr_pct / 0.01).max(1.0).min(5.0)
                     // Exit'te de aynı mantık: atr_pct hesapla, sonra volatility_penalty uygula
                     let exit_atr_pct = ctx.atr / next_c.close;
-                    let exit_volatility_penalty = (exit_atr_pct * 100.0).max(1.0).min(5.0);
+                    // ✅ FIX: Same formula as entry - ATR %1 = 1.0x, ATR %2 = 2.0x, max 5.0x
+                    let exit_volatility_penalty = (exit_atr_pct / 0.01).max(1.0).min(5.0);
                     let exit_slippage_frac = base_slippage_frac * exit_volatility_penalty;
 
                     // Çıkış fiyatını belirle (SL/TP durumunda limit fiyattan değil, tetiklenen fiyattan kayma ile)
@@ -3573,7 +3792,8 @@ pub fn run_backtest_on_series(
                 if should_close {
                     // ✅ FIX (Plan.md): Exit slippage'da da AYNI formül kullanılmalı (tutarlılık)
                     let exit_atr_pct = ctx.atr / next_c.close;
-                    let exit_volatility_penalty = (exit_atr_pct * 100.0).max(1.0).min(5.0);
+                    // ✅ FIX: Same formula as entry - ATR %1 = 1.0x, ATR %2 = 2.0x, max 5.0x
+                    let exit_volatility_penalty = (exit_atr_pct / 0.01).max(1.0).min(5.0);
                     let exit_slippage_frac = base_slippage_frac * exit_volatility_penalty;
 
                     let sl_hit = next_c.high >= final_stop_price;
@@ -3657,15 +3877,40 @@ pub fn run_backtest_on_series(
     };
 
     // ✅ CRITICAL FIX: Log Order Flow and Liquidation strategy impact
+    // ⚠️ IMPORTANT: Order Flow is ALWAYS disabled in backtest (no real-time tick data)
+    // This means backtest results will differ from production when Order Flow is enabled
     if cfg.enable_order_flow {
-        log::info!(
-            "BACKTEST: ✅ Order Flow strategies were ENABLED and tested in backtest. \
-            Results include Spoofing, Iceberg, and Absorption pattern detection."
+        // ⚠️ CRITICAL WARNING: Config has Order Flow enabled, but backtest cannot use it
+        eprintln!(
+            "  ⚠️  [{}] KRİTİK UYARI: Config'de Order Flow AKTİF ama backtest'te DEVRE DIŞI!",
+            symbol
+        );
+        eprintln!(
+            "  ⚠️  [{}] NOT: Backtest sonuçları production performansını YANSITMAYACAK.",
+            symbol
+        );
+        eprintln!(
+            "  ⚠️  [{}] NOT: Production'da Order Flow sinyalleri (Absorption, Spoofing) üretilecek.",
+            symbol
+        );
+        eprintln!(
+            "  ⚠️  [{}] NOT: Backtest'te bu sinyaller hiç üretilmedi (Order Flow verisi yok).",
+            symbol
+        );
+        eprintln!(
+            "  ⚠️  [{}] NOT: Production performansı backtest'ten DAHA İYİ olabilir (Order Flow sinyalleri eklenir).",
+            symbol
+        );
+        log::warn!(
+            "BACKTEST: ⚠️ CRITICAL - Config has enable_order_flow=true, but Order Flow is DISABLED in backtest \
+            (no real-time tick data available). Backtest results will NOT match production performance. \
+            Production will generate additional signals from Order Flow analysis (Absorption, Spoofing, Iceberg) \
+            that are completely missing in backtest."
         );
     } else {
         log::info!(
-            "BACKTEST: ⚠️ Order Flow strategies were DISABLED in config. \
-            Backtest results do NOT include Order Flow analysis."
+            "BACKTEST: ✅ Order Flow strategies were DISABLED in config. \
+            Backtest results match production (Order Flow not used in either)."
         );
     }
     
