@@ -546,6 +546,7 @@ pub(crate) struct DepthEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ForceOrderRecord {
     #[serde(rename = "side")]
     pub side: String,

@@ -1718,7 +1718,7 @@ fn calculate_indicators_for_candles(candles: &[Candle]) -> Option<SignalContext>
 /// 
 /// For production: Consider fetching real higher timeframe data from exchange API
 /// to avoid any repainting risk, though the difference should be minimal.
-fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> MultiTimeframeAnalysis {
+pub fn create_mtf_analysis(candles: &[Candle], current_ctx: &SignalContext) -> MultiTimeframeAnalysis {
     let mut mtf = MultiTimeframeAnalysis::new();
 
     if candles.is_empty() {
@@ -1976,7 +1976,7 @@ fn create_orderflow_from_real_depth(
 
 /// ✅ Plan.md: Build LiquidationMap from historical force orders (Sadece Gerçek ForceOrders ile çalışır)
 /// This provides REAL liquidation data for backtest instead of mathematical estimates
-fn build_liquidation_map_from_force_orders(
+pub fn build_liquidation_map_from_force_orders(
     force_orders: &[crate::types::ForceOrderRecord],
     current_price: f64,
     _open_interest: f64, // Not used in Plan.md version, kept for compatibility
@@ -2022,7 +2022,7 @@ pub fn classify_trend(ctx: &SignalContext) -> TrendDirection {
 /// Enhanced signal generation with quality filtering (TrendPlan.md önerileri)
 /// Volume confirmation, volatility filter, price action check
 /// Funding arbitrage integration
-fn generate_signal_enhanced(
+pub fn generate_signal_enhanced(
     candle: &Candle,
     ctx: &SignalContext,
     prev_ctx: Option<&SignalContext>,

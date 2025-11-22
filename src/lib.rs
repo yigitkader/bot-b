@@ -7,6 +7,7 @@ pub mod follow_orders;
 pub mod logging;
 pub mod metrics_cache;
 pub mod ordering;
+pub mod portfolio_backtest;
 pub mod risk_manager;
 pub mod slippage;
 pub mod state;
@@ -19,6 +20,7 @@ pub use cache::{DepthCache, SymbolInfoCache};
 
 pub use config::BotConfig;
 pub use metrics_cache::MetricsCache;
+pub use portfolio_backtest::{PortfolioBacktestResult, PortfolioCandleData, PortfolioMetrics};
 pub use risk_manager::{RiskLimits, RiskManager};
 pub use slippage::{run_slippage_tracker, SlippageStats, SlippageTracker};
 pub use symbol_scanner::{SymbolScanner, SymbolSelectionConfig};
