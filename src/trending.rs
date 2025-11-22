@@ -3479,9 +3479,12 @@ pub fn run_backtest_on_series(
                     (holding_bars >= min_holding_bars && next_c.high >= take_profit_price);
 
                 if should_close {
-                    // Çıkışta da aynı deterministik slippage mantığı
-                    let exit_volatility = ((ctx.atr / next_c.close) * 100.0).max(1.0).min(5.0);
-                    let exit_slippage = base_slippage_frac * exit_volatility;
+                    // ✅ FIX (Plan.md): Exit slippage'da da AYNI formül kullanılmalı (tutarlılık)
+                    // Entry'de: atr_pct = ctx.atr / c.close, volatility_penalty = (atr_pct * 100.0).max(1.0).min(5.0)
+                    // Exit'te de aynı mantık: atr_pct hesapla, sonra volatility_penalty uygula
+                    let exit_atr_pct = ctx.atr / next_c.close;
+                    let exit_volatility_penalty = (exit_atr_pct * 100.0).max(1.0).min(5.0);
+                    let exit_slippage_frac = base_slippage_frac * exit_volatility_penalty;
 
                     // Çıkış fiyatını belirle (SL/TP durumunda limit fiyattan değil, tetiklenen fiyattan kayma ile)
                     let sl_hit = next_c.low <= final_stop_price;
@@ -3495,7 +3498,7 @@ pub fn run_backtest_on_series(
                     };
 
                     // Long kapatırken (satış) fiyat aşağı kayar
-                    let exit_price = raw_exit_price * (1.0 - exit_slippage);
+                    let exit_price = raw_exit_price * (1.0 - exit_slippage_frac);
                     
                     let pnl_pct = ((exit_price - pos_entry_price) / pos_entry_price) - fee_frac;
                     let win = pnl_pct > 0.0;
@@ -3568,8 +3571,10 @@ pub fn run_backtest_on_series(
                     (holding_bars >= min_holding_bars && next_c.low <= take_profit_price);
 
                 if should_close {
-                    let exit_volatility = ((ctx.atr / next_c.close) * 100.0).max(1.0).min(5.0);
-                    let exit_slippage = base_slippage_frac * exit_volatility;
+                    // ✅ FIX (Plan.md): Exit slippage'da da AYNI formül kullanılmalı (tutarlılık)
+                    let exit_atr_pct = ctx.atr / next_c.close;
+                    let exit_volatility_penalty = (exit_atr_pct * 100.0).max(1.0).min(5.0);
+                    let exit_slippage_frac = base_slippage_frac * exit_volatility_penalty;
 
                     let sl_hit = next_c.high >= final_stop_price;
                     let tp_hit = next_c.low <= take_profit_price;
@@ -3582,7 +3587,7 @@ pub fn run_backtest_on_series(
                     };
 
                     // Short kapatırken (alış) fiyat yukarı kayar
-                    let exit_price = raw_exit_price * (1.0 + exit_slippage);
+                    let exit_price = raw_exit_price * (1.0 + exit_slippage_frac);
                     
                     let pnl_pct = ((pos_entry_price - exit_price) / pos_entry_price) - fee_frac;
                     let win = pnl_pct > 0.0;
@@ -4981,13 +4986,16 @@ async fn generate_signal_from_candle(
                     Ok(Some(trade_signal))
                 }
                 Err(err) => {
-                    // Signal gönderilemedi, cooldown'u geri al (reset)
-                    // This is rare but can happen if channel is closed
+                    // ✅ FIX (Plan.md): Cooldown'u None yapmak yerine, kısa bir "retry window" bırak
+                    // None yapınca hemen yeni sinyal üretilebilir, bu istenmeyen bir durum
+                    // Bunun yerine kısa bir süre sonrasına ayarla (retry window)
                     let mut state = signal_state.write().await;
+                    let retry_time = Utc::now() - cooldown_duration + chrono::Duration::seconds(5);
                     match side {
-                        Side::Long => state.last_long_time = None,
-                        Side::Short => state.last_short_time = None,
+                        Side::Long => state.last_long_time = Some(retry_time),
+                        Side::Short => state.last_short_time = Some(retry_time),
                     }
+                    warn!("TRENDING: failed to send signal: {}, 5s retry window set", err);
                     warn!("TRENDING: failed to send signal: {err}, cooldown reset");
                     Ok(None)
                 }
@@ -5177,10 +5185,12 @@ pub fn calculate_enhanced_signal_score(
     score += momentum_score;
     
     // === 3. VOLUME CONFIRMATION (0-15 points) - CRITICAL! ===
+    // ✅ FIX (Plan.md): Pass has_real_data flag to handle missing data properly
     let volume_score = calculate_volume_score(
         side,
         ctx.volume_ratio,
         ctx.buy_volume_ratio,
+        ctx.has_real_volume_data,
     );
     score += volume_score;
     
@@ -5336,11 +5346,20 @@ fn calculate_momentum_score(
 }
 
 /// Volume confirmation scoring - CRITICAL FOR CRYPTO!
+/// ✅ FIX (Plan.md): Added has_real_data parameter to handle missing data properly
 fn calculate_volume_score(
     side: SignalSide,
     volume_ratio: f64,
     buy_volume_ratio: f64,
+    has_real_data: bool,
 ) -> f64 {
+    // ✅ FIX (Plan.md): Gerçek veri yoksa nötr skor dön (bonus/ceza yok)
+    // 0.5 değeri (buy_volume_ratio için neutral) aslında skoru etkiliyor
+    // Veri eksikliğinde scoring devre dışı kalmalı (nötr skor)
+    if !has_real_data {
+        return 7.5; // Orta değer (max 15'in yarısı) - ne bonus ne ceza
+    }
+
     let mut score = 0.0;
 
     // Volume surge (0-8 points)
@@ -5609,17 +5628,19 @@ pub fn build_enhanced_signal_context(
     
     // Calculate buy volume ratio from OBI (real data)
     // If OBI not available, use neutral 0.5 (balanced market assumption)
-    let buy_volume_ratio = market_tick
+    // ✅ FIX (Plan.md): Track if real volume data is available
+    let (buy_volume_ratio, has_real_volume_data) = market_tick
         .and_then(|t| t.obi)
         .map(|obi| {
             // OBI > 1.0 means more bid pressure = more buy volume
-            if obi > 1.0 {
+            let ratio = if obi > 1.0 {
                 0.5 + (obi - 1.0).min(1.0) * 0.3 // Max 0.8
             } else {
                 0.5 - (1.0 - obi).min(1.0) * 0.3 // Min 0.2
-            }
+            };
+            (ratio, true) // Real OBI data available
         })
-        .unwrap_or(0.5); // Neutral if OBI not available (balanced market)
+        .unwrap_or((0.5, false)); // Neutral if OBI not available, no real data
 
     // Calculate MACD (simplified: EMA12 - EMA26)
     let macd = calculate_macd(candles, current_index);
@@ -5638,7 +5659,8 @@ pub fn build_enhanced_signal_context(
     // ✅ CRITICAL FIX: NO fallback values that cause incorrect scoring
     // If market_tick is missing, use values that result in ZERO scoring contribution
     // (not false positives or false negatives)
-    let (bid_ask_spread_bps, orderbook_imbalance, top_5_bid_depth_usd, top_5_ask_depth_usd) = 
+    // ✅ FIX (Plan.md): Track if real orderbook data is available
+    let (bid_ask_spread_bps, orderbook_imbalance, top_5_bid_depth_usd, top_5_ask_depth_usd, has_real_orderbook_data) = 
         if let Some(tick) = market_tick {
             // Real tick data available - use it
             let spread = if tick.ask > 0.0 && tick.bid > 0.0 {
@@ -5654,7 +5676,9 @@ pub fn build_enhanced_signal_context(
             let obi = tick.obi.unwrap_or(1.0); // 1.0 = neutral (no bonus/penalty)
             let bid_depth = tick.bid_depth_usd.unwrap_or(0.0); // 0.0 = penalty (will result in zero score)
             let ask_depth = tick.ask_depth_usd.unwrap_or(0.0); // 0.0 = penalty (will result in zero score)
-            (spread, obi, bid_depth, ask_depth)
+            // Real orderbook data available if tick exists and has valid bid/ask
+            let has_real_ob_data = tick.bid > 0.0 && tick.ask > 0.0 && (bid_depth > 0.0 || ask_depth > 0.0);
+            (spread, obi, bid_depth, ask_depth, has_real_ob_data)
         } else {
             // ❌ CRITICAL: No market tick - this should not happen in production
             // Use values that result in ZERO scoring contribution (not false positives)
@@ -5663,7 +5687,7 @@ pub fn build_enhanced_signal_context(
             // - depth = 0.0 (no depth, will result in penalty in microstructure scoring, not bonus)
             // This ensures missing data doesn't give false positive scores
             log::warn!("TRENDING: build_enhanced_signal_context called without MarketTick - missing data, using penalty values to prevent false positives");
-            (1000.0, 1.0, 0.0, 0.0) // High spread and zero depth = penalty, not bonus
+            (1000.0, 1.0, 0.0, 0.0, false) // High spread and zero depth = penalty, not bonus, no real data
         };
     
     // Multi-timeframe trends (default to current trend if not available)
@@ -5706,6 +5730,9 @@ pub fn build_enhanced_signal_context(
         nearest_resistance_distance,
         support_strength,
         resistance_strength,
+        // ✅ FIX (Plan.md): Missing data flags for proper scoring
+        has_real_orderbook_data,
+        has_real_volume_data,
     }
 }
 

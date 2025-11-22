@@ -401,18 +401,43 @@ async fn run_backtest_with_slice(
     let end_idx = (skip_first + take_count).min(all_candles.len());
     let candles_slice = &all_candles[skip_first..end_idx];
     
-    // Slice için time range
+    // ✅ KRİTİK FIX (Plan.md): Slice için time range belirle
     let start_time = candles_slice.first().map(|c| c.open_time);
     let end_time = candles_slice.last().map(|c| c.close_time);
     
-    // Diğer verileri çek (aynı time range için)
-    let funding = client.fetch_funding_rates(symbol, 100).await?;
-    let oi_hist = client
-        .fetch_open_interest_hist(symbol, period, candles_slice.len() as u32)
-        .await?;
-    let lsr_hist = client
-        .fetch_top_long_short_ratio(symbol, period, candles_slice.len() as u32)
-        .await?;
+    // ✅ KRİTİK FIX (Plan.md): Funding/OI/LSR verilerini SADECE slice time range için filtrele
+    // Bu, gelecek bilgisinin geçmişe sızmasını önler (Look-Ahead Bias önleme)
+    use chrono::{DateTime, Utc};
+    let all_funding = client.fetch_funding_rates(symbol, 500).await?;
+    let funding: Vec<_> = all_funding.into_iter()
+        .filter(|f| {
+            let ts = DateTime::<Utc>::from_timestamp_millis(f.funding_time);
+            match (ts, start_time, end_time) {
+                (Some(t), Some(s), Some(e)) => t >= s && t <= e,
+                _ => false
+            }
+        })
+        .collect();
+    
+    let all_oi = client.fetch_open_interest_hist(symbol, period, total_limit).await?;
+    let oi_hist: Vec<_> = all_oi.into_iter()
+        .filter(|o| {
+            match (start_time, end_time) {
+                (Some(s), Some(e)) => o.timestamp >= s && o.timestamp <= e,
+                _ => false
+            }
+        })
+        .collect();
+    
+    let all_lsr = client.fetch_top_long_short_ratio(symbol, period, total_limit).await?;
+    let lsr_hist: Vec<_> = all_lsr.into_iter()
+        .filter(|l| {
+            match (start_time, end_time) {
+                (Some(s), Some(e)) => l.timestamp >= s && l.timestamp <= e,
+                _ => false
+            }
+        })
+        .collect();
 
     // Force orders (slice time range için)
     let force_orders_json = get_cached_force_orders(&client, symbol, start_time, end_time, 500)

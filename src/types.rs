@@ -1086,6 +1086,10 @@ pub struct EnhancedSignalContext {
     pub nearest_resistance_distance: f64, // Distance to nearest resistance (%)
     pub support_strength: f64,          // How strong is support? (0-1)
     pub resistance_strength: f64,       // How strong is resistance? (0-1)
+    
+    // ✅ FIX (Plan.md): Missing data flags for proper scoring
+    pub has_real_orderbook_data: bool,  // Real orderbook data available?
+    pub has_real_volume_data: bool,      // Real volume data available?
 }
 
 #[derive(Debug, Clone)]

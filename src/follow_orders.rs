@@ -266,6 +266,8 @@ pub async fn run_follow_orders(
     
     // Her sembol için son bilinen ATR (optimize etmek için)
     let mut symbol_atrs: HashMap<String, f64> = HashMap::new();
+    // ✅ FIX (Plan.md): Son ATR değerlerini dinamik güncellemek için fiyat geçmişi tut
+    let mut symbol_last_prices: HashMap<String, Vec<f64>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -277,6 +279,8 @@ pub async fn run_follow_orders(
                         position_manager.close_position(&update.position_id);
                         active_positions_map.remove(&update.symbol);
                         symbol_atrs.remove(&update.symbol);
+                        // ✅ FIX (Plan.md): Pozisyon kapandığında fiyat geçmişini de temizle
+                        symbol_last_prices.remove(&update.symbol);
                     } else {
                         // Yeni veya güncellenen pozisyon
                         let is_new = !active_positions_map.contains_key(&update.symbol);
@@ -306,11 +310,35 @@ pub async fn run_follow_orders(
             },
             res = market_rx.recv() => match crate::types::handle_broadcast_recv(res) {
                 Ok(Some(tick)) => {
-                    // Sadece tick gelen sembol için kontrol yap (Verimlilik!)
+                    // ✅ FIX (Plan.md): ATR'yi dinamik olarak güncelle
+                    // Sadece aktif pozisyon olan semboller için ATR güncelle (verimlilik)
                     if let Some(position) = active_positions_map.get(&tick.symbol) {
+                        // Fiyat geçmişini güncelle
+                        let prices = symbol_last_prices
+                            .entry(tick.symbol.clone())
+                            .or_insert_with(Vec::new);
                         
-                        // ATR bilgisini al
-                        let current_atr = *symbol_atrs.get(&tick.symbol).unwrap_or(&0.01);
+                        prices.push(tick.price);
+                        
+                        // Son 14 fiyatı tut (ATR periyodu için yeterli)
+                        if prices.len() > 14 {
+                            prices.remove(0);
+                        }
+                        
+                        // Basit volatilite hesabı (gerçek ATR için high/low gerekir, ama MarketTick'te sadece price var)
+                        // True Range yerine price return'lerinin ortalamasını kullan
+                        let current_atr = if prices.len() >= 2 {
+                            let returns: Vec<f64> = prices.windows(2)
+                                .map(|w| ((w[1] - w[0]) / w[0]).abs())
+                                .collect();
+                            let avg_return = returns.iter().sum::<f64>() / returns.len() as f64;
+                            let estimated_atr = avg_return * tick.price;
+                            symbol_atrs.insert(tick.symbol.clone(), estimated_atr);
+                            estimated_atr
+                        } else {
+                            // Yeterli veri yoksa mevcut ATR'yi kullan (veya fallback)
+                            *symbol_atrs.get(&tick.symbol).unwrap_or(&0.01)
+                        };
 
                         // Position Manager ile değerlendir
                         let decision = position_manager.evaluate(

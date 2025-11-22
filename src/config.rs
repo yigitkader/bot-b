@@ -471,6 +471,39 @@ impl BotConfig {
             process::exit(1);
         }
 
+        // ✅ FIX (Plan.md): Risk/Reward oranı kontrolü
+        // ATR SL multiplier >= TP multiplier ise R:R < 1:1 olur, bu karlılığı zorlaştırır
+        if self.atr_sl_multiplier >= self.atr_tp_multiplier {
+            eprintln!("WARNING: ATR SL multiplier ({}) >= TP multiplier ({}) results in R:R < 1:1",
+                self.atr_sl_multiplier, self.atr_tp_multiplier);
+            eprintln!("  This means average loss >= average win, making profitability difficult.");
+            eprintln!("  Recommendation: Set atr_tp_multiplier > atr_sl_multiplier (e.g., 2:1 ratio)");
+        }
+        
+        // ✅ FIX (Plan.md): Enhanced scoring threshold kontrolü
+        if self.enable_enhanced_scoring {
+            if self.enhanced_score_marginal >= self.enhanced_score_good {
+                eprintln!("ERROR: enhanced_score_marginal ({}) >= enhanced_score_good ({})",
+                    self.enhanced_score_marginal, self.enhanced_score_good);
+                eprintln!("  Fix: Set enhanced_score_good > enhanced_score_marginal");
+                process::exit(1);
+            }
+            if self.enhanced_score_good >= self.enhanced_score_excellent {
+                eprintln!("ERROR: enhanced_score_good ({}) >= enhanced_score_excellent ({})",
+                    self.enhanced_score_good, self.enhanced_score_excellent);
+                eprintln!("  Fix: Set enhanced_score_excellent > enhanced_score_good");
+                process::exit(1);
+            }
+        }
+        
+        // ✅ FIX (Plan.md): Min/Max holding bars kontrolü
+        if self.min_holding_bars >= self.max_holding_bars {
+            eprintln!("ERROR: min_holding_bars ({}) >= max_holding_bars ({})",
+                self.min_holding_bars, self.max_holding_bars);
+            eprintln!("  Fix: Set max_holding_bars > min_holding_bars");
+            process::exit(1);
+        }
+
         self
     }
 
