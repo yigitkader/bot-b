@@ -205,9 +205,9 @@ async fn main() -> Result<()> {
 
     // ✅ Plan.md: Akıllı Paralel İşleme
     // Binance API ağırlık limitlerine (Weight Limit) takılmadan maksimum hızı almak için
-    // buffer_unordered ayarlandı. 100 coin'i ~3-5 dakikada tarayacak kapasitede.
-    // 10-15 concurrency güvenli ve hızlıdır. (100 coin ~ 3-5 dakika sürer)
-    let concurrency = 12; 
+    // buffer_unordered ayarlandı. 100 coin'i ~10-15 dakikada tarayacak kapasitede.
+    // Plan.md: Buffer 10 - Binance API limitlerine takılmadan maksimum hız
+    let concurrency = 10; 
     
     println!("✅ Selected {} coins for rigorous backtesting.", selected_symbols.len());
     println!("🚀 Starting parallel execution (Concurrency: {})...", concurrency);

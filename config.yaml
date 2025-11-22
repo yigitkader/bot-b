@@ -62,11 +62,12 @@ trending:
   # Çünkü geçmişe dönük anlık tahta (tick) verisi indirmiyoruz (çok büyük veri).
   # Sadece "Kline, Funding, OI, ForceOrder" gibi SOMUT verilerle çalışacağız.
   enable_order_flow: false
-  # Execution & Backtest Parameters (no hardcoded values)
-  fee_bps_round_trip: 10.0  # ✅ ACTION PLAN: Round-trip fee in basis points (10.0 = 0.10%) - Binance VIP 0 realistic. Minimum 10.0 recommended for realistic backtest results, especially with HFT mode.
+  # Execution & Backtest Parameters (Plan.md - Zero Simulation)
+  # ✅ Plan.md: Fee & Slippage (GERÇEKÇİ) - Deterministik, rastgelelik yok
+  fee_bps_round_trip: 8.0  # ✅ Plan.md: %0.08 (Binance Taker standart) - VIP0 realistic
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
-  # Slippage: Rastgele değil, baz değer. (Kod içinde volatilite ile çarpılacak)
-  slippage_bps: 5.0  # Baz slippage: %0.05. Volatilitede %0.25'e kadar çıkabilir.
+  # ✅ Plan.md: Slippage - Rastgele değil, ATR bazlı deterministik hesaplama
+  slippage_bps: 5.0  # ✅ Plan.md: Baz slippage: %0.05 (Normal volatilite). Volatilitede ATR ile çarpılacak.
   min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)
   # Signal Quality Filtering (configurable)
   min_volume_ratio: 1.5  # Minimum volume ratio vs 20-bar average

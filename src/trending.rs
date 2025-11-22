@@ -921,6 +921,43 @@ impl LiquidationMap {
     // Artık sadece gerçek Binance API'den alınan ForceOrder verileri kullanılacak.
     // Gerçek veri yoksa LiquidationMap boş kalacak ve liquidation stratejileri çalışmayacak.
 
+    /// ✅ Plan.md: Basit cascade kontrolü - sadece gerçek liquidation verisiyle çalışır
+    /// Backtest için optimize edilmiş basit versiyon
+    pub fn check_cascade(&self, current_price: f64) -> Option<CascadeSignal> {
+        let interval = if current_price > 1000.0 { 10.0 } else { 0.01 };
+        let key = (current_price / interval).round() as i64;
+        
+        // Yakın bir Long Wall var mı? (Aşağıda)
+        let downside_risk: f64 = self.long_liquidations.range(..key).rev().take(5).map(|(_, v)| *v).sum();
+        // Yakın bir Short Wall var mı? (Yukarıda)
+        let upside_risk: f64 = self.short_liquidations.range(key..).take(5).map(|(_, v)| *v).sum();
+
+        // Threshold: $500k gerçek likidasyon (düşük tuttum çünkü veri az olabilir)
+        if downside_risk > 500_000.0 {
+             // Fiyat düşerken longlar patlıyor -> SHORT fırsatı
+             return Some(CascadeSignal { 
+                 side: Side::Short, 
+                 entry_price: current_price, 
+                 target_price: current_price * 0.98,
+                 expected_pnl_pct: 0.02,
+                 wall_notional: downside_risk,
+                 confidence: 0.7,
+             });
+        }
+        if upside_risk > 500_000.0 {
+             // Fiyat çıkarken shortlar patlıyor -> LONG fırsatı
+             return Some(CascadeSignal { 
+                 side: Side::Long, 
+                 entry_price: current_price, 
+                 target_price: current_price * 1.02,
+                 expected_pnl_pct: 0.02,
+                 wall_notional: upside_risk,
+                 confidence: 0.7,
+             });
+        }
+        None
+    }
+
     /// ✅ CRITICAL FIX: Detect "liquidation walls" using dynamic price intervals
     /// Bu wall'lara yaklaştığımızda cascade riski var
     pub fn detect_liquidation_walls(
@@ -1442,13 +1479,8 @@ impl FuturesClient {
 
         let res = self.http.get(url).send().await?;
         if !res.status().is_success() {
-            // ⚠️ WARNING: Force orders endpoint may require authentication
-            // If it fails, return empty vector (backtest will use conservative estimates)
-            log::warn!(
-                "BACKTEST: Failed to fetch historical force orders for {}: {}. Using conservative liquidation estimates.",
-                symbol,
-                res.text().await.unwrap_or_else(|_| "unknown error".to_string())
-            );
+            // ✅ Plan.md: Sessizce boş dön (veri yoksa strateji çalışmaz)
+            // Backtest'te gerçek liquidation verisi yoksa, strateji devre dışı kalacak
             return Ok(Vec::new());
         }
 
@@ -1942,66 +1974,34 @@ fn create_orderflow_from_real_depth(
 // Bu fonksiyon sahte emir defteri verisi üretiyordu ve backtest sonuçlarını manipüle ediyordu.
 // Artık sadece gerçek Binance API verileri kullanılacak.
 
-/// ✅ CRITICAL FIX: Build LiquidationMap from historical force orders
+/// ✅ Plan.md: Build LiquidationMap from historical force orders (Sadece Gerçek ForceOrders ile çalışır)
 /// This provides REAL liquidation data for backtest instead of mathematical estimates
 fn build_liquidation_map_from_force_orders(
     force_orders: &[crate::types::ForceOrderRecord],
     current_price: f64,
-    open_interest: f64,
+    _open_interest: f64, // Not used in Plan.md version, kept for compatibility
 ) -> LiquidationMap {
-    let mut liq_map = LiquidationMap::new();
-    
-    if force_orders.is_empty() || open_interest <= 0.0 {
-        return liq_map;
-    }
-    
-    // Calculate price interval for clustering
-    let price_interval = if current_price > 1000.0 {
-        10.0
-    } else if current_price > 1.0 {
-        0.01
-    } else {
-        0.00001
-    };
-    
-    // Aggregate liquidations by price level
+    let mut map = LiquidationMap::new();
+    let interval = if current_price > 1000.0 { 10.0 } else { 0.01 };
+
     for order in force_orders {
-        let qty = order
-            .executed_qty
-            .as_deref()
-            .or_else(|| order.orig_qty.as_deref())
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let price = order
-            .avg_price
-            .as_deref()
-            .or_else(|| order.price.as_deref())
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        
-        if qty <= 0.0 || price <= 0.0 {
-            continue;
-        }
-        
+        // ✅ Plan.md: Basit parsing - sadece orig_qty ve price kullan
+        let qty = order.orig_qty.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        let price = order.price.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        if qty <= 0.0 || price <= 0.0 { continue; }
+
         let notional = qty * price;
-        let price_rounded = (price / price_interval).round() * price_interval;
-        let price_key = (price_rounded / price_interval) as i64;
-        
+        let key = (price / interval).round() as i64;
+
         match order.side.as_str() {
-            "SELL" => {
-                // Long liquidation (below current price typically)
-                *liq_map.long_liquidations.entry(price_key).or_insert(0.0) += notional;
-            }
-            "BUY" => {
-                // Short liquidation (above current price typically)
-                *liq_map.short_liquidations.entry(price_key).or_insert(0.0) += notional;
-            }
+            "SELL" => *map.long_liquidations.entry(key).or_insert(0.0) += notional,
+            "BUY" => *map.short_liquidations.entry(key).or_insert(0.0) += notional,
             _ => {}
         }
     }
     
-    liq_map.last_update = Utc::now();
-    liq_map
+    map.last_update = Utc::now();
+    map
 }
 
 // =======================
@@ -3696,19 +3696,15 @@ pub async fn run_backtest(
         .fetch_top_long_short_ratio(symbol, futures_period, kline_limit)
         .await?;
 
-    // ✅ CRITICAL FIX: Fetch historical force orders for realistic liquidation data
+    // ✅ Plan.md: Fetch historical force orders (GERÇEK VERİ)
+    // Sadece Binance'den çekilen gerçek ForceOrder verileri varsa strateji çalışacak
+    // Veri yoksa işlem açmayacak (tahmin yapılmayacak)
     let start_time = candles.first().map(|c| c.open_time);
     let end_time = candles.last().map(|c| c.close_time);
     let force_orders = client
         .fetch_historical_force_orders(symbol, start_time, end_time, 500)
         .await
-        .unwrap_or_else(|e| {
-            log::warn!(
-                "BACKTEST: Failed to fetch historical force orders: {}. Using conservative liquidation estimates.",
-                e
-            );
-            Vec::new()
-        });
+        .unwrap_or_default(); // ✅ Plan.md: Sessizce boş dön (veri yoksa strateji çalışmaz)
 
     let (matched_candles, contexts) =
         build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
