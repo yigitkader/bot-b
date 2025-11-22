@@ -69,7 +69,8 @@ trending:
   fee_bps_round_trip: 13.0  # ✅ Plan.md: Gerçekçi komisyon (Binance Futures Taker Fee ~0.05% * 2 = 0.10% = 10 bps, slippage dahil 13 bps güvenli)
   max_holding_bars: 48  # Maximum holding time in bars (48 = 4 hours @5m)
   # ✅ Plan.md: Slippage - Rastgele değil, ATR bazlı deterministik hesaplama
-  slippage_bps: 5.0  # ✅ Plan.md: Baz slippage: %0.05 (Normal volatilite). Volatilitede ATR ile çarpılacak. (Plan.md: 5.0 bps)
+  # Gerçekçi kayma payı (Execution lag simülasyonu için artırıldı)
+  slippage_bps: 7.0  # ✅ Plan.md: Gerçekçi slippage: %0.07 (Normal volatilite). Gerçek piyasada botun emri ile borsa eşleşmesi arasında milisaniyeler geçer ve fiyat kayar.
   min_holding_bars: 3  # Minimum holding time in bars (3 = 15 minutes @5m)
   # Signal Quality Filtering (configurable)
   min_volume_ratio: 1.5  # Minimum volume ratio vs 20-bar average

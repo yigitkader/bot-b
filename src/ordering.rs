@@ -258,45 +258,38 @@ async fn handle_signal(
         match cache.get_best_prices(&signal.symbol).await {
             Some((bid, ask)) => (bid, ask),
             None => {
-                warn!(
-                    "ORDERING: depth cache miss for {}, using calculate_order_price",
-                    signal.symbol
-                );
-                // Fallback to calculate_order_price
-                match connection
-                    .calculate_order_price(&signal.symbol, &signal.side)
-                    .await
-                {
+                warn!("ORDERING: depth cache miss for {}, using calculate_order_price", signal.symbol);
+                // Fallback: API'den güncel fiyatı çekmeyi dene
+                match connection.calculate_order_price(&signal.symbol, &signal.side).await {
                     Ok(price) => {
-                        // Use price as both bid and ask (approximation)
-                        (price * 0.9999, price * 1.0001)
+                        // API'den gelen fiyatı kullan (Bu gerçektir)
+                        // Piyasa emri olduğu için hafif bir spread payı ekle (Safety)
+                        (price * 0.9995, price * 1.0005) 
                     }
                     Err(err) => {
-                        warn!(
-                            "ORDERING: failed to calculate order price for {}: {err:?}, using signal.entry_price",
-                            signal.symbol
-                        );
-                        (signal.entry_price, signal.entry_price)
+                        // HATA: Eğer API de cevap vermiyorsa İŞLEM AÇMA.
+                        // "Sinyal fiyatından aldım" varsayımı yapmaktan iyidir.
+                        warn!("ORDERING: FATAL - Cannot get real price for {}. Skipping order to avoid bad fill. Error: {:?}", signal.symbol, err);
+                        state.set_open_order(&signal.symbol, false);
+                        return; // ÇIKIŞ YAP, SİNYALİ İPTAL ET
                     }
                 }
             }
         }
     } else {
         // Fallback: use calculate_order_price
-        match connection
-            .calculate_order_price(&signal.symbol, &signal.side)
-            .await
-        {
+        match connection.calculate_order_price(&signal.symbol, &signal.side).await {
             Ok(price) => {
-                // Use price as both bid and ask (approximation)
-                (price * 0.9999, price * 1.0001)
+                // API'den gelen fiyatı kullan (Bu gerçektir)
+                // Piyasa emri olduğu için hafif bir spread payı ekle (Safety)
+                (price * 0.9995, price * 1.0005) 
             }
             Err(err) => {
-                warn!(
-                    "ORDERING: failed to calculate order price for {}: {err:?}, using signal.entry_price",
-                    signal.symbol
-                );
-                (signal.entry_price, signal.entry_price)
+                // HATA: Eğer API de cevap vermiyorsa İŞLEM AÇMA.
+                // "Sinyal fiyatından aldım" varsayımı yapmaktan iyidir.
+                warn!("ORDERING: FATAL - Cannot get real price for {}. Skipping order to avoid bad fill. Error: {:?}", signal.symbol, err);
+                state.set_open_order(&signal.symbol, false);
+                return; // ÇIKIŞ YAP, SİNYALİ İPTAL ET
             }
         }
     };

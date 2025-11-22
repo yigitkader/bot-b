@@ -111,14 +111,15 @@ async fn fetch_and_cache_data(
     let candles: Vec<Candle>;
 
     if !kline_file.exists() {
-        let _permit = rate_limiter.acquire().await?; // Rate limit koruması
-        println!("  ⬇️  İndiriliyor: {} Klines...", symbol);
+        // Klines hafiftir, ancak yine de izne tabi olsun
+        let _permit = rate_limiter.acquire().await?;
+        println!("  ⬇️  [{}] Klines İndiriliyor...", symbol);
         candles = client.fetch_klines(symbol, interval, limit).await?;
         
         let json = serde_json::to_string(&candles)?;
         std::fs::write(&kline_file, json)?;
-        // Binance weight koruması için bekleme
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; 
+        // Kısa bekleme
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; 
     } else {
         let data = std::fs::read_to_string(&kline_file)?;
         candles = serde_json::from_str(&data)?;
@@ -130,21 +131,33 @@ async fn fetch_and_cache_data(
         let force_file = cache_dir.join(format!("{}_{}_{}_force.json", symbol, first.open_time.timestamp(), last.close_time.timestamp()));
         
         if !force_file.exists() {
+            // ForceOrders için izni al ama işlem bittikten sonra hemen bırakma, bekle.
             let _permit = rate_limiter.acquire().await?;
-            // ForceOrders Weight: 20! Çok dikkatli olunmalı.
-            println!("  ⬇️  İndiriliyor: {} ForceOrders (Ağır İstek)...", symbol);
             
-            let force_orders = client.fetch_historical_force_orders(
+            println!("  ⬇️  [{}] ForceOrders (Ağır Veri) İndiriliyor...", symbol);
+            
+            // Hata olursa backtest durmasın, boş liste dönsün
+            let force_orders = match client.fetch_historical_force_orders(
                 symbol, 
                 Some(first.open_time), 
                 Some(last.close_time), 
-                1000 // Limit
-            ).await.unwrap_or_default();
+                1000 
+            ).await {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("  ⚠️  [{}] ForceOrder hatası (atlanıyor): {}", symbol, e);
+                    Vec::new()
+                }
+            };
 
-            let json = serde_json::to_string(&force_orders)?;
-            std::fs::write(&force_file, json)?;
+            if !force_orders.is_empty() {
+                let json = serde_json::to_string(&force_orders)?;
+                std::fs::write(&force_file, json)?;
+            }
             
-            // ✅ Plan.md: ForceOrders sonrası daha uzun bekleme (Weight 20)
+            // ✅ KRİTİK: Binance Weight 1200/dk. ForceOrders 20 yer.
+            // 5 paralel * 20 weight = 100 weight. Saniyede 1-2 istek güvenli.
+            // Her indirmeden sonra 500ms bekleme ekliyoruz.
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         } else {
             // ✅ Plan.md: ForceOrders verisi eksik coinleri logla
@@ -303,50 +316,6 @@ async fn run_backtest_with_cache(
 ) -> Result<BacktestResult> {
     // ✅ Plan.md: run_fast_backtest kullan (aynı mantık, daha optimize)
     run_fast_backtest(symbol, interval, period, limit, cfg).await
-}
-
-// ✅ Plan.md: Portfolio backtest için veri hazırlama
-async fn prepare_portfolio_data(
-    symbol: &str,
-    interval: &str,
-    period: &str,
-    limit: u32,
-) -> Result<PortfolioCandleData> {
-    let cache_dir = Path::new("data_cache");
-    let client = FuturesClient::new();
-
-    // 1. Klines Oku
-    let kline_file = cache_dir.join(format!("{}_{}_{}_klines.json", symbol, interval, limit));
-    if !kline_file.exists() {
-        return Err(anyhow::anyhow!("Veri bulunamadı: {}", symbol));
-    }
-    let candles: Vec<Candle> = serde_json::from_str(&std::fs::read_to_string(&kline_file)?)?;
-
-    // 2. Force Orders Oku
-    let mut force_orders: Vec<trading_bot::types::ForceOrderRecord> = Vec::new();
-    if let (Some(first), Some(last)) = (candles.first(), candles.last()) {
-        let force_file = cache_dir.join(format!("{}_{}_{}_force.json", symbol, first.open_time.timestamp(), last.close_time.timestamp()));
-        if force_file.exists() {
-            let file_size = std::fs::metadata(&force_file).map(|m| m.len()).unwrap_or(0);
-            if file_size > 10 {
-                force_orders = serde_json::from_str(&std::fs::read_to_string(&force_file)?)?;
-            }
-        }
-    }
-
-    // 3. Diğer Metrikler
-    let funding = client.fetch_funding_rates(symbol, 100).await.unwrap_or_default();
-    let oi_hist = client.fetch_open_interest_hist(symbol, period, limit).await.unwrap_or_default();
-    let lsr_hist = client.fetch_top_long_short_ratio(symbol, period, limit).await.unwrap_or_default();
-
-    let (matched_candles, contexts) = build_signal_contexts(&candles, &funding, &oi_hist, &lsr_hist);
-
-    Ok(PortfolioCandleData {
-        symbol: symbol.to_string(),
-        candles: matched_candles,
-        contexts,
-        force_orders: if force_orders.is_empty() { None } else { Some(force_orders) },
-    })
 }
 
 // ✅ Plan.md: Portfolio backtest için veri hazırlama
@@ -567,12 +536,14 @@ async fn main() -> Result<()> {
     println!();
 
     // ✅ Plan.md: FAZ 1 - Veri İndirme ve Önbellekleme (Rate Limit Korumalı)
-    println!("\n⬇️  FAZ 1: VERİ İNDİRME VE ÖNBELLEKLEME");
+    println!("\n⬇️  FAZ 1: VERİ İNDİRME (Güvenli Mod - Max 3 Paralel)");
     println!("   Binance API limitlerine saygı duyuluyor...");
     
     let client = FuturesClient::new();
-    // ✅ Plan.md: 5 eşzamanlı indirme izni (Rate limit aşmamak için düşük tutuldu)
-    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(5)); 
+    // ✅ DÜZELTME 2: Semaphore ayarı
+    // 5 Eşzamanlı indirme yerine, ForceOrders ağırlığı yüzünden 3'e düşürelim.
+    // Bu, 100 coin için biraz daha yavaş olur ama IP ban riskini sıfırlar.
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(3)); 
     
     let download_tasks = stream::iter(selected_symbols.clone())
         .map(|symbol| {
@@ -583,7 +554,7 @@ async fn main() -> Result<()> {
                 fetch_and_cache_data(client, &symbol, &interval, limit, &sem).await
             }
         })
-        .buffer_unordered(5) // Aynı anda 5 indirme
+        .buffer_unordered(3) // Aynı anda 3 indirme (ForceOrders ağırlığı için güvenli)
         .collect::<Vec<_>>()
         .await;
 

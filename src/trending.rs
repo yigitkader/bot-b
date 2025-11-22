@@ -3244,6 +3244,8 @@ pub fn run_backtest_on_series(
     if has_real_liquidation_data {
         log::info!("BACKTEST: ✅ {} için GERÇEK Liquidation verisi mevcut. Cascade stratejisi AKTİF.", symbol);
     } else {
+        // Bu uyarıyı daha görünür yapalım
+        println!("  ⚠️  [{}] UYARI: Gerçek Liquidation verisi yok! Cascade stratejisi backtestte devre dışı.", symbol);
         log::warn!("BACKTEST: ⚠️ {} için Liquidation verisi EKSİK. Cascade stratejisi PASİF (Skor düşebilir).", symbol);
     }
 
